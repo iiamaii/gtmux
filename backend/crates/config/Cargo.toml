@@ -11,3 +11,10 @@ serde = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+# Jail은 figment 0.10의 통합 test fixture — env / cwd / file을 process-scoped
+# mutex로 isolate한다 (`serial_test`보다 figment 사용자에 합목적).
+figment = { workspace = true, features = ["toml", "env", "test"] }
+# defaults_toml round-trip 테스트가 직접 toml parse를 호출한다.
+toml = "0.8"
