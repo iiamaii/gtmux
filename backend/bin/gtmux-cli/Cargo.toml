@@ -1,0 +1,22 @@
+[package]
+name = "gtmux-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gtmux"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+gtmux-lifecycle = { path = "../../crates/lifecycle" }
+gtmux-ws-server = { path = "../../crates/ws-server" }
+gtmux-http-api = { path = "../../crates/http-api" }
+gtmux-config = { path = "../../crates/config" }
+gtmux-auth = { path = "../../crates/auth" }

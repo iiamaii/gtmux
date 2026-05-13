@@ -1,0 +1,17 @@
+[package]
+name = "gtmux-ws-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+tokio-tungstenite = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+gtmux-mux-router = { path = "../mux-router" }
+gtmux-auth = { path = "../auth" }

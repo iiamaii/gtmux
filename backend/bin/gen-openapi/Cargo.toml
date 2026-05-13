@@ -1,0 +1,27 @@
+# gen-openapi: bootstrap codegen binary (Task C3).
+#
+# Produces an OpenAPI 3.1 YAML document on stdout from utoipa-derived
+# stub structs (`Group`, `Panel`). The bodies are intentionally minimal --
+# the goal is to exercise the Rust -> OpenAPI -> TS pipeline, not to model
+# the real `canvas-layout-schema.md` yet.
+#
+# Real schema population happens once the http-api crate lands its
+# `GET/PUT /api/layout` handlers (ADR-0011 D3·D5, ADR-0012 D7).
+
+[package]
+name        = "gen-openapi"
+version     = "0.0.0"
+edition.workspace     = true
+rust-version.workspace = true
+license.workspace     = true
+publish     = false
+
+[[bin]]
+name = "gen-openapi"
+path = "src/main.rs"
+
+[dependencies]
+serde   = { workspace = true }
+utoipa  = { workspace = true }
+anyhow  = { workspace = true }
+serde_yaml = "0.9"

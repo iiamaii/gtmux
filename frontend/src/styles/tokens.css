@@ -1,0 +1,23 @@
+/* gtmux 디자인 토큰 — CSS custom properties. R8 §Scaffolding outline 정합. */
+
+:root {
+  /* 색 */
+  --color-bg: #0f172a;
+  --color-fg: #e2e8f0;
+  --color-accent: #38bdf8;
+  --color-warning: #facc15;
+  --color-danger: #ef4444;
+
+  /* 간격 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+
+  /* z-index 레이어 */
+  --z-canvas: 0;
+  --z-sidebar: 100;
+  --z-toolbar: 200;
+  --z-banner: 1000;
+  --z-modal: 2000;
+}

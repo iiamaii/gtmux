@@ -1,0 +1,10 @@
+# gtmux backend cargo configuration.
+#
+# Cross-compile은 R7 §8 D9의 cargo-zigbuild로 수행한다. zigbuild는
+# 별도 도구(`cargo install cargo-zigbuild`)로 설치하며 zig linker를 사용한다.
+# 예시:
+#   cargo zigbuild --target aarch64-apple-darwin --release
+#   cargo zigbuild --target x86_64-unknown-linux-gnu --release
+#
+# 본 파일은 의도적으로 비어 있다. zigbuild가 자체적으로 linker를
+# 관리하므로 `[target.*]` 섹션을 두면 충돌 위험이 있다.

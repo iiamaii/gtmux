@@ -1,0 +1,12 @@
+# Rust build artifacts
+target/
+
+# Per Cargo convention, libraries do not commit Cargo.lock; binaries DO.
+# 본 워크스페이스는 `bin/gtmux-cli`라는 정적 바이너리를 산출하므로
+# Cargo.lock은 *commit한다* (R7 §8 cross-compile 재현성).
+# 따라서 Cargo.lock을 본 .gitignore에서 제외해 둔다.
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

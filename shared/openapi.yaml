@@ -1,0 +1,33 @@
+openapi: 3.1.0
+info:
+  title: gtmux API
+  description: Bootstrap OpenAPI stub for Task C3 codegen pipeline. Real surface lands with http-api crate.
+  license:
+    name: MIT OR Apache-2.0
+    identifier: MIT OR Apache-2.0
+  version: 0.0.0
+paths: {}
+components:
+  schemas:
+    Group:
+      type: object
+      description: |-
+        Placeholder Group payload. ADR-0010 G-hybrid will extend this with
+        `parent_id`, `label`, `color`, `visibility`, `locked`, `order`.
+      required:
+      - id
+      properties:
+        id:
+          type: string
+          description: Stable identifier for the group node within a Canvas Layout tree.
+    Panel:
+      type: object
+      description: |-
+        Placeholder Panel payload. The real schema adds geometry, z-order,
+        visibility, lock, label, note, and parent linkage (ADR-0010).
+      required:
+      - id
+      properties:
+        id:
+          type: string
+          description: Stable identifier for the panel node within a Canvas Layout tree.
