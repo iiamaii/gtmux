@@ -1,21 +1,27 @@
-// WS binary envelope 타입 정의. ADR-0002 + grill D14 0x80–0x8F web-domain 슬롯.
-// 실제 디코더는 src/lib/ws/decode.ts.
+// WS binary envelope 타입 정의.
+//
+// 정본:
+// - `docs/ssot/wire-protocol.md` §2 (32 슬롯 표)
+// - `docs/adr/0002-transport-websocket.md` D2/D3/D4 (envelope 구조)
+// - `docs/reports/0008-frontend-stack.md` §F4 (frontend dispatcher 골격)
+//
+// 본 모듈은 *타입 alias만* 노출한다. 인코딩/디코딩 함수는 `$lib/ws/decode.ts`,
+// 런타임 `Envelope` interface 와 `FRAME_TYPE` 상수 객체도 `decode.ts` 가 origin —
+// 본 모듈은 같은 심볼을 *type-only* 로 re-export 해서 외부 모듈이 type-only import
+// 경로(`import type { Envelope } from '$lib/types/envelope'`)로 합의된 채널을 쓸
+// 수 있게 한다. (verbatimModuleSyntax + isolatedModules 둘 다 ON 이므로 type-only
+// re-export 는 `export type { ... }` 문법으로 명시.)
 
-export type Envelope =
-  | { kind: 'pane_out'; paneId: number; bytes: Uint8Array }
-  | { kind: 'layout_changed'; etag: Uint8Array }
-  | { kind: 'm_changed'; panelIds: number[] }
-  | { kind: 'i_changed'; paneId: number | null }
-  | { kind: 'viewport_changed'; x: number; y: number; zoom: number }
-  | { kind: 'focus_mode_changed'; enabled: boolean; targetPanelId: number | null };
+export type {
+  Envelope,
+  FrameTypeCode,
+  PaneOutPayload,
+  LayoutChangedPayload,
+  MChangedPayload,
+  IChangedPayload,
+  ViewportChangedPayload,
+  FocusModeChangedPayload,
+  NotifyMirrorPayload,
+} from '$lib/ws/decode';
 
-export const OPCODE = {
-  // tmux-domain (0x01–0x0F) — frontend는 PANE_OUT만 사용.
-  PANE_OUT: 0x02,
-  // web-domain (0x80–0x8F) — MT-3 broadcast.
-  LAYOUT_CHANGED: 0x80,
-  M_CHANGED: 0x81,
-  I_CHANGED: 0x82,
-  VIEWPORT_CHANGED: 0x83,
-  FOCUS_MODE_CHANGED: 0x84,
-} as const;
+export { FRAME_TYPE } from '$lib/ws/decode';

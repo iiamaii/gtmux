@@ -20,4 +20,16 @@
   --z-toolbar: 200;
   --z-banner: 1000;
   --z-modal: 2000;
+
+  /* ReconnectBanner (FE-3 D21 c2) — warn=transient/recoverable, error=blocking. */
+  --banner-warn-bg: #422006;
+  --banner-warn-fg: #fde68a;
+  --banner-warn-border: #b45309;
+  --banner-error-bg: #450a0a;
+  --banner-error-fg: #fecaca;
+  --banner-error-border: #b91c1c;
+
+  /* Zombie badge (FE-3 D21 c3) — pane_dead=1 표시. dark chip with warning accent. */
+  --zombie-bg: #1f2937;
+  --zombie-fg: var(--color-warning);
 }
