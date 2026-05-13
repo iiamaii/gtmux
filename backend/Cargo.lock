@@ -459,6 +459,7 @@ name = "gtmux-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "gtmux-auth",
  "gtmux-config",
@@ -504,8 +505,11 @@ name = "gtmux-lifecycle"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "gtmux-auth",
  "gtmux-config",
+ "libc",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
