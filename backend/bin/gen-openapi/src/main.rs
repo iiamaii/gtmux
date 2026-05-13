@@ -30,11 +30,11 @@ pub struct Panel {
 #[derive(OpenApi)]
 #[openapi(
     info(
-        title       = "gtmux API",
-        version     = "0.0.0",
+        title = "gtmux API",
+        version = "0.0.0",
         description = "Bootstrap OpenAPI stub for Task C3 codegen pipeline. Real surface lands with http-api crate.",
     ),
-    components(schemas(Group, Panel)),
+    components(schemas(Group, Panel))
 )]
 struct ApiDoc;
 

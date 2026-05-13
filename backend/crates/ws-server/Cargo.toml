@@ -13,5 +13,16 @@ bytes = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
+http = "1"
+tower-http = { workspace = true }
 gtmux-mux-router = { path = "../mux-router" }
 gtmux-auth = { path = "../auth" }
+gtmux-config = { path = "../config" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+http = "1"

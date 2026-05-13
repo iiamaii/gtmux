@@ -8,12 +8,17 @@ license.workspace = true
 [dependencies]
 tokio = { workspace = true }
 axum = { workspace = true }
+tower = { workspace = true }
 tower-http = { workspace = true }
+http = "1"
+http-body-util = "0.1"
 utoipa = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+ring = { workspace = true }
 gtmux-mux-router = { path = "../mux-router" }
 gtmux-auth = { path = "../auth" }
 gtmux-config = { path = "../config" }
