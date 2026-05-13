@@ -21,3 +21,4 @@ gtmux-ws-server = { path = "../../crates/ws-server" }
 gtmux-http-api = { path = "../../crates/http-api" }
 gtmux-config = { path = "../../crates/config" }
 gtmux-auth = { path = "../../crates/auth" }
+gtmux-mux-router = { path = "../../crates/mux-router" }

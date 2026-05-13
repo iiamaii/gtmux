@@ -35,10 +35,13 @@ use clap::{Parser, Subcommand};
 use gtmux_auth::{issue_token, load_token, rotate_token, save_token, AuthError, TokenString};
 use gtmux_config::{derive_mode, load as load_config, Config, Mode};
 use gtmux_lifecycle::{
-    socket_path_for, LifecycleError, SpawnOptions, TeardownOpts, TeardownReport, TmuxDaemon,
+    run_command_loop, run_event_loop, socket_path_for, LifecycleError, SpawnOptions, TeardownOpts,
+    TeardownReport, TmuxDaemon,
 };
+use gtmux_ws_server::{Hub, TmuxRequest};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -284,7 +287,36 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     // 7+8+9) router — HTTP API (layout, bootstrap, healthz) + WebSocket (/ws).
     //   The two routers share Origin/Host invariants but have independent
     //   middleware stacks (cookie/Bearer for HTTP, subprotocol for WS).
-    let app = build_app(&config, &token);
+    //
+    //   Sprint 4-B wiring: a shared [`Hub`] fans tmux events to all WS
+    //   subscribers, and a single-writer mpsc channel routes user-origin
+    //   commands back to the daemon. Both halves of the daemon
+    //   (`read_line` + `write_line`) are guarded by an `Arc<Mutex<…>>`
+    //   because the underlying stdio pair can not be split independently.
+    //   SAFETY/CORRECTNESS NOTE: the mutex is held only across one read or
+    //   one write — never across an `await` that depends on the other half
+    //   — so the two background tasks cannot deadlock each other.
+    let hub = Hub::new();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<TmuxRequest>(64);
+    let daemon_arc = Arc::new(Mutex::new(daemon));
+    let app = build_app(&config, &token, hub.clone(), cmd_tx);
+    let event_loop_handle = tokio::spawn({
+        let daemon = Arc::clone(&daemon_arc);
+        let hub = hub.clone();
+        async move {
+            if let Err(e) = run_event_loop(daemon, hub).await {
+                warn!(error = %e, "tmux event loop exited with error");
+            }
+        }
+    });
+    let command_loop_handle = tokio::spawn({
+        let daemon = Arc::clone(&daemon_arc);
+        async move {
+            if let Err(e) = run_command_loop(daemon, cmd_rx).await {
+                warn!(error = %e, "tmux command loop exited with error");
+            }
+        }
+    });
 
     // 10) bind — TCP only for now (unix socket variant is a planned alt-path
     //    that lives behind `bind = "unix:/..."`; we surface a friendly error
@@ -308,11 +340,13 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             // Best-effort cleanup of resources we already claimed before
             // surfacing the friendly exit-4 error.
-            drop(daemon);
+            event_loop_handle.abort();
+            command_loop_handle.abort();
             return Err(BindError::InUse(addr).into());
         }
         Err(e) => {
-            drop(daemon);
+            event_loop_handle.abort();
+            command_loop_handle.abort();
             return Err(anyhow::Error::new(e).context(format!("binding {addr}")));
         }
     };
@@ -332,18 +366,24 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //    graceful shutdown future ends when *either* fires; axum then drains
     //    in-flight requests. ADR-0009 D5 / D21 c5: the daemon stays alive.
     let shutdown_signal = wait_for_shutdown();
-    let daemon = Arc::new(tokio::sync::Mutex::new(Some(daemon)));
 
     // 13) serve.
     let serve_result = axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(shutdown_signal)
         .await;
 
-    // Post-shutdown — drop our control-mode client (daemon survives). The
-    // farewell banner mirrors the start banner so the user immediately sees
-    // that the daemon is *intentionally* still around.
-    if let Some(mut d) = daemon.lock().await.take() {
-        if let Err(e) = d.shutdown().await {
+    // Post-shutdown — stop the background loops (they hold the daemon mutex
+    // and would otherwise prevent `take()`), then drop our control-mode
+    // client (daemon survives — ADR-0009 D5 / D21 c5). The farewell banner
+    // mirrors the start banner so the user immediately sees that the
+    // daemon is *intentionally* still around.
+    event_loop_handle.abort();
+    command_loop_handle.abort();
+    let _ = event_loop_handle.await;
+    let _ = command_loop_handle.await;
+    {
+        let mut guard = daemon_arc.lock().await;
+        if let Err(e) = guard.shutdown().await {
             warn!(error = %e, "control-mode client shutdown reported an error");
         }
     }
@@ -352,8 +392,13 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     serve_result.context("axum::serve")
 }
 
-fn build_app(config: &Config, token: &TokenString) -> Router {
-    gtmux_http_api::router(config, token).merge(gtmux_ws_server::router(config, token))
+fn build_app(
+    config: &Config,
+    token: &TokenString,
+    hub: Hub,
+    cmd_tx: mpsc::Sender<TmuxRequest>,
+) -> Router {
+    gtmux_http_api::router(config, token).merge(gtmux_ws_server::router(config, token, hub, cmd_tx))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

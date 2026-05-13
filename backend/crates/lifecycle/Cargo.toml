@@ -13,6 +13,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 gtmux-config = { path = "../config" }
 gtmux-auth = { path = "../auth" }
+gtmux-mux-router = { path = "../mux-router" }
+gtmux-ws-server = { path = "../ws-server" }
 # libc는 좁은 범위 SIGTERM/SIGKILL 송신 + geteuid 호출에만 사용 (unsafe 블록 격리).
 libc = "0.2"
 
