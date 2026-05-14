@@ -130,9 +130,20 @@ impl TmuxDaemon {
     /// Spawn (or re-attach to) the dedicated tmux daemon for `opts.session_name`.
     ///
     /// argv = `["tmux", "-L", "gtmux-<session>", "-S", <socket>, "-C",
-    /// "new-session", "-A", "-s", <session>, "-d"]` per ADR-0009 D2 + ADR-0001
+    /// "new-session", "-A", "-s", <session>]` per ADR-0009 D2 + ADR-0001
     /// D11. The `-A` flag turns this into a re-attach when the session
     /// already exists, which is the D21 c2 idempotency contract.
+    ///
+    /// Note on `-d`: we intentionally do NOT pass `-d`. With `-d`, tmux
+    /// creates the session detached and then exits the control-mode client
+    /// immediately — our `run_event_loop` would see EOF before ever
+    /// reading the boot-time `%session-changed $0 <name>` line that the
+    /// Hub caches for late WS subscribers. Without `-d` the control-mode
+    /// client stays attached for as long as our `stdin` pipe is open,
+    /// which is the entire `gtmux start` lifetime. The daemon outlives
+    /// the client either way (tmux keeps the server up as long as any
+    /// session has windows), so this does not change ADR-0009 D5's
+    /// "daemon survives Server shutdown" guarantee.
     pub async fn spawn(opts: SpawnOptions) -> Result<Self> {
         let socket_path = resolve_socket_path(&opts)?;
         ensure_socket_dir(socket_path.parent().expect("socket has a parent"))?;
@@ -148,7 +159,6 @@ impl TmuxDaemon {
             .arg("-A")
             .arg("-s")
             .arg(&opts.session_name)
-            .arg("-d")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
