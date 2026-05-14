@@ -43,7 +43,7 @@ use gtmux_lifecycle::{
 use gtmux_ws_server::{Hub, TmuxRequest};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -341,7 +341,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //   — so the two background tasks cannot deadlock each other.
     let hub = Hub::new();
     let (cmd_tx, cmd_rx) = mpsc::channel::<TmuxRequest>(64);
-    let daemon_arc = Arc::new(Mutex::new(daemon));
+    let daemon_arc = Arc::new(daemon);
     // `config.frontend_dist` opts the bundled SPA in when set; smoke tests
     // set `GTMUX_FRONTEND_DIST` env (figment converts to the config field) so
     // a single port serves both the API and the static UI.
@@ -452,11 +452,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     command_loop_handle.abort();
     let _ = event_loop_handle.await;
     let _ = command_loop_handle.await;
-    {
-        let mut guard = daemon_arc.lock().await;
-        if let Err(e) = guard.shutdown().await {
-            warn!(error = %e, "control-mode client shutdown reported an error");
-        }
+    if let Err(e) = daemon_arc.shutdown().await {
+        warn!(error = %e, "control-mode client shutdown reported an error");
     }
 
     // Remove the pidfile so `gtmux start` on the next run sees `Absent`

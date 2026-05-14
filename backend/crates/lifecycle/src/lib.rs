@@ -111,6 +111,15 @@ pub struct SpawnOptions {
 
 /// 1 server : 1 tmux daemon binding. Owns the child handle (when this
 /// process spawned the daemon) and the control-mode line stream.
+///
+/// SAFETY/CORRECTNESS NOTE: stdin and stdout each sit behind their own
+/// `tokio::sync::Mutex`. This is what makes [`run_event_loop`] (which
+/// holds the stdout mutex across `read_line.await`) and
+/// [`run_command_loop`] (which holds the stdin mutex during `write_line`)
+/// non-blocking with respect to each other — a previous design used a
+/// single outer mutex and deadlocked the writer whenever tmux idled
+/// between control-mode emits. The `child` handle has its own mutex so
+/// `shutdown` can mutate it without blocking the read/write loops.
 pub struct TmuxDaemon {
     session_name: String,
     socket_path: PathBuf,
@@ -118,12 +127,11 @@ pub struct TmuxDaemon {
     /// child handle to signal. `None` when we attached to a daemon owned by
     /// a prior run — shutting that down is the teardown subcommand's job,
     /// not ours (ADR-0009 D5: Server lifecycle ⊥ tmux daemon lifecycle).
-    child: Option<Child>,
-    /// Control-mode stdout reader. `Option` so [`Self::read_line`] can take
-    /// ownership during `next_line()` without forcing the whole struct
-    /// through `&mut Pin<...>` gymnastics — we re-attach on every call.
-    control_stdout: Option<Lines<BufReader<ChildStdout>>>,
-    control_stdin: Option<ChildStdin>,
+    child: Mutex<Option<Child>>,
+    /// Control-mode stdout reader.
+    stdout_lock: Mutex<Option<Lines<BufReader<ChildStdout>>>>,
+    /// Control-mode stdin writer.
+    stdin_lock: Mutex<Option<ChildStdin>>,
 }
 
 impl TmuxDaemon {
@@ -177,9 +185,9 @@ impl TmuxDaemon {
         Ok(Self {
             session_name: opts.session_name,
             socket_path,
-            child: Some(child),
-            control_stdout: Some(BufReader::new(stdout).lines()),
-            control_stdin: Some(stdin),
+            child: Mutex::new(Some(child)),
+            stdout_lock: Mutex::new(Some(BufReader::new(stdout).lines())),
+            stdin_lock: Mutex::new(Some(stdin)),
         })
     }
 
@@ -244,9 +252,9 @@ impl TmuxDaemon {
         Ok(Self {
             session_name: opts.session_name,
             socket_path,
-            child: None,
-            control_stdout: Some(BufReader::new(stdout).lines()),
-            control_stdin: Some(stdin),
+            child: Mutex::new(None),
+            stdout_lock: Mutex::new(Some(BufReader::new(stdout).lines())),
+            stdin_lock: Mutex::new(Some(stdin)),
         })
     }
 
@@ -261,11 +269,13 @@ impl TmuxDaemon {
     /// Read one LF-terminated line from the control-mode channel. Trailing
     /// `\r` is stripped (ADR-0001 D12 CRLF normalisation). Returns `Ok(None)`
     /// at EOF — callers treat that as orderly shutdown.
-    pub async fn read_line(&mut self) -> Result<Option<Bytes>> {
-        let stream = self
-            .control_stdout
-            .as_mut()
-            .ok_or(LifecycleError::ProtocolError)?;
+    ///
+    /// `&self` rather than `&mut self`: stdin/stdout/child all sit behind
+    /// independent mutexes so the read-half can be locked without blocking
+    /// the write-half. See the struct-level note on `TmuxDaemon`.
+    pub async fn read_line(&self) -> Result<Option<Bytes>> {
+        let mut guard = self.stdout_lock.lock().await;
+        let stream = guard.as_mut().ok_or(LifecycleError::ProtocolError)?;
         match stream.next_line().await? {
             Some(mut s) => {
                 if s.ends_with('\r') {
@@ -280,17 +290,15 @@ impl TmuxDaemon {
     /// Write one line plus LF and flush. ADR-0001 D12 requires non-empty
     /// outbound lines (tmux treats a bare `\n` as a detach trigger); we
     /// assert that here instead of letting the daemon misinterpret it.
-    pub async fn write_line(&mut self, line: &[u8]) -> Result<()> {
+    pub async fn write_line(&self, line: &[u8]) -> Result<()> {
         if line.is_empty() {
             // Caller bug — bare newlines would trigger tmux detach. Refuse
             // explicitly so the failure surfaces in test rather than as a
             // mysterious disconnect at runtime.
             return Err(LifecycleError::ProtocolError);
         }
-        let stdin = self
-            .control_stdin
-            .as_mut()
-            .ok_or(LifecycleError::ProtocolError)?;
+        let mut guard = self.stdin_lock.lock().await;
+        let stdin = guard.as_mut().ok_or(LifecycleError::ProtocolError)?;
         stdin.write_all(line).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
@@ -309,14 +317,14 @@ impl TmuxDaemon {
     ///
     /// No-op on attach-mode handles (`child = None`) — the control client
     /// in that case is owned by the detached task spawned in [`Self::attach`].
-    pub async fn shutdown(&mut self) -> Result<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         // Close stdio first so tmux observes EOF on the control channel —
         // this is the polite signal for tmux to exit its client loop. We
         // still follow up with SIGTERM in case the daemon ignored it.
-        drop(self.control_stdin.take());
-        drop(self.control_stdout.take());
+        drop(self.stdin_lock.lock().await.take());
+        drop(self.stdout_lock.lock().await.take());
 
-        let Some(mut child) = self.child.take() else {
+        let Some(mut child) = self.child.lock().await.take() else {
             debug!(
                 session = %self.session_name,
                 "shutdown skipped (attach mode — daemon not owned)"
@@ -367,17 +375,12 @@ impl TmuxDaemon {
 
 /// Run the tmux read loop: `read_line → parse_line → hub.publish`.
 ///
-/// Owns one side of an `Arc<Mutex<TmuxDaemon>>` shared with
-/// [`run_command_loop`]. The mutex is held only for the duration of a single
-/// `read_line` call, after which the loop releases it and the writer side
-/// can acquire it for one command.
-///
-/// SAFETY/CORRECTNESS NOTE: this loop calls `daemon.read_line().await`
-/// *inside* the mutex. That's safe in practice because `read_line` is the
-/// only producer of bytes from the daemon and it returns as soon as one LF
-/// arrives, so the writer side is never starved for long. If a future
-/// design requires longer write bursts than the read cadence, swap to an
-/// `tokio::io::split` based design that holds the two halves independently.
+/// Shares the daemon handle with [`run_command_loop`] via `Arc<TmuxDaemon>`.
+/// The struct holds independent mutexes for stdin / stdout / child, so
+/// holding the stdout half across `read_line.await` does *not* block the
+/// writer — that distinction is load-bearing now that the control-mode
+/// client is long-lived (the previous single-mutex design deadlocked the
+/// writer whenever tmux idled between emits).
 ///
 /// Returns:
 ///   * `Ok(())` on a clean `%exit` (daemon shutdown) or stdin EOF.
@@ -386,12 +389,9 @@ impl TmuxDaemon {
 /// The hub continues to live after this function returns; subscribers see
 /// the `Event::Exit` flow through normally because the loop publishes it
 /// before returning.
-pub async fn run_event_loop(daemon: Arc<Mutex<TmuxDaemon>>, hub: Hub) -> Result<()> {
+pub async fn run_event_loop(daemon: Arc<TmuxDaemon>, hub: Hub) -> Result<()> {
     loop {
-        let line = {
-            let mut guard = daemon.lock().await;
-            guard.read_line().await?
-        };
+        let line = daemon.read_line().await?;
         let Some(bytes) = line else {
             // EOF on the daemon channel — orderly shutdown. Synthesize an
             // `Event::Exit` so subscribers can close cleanly even if tmux
@@ -438,7 +438,7 @@ pub async fn run_event_loop(daemon: Arc<Mutex<TmuxDaemon>>, hub: Hub) -> Result<
 /// keyword is also empty would error out cleanly rather than poison the
 /// channel.
 pub async fn run_command_loop(
-    daemon: Arc<Mutex<TmuxDaemon>>,
+    daemon: Arc<TmuxDaemon>,
     mut rx: mpsc::Receiver<TmuxRequest>,
 ) -> Result<()> {
     while let Some(req) = rx.recv().await {
@@ -447,8 +447,7 @@ pub async fn run_command_loop(
             warn!(?req, "skipping empty command line");
             continue;
         }
-        let mut guard = daemon.lock().await;
-        if let Err(e) = guard.write_line(line.as_bytes()).await {
+        if let Err(e) = daemon.write_line(line.as_bytes()).await {
             warn!(error = %e, "tmux write_line failed; loop exiting");
             return Err(e);
         }
@@ -1495,7 +1494,7 @@ mod tests {
             session_name: session.clone(),
             socket_dir: Some(tmp.path().to_path_buf()),
         };
-        let mut d = TmuxDaemon::spawn(opts.clone()).await.expect("spawn");
+        let d = TmuxDaemon::spawn(opts.clone()).await.expect("spawn");
         // After spawn, the socket file should exist and `has-session`
         // should succeed against it.
         // Give tmux a moment to bind the socket — spawn returns once we have
@@ -1553,7 +1552,7 @@ mod tests {
             session_name: session.clone(),
             socket_dir: Some(tmp.path().to_path_buf()),
         };
-        let mut first = TmuxDaemon::spawn(opts.clone()).await.expect("spawn");
+        let first = TmuxDaemon::spawn(opts.clone()).await.expect("spawn");
         for _ in 0..50 {
             if first.socket_path().exists() {
                 break;
@@ -1563,9 +1562,9 @@ mod tests {
         assert!(first.socket_path().exists());
 
         // attach must succeed and report no child ownership.
-        let mut second = TmuxDaemon::attach(opts.clone()).await.expect("attach");
+        let second = TmuxDaemon::attach(opts.clone()).await.expect("attach");
         assert!(
-            second.child.is_none(),
+            second.child.lock().await.is_none(),
             "attach mode must leave child = None"
         );
         // attach-mode shutdown is a no-op — daemon must survive.
@@ -1607,7 +1606,7 @@ mod tests {
             session_name: session.clone(),
             socket_dir: Some(tmp.path().to_path_buf()),
         };
-        let mut d = TmuxDaemon::spawn(opts.clone()).await.expect("spawn");
+        let d = TmuxDaemon::spawn(opts.clone()).await.expect("spawn");
         for _ in 0..50 {
             if d.socket_path().exists() {
                 break;
@@ -1926,7 +1925,7 @@ mod tests {
             session_name: session.clone(),
             socket_dir: None,
         };
-        let mut daemon = TmuxDaemon::spawn(opts).await.expect("spawn");
+        let daemon = TmuxDaemon::spawn(opts).await.expect("spawn");
         for _ in 0..50 {
             if daemon.socket_path().exists() {
                 break;
@@ -2083,9 +2082,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let socket_path = daemon.socket_path().to_path_buf();
-        // Use tokio's async Mutex here — the run_event_loop signature needs
-        // it. The std `Mutex` shadowed at module scope is for env-lock only.
-        let daemon = Arc::new(tokio::sync::Mutex::new(daemon));
+        // `TmuxDaemon` now holds its stdio behind independent internal
+        // mutexes, so `Arc<TmuxDaemon>` is the runtime shape `run_event_loop`
+        // / `run_command_loop` consume. The std `Mutex` shadowed at module
+        // scope is for env-lock only and is unrelated here.
+        let daemon = Arc::new(daemon);
         let hub = Hub::new();
         let mut rx = hub.subscribe();
 
