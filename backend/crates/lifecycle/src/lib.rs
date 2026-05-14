@@ -453,12 +453,10 @@ pub async fn run_command_loop(
 /// control-mode wire protocol — control mode reads one keyword + argv
 /// tokens per line; quoting is the caller's responsibility upstream.
 ///
-/// For [`gtmux_mux_router::Command::ListWindows`] (used as the catch-all
-/// placeholder for `resize-window` per `cmd_router::build_pane_resize_request`),
-/// we treat `args[0]` as the keyword override when it equals `"resize-window"`.
-/// This lets the WS handler emit any tmux command whose canonical keyword
-/// the mux-router enum does not yet name; future cleanup adds proper
-/// `Command::ResizeWindow` and removes the override.
+/// Structured variants (currently `ResizeWindow`) render their full argv
+/// from the variant fields and ignore `args`. This keeps the keyword +
+/// target-id contract type-safe and removes any need for `args[0]` keyword
+/// override (S5-MUX-1).
 fn serialise_command(req: &TmuxRequest) -> String {
     use gtmux_mux_router::Command as C;
     let keyword: &str = match &req.command {
@@ -471,21 +469,15 @@ fn serialise_command(req: &TmuxRequest) -> String {
         C::RefreshClientSubscribe => "refresh-client",
         C::CapturePane => "capture-pane",
         C::ListSessions => "list-sessions",
-        C::ListWindows => {
-            // Placeholder override: when `args[0]` is a recognised
-            // alternative keyword, use it instead (e.g. resize-window).
-            if let Some(first) = req.args.first() {
-                if first == "resize-window" {
-                    let rest = &req.args[1..];
-                    return std::iter::once("resize-window")
-                        .chain(rest.iter().map(String::as_str))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                }
-            }
-            "list-windows"
-        }
+        C::ListWindows => "list-windows",
         C::ListPanes => "list-panes",
+        C::ResizeWindow {
+            window_id,
+            cols,
+            rows,
+        } => {
+            return format!("resize-window -t @{window_id} -x {cols} -y {rows}");
+        }
     };
     if req.args.is_empty() {
         keyword.to_string()
@@ -2001,8 +1993,7 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────
 
     /// `serialise_command` is a pure helper — exercise its argv joining
-    /// without needing a real tmux daemon. Verifies the resize-window
-    /// override path used by `gtmux_ws_server::cmd_router::build_pane_resize_request`.
+    /// without needing a real tmux daemon.
     #[test]
     fn serialise_command_known_keywords() {
         use gtmux_mux_router::Command;
@@ -2019,28 +2010,42 @@ mod tests {
             args: vec!["-l".into(), "-t".into(), "%7".into(), "ls\n".into()],
         };
         assert_eq!(serialise_command(&req), "send-keys -l -t %7 ls\n");
-        // resize-window override via ListWindows placeholder.
-        let req = TmuxRequest {
-            id: None,
-            command: Command::ListWindows,
-            args: vec![
-                "resize-window".into(),
-                "-t".into(),
-                "%7".into(),
-                "-x".into(),
-                "120".into(),
-                "-y".into(),
-                "40".into(),
-            ],
-        };
-        assert_eq!(serialise_command(&req), "resize-window -t %7 -x 120 -y 40");
-        // ListWindows without override still produces the canonical keyword.
+        // ListWindows canonical keyword.
         let req = TmuxRequest {
             id: None,
             command: Command::ListWindows,
             args: vec!["-a".into()],
         };
         assert_eq!(serialise_command(&req), "list-windows -a");
+    }
+
+    /// S5-MUX-1: `Command::ResizeWindow` renders the full canonical argv from
+    /// its variant fields (no more `args[0]` keyword override). Target uses
+    /// the `@<window_id>` sigil per ADR-0008 D1 single-pane-per-window.
+    #[test]
+    fn resize_window_serialisation() {
+        use gtmux_mux_router::Command;
+        let req = TmuxRequest {
+            id: None,
+            command: Command::ResizeWindow {
+                window_id: 7,
+                cols: 120,
+                rows: 40,
+            },
+            args: Vec::new(),
+        };
+        assert_eq!(serialise_command(&req), "resize-window -t @7 -x 120 -y 40");
+        // `args` is ignored when the variant carries its own fields.
+        let req = TmuxRequest {
+            id: None,
+            command: Command::ResizeWindow {
+                window_id: 1,
+                cols: 80,
+                rows: 24,
+            },
+            args: vec!["should-be-ignored".into()],
+        };
+        assert_eq!(serialise_command(&req), "resize-window -t @1 -x 80 -y 24");
     }
 
     #[tokio::test]

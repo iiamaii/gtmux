@@ -121,30 +121,27 @@ pub fn build_pane_in_request(pane_id: u32, bytes: &[u8]) -> TmuxRequest {
 /// Build the [`TmuxRequest`] for a `0x04 PANE_RESIZE` envelope.
 ///
 /// SSoT §2.1 + ADR-0008 D2: single-pane-per-window convention → use
-/// `resize-window` (NOT `resize-pane`). We surface this as
-/// [`Command::RefreshClientSubscribe`] because the mux-router `Command`
-/// enum does not yet have a `ResizeWindow` variant — see follow-up below.
+/// `resize-window` (NOT `resize-pane`). Emits [`Command::ResizeWindow`]
+/// directly; the lifecycle writer renders the canonical argv from the
+/// variant fields, so `args` is empty here.
 ///
-/// **CORRECTNESS NOTE**: mapping resize through `Command::ListWindows` is
-/// only a stop-gap so the wiring compiles; the lifecycle writer ignores the
-/// discriminator and serialises directly from `args`. The enum will gain a
-/// `ResizeWindow` variant in S4-D once the lifecycle writer is in place.
+/// `pane_id` from the wire frame is treated as the window target under the
+/// single-pane convention (ADR-0008 D1) — every gtmux-created Panel maps 1:1
+/// to a tmux Window, so a pane-scoped resize trigger is also a window-scoped
+/// resize trigger. `cols`/`rows` are u32 on the wire but tmux cell dimensions
+/// fit comfortably in u16; we saturate at the upper bound to keep the variant
+/// type-safe rather than reject the frame outright.
 pub fn build_pane_resize_request(pane_id: u32, cols: u32, rows: u32) -> TmuxRequest {
+    let cols = u16::try_from(cols).unwrap_or(u16::MAX);
+    let rows = u16::try_from(rows).unwrap_or(u16::MAX);
     TmuxRequest {
         id: None,
-        // Placeholder discriminant; the real `tmux resize-window` argv is
-        // carried entirely in `args`. The command loop in lifecycle reads
-        // `args` first, not the discriminator.
-        command: Command::ListWindows,
-        args: vec![
-            "resize-window".to_string(),
-            "-t".to_string(),
-            format!("%{pane_id}"),
-            "-x".to_string(),
-            cols.to_string(),
-            "-y".to_string(),
-            rows.to_string(),
-        ],
+        command: Command::ResizeWindow {
+            window_id: pane_id,
+            cols,
+            rows,
+        },
+        args: Vec::new(),
     }
 }
 
@@ -207,12 +204,40 @@ mod tests {
     }
 
     #[test]
-    fn pane_resize_args_shape() {
+    fn pane_resize_routes_to_resize_window() {
+        // S5-MUX-1: PANE_RESIZE → Command::ResizeWindow direct emission.
+        // No more keyword-override via Command::ListWindows.
         let req = build_pane_resize_request(37, 120, 40);
-        assert_eq!(
-            req.args,
-            vec!["resize-window", "-t", "%37", "-x", "120", "-y", "40"]
+        assert!(
+            req.args.is_empty(),
+            "args is empty — variant carries fields"
         );
+        match req.command {
+            Command::ResizeWindow {
+                window_id,
+                cols,
+                rows,
+            } => {
+                assert_eq!(window_id, 37);
+                assert_eq!(cols, 120);
+                assert_eq!(rows, 40);
+            }
+            other => panic!("expected ResizeWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pane_resize_saturates_oversized_dimensions() {
+        // Wire u32 → variant u16. Anything beyond u16::MAX saturates so the
+        // frame is never silently dropped at the boundary.
+        let req = build_pane_resize_request(1, 70_000, 80_000);
+        match req.command {
+            Command::ResizeWindow { cols, rows, .. } => {
+                assert_eq!(cols, u16::MAX);
+                assert_eq!(rows, u16::MAX);
+            }
+            other => panic!("expected ResizeWindow, got {other:?}"),
+        }
     }
 
     #[test]

@@ -133,6 +133,124 @@ function stripQuotes(s: string): string {
   return s;
 }
 
+// ── PUT /api/layout — append-panel helper ──────────────────────────────────
+
+/**
+ * S5-FE-NEW-PANEL 의 PUT 절반 — *append-only* mutation. 현재 store 상태에 panel
+ * 한 개를 끝에 추가하고 `If-Match` 와 함께 PUT.
+ *
+ * 412 (ETag mismatch) 수신 시 1회만 자동 rebase 한다: GET 으로 최신 snapshot 을
+ * 받아 *그 위에* 다시 append 한다. 두 번째도 412 이면 호출 측에 throw — 사용자
+ * 알림 트리거.
+ *
+ * 본 helper 는 *concurrent edit 모델 없이* 단일 사용자 가정 — `panels`/`groups`
+ * 의 다른 mutation 이 동시에 in-flight 인 경우는 본 sprint 범위 밖 (P1+).
+ */
+export interface NewPanelInput {
+  /** `p` prefix + ULID/UUID 36자 이내 (schema §1 Panel.id pattern). */
+  readonly id: string;
+  /** `%N` 형식. tmux mirror 와 정합. */
+  readonly pane_id: string;
+  readonly x: number;
+  readonly y: number;
+  readonly w: number;
+  readonly h: number;
+  readonly z: number;
+}
+
+export async function putLayoutAppendPanel(
+  token: string,
+  input: NewPanelInput,
+): Promise<{ etag: string }> {
+  // 첫 시도 — 현재 store 의 panels/groups 를 그대로 가져와 새 panel 을 추가.
+  const firstEtag = layoutStore.etag;
+  let result = await attemptAppend(token, input, firstEtag);
+  if (result.kind === 'ok') return { etag: result.etag };
+  if (result.kind === 'fatal') throw new Error(result.message);
+  // 412 — GET 으로 rebase 후 1회 재시도.
+  const refreshed = await fetchLayoutAndHydrate(token, null);
+  if (refreshed === null) {
+    throw new Error('layout rebase fetch failed');
+  }
+  const secondEtag = layoutStore.etag;
+  result = await attemptAppend(token, input, secondEtag);
+  if (result.kind === 'ok') return { etag: result.etag };
+  if (result.kind === 'fatal') throw new Error(result.message);
+  throw new Error('layout PUT 412 after rebase — concurrent writer suspected');
+}
+
+type AttemptResult =
+  | { kind: 'ok'; etag: string }
+  | { kind: 'rebase' } // 412
+  | { kind: 'fatal'; message: string };
+
+async function attemptAppend(
+  token: string,
+  input: NewPanelInput,
+  currentEtag: string | null,
+): Promise<AttemptResult> {
+  // schema §1: panels[] 는 모든 기존 entries + 새 entry. groups 는 그대로 유지.
+  const panels = [...panelsStore.panels.values()];
+  const newPanel: Panel = {
+    id: input.id,
+    // 잠정 PanelsStore.Panel 의 placeholder 정의에는 미정 필드가 많으므로 cast.
+    // schema §1 의 모든 required 필드를 명시한다 — visibility/minimized/locked/parent_id.
+    ...({
+      parent_id: null,
+      pane_id: input.pane_id,
+      x: input.x,
+      y: input.y,
+      w: input.w,
+      h: input.h,
+      z: input.z,
+      visibility: true,
+      minimized: false,
+      locked: false,
+      label: null,
+      note: null,
+    } as Record<string, unknown>),
+  };
+  panels.push(newPanel);
+  const groups = [...groupsStore.groups.values()];
+
+  // 본 helper 는 schema_version 을 store 값에서 가져온다 (hydrate 직후 값 유지).
+  const body = JSON.stringify({
+    schema_version: layoutStore.schemaVersion,
+    etag: currentEtag ?? '00000000000000000000000000000000',
+    panels,
+    groups,
+  });
+
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${token}`,
+  };
+  if (currentEtag !== null) {
+    headers['If-Match'] = `"${currentEtag}"`;
+  }
+
+  let res: Response;
+  try {
+    res = await fetch('/api/layout', {
+      method: 'PUT',
+      headers,
+      credentials: 'same-origin',
+      body,
+    });
+  } catch (e) {
+    return { kind: 'fatal', message: `PUT /api/layout network failure: ${String(e)}` };
+  }
+  if (res.status === 204) {
+    const etag = stripQuotes(res.headers.get('ETag') ?? '');
+    return { kind: 'ok', etag };
+  }
+  if (res.status === 412) {
+    return { kind: 'rebase' };
+  }
+  return { kind: 'fatal', message: `PUT /api/layout returned ${res.status}` };
+}
+
 // ── 미사용 export 제거 (호환성) ────────────────────────────────────────────
 //
 // 기존 `getLayout()` placeholder 는 본 모듈의 fetchLayoutAndHydrate 로 대체되었다.

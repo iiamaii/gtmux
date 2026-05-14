@@ -50,6 +50,18 @@ pub enum Command {
     ListWindows,
     /// `tmux list-panes -a -F` — 부트스트랩 1회 스냅샷.
     ListPanes,
+    /// `tmux resize-window -t @<window_id> -x <cols> -y <rows>` — single-pane
+    /// 컨벤션(ADR-0008 D1) 하에서 window-size = pane-size, 따라서 pane resize는
+    /// `resize-window`로 직접 발급한다. `resize-pane`/`select-layout`은
+    /// allowlist에서 영구 제외(ADR-0008 D2).
+    ResizeWindow {
+        /// `@<window_id>` 대상 — single-pane 컨벤션 하에서 panel 1개 = window 1개.
+        window_id: u32,
+        /// 새 가로 cell 수. tmux 측은 u16 범위로 충분.
+        cols: u16,
+        /// 새 세로 cell 수.
+        rows: u16,
+    },
 }
 
 /// 부트스트랩 placeholder — control mode 클라이언트 attach 시그니처.

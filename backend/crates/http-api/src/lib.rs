@@ -307,13 +307,12 @@ async fn origin_check_middleware(
         if origin_str.is_empty() || origin_str == "null" {
             return HttpApiError::OriginForbidden.into_response();
         }
-        if !state
-            .config
-            .security
-            .cors_origins
-            .iter()
-            .any(|allowed| allowed == origin_str)
-        {
+        // `effective_cors_origins` falls back to `http://<bind>:<port>` when
+        // the user left the list empty (G1 same-origin default). Cloud
+        // deployments with TLS terminate at a reverse proxy and must set
+        // the list explicitly (no `wss://` synthesis here).
+        let allowed = state.config.effective_cors_origins();
+        if !allowed.iter().any(|a| a == origin_str) {
             return HttpApiError::OriginForbidden.into_response();
         }
     }

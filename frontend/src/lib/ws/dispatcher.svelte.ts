@@ -26,8 +26,10 @@ import { SvelteSet } from 'svelte/reactivity';
 import { connectionStore } from '$lib/stores/connection.svelte';
 import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
 import { layoutStore } from '$lib/stores/layout.svelte';
+import { muxStore } from '$lib/stores/mux.svelte';
 import {
   FRAME_TYPE,
+  decodeCtrl,
   decodeFocusMode,
   decodeIChanged,
   decodeLayoutChanged,
@@ -37,6 +39,7 @@ import {
   decodeViewport,
   type Envelope,
 } from './decode';
+import { resolveCtrl, type CtrlResponse } from './ctrl-registry';
 import { WsClient, computeWsUrl, type ConnectionState, type WsClientOptions } from './client';
 
 // ── PANE_OUT handler 레지스트리 ────────────────────────────────────────────
@@ -129,13 +132,13 @@ export function dispatch(env: Envelope): void {
     case FRAME_TYPE.FOCUS_MODE_CHANGED:
       return handleFocusModeChanged(env.payload);
     case FRAME_TYPE.CTRL:
+      return handleCtrlResponse(env.payload);
     case FRAME_TYPE.PANE_IN:
     case FRAME_TYPE.PANE_RESIZE:
     case FRAME_TYPE.PANE_PAUSE:
     case FRAME_TYPE.PANE_RESUME:
-      // CTRL response 는 추후 Sprint 4 에서 command-id 매칭으로 별도 라우터를 두지만
-      // MVP dispatcher 는 그 frame 들을 silently drop (FE-1 범위 밖).
-      console.debug('[ws] tmux-domain frame ignored kind=0x%s', env.kind.toString(16));
+      // 본 4종은 client→server 방향 — 수신 시 loopback / echo 시나리오만 가능.
+      console.debug('[ws] client-origin frame echoed back kind=0x%s', env.kind.toString(16));
       return;
     default: {
       // Exhaustiveness check — FRAME_TYPE 에 새 슬롯이 추가되면 컴파일 에러.
@@ -153,6 +156,11 @@ function handlePaneOut(payload: Uint8Array): void {
     console.warn('[ws] 0x02 PANE_OUT decode failed');
     return;
   }
+  // First-sight pane discovery — backend 는 별도 `pane-add` event 를 emit 하지 않으므로
+  // PANE_OUT 의 paneId 를 mux store 의 진실로 차용. addPane 은 idempotent.
+  // 본 보조 매칭이 New Panel UX 흐름의 pane_id 캡처에 쓰인다 (S5-FE-NEW-PANEL 의
+  // pending action 우회 경로 — backend success ack 정식 wire 전까지).
+  muxStore.addPane(decoded.paneId);
   const handler = paneOutHandlers.get(String(decoded.paneId));
   if (!handler) {
     // panel 이 아직 마운트되지 않은 시점에 ring buffer replay 가 도착할 수 있음 —
@@ -181,20 +189,113 @@ function handleNotifyMirror(payload: Uint8Array): void {
       connectionStore.markSlow(decoded.paneId);
       return;
     case 'window-add':
+      routeWindowAdd(decoded.body);
+      return;
     case 'window-renamed':
+      routeWindowRenamed(decoded.body);
+      return;
     case 'window-close':
+      routeWindowClose(decoded.body);
+      return;
     case 'session-changed':
+      routeSessionChanged(decoded.body);
+      return;
     case 'layout-change':
-    case 'subscription-changed':
+      routeLayoutChange(decoded.body);
+      return;
     case 'pane-mode-changed':
-      // FE-4 의 fetchLayout 트리거가 일부 (window-add/close/layout-change) 흡수 —
-      // P1+ 에서 mux mirror 모듈로 위임 예정. 현재는 debug log only.
-      console.debug('[gtmux] notify kind=%s pane=%d', kind, decoded.paneId);
+      routePaneModeChanged(decoded.paneId, decoded.body);
+      return;
+    case 'subscription-changed':
+      // SSoT §2.3 — `{name, value}` 형식. mux store 에 currently 저장 슬롯 없음
+      // (백엔드가 subscription 자체를 관리하므로 미러 필요성 미정 — P1+ 평가).
+      console.debug('[gtmux] subscription-changed pane=%d', decoded.paneId);
       return;
     default:
       // 미정의 kind 는 SSoT §2.3 forward-compat 에 따라 조용히 무시.
       return;
   }
+}
+
+// ── NOTIFY_MIRROR kind routing helpers ─────────────────────────────────────
+//
+// 각 helper 는 SSoT §2.3 의 추가 JSON 필드를 읽어 mux store 메서드로 위임한다.
+// JSON 필드 누락은 *해당 frame drop* (forward-compat) — 빈 문자열 fallback 도 가능
+// 하지만 store 진실을 noise 로 덮어쓰지 않도록 명시적으로 검증.
+
+function routeWindowAdd(body: Readonly<Record<string, unknown>>): void {
+  const windowId = pickString(body, 'window_id');
+  if (windowId === null) return;
+  const name = pickString(body, 'name') ?? '';
+  muxStore.addWindow(windowId, name);
+}
+
+function routeWindowRenamed(body: Readonly<Record<string, unknown>>): void {
+  const windowId = pickString(body, 'window_id');
+  if (windowId === null) return;
+  const name = pickString(body, 'name') ?? '';
+  muxStore.renameWindow(windowId, name);
+}
+
+function routeWindowClose(body: Readonly<Record<string, unknown>>): void {
+  const windowId = pickString(body, 'window_id');
+  if (windowId === null) return;
+  muxStore.closeWindow(windowId);
+}
+
+function routeSessionChanged(body: Readonly<Record<string, unknown>>): void {
+  const sessionId = pickString(body, 'session_id');
+  if (sessionId === null) return;
+  const name = pickString(body, 'name') ?? '';
+  muxStore.setSession(sessionId, name);
+}
+
+function routeLayoutChange(body: Readonly<Record<string, unknown>>): void {
+  const windowId = pickString(body, 'window_id');
+  if (windowId === null) return;
+  const layout = pickString(body, 'layout') ?? '';
+  muxStore.setLayout(windowId, layout);
+}
+
+function routePaneModeChanged(paneId: number, body: Readonly<Record<string, unknown>>): void {
+  const mode = pickString(body, 'mode') ?? '';
+  muxStore.setPaneMode(paneId, mode);
+}
+
+function pickString(body: Readonly<Record<string, unknown>>, key: string): string | null {
+  const v = body[key];
+  return typeof v === 'string' ? v : null;
+}
+
+// ── 0x01 CTRL response 처리 ────────────────────────────────────────────────
+
+function handleCtrlResponse(payload: Uint8Array): void {
+  const decoded = decodeCtrl(payload);
+  if (!decoded) {
+    console.warn('[ws] 0x01 CTRL response decode failed');
+    return;
+  }
+  if (decoded.id === null) {
+    // 서버가 id 없는 응답을 보내는 경우는 ERR_BAD_REQUEST 같은 broadcast-style 에러.
+    // pending registry 매칭이 불가능 — debug 만 남김.
+    console.debug('[ws] CTRL response without id', decoded.body);
+    return;
+  }
+  const ok = decoded.body['ok'] === true;
+  const response: CtrlResponse = {
+    id: decoded.id,
+    ok,
+    ...(ok && typeof decoded.body['result'] === 'object' && decoded.body['result'] !== null
+      ? { result: decoded.body['result'] as Readonly<Record<string, unknown>> }
+      : {}),
+    ...(typeof decoded.body['error'] === 'string'
+      ? { error: decoded.body['error'] as string }
+      : {}),
+    ...(typeof decoded.body['code'] === 'string'
+      ? { code: decoded.body['code'] as string }
+      : {}),
+  };
+  resolveCtrl(response);
 }
 
 function handleLayoutChanged(payload: Uint8Array): void {

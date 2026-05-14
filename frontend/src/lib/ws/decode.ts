@@ -274,6 +274,45 @@ export function encodePaneBareId(paneId: number): Uint8Array {
 }
 
 /**
+ * `0x01 CTRL` payload = `varint 0 + UTF-8 JSON`. SSoT §2.1 + §2.4.
+ *
+ * 요청 인코딩: `{id, cmd, args}` — 문자열 배열만 허용 (shell 문자열·자유 형식 금지).
+ * 본 helper 는 *요청 송신용* 인코딩만 담당하며, 응답(JSON `{id, ok, ...}`) 파싱은
+ * `decodeCtrl` 가 담당한다.
+ */
+export function encodeCtrl(id: string, cmd: string, args: readonly string[]): Uint8Array {
+  const json = JSON.stringify({ id, cmd, args });
+  const head = writeVarintU(0);
+  const body = new TextEncoder().encode(json);
+  const out = new Uint8Array(head.length + body.length);
+  out.set(head, 0);
+  out.set(body, head.length);
+  return out;
+}
+
+/** `0x01 CTRL` payload decode (response 측). 형식 위반 시 null. */
+export interface CtrlDecoded {
+  readonly id: string | null;
+  readonly body: Readonly<Record<string, unknown>>;
+}
+export function decodeCtrl(payload: Uint8Array): CtrlDecoded | null {
+  const view = makeView(payload);
+  const head = readVarintU(view, 0);
+  if (!head || head.value !== 0) return null;
+  const jsonBytes = payload.subarray(head.next);
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(jsonBytes));
+  } catch {
+    return null;
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return null;
+  const obj = body as Record<string, unknown>;
+  const id = typeof obj['id'] === 'string' ? (obj['id'] as string) : null;
+  return { id, body: obj as Readonly<Record<string, unknown>> };
+}
+
+/**
  * `0x07 NOTIFY_MIRROR` payload = `varint paneId + UTF-8 JSON`. SSoT §2.1 + §2.3.
  * JSON 파싱 실패 / non-object 는 null 반환 (호출 측은 그 frame drop).
  */

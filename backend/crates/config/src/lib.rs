@@ -427,6 +427,23 @@ impl Config {
             Mode::Cloud => Vec::new(),
         }
     }
+
+    /// `cors_origins`가 비어 있으면 bind+port로부터 same-origin 디폴트를
+    /// 합성해 반환한다 — `docs/reports/0017-progress-status.md` §3.2 G1.
+    /// ADR-0003 D3 (정확 일치 화이트리스트, wildcard 거부) 정합을 깨지 않고,
+    /// SPA가 동일 출처(`http://<bind>:<port>`)로 `fetch('/api/...')` 할 때
+    /// `origin_forbidden`로 차단되지 않게 한다. `effective_host_allowlist`
+    /// 와 동일한 in-place-unsafe + 새 Vec 반환 패턴을 따른다.
+    ///
+    /// TLS 종단은 cloud 모드의 책임이므로 본 helper는 항상 `http://` 스킴만
+    /// 합성한다 (cloud 모드는 외부 reverse proxy의 `wss://` host를 명시해야
+    /// 하며, 그 경우 사용자는 `cors_origins`를 직접 채워야 한다).
+    pub fn effective_cors_origins(&self) -> Vec<String> {
+        if !self.security.cors_origins.is_empty() {
+            return self.security.cors_origins.clone();
+        }
+        vec![format!("http://{}:{}", self.server.bind, self.server.port)]
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -655,6 +672,49 @@ bind = "127.0.0.1"
             )?;
             let err = load(Some(Path::new("gtmux.toml")), "").unwrap_err();
             assert!(matches!(err, ConfigError::Validation(_)));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn effective_cors_origins_synthesises_from_bind_and_port() {
+        // 빈 cors_origins → http://<bind>:<port> 1개 합성 (G1).
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file("gtmux.toml", minimal_toml())?;
+            let cfg = load(Some(Path::new("gtmux.toml")), "").unwrap();
+            assert!(cfg.security.cors_origins.is_empty(), "precondition");
+            let origins = cfg.effective_cors_origins();
+            assert_eq!(origins, vec!["http://127.0.0.1:9001".to_string()]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn effective_cors_origins_passes_explicit_through_unchanged() {
+        // 사용자가 명시한 값은 그대로 — backward compatibility 보장.
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "gtmux.toml",
+                r#"schema_version = 1
+[server]
+session = "alpha"
+port = 9001
+bind = "127.0.0.1"
+[security]
+cors_origins = ["http://example.test:8443", "http://127.0.0.1:9001"]
+"#,
+            )?;
+            let cfg = load(Some(Path::new("gtmux.toml")), "").unwrap();
+            let origins = cfg.effective_cors_origins();
+            assert_eq!(
+                origins,
+                vec![
+                    "http://example.test:8443".to_string(),
+                    "http://127.0.0.1:9001".to_string(),
+                ]
+            );
             Ok(())
         });
     }

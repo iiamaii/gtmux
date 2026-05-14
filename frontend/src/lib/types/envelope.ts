@@ -22,6 +22,14 @@ export type {
   ViewportChangedPayload,
   FocusModeChangedPayload,
   NotifyMirrorPayload,
+  CtrlDecoded,
 } from '$lib/ws/decode';
 
 export { FRAME_TYPE } from '$lib/ws/decode';
+
+// 인코딩 helper — `$lib/ws/ctrl-registry` 가 사용. 동일 모듈에서 직접 export 해도
+// 되지만, 본 모듈을 *모든 envelope 계약 single point* 로 유지하기 위해 re-export.
+//
+// `encodeCtrlRequest` 는 SSoT §2.4 의 *요청* 인코딩 — `{id, cmd, args}` shape 만
+// 지원. 응답 인코딩(=decoding)은 `decodeCtrl` 사용.
+export { encodeCtrl as encodeCtrlRequest, decodeCtrl } from '$lib/ws/decode';

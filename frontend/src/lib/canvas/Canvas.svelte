@@ -23,6 +23,7 @@
   import { panelsStore } from '$lib/stores/panels.svelte';
   import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
   import PanelNode from './PanelNode.svelte';
+  import NewPanelButton from './NewPanelButton.svelte';
 
   // Panel JSON shape — `docs/ssot/canvas-layout-schema.md` §1 `$defs/Panel`의 부분 view.
   // 코드젠된 `$lib/types/canvas-layout.d.ts`가 정본이 되기 전까지의 잠정 정의 — 정본
@@ -104,6 +105,9 @@
 </script>
 
 <div class="canvas-root">
+  <div class="canvas-toolbar">
+    <NewPanelButton />
+  </div>
   <SvelteFlow
     {nodes}
     edges={[]}
@@ -129,5 +133,24 @@
     width: 100%;
     height: 100%;
     min-height: 0;
+    position: relative;
+  }
+
+  /* 캔버스 좌상단에 overlay — SvelteFlow 의 pan/zoom 영역을 가리지 않도록 절대 위치
+     + pointer-events 는 자식 버튼에만 활성. */
+  .canvas-toolbar {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    pointer-events: none;
+  }
+
+  .canvas-toolbar :global(.new-panel-btn),
+  .canvas-toolbar :global(.new-panel-error) {
+    pointer-events: auto;
   }
 </style>
