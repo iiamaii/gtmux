@@ -455,11 +455,23 @@ async fn bootstrap_handler(
     let secure_flag = matches!(state.config.mode(), Mode::Cloud);
     let cookie = build_session_cookie(&presented, secure_flag);
 
+    // The cookie is HttpOnly (XSS hardening) so JavaScript cannot read the
+    // token. The SPA needs the token for the WS Sec-WebSocket-Protocol
+    // header, however, which JS *does* compose — so we ship a one-shot HTML
+    // hop that mirrors the token into sessionStorage and then replaces the
+    // URL with the redirect target. The cookie still rides along for
+    // tower-http ServeDir requests that some user flows depend on.
+    let body = render_bootstrap_landing(&presented, &target);
+
     let mut resp = Response::builder()
-        .status(StatusCode::FOUND)
-        .header(header::LOCATION, target)
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .header(header::SET_COOKIE, cookie)
-        .body(Body::empty())
+        // Tell intermediaries (and the browser) never to cache the landing
+        // page — the inline token must not be replayed from disk on the
+        // next demo session.
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(body))
         .unwrap_or_else(|_| {
             // Builder errors only when header values contain CRLF — our inputs
             // are all server-generated, so this is unreachable. We still avoid
@@ -468,6 +480,33 @@ async fn bootstrap_handler(
         });
     apply_security_headers(resp.headers_mut(), state.config.mode());
     resp
+}
+
+/// Render the minimal landing page that copies the token into
+/// sessionStorage and then redirects to `target`. Token + target are
+/// JSON-encoded so any character set (including future formats) ends up
+/// in a safe JavaScript string literal; `</` is rewritten as `<\/` so a
+/// pathological target cannot terminate the inline `<script>` early.
+fn render_bootstrap_landing(token: &str, target: &str) -> String {
+    fn js_literal(value: &str) -> String {
+        let json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+        json.replace("</", "<\\/")
+    }
+    let token_js = js_literal(token);
+    let target_js = js_literal(target);
+    format!(
+        r#"<!doctype html>
+<meta charset="utf-8">
+<title>gtmux — authenticating</title>
+<script>
+(function () {{
+  try {{ sessionStorage.setItem('gtmux_token', {token_js}); }} catch (e) {{}}
+  window.location.replace({target_js});
+}})();
+</script>
+<noscript>JavaScript is required to complete gtmux authentication.</noscript>
+"#
+    )
 }
 
 fn build_session_cookie(token_value: &str, secure: bool) -> String {
@@ -1096,7 +1135,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_success_sets_cookie_and_redirects() {
+    async fn bootstrap_success_sets_cookie_and_returns_landing_html() {
         let (app, token) = make_app();
         let uri = format!("/auth/bootstrap?token={}", token.0);
         let resp = app
@@ -1109,20 +1148,32 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::FOUND);
-        let location = resp
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
             .headers()
-            .get(header::LOCATION)
-            .expect("Location set")
+            .get(header::CONTENT_TYPE)
+            .expect("content-type set")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/html"),
+            "expected text/html landing, got {content_type}"
+        );
+        let cache_control = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .expect("cache-control set")
             .to_str()
             .unwrap();
-        assert_eq!(location, "/");
+        assert_eq!(cache_control, "no-store");
         let set_cookie = resp
             .headers()
             .get(header::SET_COOKIE)
             .expect("Set-Cookie present")
             .to_str()
-            .unwrap();
+            .unwrap()
+            .to_string();
         assert!(
             set_cookie.starts_with(&format!("{}=", COOKIE_NAME_STR)),
             "cookie must start with {}=, got: {set_cookie}",
@@ -1133,6 +1184,46 @@ mod tests {
         assert!(set_cookie.contains("Path=/"));
         // Local mode → no Secure flag (TLS-less HTTP would drop it).
         assert!(!set_cookie.contains("Secure"));
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body_bytes).unwrap().to_string();
+        // Token is mirrored into sessionStorage so the SPA can read it for
+        // the WS Sec-WebSocket-Protocol path.
+        assert!(
+            body.contains(&format!(
+                "sessionStorage.setItem('gtmux_token', \"{}\"",
+                token.0
+            )),
+            "landing must inject sessionStorage token, got: {body}"
+        );
+        // And the user lands on `/` (or any normalised target).
+        assert!(
+            body.contains("window.location.replace(\"/\")"),
+            "landing must replace location to '/', got: {body}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_landing_escapes_inline_script_terminator() {
+        // Direct unit-level pin on `render_bootstrap_landing` — exercising
+        // the renderer with values that *would* close `<script>` early if
+        // we ever stopped rewriting `</` to `<\/` inside JS string literals.
+        let body = render_bootstrap_landing("abc-token", "/path</script><b>oops");
+        assert!(
+            !body.contains("</script><b>oops"),
+            "raw </script> leaked into HTML: {body}"
+        );
+        assert!(
+            body.contains("<\\/script>"),
+            "expected escaped <\\/script>, got: {body}"
+        );
+        // And the token still lands intact in the JS string literal.
+        assert!(
+            body.contains("sessionStorage.setItem('gtmux_token', \"abc-token\")"),
+            "token must be present in landing body: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1172,50 +1263,40 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_redirect_target_rejects_external() {
-        let (app, token) = make_app();
-        let uri = format!(
-            "/auth/bootstrap?token={}&redirect=https://evil.example/x",
-            token.0
-        );
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri(&uri)
-                    .header(header::HOST, TEST_HOST)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FOUND);
-        let location = resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(location, "/", "open-redirect must be normalised to '/'");
-
-        // Protocol-relative also rejected.
-        let (app, token) = make_app();
-        let uri = format!("/auth/bootstrap?token={}&redirect=//evil.example", token.0);
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri(&uri)
-                    .header(header::HOST, TEST_HOST)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let location = resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(location, "/");
+        // The redirect lives inside the inline landing JS now (no Location
+        // header). External / protocol-relative inputs must still be
+        // normalised down to "/" before they reach the JS string literal.
+        for evil in [
+            "https://evil.example/x",
+            "//evil.example",
+            "/\\evil.example",
+        ] {
+            let (app, token) = make_app();
+            let uri = format!("/auth/bootstrap?token={}&redirect={evil}", token.0);
+            let resp = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(&uri)
+                        .header(header::HOST, TEST_HOST)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body_bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body_bytes).unwrap().to_string();
+            assert!(
+                body.contains("window.location.replace(\"/\")"),
+                "evil input {evil} must normalise to '/', got: {body}"
+            );
+            assert!(
+                !body.contains("evil.example"),
+                "evil host leaked into landing for input {evil}: {body}"
+            );
+        }
     }
 
     #[tokio::test]
