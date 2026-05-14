@@ -41,8 +41,8 @@ use gtmux_config::{derive_mode, load_with_overrides as load_config, Config, Mode
 use gtmux_pty_backend::PtyBackend;
 use gtmux_ws_server::Hub;
 use state_files::{
-    check_pidfile_liveness, pidfile_path_for, stop_server, write_pidfile, PidLiveness,
-    StateFileError, StopOutcome, TeardownOpts, TeardownReport,
+    check_pidfile_liveness, layout_path_for, pidfile_path_for, stop_server, write_pidfile,
+    PidLiveness, StateFileError, StopOutcome, TeardownOpts, TeardownReport,
 };
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -329,6 +329,15 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         },
     };
 
+    // 6a) layout file path — S7-PERSISTENCE-MINIMAL / ADR-0006.
+    //     Resolved up-front so the AppState constructor can attempt the
+    //     boot-time load (D10 7-state table) before the router is wired.
+    //     XDG-path errors are fatal: without a usable state dir we cannot
+    //     guarantee post-PUT persistence and the 0006 contract breaks
+    //     silently.
+    let layout_path = layout_path_for(&config.server.session)
+        .context("resolving layout file path under XDG_STATE_HOME")?;
+
     // 7+8+9) router — HTTP API (layout, bootstrap, healthz) + WebSocket (/ws).
     //   The Hub wraps the PtyBackend (ADR-0013 D11 trivial multi-attach mirror
     //   + the multiplexed `(pane_id, bytes)` broadcast described in
@@ -339,6 +348,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         &config,
         &token,
         hub.clone(),
+        layout_path,
         config.frontend_dist.as_deref(),
     );
 
@@ -425,11 +435,19 @@ fn build_app(
     config: &Config,
     token: &TokenString,
     hub: Hub,
+    layout_path: PathBuf,
     frontend_dist: Option<&std::path::Path>,
 ) -> Router {
     // AppState gets a hub clone so layout_put_handler can broadcast
-    // LAYOUT_CHANGED to live WS subscribers right after a successful PUT.
-    let app_state = gtmux_http_api::AppState::with_hub(config.clone(), token.clone(), hub.clone());
+    // LAYOUT_CHANGED to live WS subscribers right after a successful PUT,
+    // plus the layout file path so the PUT-time atomic write + boot-time
+    // ADR-0006 D10 7-state load run against the canonical state-dir file.
+    let app_state = gtmux_http_api::AppState::with_hub_and_path(
+        config.clone(),
+        token.clone(),
+        hub.clone(),
+        layout_path,
+    );
     gtmux_http_api::router_with_app_state(app_state, frontend_dist)
         .merge(gtmux_ws_server::router(config, token, hub))
 }
