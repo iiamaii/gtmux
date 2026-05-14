@@ -120,7 +120,11 @@
     </header>
     <div class="panel-body">
       {#if isStreaming && isAtUnitZoom && typeof data.pane_id === 'string'}
-        <XtermHost paneId={data.pane_id} />
+        <!-- SSoT pane_id is `%N` (string). XtermHost / dispatcher's
+             registerPaneOut key both use the integer part as a decimal
+             string ("N"), so we strip the leading `%` here at the
+             single source of truth. -->
+        <XtermHost paneId={data.pane_id.replace(/^%/, '')} />
       {:else}
         <PanelPlaceholder label={headerLabel} reason={isStreaming ? 'zoom' : 'suspended'} />
       {/if}

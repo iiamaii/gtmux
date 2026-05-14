@@ -543,6 +543,7 @@ dependencies = [
  "gtmux-auth",
  "gtmux-config",
  "gtmux-mux-router",
+ "gtmux-ws-server",
  "http",
  "http-body-util",
  "ring",

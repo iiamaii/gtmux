@@ -25,7 +25,9 @@ import { SvelteSet } from 'svelte/reactivity';
 
 import { connectionStore } from '$lib/stores/connection.svelte';
 import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
-import { layoutStore } from '$lib/stores/layout.svelte';
+// layoutStore 의 etag 갱신은 `lib/http/layout::fetchLayoutAndHydrate` 가 단일
+// 책임을 진다 — broadcast 도착 시점에 setEtag 하면 후속 GET 의 If-None-Match
+// 와 일치해 304 가 떨어지므로, 본 모듈은 etag 를 만지지 않는다.
 import { muxStore } from '$lib/stores/mux.svelte';
 import {
   FRAME_TYPE,
@@ -343,12 +345,14 @@ function handleLayoutChanged(payload: Uint8Array): void {
     console.warn('[ws] 0x80 LAYOUT_CHANGED decode failed');
     return;
   }
-  // ETag hex 직렬화 — store 가 string 으로 보관해 If-Match 헤더에 그대로 쓰기 위함
-  // (canvas-layout-schema.md §2 의 ETag 정규화: WS 구간 raw 16B, HTTP 구간 hex).
-  layoutStore.setEtag(bytesToHex(decoded.etag));
-  // Pull-through-notify: re-fetch 는 `$lib/http/layout` 책임. 미등록이면 MVP scope.
-  // handler 가 Promise 를 반환해도 dispatcher 는 await 하지 않는다 — fan-out 은
-  // non-blocking, fetch 결과는 store hydrate 로 도달.
+  // DO NOT setEtag here. If we cache the broadcast etag *before* the
+  // re-fetch fires, fetchLayoutAndHydrate sends If-None-Match=<new_etag>
+  // and the server responds 304 — leaving panelsStore with the pre-PUT
+  // contents and the new panel invisible until a manual refresh. Let
+  // fetchLayoutAndHydrate own the etag transition: it calls setEtag on
+  // the 200 response after hydratePanels, and leaves the store alone on
+  // 304. The broadcast etag bytes are passed through for callers that
+  // want to short-circuit conditional fetches (none today).
   const handler = layoutRefetchHandler;
   if (handler) {
     const result = handler(decoded.etag);
@@ -423,18 +427,6 @@ function addZombie(paneId: number): void {
   const current = connectionStore.zombiePaneIds;
   if (current.includes(paneId)) return;
   connectionStore.markZombie([...current, paneId]);
-}
-
-const HEX_CHARS = '0123456789abcdef';
-
-function bytesToHex(bytes: Uint8Array): string {
-  let out = '';
-  for (let i = 0; i < bytes.length; i += 1) {
-    const b = bytes[i] ?? 0;
-    out += HEX_CHARS[(b >>> 4) & 0x0f];
-    out += HEX_CHARS[b & 0x0f];
-  }
-  return out;
 }
 
 function noop(): void {
