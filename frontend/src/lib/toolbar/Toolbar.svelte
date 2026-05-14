@@ -19,9 +19,12 @@
 
 <style>
   .toolbar {
+    /* Explicit 40px stopgap. Stage C splits this into 44px Titlebar +
+     * 56px Toolbar — at that point the `--layout-*` tokens drive each
+     * half. For now keep the chrome compact. */
     display: flex;
     align-items: center;
-    height: var(--layout-toolbar-h, 40px);
+    height: 40px;
     padding: 0 var(--space-12);
     background: var(--color-surface);
     border-bottom: 1px solid var(--color-border);

@@ -58,13 +58,11 @@
     parentId?: string;
   } = $props();
 
-  // R8 §F8 정본: ε = 0.02. `|zoom - 1| < ε` 일 때 xterm DOM 가시.
-  // ε 도입 근거: 외부에서 정확히 1.0이 도착하지 않는 부동소수점 조립 (Svelte Flow 내부
-  // zoom 보정 + 사용자 wheel step) 보호.
-  const ZOOM_UNIT_EPS = 0.02;
-  const isAtUnitZoom = $derived(
-    Math.abs(ephemeralStore.viewport.zoom - 1) < ZOOM_UNIT_EPS
-  );
+  // Zoom-blur placeholder (R8 §F8 policy b) 임시 폐기 — 사용자 demo 시
+  // zoom != 1 에서도 xterm 가시 유지 필요. WebGL cell metric 캐시 비용은
+  // 50 pane × 빠른 zoom step 시점에 재평가 (별도 task). 본 derived 는
+  // 항상 true 로 픽스해 PanelPlaceholder 분기를 사실상 비활성화.
+  const isAtUnitZoom = $derived(true);
 
   // schema 정합: visibility=false면 렌더 X. 단 SvelteFlow는 이미 nodes 배열을 필터링하지
   // 않으므로 본 컴포넌트가 무화면 분기를 직접 처리 (Node.hidden 대신).

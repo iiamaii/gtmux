@@ -1,3 +1,4 @@
+import './styles/global.css';
 import { mount } from 'svelte';
 import Page from './routes/+page.svelte';
 
