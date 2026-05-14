@@ -346,7 +346,16 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let hub = Hub::new();
     let (cmd_tx, cmd_rx) = mpsc::channel::<TmuxRequest>(64);
     let daemon_arc = Arc::new(Mutex::new(daemon));
-    let app = build_app(&config, &token, hub.clone(), cmd_tx);
+    // `config.frontend_dist` opts the bundled SPA in when set; smoke tests
+    // set `GTMUX_FRONTEND_DIST` env (figment converts to the config field) so
+    // a single port serves both the API and the static UI.
+    let app = build_app(
+        &config,
+        &token,
+        hub.clone(),
+        cmd_tx,
+        config.frontend_dist.as_deref(),
+    );
     let event_loop_handle = tokio::spawn({
         let daemon = Arc::clone(&daemon_arc);
         let hub = hub.clone();
@@ -478,8 +487,10 @@ fn build_app(
     token: &TokenString,
     hub: Hub,
     cmd_tx: mpsc::Sender<TmuxRequest>,
+    frontend_dist: Option<&std::path::Path>,
 ) -> Router {
-    gtmux_http_api::router(config, token).merge(gtmux_ws_server::router(config, token, hub, cmd_tx))
+    gtmux_http_api::router_with_static(config, token, frontend_dist)
+        .merge(gtmux_ws_server::router(config, token, hub, cmd_tx))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

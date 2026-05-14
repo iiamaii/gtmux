@@ -25,9 +25,29 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SESSION="${GTMUX_SMOKE_SESSION:-smoke}"
 PORT="${GTMUX_SMOKE_PORT:-9999}"
-SOCKET="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/gtmux-${SESSION}"
+# Path conventions are owned by `lifecycle::socket_path_for` and
+# `lifecycle::pidfile_path_for` (Sprint 4-B/D). Keep these in sync with
+# those Rust functions, not the comment block from the bootstrap draft.
+# Socket directory differs by XDG presence: `${XDG_RUNTIME_DIR}/gtmux/` vs
+# `/tmp/gtmux-<uid>/` (the fallback name embeds the uid so there is no
+# extra `gtmux/` subdirectory).
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  SOCKET="${XDG_RUNTIME_DIR}/gtmux/${SESSION}.sock"
+else
+  SOCKET="/tmp/gtmux-$(id -u)/${SESSION}.sock"
+fi
 TOKEN_FILE="${XDG_STATE_HOME:-${HOME}/.local/state}/gtmux/${SESSION}.token"
-PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/gtmux/${SESSION}.pid"
+PID_FILE="${XDG_STATE_HOME:-${HOME}/.local/state}/gtmux/${SESSION}.pid"
+# Bundled SPA dir — opted in by `Cmd::Start` when `GTMUX_FRONTEND_DIST` is
+# set so a single port serves both the API and the UI.
+export GTMUX_FRONTEND_DIST="${ROOT}/frontend/dist"
+# `gtmux start` honours `--session` + `--port`, but the config loader
+# validates the figment merge before the CLI override is applied (port=0
+# default is rejected). Export the same values via `GTMUX_SERVER__*` so
+# the figment chain sees a valid `[server]` section.
+export GTMUX_SERVER__SESSION="${SESSION}"
+export GTMUX_SERVER__PORT="${PORT}"
+export GTMUX_SERVER__BIND="127.0.0.1"
 
 # Toggle this to 0 once gtmux-cli subcommand bodies are implemented.
 # Defaults to 1 so CI does not fail on the placeholder steps.
@@ -122,9 +142,9 @@ fi
 #   - `tmux -L gtmux-${SESSION} list-sessions -F '#S'` returns a line equal to
 #     ${SESSION}.
 #   - Attaching with TERM=xterm-256color produces no error within 2s.
-echo "==[4/9]== tmux -L gtmux-${SESSION} list-sessions (attach probe)"
+echo "==[4/9]== tmux -L gtmux-${SESSION} -S ${SOCKET} list-sessions (attach probe)"
 if [ "${SMOKE_GATE_RUNTIME}" = "0" ]; then
-  if tmux -L "gtmux-${SESSION}" list-sessions -F '#S' 2>/dev/null | grep -qx "${SESSION}"; then
+  if tmux -L "gtmux-${SESSION}" -S "${SOCKET}" list-sessions -F '#S' 2>/dev/null | grep -qx "${SESSION}"; then
     record "  PASS  step 4  tmux external attach reachable"
   else
     record "  FAIL  step 4  tmux external attach probe failed"
@@ -218,9 +238,10 @@ req = (
 s = socket.create_connection(("127.0.0.1", ${PORT}))
 s.sendall(req.encode())
 resp = s.recv(4096).decode(errors="replace")
-assert "101 Switching Protocols" in resp, resp
-assert "Sec-WebSocket-Protocol: gtmux.v1\r\n" in resp, resp
-assert "bearer." not in resp, "token echoed back: " + resp
+low = resp.lower()
+assert "101 switching protocols" in low, resp
+assert "sec-websocket-protocol: gtmux.v1\r\n" in low, resp
+assert "bearer." not in low, "token echoed back: " + resp
 PY
     record "  PASS  step 6  WS handshake verified via python fallback"
   fi
@@ -253,7 +274,7 @@ if [ "${SMOKE_GATE_RUNTIME}" = "0" ]; then
        "http://127.0.0.1:${PORT}/api/layout" -o /tmp/gtmux-smoke-layout.json)
   echo "${HDRS}" | grep -qi '^etag: "[0-9a-f]\{32\}"' \
     || { record "  FAIL  step 7  ETag header missing or malformed"; exit 1; }
-  python3 -c 'import json,sys;d=json.load(open("/tmp/gtmux-smoke-layout.json"));assert d=={"groups":[],"panels":[]}' \
+  python3 -c 'import json;d=json.load(open("/tmp/gtmux-smoke-layout.json"));assert d.get("groups")==[] and d.get("panels")==[] and d.get("schema_version")==1, d' \
     || { record "  FAIL  step 7  body shape mismatch"; exit 1; }
   record "  PASS  step 7  /api/layout returned empty schema + ETag"
 else
@@ -305,9 +326,9 @@ record "  N/A   step 8  MANUAL visual probe — see comment block (frontend WS+x
 # Pass when:
 #   - All five paths above non-existent after exit 0.
 #   - tmux -L gtmux-<s> list-sessions → "no server running on /tmp/tmux-...".
-echo "==[9/9]== gtmux teardown --session ${SESSION}"
+echo "==[9/9]== gtmux teardown --session ${SESSION} --force"
 if [ "${SMOKE_GATE_RUNTIME}" = "0" ]; then
-  if "${ROOT}/backend/target/debug/gtmux" teardown --session "${SESSION}"; then
+  if "${ROOT}/backend/target/debug/gtmux" teardown --session "${SESSION}" --force; then
     for path in "${SOCKET}" "${TOKEN_FILE}" "${PID_FILE}"; do
       if [ -e "${path}" ]; then
         record "  FAIL  step 9  leftover: ${path}"

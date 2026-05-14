@@ -43,6 +43,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -61,6 +62,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing::warn;
 
@@ -206,16 +208,36 @@ impl IntoResponse for HttpApiError {
 ///
 /// Returns an owned `axum::Router` ready to be merged with the WebSocket
 /// router and handed to `axum::serve`. The config and token are cloned into
-/// the `AppState` — callers may continue to hold their own references.
+/// the `AppState` — callers may continue to hold their own references. No SPA
+/// static fallback is wired; unknown paths return the structured 404.
 pub fn router(config: &Config, token: &TokenString) -> Router {
+    router_with_static(config, token, None)
+}
+
+/// Like [`router`] but mounts the built SPA at `frontend_dist` as the catch-all
+/// fallback. Unknown paths first try the directory, then fall back to
+/// `index.html` so client-side routing works. Used by `gtmux start` to serve
+/// the bundled UI from a single port; tests typically pass `None`.
+pub fn router_with_static(
+    config: &Config,
+    token: &TokenString,
+    frontend_dist: Option<&Path>,
+) -> Router {
     let state = AppState::new(config.clone(), token.clone());
-    router_with_state(state)
+    router_with_state_and_spa(state, frontend_dist)
 }
 
 /// Variant of [`router`] that lets callers (and tests) supply a pre-built
 /// `AppState` — used to seed a non-empty layout or share counters across
 /// multiple router instances. Production callers should prefer [`router`].
 pub fn router_with_state(state: AppState) -> Router {
+    router_with_state_and_spa(state, None)
+}
+
+/// Internal builder shared by every public router constructor. The optional
+/// `frontend_dist` swaps the catch-all 404 for a `ServeDir` + `ServeFile`
+/// chain so a single port serves both the API and the bundled SPA.
+pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) -> Router {
     // Authenticated subtree — `/api/*` routes. Bearer middleware is applied
     // here (not on the outer router) so `/healthz` and `/auth/bootstrap`
     // bypass it. Origin/Host checks still run on every request via the outer
@@ -230,12 +252,25 @@ pub fn router_with_state(state: AppState) -> Router {
             bearer_auth_middleware,
         ));
 
-    Router::new()
+    let mut router = Router::new()
         .merge(api)
         .route("/auth/bootstrap", get(bootstrap_handler))
-        .route("/healthz", get(healthz_handler))
-        // Catch-all 404 with structured body for client diagnostics.
-        .fallback(not_found_handler)
+        .route("/healthz", get(healthz_handler));
+
+    router = match frontend_dist {
+        Some(dist) => {
+            // SPA fallback: serve from `dist`, deferring unmatched paths to
+            // `index.html` so client-side routing works. The Origin/Host
+            // middleware still gates these requests; top-level navigations
+            // omit Origin and so are passed through (see middleware below).
+            let index = dist.join("index.html");
+            let serve = ServeDir::new(dist).not_found_service(ServeFile::new(index));
+            router.fallback_service(serve)
+        }
+        None => router.fallback(not_found_handler),
+    };
+
+    router
         .layer(middleware::from_fn_with_state(
             state.clone(),
             host_check_middleware,
@@ -740,6 +775,7 @@ mod tests {
                 host_allowlist: vec![TEST_HOST.to_string()],
             },
             cloud: None,
+            frontend_dist: None,
         }
     }
 

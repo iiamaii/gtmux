@@ -88,6 +88,11 @@ pub struct Config {
     /// Cloud 모드에서만 활성. Local 모드면 `None` 이어야 한다.
     #[serde(default)]
     pub cloud: Option<CloudConfig>,
+    /// 옵션: 빌드된 SPA 디렉터리 경로. 설정되면 http-api 라우터가 fallback
+    /// 으로 정적 파일을 서빙하여 동일 포트에서 API + UI를 함께 노출한다.
+    /// `gtmux start` 시 `GTMUX_FRONTEND_DIST` env 또는 TOML 필드로 지정.
+    #[serde(default)]
+    pub frontend_dist: Option<std::path::PathBuf>,
 }
 
 /// `[server]` 섹션 — Server identity 영역.
@@ -222,6 +227,7 @@ pub fn load(path: Option<&Path>, session: &str) -> Result<Config, ConfigError> {
         runtime: RuntimeConfig::default(),
         security: SecurityConfig::default(),
         cloud: None,
+        frontend_dist: None,
     };
 
     let mut figment = Figment::from(Serialized::defaults(defaults));
@@ -309,6 +315,7 @@ struct DefaultsSeed {
     runtime: RuntimeConfig,
     security: SecurityConfig,
     cloud: Option<CloudConfig>,
+    frontend_dist: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
