@@ -26,12 +26,12 @@
 <style>
   .toast-host {
     position: fixed;
-    right: var(--space-4);
-    bottom: var(--space-4);
+    right: var(--space-16);
+    bottom: var(--space-16);
     z-index: var(--z-toast);
     display: flex;
     flex-direction: column-reverse;
-    gap: var(--space-2);
+    gap: var(--space-8);
     pointer-events: none;
     max-width: 360px;
   }
@@ -39,13 +39,13 @@
   .toast {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
-    padding: var(--space-2) var(--space-3);
+    gap: var(--space-8);
+    padding: var(--space-8) var(--space-12);
     background: var(--color-surface-2);
     color: var(--color-fg);
     border: 1px solid var(--color-border-strong);
     border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-3);
+    box-shadow: var(--shadow-lg);
     font-size: var(--text-sm);
     pointer-events: auto;
     animation: toast-in var(--motion-normal) var(--motion-easing);
@@ -88,7 +88,7 @@
   }
 
   .toast-dismiss:hover {
-    background: var(--color-surface-3);
+    background: var(--color-glass-2);
     color: var(--color-fg);
   }
 

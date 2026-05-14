@@ -1,90 +1,148 @@
-/* gtmux design tokens — single source of truth (ADR-0016).
+/* gtmux design tokens — single source of truth (ADR-0016 + 2026-05-15 amend ×1).
  *
- * 7 categories: color (semantic), spacing, typography, radius, shadow,
- * motion, layout. Plus 3 auxiliary token sets: z-index layers,
- * banner warn/error, zombie badge.
+ * 8 categories: color (semantic), spacing, typography, radius, shadow,
+ * motion, layout, canvas. Plus auxiliary legacy banner / zombie tokens.
  *
- * Naming: --<category>-<role>[-<variant>]. Role-based only — no primitive
- * color names like `--color-blue-500`. See ADR-0016 §D2.
+ * Theme: `:root` = light (Figma default). `:root.dark` = dark variant.
+ * Toggle by adding/removing the `dark` class on `<html>` (ThemeToggle owns it).
+ *
+ * Naming: --<category>-<role>[-<variant>]. Role-based — no primitive
+ * colour names. See ADR-0016 §D2.
  *
  * Adding / changing tokens: ADR-0016 §D7 amend policy.
  */
 
 :root {
-  /* ── Color: semantic ───────────────────────────────── */
-  --color-bg: #0f172a;
-  --color-surface-1: #111827;
-  --color-surface-2: #1e293b;
-  --color-surface-3: #334155;
-  --color-fg: #e2e8f0;
-  --color-fg-muted: #94a3b8;
-  --color-fg-subtle: #64748b;
-  --color-border-subtle: #1f2937;
-  --color-border-strong: #334155;
+  /* ── Color: semantic (light) ───────────────────────── */
+  --color-bg: #ffffff;
+  --color-surface: #ffffff;
+  --color-surface-2: #f5f5f5;
+  --color-fg: #000000;
+  --color-fg-muted: #6b6b6b;
+  --color-fg-subtle: #9a9a9a;
+  --color-border: rgba(0, 0, 0, 0.10);
+  --color-border-strong: rgba(0, 0, 0, 0.18);
+  --color-glass-1: rgba(0, 0, 0, 0.06);
+  --color-glass-2: rgba(0, 0, 0, 0.10);
 
-  --color-accent: #38bdf8;
-  --color-accent-fg: #052e16;
+  --color-accent: #0d99ff;
+  --color-accent-fg: #ffffff;
   --color-success: #22c55e;
   --color-warning: #facc15;
-  --color-danger: #ef4444;
-  --color-info: #60a5fa;
+  --color-danger: #e5484d;
+  --color-info: #0d99ff;
 
-  /* ── Spacing ────────────────────────────────────────── */
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-5: 24px;
-  --space-6: 32px;
-  --space-7: 48px;
+  /* ── Canvas ─────────────────────────────────────────── */
+  --canvas-bg: #f3f3f3;
+  --canvas-grid: rgba(0, 0, 0, 0.05);
+
+  /* ── Spacing (8px base + finer steps for Figma chrome) ─ */
+  --space-2: 2px;
+  --space-4: 4px;
+  --space-6: 6px;
+  --space-8: 8px;
+  --space-10: 10px;
+  --space-12: 12px;
+  --space-14: 14px;
+  --space-16: 16px;
+  --space-18: 18px;
+  --space-20: 20px;
+  --space-24: 24px;
+  --space-36: 36px;
 
   /* ── Typography ─────────────────────────────────────── */
-  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  --text-xs: 10px;
-  --text-sm: 11px;
-  --text-base: 12px;
-  --text-md: 13px;
-  --text-lg: 14px;
+  --font-sans: 'SF Pro Display', -apple-system, BlinkMacSystemFont,
+               'Segoe UI', Roboto, system-ui, sans-serif;
+  --font-mono: 'SF Mono', Menlo, 'JetBrains Mono', ui-monospace, monospace;
+  --text-xs: 9px;
+  --text-sm: 10px;
+  --text-base: 11px;
+  --text-md: 12px;
+  --text-lg: 13px;
   --text-xl: 16px;
   --leading-tight: 1.2;
   --leading-normal: 1.4;
   --weight-regular: 400;
   --weight-medium: 500;
-  --weight-semibold: 600;
+  --weight-semibold: 540;
 
   /* ── Radius ─────────────────────────────────────────── */
-  --radius-sm: 3px;
-  --radius-md: 4px;
-  --radius-lg: 6px;
-  --radius-xl: 8px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-pill: 50px;
 
-  /* ── Shadow ─────────────────────────────────────────── */
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.25);
-  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.35);
-  --shadow-3: 0 8px 24px rgba(0, 0, 0, 0.45);
-  --shadow-4: 0 16px 48px rgba(0, 0, 0, 0.55);
+  /* ── Shadow — Figma hairline + soft drop ─────────────── */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06),
+               0 0 0 0.5px rgba(0, 0, 0, 0.06);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.12),
+               0 0 0 0.5px rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 20px 48px rgba(0, 0, 0, 0.18),
+               0 0 0 0.5px rgba(0, 0, 0, 0.08);
 
   /* ── Motion ─────────────────────────────────────────── */
-  --motion-fast: 80ms;
-  --motion-normal: 160ms;
-  --motion-slow: 240ms;
-  --motion-easing: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --motion-fast: 100ms;
+  --motion-normal: 200ms;
+  --motion-slow: 250ms;
+  --motion-easing: cubic-bezier(0.4, 0, 0.2, 1);
 
   /* ── Layout ─────────────────────────────────────────── */
-  --layout-toolbar-h: 40px;
-  --layout-sidebar-w: 260px;
+  --layout-titlebar-h: 44px;
+  --layout-toolbar-h: 56px;
+  --layout-sidebar-w: 248px;
+  --layout-sidebar-right-w: 268px;
   --layout-banner-h: 32px;
 
   /* ── z-index layers ─────────────────────────────────── */
   --z-canvas: 0;
-  --z-sidebar: 100;
-  --z-toolbar: 200;
+  --z-canvas-overlay: 18;
+  --z-rail: 19;
+  --z-side-panel: 20;
+  --z-toolbar: 25;
+  --z-titlebar: 30;
+  --z-context-menu: 100;
   --z-banner: 1000;
   --z-modal: 2000;
   --z-toast: 3000;
 
-  /* ── ReconnectBanner (FE-3 D21 c2) ──────────────────── */
+  /* ── Legacy banner (FE-3 D21 c2) — light values ─────── */
+  --banner-warn-bg: #fef3c7;
+  --banner-warn-fg: #78350f;
+  --banner-warn-border: #f59e0b;
+  --banner-error-bg: #fee2e2;
+  --banner-error-fg: #7f1d1d;
+  --banner-error-border: #ef4444;
+
+  /* ── Zombie badge (FE-3 D21 c3) ─────────────────────── */
+  --zombie-bg: var(--color-surface-2);
+  --zombie-fg: var(--color-warning);
+}
+
+:root.dark {
+  --color-bg: #1e1e1e;
+  --color-surface: #2c2c2c;
+  --color-surface-2: #383838;
+  --color-fg: #f5f5f5;
+  --color-fg-muted: #9a9a9a;
+  --color-fg-subtle: #6b6b6b;
+  --color-border: rgba(255, 255, 255, 0.10);
+  --color-border-strong: rgba(255, 255, 255, 0.18);
+  --color-glass-1: rgba(255, 255, 255, 0.06);
+  --color-glass-2: rgba(255, 255, 255, 0.10);
+
+  /* accent / success / warning / danger / info — Figma blue is
+   * theme-agnostic, semantic colors keep identity across themes. */
+
+  --canvas-bg: #1a1a1a;
+  --canvas-grid: rgba(255, 255, 255, 0.04);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4),
+               0 0 0 0.5px rgba(255, 255, 255, 0.06);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.5),
+               0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  --shadow-lg: 0 20px 48px rgba(0, 0, 0, 0.6),
+               0 0 0 0.5px rgba(255, 255, 255, 0.08);
+
   --banner-warn-bg: #422006;
   --banner-warn-fg: #fde68a;
   --banner-warn-border: #b45309;
@@ -92,15 +150,11 @@
   --banner-error-fg: #fecaca;
   --banner-error-border: #b91c1c;
 
-  /* ── Zombie badge (FE-3 D21 c3) ─────────────────────── */
   --zombie-bg: #1f2937;
   --zombie-fg: var(--color-warning);
 }
 
-/* Respect user system preference for reduced motion. Override --motion-*
- * to 0 so transitions / animations effectively become instant. Anything
- * using these tokens (modal enter, dropdown open, banner fade) inherits
- * the reduced behaviour without per-component branching. */
+/* Respect user's reduced-motion preference. */
 @media (prefers-reduced-motion: reduce) {
   :root {
     --motion-fast: 0ms;

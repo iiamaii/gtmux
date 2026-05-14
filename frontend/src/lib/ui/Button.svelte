@@ -54,7 +54,7 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: var(--space-1);
+    gap: var(--space-16);
     border-radius: var(--radius-md);
     font-family: inherit;
     font-weight: var(--weight-medium);
@@ -74,13 +74,13 @@
 
   .btn-sm {
     height: 24px;
-    padding: 0 var(--space-2);
+    padding: 0 var(--space-8);
     font-size: var(--text-sm);
   }
 
   .btn-md {
     height: 32px;
-    padding: 0 var(--space-3);
+    padding: 0 var(--space-12);
     font-size: var(--text-base);
   }
 
@@ -101,7 +101,7 @@
   }
 
   .btn-secondary:hover:not(:disabled) {
-    background: var(--color-surface-3);
+    background: var(--color-glass-2);
     border-color: var(--color-fg-subtle);
   }
 

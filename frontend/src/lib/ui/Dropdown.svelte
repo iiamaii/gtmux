@@ -85,12 +85,12 @@
   .dropdown-menu {
     position: absolute;
     min-width: 180px;
-    margin-top: var(--space-1);
+    margin-top: var(--space-16);
     background: var(--color-surface-2);
     border: 1px solid var(--color-border-strong);
     border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-3);
-    padding: var(--space-1);
+    box-shadow: var(--shadow-lg);
+    padding: var(--space-16);
     z-index: var(--z-toolbar);
     animation: dropdown-in var(--motion-normal) var(--motion-easing);
   }
@@ -122,9 +122,9 @@
   .dropdown-menu :global(a) {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--space-8);
     width: 100%;
-    padding: var(--space-2) var(--space-3);
+    padding: var(--space-8) var(--space-12);
     background: transparent;
     border: 0;
     border-radius: var(--radius-md);
@@ -138,7 +138,7 @@
 
   .dropdown-menu :global(button:hover:not(:disabled)),
   .dropdown-menu :global(a:hover) {
-    background: var(--color-surface-3);
+    background: var(--color-glass-2);
   }
 
   .dropdown-menu :global(button:disabled) {

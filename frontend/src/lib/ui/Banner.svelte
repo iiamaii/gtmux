@@ -34,9 +34,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: var(--space-2);
+    gap: var(--space-8);
     height: var(--layout-banner-h);
-    padding: 0 var(--space-4);
+    padding: 0 var(--space-16);
     font-size: var(--text-sm);
     font-weight: var(--weight-medium);
     border-bottom: 1px solid transparent;

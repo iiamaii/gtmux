@@ -9,37 +9,42 @@ body {
   background: var(--color-bg);
   color: var(--color-fg);
   font-family: var(--font-sans);
-  font-size: var(--text-base);
+  font-size: var(--text-md);
   line-height: var(--leading-normal);
+  font-feature-settings: 'kern' 1;
+  letter-spacing: -0.14px;
+  -webkit-font-smoothing: antialiased;
+  transition:
+    background var(--motion-normal) var(--motion-easing),
+    color var(--motion-normal) var(--motion-easing);
 }
 
 * {
   box-sizing: border-box;
 }
 
-/* Consistent focus ring across the app — info accent + offset so it stays
- * visible against busy backgrounds. Components that need a custom focus
- * style opt out by setting `outline: none` on `:focus-visible` deliberately. */
+/* Figma-signature dashed accent focus ring. Components that need a
+ * different focus style override on `:focus-visible` deliberately. */
 :focus-visible {
-  outline: 2px solid var(--color-info);
-  outline-offset: 2px;
+  outline: 2px dashed var(--color-accent);
+  outline-offset: 1px;
   border-radius: var(--radius-sm);
 }
 
-/* Dark scrollbar — WebKit + Firefox. Matches surface-2 so it blends with
- * sidebar / panel chrome. */
+/* Dark scrollbar — matches surface-2 so it blends with sidebar /
+ * panel chrome. */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--color-surface-1);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--color-surface-3);
-  border-radius: var(--radius-md);
+  background: var(--color-border-strong);
+  border-radius: var(--radius-sm);
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -47,19 +52,18 @@ body {
 }
 
 * {
-  scrollbar-color: var(--color-surface-3) var(--color-surface-1);
+  scrollbar-color: var(--color-border-strong) transparent;
   scrollbar-width: thin;
 }
 
 /* Text-selection — accent tint at low opacity so a busy terminal screen
  * does not flash a saturated highlight. */
 ::selection {
-  background: rgba(56, 189, 248, 0.28); /* --color-accent at ~28% */
+  background: rgba(13, 153, 255, 0.28); /* --color-accent at ~28% */
   color: var(--color-fg);
 }
 
-/* Default button reset so primitives in src/lib/ui/ start from a clean
- * slate. Project buttons override via their own scoped styles. */
+/* Button reset for src/lib/ui/ primitives. */
 button {
   font-family: inherit;
   font-size: inherit;
@@ -68,8 +72,29 @@ button {
   border: 0;
   padding: 0;
   cursor: pointer;
+  letter-spacing: inherit;
 }
 
 button:disabled {
   cursor: not-allowed;
+}
+
+/* Mono utility — section headers, kbd, numeric inputs. */
+.mono-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  font-weight: var(--weight-regular);
+  color: var(--color-fg-muted);
+}
+
+kbd {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--color-glass-2);
+  color: var(--color-fg);
+  letter-spacing: 0.4px;
 }

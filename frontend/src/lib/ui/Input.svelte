@@ -64,7 +64,7 @@
   .input-field {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1);
+    gap: var(--space-16);
   }
 
   .input-label {
@@ -75,8 +75,8 @@
 
   .input-control {
     height: 32px;
-    padding: 0 var(--space-3);
-    background: var(--color-surface-1);
+    padding: 0 var(--space-12);
+    background: var(--color-surface);
     color: var(--color-fg);
     border: 1px solid var(--color-border-strong);
     border-radius: var(--radius-md);

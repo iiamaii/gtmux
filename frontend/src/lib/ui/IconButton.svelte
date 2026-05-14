@@ -90,7 +90,7 @@
   }
 
   .icon-btn-secondary:hover:not(:disabled) {
-    background: var(--color-surface-3);
+    background: var(--color-glass-2);
     color: var(--color-fg);
   }
 

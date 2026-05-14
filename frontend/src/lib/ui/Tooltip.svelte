@@ -49,38 +49,38 @@
   .tooltip {
     position: absolute;
     z-index: 10;
-    padding: var(--space-1) var(--space-2);
-    background: var(--color-surface-3);
+    padding: var(--space-16) var(--space-8);
+    background: var(--color-glass-2);
     color: var(--color-fg);
     font-size: var(--text-sm);
     line-height: var(--leading-tight);
     border-radius: var(--radius-sm);
-    box-shadow: var(--shadow-2);
+    box-shadow: var(--shadow-md);
     white-space: nowrap;
     pointer-events: none;
     animation: tooltip-in var(--motion-fast) var(--motion-easing);
   }
 
   .tooltip-top {
-    bottom: calc(100% + var(--space-1));
+    bottom: calc(100% + var(--space-16));
     left: 50%;
     transform: translateX(-50%);
   }
 
   .tooltip-bottom {
-    top: calc(100% + var(--space-1));
+    top: calc(100% + var(--space-16));
     left: 50%;
     transform: translateX(-50%);
   }
 
   .tooltip-left {
-    right: calc(100% + var(--space-1));
+    right: calc(100% + var(--space-16));
     top: 50%;
     transform: translateY(-50%);
   }
 
   .tooltip-right {
-    left: calc(100% + var(--space-1));
+    left: calc(100% + var(--space-16));
     top: 50%;
     transform: translateY(-50%);
   }
