@@ -19,12 +19,15 @@
   import Canvas from '$lib/canvas/Canvas.svelte';
   import Titlebar from '$lib/chrome/Titlebar.svelte';
   import Sidebar from '$lib/sidebar/Sidebar.svelte';
+  import PaneInfoPanel from '$lib/chrome/PaneInfoPanel.svelte';
+  import RailToggle from '$lib/chrome/RailToggle.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
   import Toast from '$lib/ui/Toast.svelte';
   import { createDispatcher, setLayoutRefetchHandler } from '$lib/ws/dispatcher.svelte';
   import { createLayoutRefetchHandler, fetchLayoutAndHydrate } from '$lib/http/layout';
   import { layoutStore } from '$lib/stores/layout.svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
+  import { chromeStore } from '$lib/stores/chrome.svelte';
   import type { WsClient } from '$lib/ws/client';
 
   const TOKEN_STORAGE_KEY = 'gtmux_token';
@@ -119,10 +122,23 @@
   <ReconnectBanner />
   <Titlebar />
   <div class="workspace">
-    <Sidebar />
     <main class="canvas-pane">
       <Canvas />
     </main>
+    <Sidebar collapsed={chromeStore.state.sidebarCollapsed} />
+    <PaneInfoPanel collapsed={chromeStore.state.paneInfoCollapsed} />
+    <RailToggle
+      side="left"
+      collapsed={chromeStore.state.sidebarCollapsed}
+      onclick={() => chromeStore.toggleSidebar()}
+      aria-label="Toggle layer panel"
+    />
+    <RailToggle
+      side="right"
+      collapsed={chromeStore.state.paneInfoCollapsed}
+      onclick={() => chromeStore.togglePaneInfo()}
+      aria-label="Toggle pane info panel"
+    />
   </div>
 </div>
 <Toast />
@@ -142,35 +158,41 @@
     overflow: hidden;
   }
 
+  /* Stage E — workspace is an `absolute` overlay host. Canvas fills the
+   * area entirely; Sidebar / PaneInfoPanel / RailToggle ×2 float on top
+   * with their own absolute positions. This matches ref/frontend-design
+   * §1.3 and ADR-0017 §D1. */
   .workspace {
     flex: 1 1 auto;
-    display: flex;
-    flex-direction: row;
+    position: relative;
     min-height: 0;
     min-width: 0;
+    overflow: hidden;
   }
 
   .canvas-pane {
-    flex: 1 1 auto;
+    position: absolute;
+    inset: 0;
     min-width: 0;
     min-height: 0;
-    position: relative;
   }
 
-  /* Responsive breakpoints — narrow viewports collapse the sidebar so
-   * canvas keeps usable real-estate. Real collapsible rail (Stage E)
-   * supersedes this with a user-controlled toggle. */
-  @media (max-width: 800px) {
-    .workspace :global(.sidebar) {
-      width: 180px;
-      flex: 0 0 180px;
-      min-width: 180px;
+  /* Responsive — narrow viewports auto-collapse the floating panels.
+   * The user can still toggle via RailToggle (which now rides the
+   * viewport edge). */
+  @media (max-width: 900px) {
+    .workspace :global(.pane-info:not(.collapsed)) {
+      transform: translateX(calc(var(--layout-sidebar-right-w) + var(--space-12)));
+      opacity: 0;
+      pointer-events: none;
     }
   }
 
-  @media (max-width: 600px) {
-    .workspace :global(.sidebar) {
-      display: none;
+  @media (max-width: 700px) {
+    .workspace :global(.sidebar:not(.collapsed)) {
+      transform: translateX(calc(-1 * (var(--layout-sidebar-w) + var(--space-12))));
+      opacity: 0;
+      pointer-events: none;
     }
   }
 </style>

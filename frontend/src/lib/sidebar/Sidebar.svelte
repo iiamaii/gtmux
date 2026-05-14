@@ -31,6 +31,12 @@
   import { muxStore } from '$lib/stores/mux.svelte';
   import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
 
+  /** Floating chrome state — driven by chromeStore (Stage E). */
+  interface Props {
+    collapsed?: boolean;
+  }
+  const { collapsed = false }: Props = $props();
+
   // SSoT (`docs/ssot/canvas-layout-schema.md` §1 `$defs/Group`) 의 부분 view —
   // `codebase/frontend/src/lib/types/canvas-layout.d.ts` 가 codegen 으로 채워지기 전까지의
   // 잠정 타입. Canvas.svelte 의 PanelData 패턴과 동일 (R8 §F3 명시).
@@ -158,7 +164,7 @@
   }
 </script>
 
-<aside class="sidebar" aria-label="Layer panel">
+<aside class="sidebar" class:collapsed aria-label="Layer panel">
   <header class="sidebar-header">
     <span class="sidebar-title">Layers</span>
   </header>
@@ -294,22 +300,35 @@
 </aside>
 
 <style>
-  /* Width 248px fixed (plan 0005 Stage E — floating panel ready, currently
-   * still docked. Background uses --color-surface so it sits one step
-   * brighter than the canvas (--color-bg). */
+  /* Stage E — floating panel. Sits over the canvas with shadow + radius,
+   * 8px gap from the workspace edges. Collapse animates outward to the
+   * viewport edge (transform translateX) so the RailToggle can pull it
+   * back. */
   .sidebar {
-    flex: 0 0 var(--layout-sidebar-w);
+    position: absolute;
+    top: var(--space-8);
+    bottom: var(--space-8);
+    left: var(--space-8);
     width: var(--layout-sidebar-w);
-    min-width: var(--layout-sidebar-w);
-    height: 100%;
     box-sizing: border-box;
     overflow: auto;
     background: var(--color-surface);
     color: var(--color-fg);
-    border-right: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md);
+    z-index: var(--z-side-panel);
     font-size: var(--text-lg);
     line-height: var(--leading-normal);
     user-select: none;
+    transition:
+      transform var(--motion-slow) var(--motion-easing),
+      opacity var(--motion-normal) var(--motion-easing);
+  }
+
+  .sidebar.collapsed {
+    transform: translateX(calc(-1 * (var(--layout-sidebar-w) + var(--space-12))));
+    opacity: 0;
+    pointer-events: none;
   }
 
   .sidebar-header {
