@@ -8,13 +8,68 @@ body {
   height: 100%;
   background: var(--color-bg);
   color: var(--color-fg);
-  font-family:
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    sans-serif;
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
 }
 
 * {
   box-sizing: border-box;
+}
+
+/* Consistent focus ring across the app — info accent + offset so it stays
+ * visible against busy backgrounds. Components that need a custom focus
+ * style opt out by setting `outline: none` on `:focus-visible` deliberately. */
+:focus-visible {
+  outline: 2px solid var(--color-info);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Dark scrollbar — WebKit + Firefox. Matches surface-2 so it blends with
+ * sidebar / panel chrome. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-surface-1);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-surface-3);
+  border-radius: var(--radius-md);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-fg-subtle);
+}
+
+* {
+  scrollbar-color: var(--color-surface-3) var(--color-surface-1);
+  scrollbar-width: thin;
+}
+
+/* Text-selection — accent tint at low opacity so a busy terminal screen
+ * does not flash a saturated highlight. */
+::selection {
+  background: rgba(56, 189, 248, 0.28); /* --color-accent at ~28% */
+  color: var(--color-fg);
+}
+
+/* Default button reset so primitives in src/lib/ui/ start from a clean
+ * slate. Project buttons override via their own scoped styles. */
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
 }

@@ -1,27 +1,90 @@
-/* gtmux 디자인 토큰 — CSS custom properties. R8 §Scaffolding outline 정합. */
+/* gtmux design tokens — single source of truth (ADR-0016).
+ *
+ * 7 categories: color (semantic), spacing, typography, radius, shadow,
+ * motion, layout. Plus 3 auxiliary token sets: z-index layers,
+ * banner warn/error, zombie badge.
+ *
+ * Naming: --<category>-<role>[-<variant>]. Role-based only — no primitive
+ * color names like `--color-blue-500`. See ADR-0016 §D2.
+ *
+ * Adding / changing tokens: ADR-0016 §D7 amend policy.
+ */
 
 :root {
-  /* 색 */
+  /* ── Color: semantic ───────────────────────────────── */
   --color-bg: #0f172a;
+  --color-surface-1: #111827;
+  --color-surface-2: #1e293b;
+  --color-surface-3: #334155;
   --color-fg: #e2e8f0;
+  --color-fg-muted: #94a3b8;
+  --color-fg-subtle: #64748b;
+  --color-border-subtle: #1f2937;
+  --color-border-strong: #334155;
+
   --color-accent: #38bdf8;
+  --color-accent-fg: #052e16;
+  --color-success: #22c55e;
   --color-warning: #facc15;
   --color-danger: #ef4444;
+  --color-info: #60a5fa;
 
-  /* 간격 */
+  /* ── Spacing ────────────────────────────────────────── */
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
   --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
 
-  /* z-index 레이어 */
+  /* ── Typography ─────────────────────────────────────── */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --text-xs: 10px;
+  --text-sm: 11px;
+  --text-base: 12px;
+  --text-md: 13px;
+  --text-lg: 14px;
+  --text-xl: 16px;
+  --leading-tight: 1.2;
+  --leading-normal: 1.4;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* ── Radius ─────────────────────────────────────────── */
+  --radius-sm: 3px;
+  --radius-md: 4px;
+  --radius-lg: 6px;
+  --radius-xl: 8px;
+
+  /* ── Shadow ─────────────────────────────────────────── */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.35);
+  --shadow-3: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-4: 0 16px 48px rgba(0, 0, 0, 0.55);
+
+  /* ── Motion ─────────────────────────────────────────── */
+  --motion-fast: 80ms;
+  --motion-normal: 160ms;
+  --motion-slow: 240ms;
+  --motion-easing: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* ── Layout ─────────────────────────────────────────── */
+  --layout-toolbar-h: 40px;
+  --layout-sidebar-w: 260px;
+  --layout-banner-h: 32px;
+
+  /* ── z-index layers ─────────────────────────────────── */
   --z-canvas: 0;
   --z-sidebar: 100;
   --z-toolbar: 200;
   --z-banner: 1000;
   --z-modal: 2000;
+  --z-toast: 3000;
 
-  /* ReconnectBanner (FE-3 D21 c2) — warn=transient/recoverable, error=blocking. */
+  /* ── ReconnectBanner (FE-3 D21 c2) ──────────────────── */
   --banner-warn-bg: #422006;
   --banner-warn-fg: #fde68a;
   --banner-warn-border: #b45309;
@@ -29,7 +92,19 @@
   --banner-error-fg: #fecaca;
   --banner-error-border: #b91c1c;
 
-  /* Zombie badge (FE-3 D21 c3) — pane_dead=1 표시. dark chip with warning accent. */
+  /* ── Zombie badge (FE-3 D21 c3) ─────────────────────── */
   --zombie-bg: #1f2937;
   --zombie-fg: var(--color-warning);
+}
+
+/* Respect user system preference for reduced motion. Override --motion-*
+ * to 0 so transitions / animations effectively become instant. Anything
+ * using these tokens (modal enter, dropdown open, banner fade) inherits
+ * the reduced behaviour without per-component branching. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-normal: 0ms;
+    --motion-slow: 0ms;
+  }
 }
