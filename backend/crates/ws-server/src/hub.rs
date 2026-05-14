@@ -39,11 +39,17 @@ use crate::ring::RingBuffer;
 /// snapshot instead of dropping the connection.
 pub const HUB_BROADCAST_CAPACITY: usize = 256;
 
-/// Fan-out hub. Cheap to clone — internally holds two `Arc`s.
+/// Fan-out hub. Cheap to clone — internally holds three `Arc`s.
 #[derive(Debug, Clone)]
 pub struct Hub {
     events: broadcast::Sender<Event>,
     ring_buffers: Arc<RwLock<HashMap<u32, RingBuffer>>>,
+    /// Most-recent `%session-changed` payload. tmux emits this exactly once
+    /// per control-mode attach (typically at boot), so late WS subscribers
+    /// would miss it without an explicit catch-up channel. We mirror the
+    /// payload here and replay it from [`handle_socket`] just before the
+    /// ring-buffer flush.
+    last_session: Arc<RwLock<Option<(u32, String)>>>,
 }
 
 impl Hub {
@@ -53,6 +59,7 @@ impl Hub {
         Self {
             events,
             ring_buffers: Arc::new(RwLock::new(HashMap::new())),
+            last_session: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -93,6 +100,13 @@ impl Hub {
                     .or_insert_with(RingBuffer::new)
                     .append(bytes);
             }
+            Event::SessionChanged { session_id, name } => {
+                // Cache for late subscribers — tmux only emits this on
+                // control-mode attach, so WS clients that connect after
+                // boot would otherwise never see it.
+                let mut slot = self.last_session.write().await;
+                *slot = Some((*session_id, name.clone()));
+            }
             _ => {}
         }
         // 2) Broadcast. `Err` here means "no live subscribers" — fine; we
@@ -129,6 +143,12 @@ impl Hub {
     /// Current number of live subscribers — useful in tests and metrics.
     pub fn subscriber_count(&self) -> usize {
         self.events.receiver_count()
+    }
+
+    /// Most-recent cached `%session-changed`, if one has been observed.
+    /// `None` until tmux's control-mode attach emits the first event.
+    pub async fn snapshot_session(&self) -> Option<(u32, String)> {
+        self.last_session.read().await.clone()
     }
 }
 
@@ -204,5 +224,32 @@ mod tests {
         hub.publish(Event::SessionsChanged).await;
         assert!(hub.snapshot(7).await.is_none());
         assert!(hub.snapshot_all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_changed_cached_for_late_subscriber() {
+        let hub = Hub::new();
+        // No publish yet — snapshot must be None.
+        assert!(hub.snapshot_session().await.is_none());
+        // Publish before any subscriber exists (the broadcast send returns
+        // Err in this state, which is the normal startup race).
+        hub.publish(Event::SessionChanged {
+            session_id: 0,
+            name: "demo".to_string(),
+        })
+        .await;
+        let snap = hub.snapshot_session().await.expect("cache populated");
+        assert_eq!(snap, (0, "demo".to_string()));
+
+        // A later publish replaces the cache wholesale.
+        hub.publish(Event::SessionChanged {
+            session_id: 1,
+            name: "work".to_string(),
+        })
+        .await;
+        assert_eq!(
+            hub.snapshot_session().await.unwrap(),
+            (1, "work".to_string())
+        );
     }
 }

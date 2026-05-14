@@ -589,7 +589,28 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cmd_tx: mpsc::Sender<TmuxReq
         }
     }
 
-    // Catch-up replay: every pane's ring buffer becomes a 0x02 PANE_OUT
+    // Catch-up replay 1/2 — `%session-changed`. tmux emits this exactly
+    // once per control-mode attach, so WS subscribers that connect after
+    // the daemon booted (i.e. every browser load) would never see it via
+    // the live fan-out. The hub caches the last observed session and we
+    // replay it here as a 0x07 NOTIFY_MIRROR envelope before any pane
+    // output reaches the dispatcher.
+    if let Some((session_id, name)) = hub.snapshot_session().await {
+        if let Some(env) = event_to_envelope(&Event::SessionChanged { session_id, name }) {
+            if let Ok(buf) = env.encode() {
+                if sink
+                    .send(Message::Binary(buf.to_vec().into()))
+                    .await
+                    .is_err()
+                {
+                    debug!("ws session catch-up send failed; peer hung up during replay");
+                    return;
+                }
+            }
+        }
+    }
+
+    // Catch-up replay 2/2: every pane's ring buffer becomes a 0x02 PANE_OUT
     // envelope. We do this *after* the LAYOUT_CHANGED hello so the client's
     // dispatcher is already in steady-state mode.
     let snapshots = hub.snapshot_all().await;
