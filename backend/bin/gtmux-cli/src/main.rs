@@ -230,6 +230,15 @@ struct StartArgs {
 ///  12) install shutdown handlers  — SIGINT + SIGTERM → graceful (D5 daemon ⊥)
 ///  13) axum::serve(...)           — with_graceful_shutdown
 async fn start(args: StartArgs) -> anyhow::Result<()> {
+    // 1a) Nested-tmux startup guard — ADR-0014 D10 amend (2026-05-14) 1차 방어.
+    //     If the user is running gtmux from inside an existing outer tmux
+    //     session, the inherited `TMUX` env makes the child shells we spawn
+    //     visible to that outer tmux server. Best to fail fast with a clear
+    //     diagnostic — 0022 L-17 "prevention > recovery" principle.
+    if let Ok(val) = std::env::var("TMUX") {
+        return Err(StartError::NestedTmux(val).into());
+    }
+
     // 2) config — figment chain. CLI `--session` and `--port` are passed in as
     //    figment overrides so they win against TOML / env *before* validation
     //    runs. Mutating `config.server.port` after load is the old path; it
@@ -675,7 +684,15 @@ impl std::error::Error for BindError {}
 /// another --port").
 #[derive(Debug)]
 enum StartError {
-    AlreadyRunning { session: String, pid: libc::pid_t },
+    AlreadyRunning {
+        session: String,
+        pid: libc::pid_t,
+    },
+    /// ADR-0014 D10 amend (2026-05-14) — `TMUX` env detected, refuse to start
+    /// inside an outer tmux session. The variant carries the env value so
+    /// the diagnostic surfaces the actual offender (e.g. the outer socket
+    /// path) and the user can locate / exit it without guessing.
+    NestedTmux(String),
 }
 
 impl std::fmt::Display for StartError {
@@ -685,6 +702,13 @@ impl std::fmt::Display for StartError {
                 f,
                 "gtmux server already running for session '{session}' (pid {pid}). \
                  Use `gtmux stop --session {session}` first, or pick another --session."
+            ),
+            StartError::NestedTmux(val) => write!(
+                f,
+                "refusing to start inside an existing tmux session (TMUX env = {val:?}). \
+                 Exit the outer tmux first, or run `unset TMUX` then retry. \
+                 Spawning child shells under a nested tmux corrupts their environment \
+                 (see docs/adr/0014-process-supervisor.md D10)."
             ),
         }
     }
@@ -704,8 +728,15 @@ fn report_start_error(err: anyhow::Error) -> ExitCode {
     if let Some(BindError::InUse(_)) = err.downcast_ref::<BindError>() {
         return ExitCode::from(EXIT_PORT_IN_USE);
     }
-    if let Some(StartError::AlreadyRunning { .. }) = err.downcast_ref::<StartError>() {
-        return ExitCode::from(EXIT_PORT_IN_USE);
+    if let Some(start) = err.downcast_ref::<StartError>() {
+        return match start {
+            StartError::AlreadyRunning { .. } => ExitCode::from(EXIT_PORT_IN_USE),
+            // Same family as port-in-use / already-running — the user has
+            // *something running* that conflicts and they need to clean it
+            // up before retrying. Exit 4 is the matching diagnostic per
+            // grill D20 + ADR-0007 D3 + ADR-0014 D10 amend.
+            StartError::NestedTmux(_) => ExitCode::from(EXIT_PORT_IN_USE),
+        };
     }
     if let Some(life) = err.downcast_ref::<LifecycleError>() {
         return match life {
