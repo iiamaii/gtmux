@@ -1,10 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-  "crates/mux-router",
   "crates/ws-server",
   "crates/http-api",
-  "crates/lifecycle",
   "crates/config",
   "crates/auth",
   "crates/pty-backend",

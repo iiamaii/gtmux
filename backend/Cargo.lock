@@ -561,11 +561,11 @@ dependencies = [
  "gtmux-auth",
  "gtmux-config",
  "gtmux-http-api",
- "gtmux-lifecycle",
- "gtmux-mux-router",
+ "gtmux-pty-backend",
  "gtmux-ws-server",
  "libc",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -591,7 +591,6 @@ dependencies = [
  "axum",
  "gtmux-auth",
  "gtmux-config",
- "gtmux-mux-router",
  "gtmux-ws-server",
  "http",
  "http-body-util",
@@ -604,36 +603,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "utoipa",
-]
-
-[[package]]
-name = "gtmux-lifecycle"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "gtmux-auth",
- "gtmux-config",
- "gtmux-mux-router",
- "gtmux-ws-server",
- "libc",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "gtmux-mux-router"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "winnow 0.6.26",
 ]
 
 [[package]]
@@ -662,7 +631,7 @@ dependencies = [
  "futures",
  "gtmux-auth",
  "gtmux-config",
- "gtmux-mux-router",
+ "gtmux-pty-backend",
  "http",
  "serde",
  "serde_json",
@@ -1555,7 +1524,7 @@ dependencies = [
  "serde_spanned",
  "toml_datetime",
  "toml_write",
- "winnow 0.7.15",
+ "winnow",
 ]
 
 [[package]]
@@ -2020,15 +1989,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "winnow"
-version = "0.6.26"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e90edd2ac1aa278a5c4599b1d89cf03074b610800f866d4026dc199d7929a28"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winnow"

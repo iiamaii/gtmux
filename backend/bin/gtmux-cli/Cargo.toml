@@ -16,15 +16,15 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
-gtmux-lifecycle = { path = "../../crates/lifecycle" }
+gtmux-pty-backend = { path = "../../crates/pty-backend" }
 gtmux-ws-server = { path = "../../crates/ws-server" }
 gtmux-http-api = { path = "../../crates/http-api" }
 gtmux-config = { path = "../../crates/config" }
 gtmux-auth = { path = "../../crates/auth" }
-gtmux-mux-router = { path = "../../crates/mux-router" }
-# libc surfaces `pid_t` for the LIFE-3 pidfile types we accept from the
-# lifecycle crate. No signal delivery happens here — that stays inside
-# `gtmux_lifecycle::stop_server`.
+thiserror = { workspace = true }
+# libc surfaces `pid_t` + `kill(2)` for the pidfile + SIGTERM teardown
+# logic in `state_files.rs` (inlined from the pre-Stage-B lifecycle crate
+# after ADR-0013 made the tmux-specific parts of that crate obsolete).
 libc = "0.2"
 
 [dev-dependencies]

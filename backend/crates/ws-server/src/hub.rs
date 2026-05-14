@@ -1,171 +1,115 @@
-//! Fan-out hub: mux-router [`gtmux_mux_router::Event`]s → WS subscribers + per-pane
-//! ring buffers for catch-up replay on new attaches.
+//! Hub — PtyBackend wrapper + WS-facing fan-out channels.
 //!
-//! 정본:
-//! - `docs/ssot/wire-protocol.md` §2 (12 frame slot ↔ Event mapping)
-//! - `docs/adr/0001-tmux-integration-control-mode.md` D7 (`%output` →
-//!   per-pane ring buffer → WS binary frame), D8 (Panel Streaming State
-//!   pause/continue), D12 (notify mirroring)
-//! - `docs/reports/0010-grill-amendments.md` D13 (MT-3 Live Mirror — all
-//!   subscribers see the same event stream), D15 (128 KiB ring per pane).
+//! After ADR-0013 (PTY direct, no tmux) the old per-Event hub model is gone.
+//! The replacement responsibilities are narrow:
 //!
-//! The hub holds two pieces of shared state:
-//!   * `events: broadcast::Sender<Event>` — every subscriber observes the
-//!     same `Event` stream after they call [`Hub::subscribe`]. Capacity is
-//!     [`HUB_BROADCAST_CAPACITY`]; lagged subscribers see a
-//!     `RecvError::Lagged` and the WS handler re-syncs via [`Hub::snapshot`].
-//!   * `ring_buffers: RwLock<HashMap<u32, RingBuffer>>` — per-pane terminal
-//!     state, capped per [`crate::ring::RING_BUFFER_CAPACITY`]. Used at
-//!     attach time to replay the last bytes the user would have seen.
+//! - **layout_events** — broadcast a 16-byte ETag every time the layout
+//!   JSON is overwritten on disk. Consumed by the WS handler so the SPA
+//!   can revalidate via `If-None-Match` (kept identical to the legacy API
+//!   so `gtmux_http_api` did not need to change shape — see line 122/144
+//!   of `crates/http-api/src/lib.rs`).
+//! - **pane_output** — single multiplexed `(PaneId, Bytes)` broadcast.
+//!   Internally a background task subscribes to every Pane's per-pane
+//!   broadcast in [`gtmux_pty_backend`] and forwards the bytes here,
+//!   so the WS handler can drive ALL panes off one `select!` arm
+//!   without dynamic `StreamMap` gymnastics.
+//! - **backend access** — [`Hub::backend`] exposes the supervisor so the
+//!   WS handler can call `send_input`, `resize`, `kill`, `spawn`, etc.,
+//!   and so test code can inspect pane state without a custom shim.
 //!
-//! [`Hub::publish`] is the *only* mutator of both pieces of state. The
-//! event loop in `gtmux_lifecycle::run_event_loop` is the sole producer in
-//! production; tests call `publish` directly.
+//! Catch-up replay (per-pane ring buffer flush at WS attach) is owned by
+//! the WS handler itself, *not* by Hub — the handler iterates
+//! `backend.pane_ids()` and calls `backend.subscribe_output(id).0` to get
+//! the ring snapshot. Putting the catch-up in Hub would force per-subscriber
+//! state that the broadcast model would never naturally express.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use gtmux_mux_router::Event;
-use tokio::sync::{broadcast, RwLock};
+use bytes::Bytes;
+use gtmux_pty_backend::{BackendNotify, PaneId, PtyBackend};
+use tokio::sync::broadcast;
+use tracing::debug;
 
-use crate::ring::RingBuffer;
-
-/// Broadcast channel capacity for the live event fan-out.
-///
-/// Sized for the steady-state scenario in `docs/reports/0010-grill-amendments.md`
-/// D19 (50 panes × occasional burst). Each subscriber gets its own
-/// independent queue at this depth — when a subscriber lags past the cap it
-/// gets `RecvError::Lagged` and the WS handler restarts from a fresh
-/// snapshot instead of dropping the connection.
+/// Fan-out channel depth for the multiplexed pane output stream. Sized
+/// for 50-pane × occasional-burst (mirrors the legacy `HUB_BROADCAST_CAPACITY`
+/// value before §2.4 of `docs/reports/0026-stage-b-carry-forward.md` —
+/// keep until measurement says otherwise).
 pub const HUB_BROADCAST_CAPACITY: usize = 256;
 
-/// Fan-out hub. Cheap to clone — internally holds three `Arc`s.
-#[derive(Debug, Clone)]
+/// Fan-out channel depth for the layout-changed signal. 16 is generous —
+/// the layout PUT is human-paced.
+const LAYOUT_BROADCAST_CAPACITY: usize = 16;
+
+/// `Hub` is cheap to clone — internal state is `Arc<…>` + broadcast senders.
+#[derive(Clone)]
 pub struct Hub {
-    events: broadcast::Sender<Event>,
-    ring_buffers: Arc<RwLock<HashMap<u32, RingBuffer>>>,
-    /// Most-recent `%session-changed` payload. tmux emits this exactly once
-    /// per control-mode attach (typically at boot), so late WS subscribers
-    /// would miss it without an explicit catch-up channel. We mirror the
-    /// payload here and replay it from [`handle_socket`] just before the
-    /// ring-buffer flush.
-    last_session: Arc<RwLock<Option<(u32, String)>>>,
-    /// Web-domain LAYOUT_CHANGED broadcast. Carries the 16-byte raw ETag
-    /// of the most recently committed canvas layout. Separate channel
-    /// from `events` because the ordering vs. mux events is independent
-    /// (LAYOUT_CHANGED is idempotent — clients revalidate via
-    /// `If-None-Match`) and conflating them would bloat `Event`.
+    backend: PtyBackend,
+    /// Multiplexed `(pane_id, bytes)` live output stream. Each WS subscriber
+    /// receives an independent queue at [`HUB_BROADCAST_CAPACITY`] depth.
+    pane_output: broadcast::Sender<(PaneId, Bytes)>,
+    /// Web-domain LAYOUT_CHANGED broadcast — 16-byte ETag of the most
+    /// recently committed canvas layout. Kept name-compatible with the
+    /// pre-Stage-B Hub so `gtmux_http_api::layout_put_handler` keeps
+    /// working without an edit.
     layout_events: broadcast::Sender<[u8; 16]>,
+    /// JoinHandle of the multiplexer driver task. Kept inside an `Arc`
+    /// so cloning `Hub` is cheap; the task lives for the lifetime of the
+    /// Server (it exits when both the backend notify channel and the
+    /// existing per-pane broadcasts have all closed — i.e. when
+    /// [`PtyBackend`]'s last clone is dropped).
+    _mux_task: Arc<tokio::task::JoinHandle<()>>,
 }
 
 impl Hub {
-    /// Construct an empty hub. No subscribers, no ring buffers.
-    pub fn new() -> Self {
-        let (events, _) = broadcast::channel(HUB_BROADCAST_CAPACITY);
-        let (layout_events, _) = broadcast::channel(16);
+    /// Build a hub backed by `backend`. Spawns the multiplexer driver task
+    /// before returning, so subscribers attached immediately afterwards
+    /// observe every byte emitted from this point forward.
+    pub fn new(backend: PtyBackend) -> Self {
+        let (pane_output, _) = broadcast::channel(HUB_BROADCAST_CAPACITY);
+        let (layout_events, _) = broadcast::channel(LAYOUT_BROADCAST_CAPACITY);
+
+        let mux_backend = backend.clone();
+        let mux_tx = pane_output.clone();
+        let mux_task = tokio::spawn(async move {
+            run_multiplexer(mux_backend, mux_tx).await;
+        });
+
         Self {
-            events,
-            ring_buffers: Arc::new(RwLock::new(HashMap::new())),
-            last_session: Arc::new(RwLock::new(None)),
+            backend,
+            pane_output,
             layout_events,
+            _mux_task: Arc::new(mux_task),
         }
     }
 
-    /// Subscribe to the live event stream. Each subscriber gets an
-    /// independent queue — see [`HUB_BROADCAST_CAPACITY`].
-    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
-        self.events.subscribe()
+    /// Borrow the underlying [`PtyBackend`]. The WS handler uses this for
+    /// `send_input` / `resize` / `kill` / `spawn` / `subscribe_output`
+    /// (ring snapshot for catch-up replay).
+    pub fn backend(&self) -> &PtyBackend {
+        &self.backend
     }
 
-    /// Publish an event to all subscribers.
-    ///
-    /// Side effect: when the event carries `%output` bytes (either
-    /// [`Event::Output`] or [`Event::ExtendedOutput`]) the bytes are
-    /// appended to the matching pane's ring buffer before broadcast. This
-    /// ordering matters — a new subscriber that attaches *between* the
-    /// append and the broadcast still sees a coherent view, because
-    /// `subscribe` only delivers events sent *after* it returns and the
-    /// ring buffer already contains the bytes that preceded it.
-    ///
-    /// SAFETY/CORRECTNESS NOTE: the `RwLock` is held only across the
-    /// `append` call (a memcpy + bounded VecDeque mutation). No
-    /// async-await sits inside the critical section, so a stuck subscriber
-    /// cannot wedge the producer.
-    pub async fn publish(&self, event: Event) {
-        // 1) Update per-pane ring buffer for output events. Ignore the
-        //    broadcast result — when there are no subscribers the channel
-        //    returns `Err`; that is the normal idle state, not an error.
-        match &event {
-            Event::Output { pane_id, bytes } => {
-                let mut bufs = self.ring_buffers.write().await;
-                bufs.entry(*pane_id)
-                    .or_insert_with(RingBuffer::new)
-                    .append(bytes);
-            }
-            Event::ExtendedOutput { pane_id, bytes, .. } => {
-                let mut bufs = self.ring_buffers.write().await;
-                bufs.entry(*pane_id)
-                    .or_insert_with(RingBuffer::new)
-                    .append(bytes);
-            }
-            Event::SessionChanged { session_id, name } => {
-                // Cache for late subscribers — tmux only emits this on
-                // control-mode attach, so WS clients that connect after
-                // boot would otherwise never see it.
-                let mut slot = self.last_session.write().await;
-                *slot = Some((*session_id, name.clone()));
-            }
-            _ => {}
-        }
-        // 2) Broadcast. `Err` here means "no live subscribers" — fine; we
-        //    have already persisted the bytes (if any) to the ring buffer
-        //    so a future subscriber will catch up via `snapshot`.
-        let _ = self.events.send(event);
+    /// Subscribe to the multiplexed live pane-output stream. Every WS
+    /// connection should subscribe *before* doing catch-up replay so
+    /// bytes emitted during the replay window are not lost.
+    pub fn subscribe_pane_output(&self) -> broadcast::Receiver<(PaneId, Bytes)> {
+        self.pane_output.subscribe()
     }
 
-    /// Borrow the per-pane ring buffer snapshot for *every* pane that has
-    /// ever produced output. Returned in unspecified order — callers that
-    /// care about reproducible replay must sort by `pane_id`.
-    ///
-    /// Returns owned `Vec<u8>` per pane so the caller may release the lock
-    /// before sending the bytes over the (potentially slow) WS sink.
-    pub async fn snapshot_all(&self) -> Vec<(u32, Vec<u8>)> {
-        let bufs = self.ring_buffers.read().await;
-        let mut out: Vec<(u32, Vec<u8>)> = bufs
-            .iter()
-            .filter(|(_, rb)| !rb.is_empty())
-            .map(|(pane_id, rb)| (*pane_id, rb.snapshot()))
-            .collect();
-        out.sort_by_key(|(pane_id, _)| *pane_id);
-        out
+    /// Subscribe to backend-level notifications (`pane-spawned`,
+    /// `pane-died`, `layout-changed`, `server-ready`). The WS handler
+    /// translates each variant to the matching `0x07 NOTIFY_MIRROR`
+    /// envelope.
+    pub fn subscribe_notify(&self) -> broadcast::Receiver<BackendNotify> {
+        self.backend.subscribe_notify()
     }
 
-    /// Borrow one pane's snapshot. `None` if the pane has not yet produced
-    /// any output (or if the buffer was drained past the cap by a later
-    /// burst — currently never, but reserved for future eviction policy).
-    pub async fn snapshot(&self, pane_id: u32) -> Option<Vec<u8>> {
-        let bufs = self.ring_buffers.read().await;
-        bufs.get(&pane_id).map(RingBuffer::snapshot)
-    }
-
-    /// Current number of live subscribers — useful in tests and metrics.
-    pub fn subscriber_count(&self) -> usize {
-        self.events.receiver_count()
-    }
-
-    /// Most-recent cached `%session-changed`, if one has been observed.
-    /// `None` until tmux's control-mode attach emits the first event.
-    pub async fn snapshot_session(&self) -> Option<(u32, String)> {
-        self.last_session.read().await.clone()
-    }
-
-    /// Broadcast a new canvas-layout ETag to every live WS subscriber.
-    /// The HTTP `layout_put_handler` calls this after a successful PUT so
-    /// the SPA can revalidate via `If-None-Match` and re-hydrate its
-    /// panels store.
+    /// Broadcast a new canvas-layout ETag. Called from
+    /// `gtmux_http_api::layout_put_handler` after a successful PUT —
+    /// signature preserved across Stage B for API compatibility.
     pub fn publish_layout_changed(&self, etag: [u8; 16]) {
-        // Send result is `Err` only when nobody is subscribed — fine for
-        // pre-WS-connection puts. Drop silently.
+        // `Err` only means "no subscribers"; that is the normal startup
+        // state, not an error.
         let _ = self.layout_events.send(etag);
     }
 
@@ -173,12 +117,83 @@ impl Hub {
     pub fn subscribe_layout(&self) -> broadcast::Receiver<[u8; 16]> {
         self.layout_events.subscribe()
     }
+
+    /// Live subscriber count on the multiplexed pane-output channel.
+    /// Used in tests + future operational dashboards.
+    pub fn subscriber_count(&self) -> usize {
+        self.pane_output.receiver_count()
+    }
 }
 
-impl Default for Hub {
-    fn default() -> Self {
-        Self::new()
+/// Multiplexer driver: subscribe to every Pane's per-pane broadcast in
+/// [`PtyBackend`] and fan the bytes into `tx`. Tracks newly-spawned panes
+/// via the backend's notify channel.
+async fn run_multiplexer(backend: PtyBackend, tx: broadcast::Sender<(PaneId, Bytes)>) {
+    let mut notify = backend.subscribe_notify();
+
+    // Hook up every pane that already exists. In normal startup the
+    // backend is freshly constructed and `pane_ids()` is empty, but a
+    // Hub built around a *re-attached* backend (future feature) would
+    // need this.
+    for id in backend.pane_ids() {
+        spawn_pane_forwarder(&backend, id, tx.clone());
     }
+
+    // Subscribe to PaneSpawned events to wire up forwarders for future
+    // panes. PaneDied / LayoutChanged / ServerReady are *not* relevant
+    // to the multiplexer (those flow on a separate notify channel that
+    // each WS subscriber consumes directly via `subscribe_notify`); we
+    // pattern-match exhaustively so future variants flag a compile
+    // error when added.
+    while let Ok(n) = notify.recv().await {
+        match n {
+            BackendNotify::PaneSpawned { id, .. } => {
+                spawn_pane_forwarder(&backend, id, tx.clone());
+            }
+            BackendNotify::PaneDied { .. }
+            | BackendNotify::LayoutChanged
+            | BackendNotify::ServerReady => {
+                // not our concern — handled by per-WS subscribers directly
+            }
+        }
+    }
+    debug!("hub multiplexer: backend notify closed, exiting");
+}
+
+/// Spawn one forwarder task per pane. The task drains the pane's
+/// per-pane broadcast and forwards into the multiplexed channel until
+/// the pane closes its broadcast (which happens when
+/// [`gtmux_pty_backend::PaneHandle`] is dropped).
+fn spawn_pane_forwarder(backend: &PtyBackend, id: PaneId, tx: broadcast::Sender<(PaneId, Bytes)>) {
+    let Some((_replay, mut rx)) = backend.subscribe_output(id) else {
+        // The pane was killed between the spawned notify and this
+        // subscribe. Nothing to forward.
+        return;
+    };
+    // Drop the replay snapshot — per-connection catch-up does its own
+    // replay via `backend.subscribe_output(id).0` so the WS subscriber
+    // controls the ordering against `subscribe_pane_output`.
+    drop(_replay);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(bytes) => {
+                    // `Err` from `send` means "no subscribers right now",
+                    // which is a normal state (no WS clients attached).
+                    // We keep draining so the broadcast cap does not fill
+                    // up and stall the pane's reader thread.
+                    let _ = tx.send((id, bytes));
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    debug!(pane = %id, skipped = n, "pane forwarder lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    debug!(pane = %id, "pane forwarder: source closed");
+                    return;
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -187,92 +202,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn publish_with_no_subscribers_is_silent() {
-        let hub = Hub::new();
+    async fn empty_hub_has_no_subscribers() {
+        let backend = PtyBackend::new();
+        let hub = Hub::new(backend);
+        assert_eq!(hub.subscriber_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn layout_publish_with_no_subscribers_is_silent() {
+        let backend = PtyBackend::new();
+        let hub = Hub::new(backend);
         // Must not panic / error even though nobody is listening.
-        hub.publish(Event::Output {
-            pane_id: 1,
-            bytes: b"hello".to_vec(),
-        })
-        .await;
-        // Ring buffer still captured the bytes — verifies the "no
-        // subscriber" path still persists output for later catch-up.
-        let snap = hub.snapshot(1).await.unwrap();
-        assert_eq!(snap, b"hello".to_vec());
+        hub.publish_layout_changed([0u8; 16]);
     }
 
     #[tokio::test]
-    async fn snapshot_unknown_pane_is_none() {
-        let hub = Hub::new();
-        assert!(hub.snapshot(42).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn snapshot_all_orders_by_pane_id() {
-        let hub = Hub::new();
-        hub.publish(Event::Output {
-            pane_id: 5,
-            bytes: b"five".to_vec(),
-        })
-        .await;
-        hub.publish(Event::Output {
-            pane_id: 1,
-            bytes: b"one".to_vec(),
-        })
-        .await;
-        let all = hub.snapshot_all().await;
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].0, 1);
-        assert_eq!(all[1].0, 5);
-        assert_eq!(all[0].1, b"one".to_vec());
-        assert_eq!(all[1].1, b"five".to_vec());
-    }
-
-    #[tokio::test]
-    async fn extended_output_also_lands_in_ring_buffer() {
-        let hub = Hub::new();
-        hub.publish(Event::ExtendedOutput {
-            pane_id: 3,
-            age_ms: 1234,
-            bytes: b"ext".to_vec(),
-        })
-        .await;
-        assert_eq!(hub.snapshot(3).await.unwrap(), b"ext".to_vec());
-    }
-
-    #[tokio::test]
-    async fn non_output_events_do_not_touch_ring_buffer() {
-        let hub = Hub::new();
-        hub.publish(Event::Pause { pane_id: 7 }).await;
-        hub.publish(Event::SessionsChanged).await;
-        assert!(hub.snapshot(7).await.is_none());
-        assert!(hub.snapshot_all().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn session_changed_cached_for_late_subscriber() {
-        let hub = Hub::new();
-        // No publish yet — snapshot must be None.
-        assert!(hub.snapshot_session().await.is_none());
-        // Publish before any subscriber exists (the broadcast send returns
-        // Err in this state, which is the normal startup race).
-        hub.publish(Event::SessionChanged {
-            session_id: 0,
-            name: "demo".to_string(),
-        })
-        .await;
-        let snap = hub.snapshot_session().await.expect("cache populated");
-        assert_eq!(snap, (0, "demo".to_string()));
-
-        // A later publish replaces the cache wholesale.
-        hub.publish(Event::SessionChanged {
-            session_id: 1,
-            name: "work".to_string(),
-        })
-        .await;
-        assert_eq!(
-            hub.snapshot_session().await.unwrap(),
-            (1, "work".to_string())
-        );
+    async fn layout_subscriber_receives_etag() {
+        let backend = PtyBackend::new();
+        let hub = Hub::new(backend);
+        let mut rx = hub.subscribe_layout();
+        let etag = [42u8; 16];
+        hub.publish_layout_changed(etag);
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert_eq!(got, etag);
     }
 }
