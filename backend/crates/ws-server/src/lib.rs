@@ -704,7 +704,22 @@ async fn handle_client_envelope(
                 return false;
             }
             match dispatch_ctrl(backend, ctrl.id.clone(), &ctrl.cmd, &ctrl.args) {
-                CtrlOutcome::Ok => {}
+                CtrlOutcome::Ok => {
+                    // Ack every CTRL success so the frontend's `sendCtrl`
+                    // Promise resolves (otherwise it times out after 5 s).
+                    // For `new-pane` the spawned PaneId is *also* surfaced
+                    // via the `pane-spawned` NOTIFY broadcast — the ack
+                    // body deliberately stays minimal (`{ok:true,id}`) so
+                    // the frontend's two-path race (response vs first-sight
+                    // mux) keeps its existing semantics. (Bugfix 2026-05-15:
+                    // kill-pane was timing out at 5 s because no ack was
+                    // sent on the success path.)
+                    let body = payload::encode_ctrl_success(ctrl.id.as_deref());
+                    let ack = Envelope::new(FrameType::Ctrl, Bytes::from(body));
+                    if let Ok(buf) = ack.encode() {
+                        let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                    }
+                }
                 CtrlOutcome::OkAndExit => {
                     // Acknowledge the kill-session request, then raise SIGTERM
                     // on ourselves so axum::serve's graceful_shutdown future
