@@ -29,6 +29,9 @@
   import { Terminal } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import { Unicode11Addon } from '@xterm/addon-unicode11';
+  // xterm v6 의 cell rendering 은 본 stylesheet 가 없으면 동작하지 않는다 — DOM 은
+  // 만들어지지만 cell width/height 가 0 으로 잡혀 글자가 화면에 보이지 않음.
+  import '@xterm/xterm/css/xterm.css';
   import { SECURE_XTERM_OPTIONS } from '$lib/xterm/options';
   import { registerPaneOut, unregisterPaneOut } from '$lib/ws/dispatcher.svelte';
   import { encodePaneIn, encodePaneResize, FRAME_TYPE } from '$lib/ws/decode';
@@ -65,6 +68,9 @@
     const paneIdNumLocal = paneIdNum;
     const paneIdValid = Number.isInteger(paneIdNumLocal) && paneIdNumLocal > 0;
 
+    const rect0 = containerEl.getBoundingClientRect();
+    console.debug('[xterm] mount pane=%s container=%dx%d', paneId, rect0.width, rect0.height);
+
     const term = new Terminal(SECURE_XTERM_OPTIONS);
     const fitAddon = new FitAddon();
     const unicode11Addon = new Unicode11Addon();
@@ -74,9 +80,9 @@
     term.open(containerEl);
     try {
       fitAddon.fit();
+      console.debug('[xterm] post-fit pane=%s cols=%d rows=%d', paneId, term.cols, term.rows);
     } catch (e) {
-      // fit() 은 컨테이너가 0×0 이면 throw 가능 — 디버그 로그만 남기고 진행.
-      console.debug('[gtmux] xterm initial fit failed', e);
+      console.debug('[xterm] initial fit failed pane=%s err=%o', paneId, e);
     }
 
     // PaneOut 등록 — WS dispatcher 가 이 paneId 로 도착한 PANE_OUT(0x02) 을 본

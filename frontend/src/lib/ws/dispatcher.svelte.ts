@@ -91,11 +91,14 @@ function appendLateBuffer(paneKey: string, bytes: Uint8Array): void {
 
 export function registerPaneOut(paneId: string, handler: PaneOutHandler): void {
   paneOutHandlers.set(paneId, handler);
-  // Flush any pre-mount bytes we stashed for this pane.
   const queued = paneOutLateBuffers.get(paneId);
   if (queued && queued.length > 0) {
+    console.debug('[ws] registerPaneOut pane=%s flushing %d buffered chunk(s)',
+      paneId, queued.length);
     for (const bytes of queued) handler(bytes, noop);
     paneOutLateBuffers.delete(paneId);
+  } else {
+    console.debug('[ws] registerPaneOut pane=%s (no buffered bytes)', paneId);
   }
 }
 
@@ -203,12 +206,12 @@ function handlePaneOut(payload: Uint8Array): void {
   const key = String(decoded.paneId);
   const handler = paneOutHandlers.get(key);
   if (!handler) {
-    // Panel not yet mounted — stash the bytes so the eventual
-    // registerPaneOut call can flush them. The New-Panel flow always
-    // hits this branch for the very first PANE_OUT of the new pane.
+    console.debug('[ws] PANE_OUT pane=%s len=%d → late-buffer (no handler yet)',
+      key, decoded.bytes.length);
     appendLateBuffer(key, decoded.bytes);
     return;
   }
+  console.debug('[ws] PANE_OUT pane=%s len=%d → handler', key, decoded.bytes.length);
   handler(decoded.bytes, noop);
 }
 
