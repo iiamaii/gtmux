@@ -22,3 +22,4 @@ ring = { workspace = true }
 gtmux-mux-router = { path = "../mux-router" }
 gtmux-auth = { path = "../auth" }
 gtmux-config = { path = "../config" }
+gtmux-ws-server = { path = "../ws-server" }

@@ -482,7 +482,10 @@ fn build_app(
     cmd_tx: mpsc::Sender<TmuxRequest>,
     frontend_dist: Option<&std::path::Path>,
 ) -> Router {
-    gtmux_http_api::router_with_static(config, token, frontend_dist)
+    // AppState gets a hub clone so layout_put_handler can broadcast
+    // LAYOUT_CHANGED to live WS subscribers right after a successful PUT.
+    let app_state = gtmux_http_api::AppState::with_hub(config.clone(), token.clone(), hub.clone());
+    gtmux_http_api::router_with_app_state(app_state, frontend_dist)
         .merge(gtmux_ws_server::router(config, token, hub, cmd_tx))
 }
 

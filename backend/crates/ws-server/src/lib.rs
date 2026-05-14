@@ -569,6 +569,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cmd_tx: mpsc::Sender<TmuxReq
     // Subscribe BEFORE the catch-up replay so events that arrive while we
     // are flushing snapshots are not lost.
     let mut rx = hub.subscribe();
+    let mut layout_rx = hub.subscribe_layout();
 
     // Send the initial LAYOUT_CHANGED envelope so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -718,6 +719,29 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cmd_tx: mpsc::Sender<TmuxReq
                             "hub closed",
                         )).await;
                         return;
+                    }
+                }
+            }
+            layout = layout_rx.recv() => {
+                match layout {
+                    Ok(etag) => {
+                        let env = Envelope::new(
+                            FrameType::LayoutChanged,
+                            Bytes::from(payload::encode_layout_changed(&etag)),
+                        );
+                        if let Ok(buf) = env.encode() {
+                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "ws layout subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — the main `rx` arm will hit the same
+                        // closed branch on its next loop turn and close the
+                        // connection cleanly. Drop through.
                     }
                 }
             }

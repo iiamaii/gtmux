@@ -119,17 +119,32 @@ pub struct AppState {
     /// Auth-failure counter exposed for downstream rate-limit middleware
     /// (P1 enforcement; ADR-0003 D12 cloud-only). The counter is monotonic.
     pub auth_failure_counter: Arc<AtomicU64>,
+    /// Optional WS broadcast hub. When set, `layout_put_handler` publishes
+    /// the new ETag so live WS subscribers re-hydrate via the dispatcher's
+    /// `LAYOUT_CHANGED` path. `None` in unit-tests that exercise the HTTP
+    /// surface in isolation.
+    pub hub: Option<gtmux_ws_server::Hub>,
 }
 
 impl AppState {
     /// Assemble shared state with a fresh empty layout snapshot.
+    /// `hub` is `None`; production callers must use [`AppState::with_hub`].
     pub fn new(config: Config, token: TokenString) -> Self {
         Self {
             config: Arc::new(config),
             token: Arc::new(token),
             layout: Arc::new(RwLock::new(LayoutSnapshot::empty())),
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
+            hub: None,
         }
+    }
+
+    /// Assemble shared state and attach a WS broadcast hub so PUT-driven
+    /// layout commits fan out to live subscribers.
+    pub fn with_hub(config: Config, token: TokenString, hub: gtmux_ws_server::Hub) -> Self {
+        let mut me = Self::new(config, token);
+        me.hub = Some(hub);
+        me
     }
 }
 
@@ -224,6 +239,12 @@ pub fn router_with_static(
     frontend_dist: Option<&Path>,
 ) -> Router {
     let state = AppState::new(config.clone(), token.clone());
+    router_with_state_and_spa(state, frontend_dist)
+}
+
+/// Production variant: takes a fully-wired [`AppState`] (typically built
+/// via [`AppState::with_hub`]) and an optional bundled SPA directory.
+pub fn router_with_app_state(state: AppState, frontend_dist: Option<&Path>) -> Router {
     router_with_state_and_spa(state, frontend_dist)
 }
 
@@ -627,9 +648,25 @@ async fn layout_put_handler(State(state): State<AppState>, req: Request) -> Resp
     }
 
     let new_snap = LayoutSnapshot::from_body(body);
+    let new_etag = new_snap.etag;
     let new_etag_quoted = format!("\"{}\"", new_snap.etag_hex);
     *snap = new_snap;
     drop(snap);
+
+    // Fan out LAYOUT_CHANGED to every live WS subscriber so the SPA
+    // dispatcher revalidates via `If-None-Match` and rehydrates panels.
+    match &state.hub {
+        Some(hub) => {
+            tracing::debug!(
+                etag = %new_etag_quoted,
+                "layout_put_handler: publishing LAYOUT_CHANGED to WS subscribers"
+            );
+            hub.publish_layout_changed(new_etag);
+        }
+        None => {
+            tracing::debug!("layout_put_handler: no hub attached, skipping broadcast");
+        }
+    }
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)

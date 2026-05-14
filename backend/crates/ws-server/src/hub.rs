@@ -50,16 +50,24 @@ pub struct Hub {
     /// payload here and replay it from [`handle_socket`] just before the
     /// ring-buffer flush.
     last_session: Arc<RwLock<Option<(u32, String)>>>,
+    /// Web-domain LAYOUT_CHANGED broadcast. Carries the 16-byte raw ETag
+    /// of the most recently committed canvas layout. Separate channel
+    /// from `events` because the ordering vs. mux events is independent
+    /// (LAYOUT_CHANGED is idempotent — clients revalidate via
+    /// `If-None-Match`) and conflating them would bloat `Event`.
+    layout_events: broadcast::Sender<[u8; 16]>,
 }
 
 impl Hub {
     /// Construct an empty hub. No subscribers, no ring buffers.
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(HUB_BROADCAST_CAPACITY);
+        let (layout_events, _) = broadcast::channel(16);
         Self {
             events,
             ring_buffers: Arc::new(RwLock::new(HashMap::new())),
             last_session: Arc::new(RwLock::new(None)),
+            layout_events,
         }
     }
 
@@ -149,6 +157,21 @@ impl Hub {
     /// `None` until tmux's control-mode attach emits the first event.
     pub async fn snapshot_session(&self) -> Option<(u32, String)> {
         self.last_session.read().await.clone()
+    }
+
+    /// Broadcast a new canvas-layout ETag to every live WS subscriber.
+    /// The HTTP `layout_put_handler` calls this after a successful PUT so
+    /// the SPA can revalidate via `If-None-Match` and re-hydrate its
+    /// panels store.
+    pub fn publish_layout_changed(&self, etag: [u8; 16]) {
+        // Send result is `Err` only when nobody is subscribed — fine for
+        // pre-WS-connection puts. Drop silently.
+        let _ = self.layout_events.send(etag);
+    }
+
+    /// Subscribe to the layout-change broadcast.
+    pub fn subscribe_layout(&self) -> broadcast::Receiver<[u8; 16]> {
+        self.layout_events.subscribe()
     }
 }
 
