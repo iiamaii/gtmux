@@ -126,6 +126,20 @@ export function setLayoutRefetchHandler(handler: LayoutRefetchHandler | null): v
   layoutRefetchHandler = handler;
 }
 
+// ── pane-spawned auto-mount hook (ADR-0015, Stage I) ──────────────────────
+//
+// dispatcher 의 `pane-spawned` NOTIFY 안에서 호출되는 cascade PUT helper.
+// `$lib/http/layout` 의 `appendPanelIfMissing` 을 등록해야 토큰을 알 수 있는
+// `+page.svelte` 측이 wire 한다. 미등록 시 silent drop — 외부 spawn 시나리오
+// 가 아직 없으므로 NewPanelButton path 가 layout 을 만든다.
+
+export type AutoMountHandler = (paneId: number) => Promise<void> | void;
+let autoMountHandler: AutoMountHandler | null = null;
+
+export function setAutoMountHandler(handler: AutoMountHandler | null): void {
+  autoMountHandler = handler;
+}
+
 // ── Dispatcher factory ─────────────────────────────────────────────────────
 
 export interface DispatcherOptions {
@@ -228,14 +242,27 @@ function handleNotifyMirror(payload: Uint8Array): void {
   // subscription-changed / slow-pane) are permanently retired —
   // the backend never emits them.
   switch (kind) {
-    case 'pane-spawned':
+    case 'pane-spawned': {
       // Idempotent — addPane is also called from PANE_OUT first-sight
       // for the catch-up race. Carry the optional `request_id` to
       // ctrl-registry if it correlates with a pending request: a
       // missing request_id is the (more common) broadcast case where
       // the NOTIFY simply tells every WS subscriber a new pane exists.
       muxStore.addPane(decoded.paneId);
+      // Stage I (ADR-0015) — auto-mount the pane into Canvas Layout if
+      // it isn't there yet. Idempotent guard inside the helper handles
+      // the two-path race (NewPanelButton + dispatcher both firing).
+      const mount = autoMountHandler;
+      if (mount) {
+        const result = mount(decoded.paneId);
+        if (result instanceof Promise) {
+          result.catch((e: unknown) => {
+            console.warn('[gtmux] pane-spawned auto-mount failed', e);
+          });
+        }
+      }
       return;
+    }
     case 'pane-died':
       // D21 c4 — panel header 의 zombie badge 와 직결.
       muxStore.killPane(decoded.paneId);

@@ -29,7 +29,7 @@
   import { muxStore } from '$lib/stores/mux.svelte';
   import { panelsStore } from '$lib/stores/panels.svelte';
   import { sendCtrl } from '$lib/ws/ctrl-registry';
-  import { putLayoutAppendPanel } from '$lib/http/layout';
+  import { appendPanelIfMissing } from '$lib/http/layout';
   import type { WsClient } from '$lib/ws/client';
 
   interface WsClientHolder { current: WsClient | null }
@@ -185,17 +185,12 @@
         throw new Error('pane_id not captured');
       }
 
-      // 4) viewport center → world coords. nextZ() 로 top-most.
+      // 4) appendPanelIfMissing — 본 path 와 dispatcher 의 pane-spawned hook
+      //    이 같은 helper 를 호출하므로 idempotent (ADR-0015 D3/D4). 첫 도착
+      //    쪽의 좌표가 잠긴다 — 본 path 는 viewport center 를 전달해 사용자
+      //    명시 클릭의 mental model 을 보존.
       const center = computeViewportCenter();
-      await putLayoutAppendPanel(token, {
-        id: genPanelId(),
-        pane_id: `%${paneId}`,
-        x: center.x,
-        y: center.y,
-        w: PANEL_DEFAULT_W,
-        h: PANEL_DEFAULT_H,
-        z: nextZ(),
-      });
+      await appendPanelIfMissing(paneId, { token, coords: center });
       // 성공 — LAYOUT_CHANGED broadcast 가 fetchLayoutAndHydrate 를 깨우므로
       // panelsStore 가 자동으로 새 panel 을 보이게 된다 (Pull-through-notify).
     } catch (e) {

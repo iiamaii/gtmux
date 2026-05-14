@@ -27,8 +27,8 @@
   import ContextMenu from '$lib/chrome/ContextMenu.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
   import Toast from '$lib/ui/Toast.svelte';
-  import { createDispatcher, setLayoutRefetchHandler } from '$lib/ws/dispatcher.svelte';
-  import { createLayoutRefetchHandler, fetchLayoutAndHydrate } from '$lib/http/layout';
+  import { createDispatcher, setLayoutRefetchHandler, setAutoMountHandler } from '$lib/ws/dispatcher.svelte';
+  import { appendPanelIfMissing, createLayoutRefetchHandler, fetchLayoutAndHydrate } from '$lib/http/layout';
   import { layoutStore } from '$lib/stores/layout.svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
   import { chromeStore } from '$lib/stores/chrome.svelte';
@@ -105,6 +105,12 @@
     const refetch = createLayoutRefetchHandler(token);
     setLayoutRefetchHandler(refetch);
 
+    // Stage I (ADR-0015) — pane-spawned NOTIFY 시 layout 에 없는 pane
+    // cascade PUT. NewPanelButton 의 명시 PUT 과 idempotent 가드 공유.
+    setAutoMountHandler(async (paneId) => {
+      await appendPanelIfMissing(paneId, { token });
+    });
+
     // 초기 hydrate — WS connect 와 병렬. 실패해도 banner 가 사용자에게 안내.
     void fetchLayoutAndHydrate(token, layoutStore.etag);
 
@@ -118,6 +124,7 @@
       wsClientHolder.current = null;
     }
     setLayoutRefetchHandler(null);
+    setAutoMountHandler(null);
   });
 </script>
 

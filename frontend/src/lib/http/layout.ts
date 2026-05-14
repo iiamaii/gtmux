@@ -317,3 +317,88 @@ async function commitCurrent(token: string, currentEtag: string | null): Promise
 // connectionStore 는 향후 fetch 실패 시 banner 트리거에 사용 — 본 task 범위에서는
 // 단순 console.warn 으로 그치고, store 와의 wiring 은 P1+ 의 별도 트랙.
 void connectionStore;
+
+// ── appendPanelIfMissing — Stage I (ADR-0015) auto-mount entry ──────────────
+//
+// dispatcher 의 `pane-spawned` NOTIFY hook 과 NewPanelButton 의 명시 spawn
+// path 두 곳에서 같은 가드를 통과한다. layout 에 이미 같은 pane_id 의 panel
+// 이 있으면 *no-op return* — 다중 탭 / two-path race 시 두 번째 호출이
+// 자연스럽게 흡수된다 (ADR-0015 D4 + D6).
+//
+// coords:
+//   - 'cascade' (default) → origin + N×40px (N = 현 panels.size)
+//   - { x, y } → 명시 좌표 (NewPanelButton 의 viewport-center 등)
+//
+// Panel.id 는 helper 내부에서 자동 생성. UUIDv4 의 hyphen 제거 + `p` prefix.
+
+const PANEL_DEFAULT_W = 480;
+const PANEL_DEFAULT_H = 320;
+const CASCADE_STEP = 40;
+
+export interface AppendPanelIfMissingOpts {
+  /** Token for the PUT. Pass the same value the rest of the app uses. */
+  readonly token: string;
+  /** Optional explicit coords; otherwise cascade. */
+  readonly coords?: { x: number; y: number };
+}
+
+function genPanelId(): string {
+  const u =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Math.random().toString(16).slice(2)}${Math.random().toString(16).slice(2)}`;
+  return `p${u.replace(/-/g, '').slice(0, 32)}`;
+}
+
+function nextZ(): number {
+  let max = 0;
+  for (const p of panelsStore.panels.values() as Iterable<Record<string, unknown>>) {
+    const z = typeof p['z'] === 'number' ? (p['z'] as number) : 0;
+    if (z > max) max = z;
+  }
+  return max + 1;
+}
+
+function cascadeCoords(): { x: number; y: number } {
+  const n = panelsStore.panels.size;
+  return { x: n * CASCADE_STEP, y: n * CASCADE_STEP };
+}
+
+/** Idempotent auto-mount entry. Returns the panel id (existing or newly
+ *  created), or `null` if the underlying PUT failed beyond rebase. */
+export async function appendPanelIfMissing(
+  paneId: number,
+  opts: AppendPanelIfMissingOpts,
+): Promise<string | null> {
+  const expected = `%${paneId}`;
+  // Idempotent guard — search panels for matching pane_id.
+  for (const p of panelsStore.panels.values() as Iterable<Record<string, unknown>>) {
+    if (p['pane_id'] === expected) {
+      return typeof p['id'] === 'string' ? (p['id'] as string) : null;
+    }
+  }
+  const coords = opts.coords ?? cascadeCoords();
+  const panelId = genPanelId();
+  try {
+    await putLayoutAppendPanel(opts.token, {
+      id: panelId,
+      pane_id: expected,
+      x: coords.x,
+      y: coords.y,
+      w: PANEL_DEFAULT_W,
+      h: PANEL_DEFAULT_H,
+      z: nextZ(),
+    });
+    return panelId;
+  } catch (e) {
+    // After 412 rebase the panel may already exist (another tab won the
+    // race) — re-check the guard before declaring failure.
+    for (const p of panelsStore.panels.values() as Iterable<Record<string, unknown>>) {
+      if (p['pane_id'] === expected) {
+        return typeof p['id'] === 'string' ? (p['id'] as string) : null;
+      }
+    }
+    console.warn('[gtmux] appendPanelIfMissing failed', e);
+    return null;
+  }
+}
