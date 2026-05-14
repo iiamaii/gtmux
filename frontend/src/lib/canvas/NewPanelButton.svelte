@@ -146,12 +146,16 @@
       // 1) snapshot 현재 mux pane set — fallback 매칭의 기준점.
       const baseline = new Set<number>(muxStore.panes.keys());
 
-      // 2) CTRL 요청 — `-P -F #{pane_id}` 는 tmux 가 생성된 pane id 를 출력하게 한다.
-      //    backend 가 success encoder 를 정식 wire 하면 result.pane_id 로 매칭 가능.
+      // 2) CTRL 요청. tmux 의 control-mode stdin 파서는 `#` 를 comment
+      //    시작으로 처리해 `-F #{pane_id}` 가 `-F` 단독으로 잘려 parse error 가
+      //    난다. backend 가 안전한 quoting 을 적용하기 전까지는 -P/-F 를 떼고
+      //    응답 매칭은 PANE_OUT first-sight (waitForNewPane) 한 경로로만
+      //    돌린다. CTRL ack 에 result.pane_id 가 실리는 시점에서 다시 -F 를
+      //    켜는 것이 정공법.
       const { response } = sendCtrl(
         client,
         'new-window',
-        ['-t', sessionName, '-P', '-F', '#{pane_id}'],
+        ['-t', sessionName],
         { timeoutMs: 5_000 },
       );
 

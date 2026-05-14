@@ -826,6 +826,7 @@ async fn handle_client_envelope(
         }
         FrameType::Ctrl => {
             let Some(ctrl) = payload::decode_ctrl_request(&env.payload) else {
+                debug!("ws CTRL: decode_ctrl_request returned None (invalid JSON)");
                 let body = payload::encode_ctrl_error(None, "ERR_BAD_REQUEST", "invalid CTRL JSON");
                 let err = Envelope::new(FrameType::Ctrl, Bytes::from(body));
                 if let Ok(buf) = err.encode() {
@@ -833,7 +834,14 @@ async fn handle_client_envelope(
                 }
                 return false;
             };
+            debug!(
+                cmd = %ctrl.cmd,
+                id = ?ctrl.id,
+                argc = ctrl.args.len(),
+                "ws CTRL: decoded request"
+            );
             if !is_allowed_ctrl_cmd(&ctrl.cmd) {
+                debug!(cmd = %ctrl.cmd, "ws CTRL: rejected (not in allowlist)");
                 let body = payload::encode_ctrl_error(
                     ctrl.id.as_deref(),
                     "ERR_NOT_ALLOWED",
@@ -845,8 +853,16 @@ async fn handle_client_envelope(
                 }
                 return false;
             }
-            if let Some(req) = build_ctrl_request(ctrl.id, &ctrl.cmd, ctrl.args) {
-                let _ = cmd_tx.send(req).await;
+            if let Some(req) = build_ctrl_request(ctrl.id.clone(), &ctrl.cmd, ctrl.args.clone()) {
+                debug!(cmd = %ctrl.cmd, id = ?ctrl.id, "ws CTRL: forwarding TmuxRequest to cmd_tx");
+                match cmd_tx.send(req).await {
+                    Ok(()) => debug!(cmd = %ctrl.cmd, "ws CTRL: cmd_tx.send succeeded"),
+                    Err(e) => {
+                        debug!(cmd = %ctrl.cmd, error = %e, "ws CTRL: cmd_tx.send FAILED (channel closed)");
+                    }
+                }
+            } else {
+                debug!(cmd = %ctrl.cmd, "ws CTRL: build_ctrl_request returned None");
             }
             false
         }

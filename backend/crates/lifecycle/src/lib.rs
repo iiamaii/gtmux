@@ -392,6 +392,9 @@ impl TmuxDaemon {
 pub async fn run_event_loop(daemon: Arc<TmuxDaemon>, hub: Hub) -> Result<()> {
     loop {
         let line = daemon.read_line().await?;
+        if let Some(ref bytes) = line {
+            debug!(line = %String::from_utf8_lossy(bytes), "run_event_loop: read tmux stdout");
+        }
         let Some(bytes) = line else {
             // EOF on the daemon channel — orderly shutdown. Synthesize an
             // `Event::Exit` so subscribers can close cleanly even if tmux
@@ -447,11 +450,14 @@ pub async fn run_command_loop(
             warn!(?req, "skipping empty command line");
             continue;
         }
+        debug!(line = %line, "run_command_loop: writing tmux stdin");
         if let Err(e) = daemon.write_line(line.as_bytes()).await {
             warn!(error = %e, "tmux write_line failed; loop exiting");
             return Err(e);
         }
+        debug!("run_command_loop: write_line ok");
     }
+    debug!("run_command_loop: rx closed, exiting");
     Ok(())
 }
 
