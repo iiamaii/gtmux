@@ -16,11 +16,15 @@
   // 5. onDestroy: wsClient.stop() + setLayoutRefetchHandler(null) 로 cleanup.
 
   import { setContext, onDestroy, onMount } from 'svelte';
+  import { SvelteFlowProvider } from '@xyflow/svelte';
   import Canvas from '$lib/canvas/Canvas.svelte';
   import Titlebar from '$lib/chrome/Titlebar.svelte';
   import Sidebar from '$lib/sidebar/Sidebar.svelte';
   import PaneInfoPanel from '$lib/chrome/PaneInfoPanel.svelte';
   import RailToggle from '$lib/chrome/RailToggle.svelte';
+  import HelpBar from '$lib/chrome/HelpBar.svelte';
+  import ViewportCtrl from '$lib/chrome/ViewportCtrl.svelte';
+  import ContextMenu from '$lib/chrome/ContextMenu.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
   import Toast from '$lib/ui/Toast.svelte';
   import { createDispatcher, setLayoutRefetchHandler } from '$lib/ws/dispatcher.svelte';
@@ -76,6 +80,9 @@
   const wsClientHolder: WsClientHolder = { current: null };
   setContext<WsClientHolder>('wsClient', wsClientHolder);
 
+  // ContextMenu host — Canvas dispatches openAt(...) via this ref.
+  let contextMenuRef: { openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null }) => void } | undefined = $state();
+
   onMount(() => {
     // Theme — re-apply on mount so the in-memory state and <html class>
     // converge after Svelte hydrates. The inline FOUC-guard in index.html
@@ -121,25 +128,30 @@
 <div class="app">
   <ReconnectBanner />
   <Titlebar />
-  <div class="workspace">
-    <main class="canvas-pane">
-      <Canvas />
-    </main>
-    <Sidebar collapsed={chromeStore.state.sidebarCollapsed} />
-    <PaneInfoPanel collapsed={chromeStore.state.paneInfoCollapsed} />
-    <RailToggle
-      side="left"
-      collapsed={chromeStore.state.sidebarCollapsed}
-      onclick={() => chromeStore.toggleSidebar()}
-      aria-label="Toggle layer panel"
-    />
-    <RailToggle
-      side="right"
-      collapsed={chromeStore.state.paneInfoCollapsed}
-      onclick={() => chromeStore.togglePaneInfo()}
-      aria-label="Toggle pane info panel"
-    />
-  </div>
+  <SvelteFlowProvider>
+    <div class="workspace">
+      <main class="canvas-pane">
+        <Canvas onContextMenuRequest={(args) => contextMenuRef?.openAt(args)} />
+      </main>
+      <Sidebar collapsed={chromeStore.state.sidebarCollapsed} />
+      <PaneInfoPanel collapsed={chromeStore.state.paneInfoCollapsed} />
+      <RailToggle
+        side="left"
+        collapsed={chromeStore.state.sidebarCollapsed}
+        onclick={() => chromeStore.toggleSidebar()}
+        aria-label="Toggle layer panel"
+      />
+      <RailToggle
+        side="right"
+        collapsed={chromeStore.state.paneInfoCollapsed}
+        onclick={() => chromeStore.togglePaneInfo()}
+        aria-label="Toggle pane info panel"
+      />
+      <HelpBar />
+      <ViewportCtrl />
+      <ContextMenu bind:this={contextMenuRef} />
+    </div>
+  </SvelteFlowProvider>
 </div>
 <Toast />
 

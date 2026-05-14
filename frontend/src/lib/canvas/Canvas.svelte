@@ -23,6 +23,20 @@
   import PanelNode from './PanelNode.svelte';
   import NewPanelButton from './NewPanelButton.svelte';
 
+  interface CanvasProps {
+    /** ContextMenu trigger — `+page.svelte` 가 호스팅하는 ContextMenu
+     *  싱글톤의 `openAt` 으로 wire. `null/undefined` 시 컨텍스트 메뉴
+     *  비활성 — Canvas 내부 동작에 영향 없음. */
+    onContextMenuRequest?: (args: {
+      clientX: number;
+      clientY: number;
+      paneId?: string | null;
+      panelId?: string | null;
+    }) => void;
+  }
+
+  const { onContextMenuRequest }: CanvasProps = $props();
+
   const TOKEN_STORAGE_KEY = 'gtmux_token';
   function readToken(): string | null {
     try {
@@ -119,6 +133,34 @@
       console.warn('[gtmux] drag commit failed:', e);
     });
   }
+
+  // Right-click handlers — pane area + node. Both prevent the native
+  // browser context menu so our styled one wins. paneId / panelId
+  // surface for the menu so item actions (Copy / Close) know what
+  // they're acting on.
+  function onpanecontextmenu({ event }: { event: MouseEvent | TouchEvent }) {
+    if (!(event instanceof MouseEvent)) return;
+    event.preventDefault();
+    onContextMenuRequest?.({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      paneId: null,
+      panelId: null,
+    });
+  }
+
+  function onnodecontextmenu({ event, node }: { event: MouseEvent | TouchEvent; node: Node }) {
+    if (!(event instanceof MouseEvent)) return;
+    event.preventDefault();
+    const data = node.data as Record<string, unknown> | undefined;
+    const paneId = typeof data?.['pane_id'] === 'string' ? (data['pane_id'] as string) : null;
+    onContextMenuRequest?.({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      paneId,
+      panelId: node.id,
+    });
+  }
 </script>
 
 <div class="canvas-root">
@@ -133,6 +175,8 @@
     {onpaneclick}
     {onnodedragstop}
     {onmove}
+    {onpanecontextmenu}
+    {onnodecontextmenu}
     panOnDrag={[1, 2]}
     minZoom={0.05}
     maxZoom={3}
