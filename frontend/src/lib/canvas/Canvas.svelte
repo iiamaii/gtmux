@@ -22,8 +22,18 @@
   import '@xyflow/svelte/dist/style.css';
   import { panelsStore } from '$lib/stores/panels.svelte';
   import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
+  import { putLayoutCommitCurrent } from '$lib/http/layout';
   import PanelNode from './PanelNode.svelte';
   import NewPanelButton from './NewPanelButton.svelte';
+
+  const TOKEN_STORAGE_KEY = 'gtmux_token';
+  function readToken(): string | null {
+    try {
+      return sessionStorage.getItem(TOKEN_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  }
 
   // Panel JSON shape — `docs/ssot/canvas-layout-schema.md` §1 `$defs/Panel`의 부분 view.
   // 코드젠된 `$lib/types/canvas-layout.d.ts`가 정본이 되기 전까지의 잠정 정의 — 정본
@@ -95,12 +105,22 @@
     }
   }
 
-  // 노드 드래그 종료 → 위치 commit. 본 task 범위에서는 store mutation API가 placeholder
-  // 단계라 console.debug만. 실제 D11 G-hybrid drag-delta는 panels.svelte.ts의 movePanel
-  // 액션이 노출되는 시점에 본 핸들러에서 호출.
+  // 노드 드래그 종료 → 1) store 에 새 위치 commit (다음 derived 재계산 시 회귀
+  // 방지) 2) backend PUT /api/layout 으로 영속화. SvelteFlow 는 controlled mode
+  // 라 `nodes` prop 가 store derived 인데, store 가 갱신되지 않으면 다음
+  // selection / click 이벤트가 derived 를 다시 돌릴 때 원래 위치로 snap back 한다.
   function onnodedragstop({ targetNode }: { targetNode: Node | null }) {
     if (!targetNode) return;
-    console.debug('node drag stop', targetNode.id, targetNode.position);
+    const { id, position } = targetNode;
+    panelsStore.movePanel(id, position.x, position.y);
+    const token = readToken();
+    if (token === null) {
+      console.warn('[gtmux] drag commit skipped: no auth token');
+      return;
+    }
+    void putLayoutCommitCurrent(token).catch((e) => {
+      console.warn('[gtmux] drag commit failed:', e);
+    });
   }
 </script>
 

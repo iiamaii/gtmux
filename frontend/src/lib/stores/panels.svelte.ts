@@ -5,10 +5,24 @@ import { SvelteMap } from 'svelte/reactivity';
 export interface Panel {
   id: string;
   // 실제 필드는 codegen 산출 CanvasLayout.Panel 사용. 본 스켈레톤은 placeholder.
+  // 잠정적으로 잘 사용되는 필드만 명시: x/y/w/h/z + 기타.
+  [key: string]: unknown;
 }
 
 class PanelsStore {
   panels = $state(new SvelteMap<string, Panel>());
+
+  /**
+   * Commit a Panel position delta into the store. The Canvas drag handler
+   * calls this on `onnodedragstop` so the store is the source of truth for
+   * the next derived re-render (otherwise SvelteFlow's controlled `nodes`
+   * prop snaps back to the pre-drag value on the next selection event).
+   */
+  movePanel(id: string, x: number, y: number): void {
+    const current = this.panels.get(id);
+    if (!current) return;
+    this.panels.set(id, { ...current, x, y });
+  }
 }
 
 export const panelsStore = new PanelsStore();

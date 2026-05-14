@@ -668,11 +668,13 @@ async fn layout_put_handler(State(state): State<AppState>, req: Request) -> Resp
         }
     }
 
+    // canvas-layout-schema §4.2: 204 No Content + ETag header. The empty
+    // body distinguishes a confirmed commit from a 200-style response so
+    // the SPA's PUT helper does not misclassify it as an error.
     let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
+        .status(StatusCode::NO_CONTENT)
         .header(header::ETAG, &new_etag_quoted)
-        .body(Body::from(b"{}".to_vec()))
+        .body(Body::empty())
         .expect("static headers");
     apply_security_headers(resp.headers_mut(), state.config.mode());
     resp
@@ -1048,7 +1050,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(put.status(), StatusCode::OK);
+        assert_eq!(put.status(), StatusCode::NO_CONTENT);
         let etag2 = put
             .headers()
             .get(header::ETAG)

@@ -56,8 +56,45 @@ type PaneOutHandler = (buf: Uint8Array, cb: () => void) => void;
 
 const paneOutHandlers = new Map<string, PaneOutHandler>();
 
+/**
+ * Buffer of PANE_OUT bytes that arrived BEFORE a handler was registered.
+ *
+ * The New-Panel flow has a mount-vs-emit race: tmux emits the new pane's
+ * first shell prompt (a single PANE_OUT frame) ~immediately after
+ * `new-window`, while the SPA only mounts the corresponding XtermHost
+ * after `PUT /api/layout` → `LAYOUT_CHANGED` → re-hydrate. Without a
+ * buffer, that prompt is dropped and the panel is blank until the user
+ * types something.
+ *
+ * Capped per-pane to avoid memory blow-up if a panel never mounts —
+ * 256 KiB matches the backend's PUT body cap roughly and is well over
+ * a typical shell-prompt redraw (a few hundred bytes including SGR).
+ */
+const PANE_LATE_BUFFER_CAP = 256 * 1024;
+const paneOutLateBuffers = new Map<string, Uint8Array[]>();
+
+function appendLateBuffer(paneKey: string, bytes: Uint8Array): void {
+  const queued = paneOutLateBuffers.get(paneKey) ?? [];
+  const totalSoFar = queued.reduce((acc, b) => acc + b.length, 0);
+  if (totalSoFar >= PANE_LATE_BUFFER_CAP) {
+    // Drop oldest until the new chunk fits. (FIFO — keep the *most recent*
+    // bytes, which are usually the most relevant for visual catch-up.)
+    while (queued.length > 0 && queued.reduce((a, b) => a + b.length, 0) + bytes.length > PANE_LATE_BUFFER_CAP) {
+      queued.shift();
+    }
+  }
+  queued.push(bytes);
+  paneOutLateBuffers.set(paneKey, queued);
+}
+
 export function registerPaneOut(paneId: string, handler: PaneOutHandler): void {
   paneOutHandlers.set(paneId, handler);
+  // Flush any pre-mount bytes we stashed for this pane.
+  const queued = paneOutLateBuffers.get(paneId);
+  if (queued && queued.length > 0) {
+    for (const bytes of queued) handler(bytes, noop);
+    paneOutLateBuffers.delete(paneId);
+  }
 }
 
 export function unregisterPaneOut(paneId: string): void {
@@ -161,11 +198,13 @@ function handlePaneOut(payload: Uint8Array): void {
   // 본 보조 매칭이 New Panel UX 흐름의 pane_id 캡처에 쓰인다 (S5-FE-NEW-PANEL 의
   // pending action 우회 경로 — backend success ack 정식 wire 전까지).
   muxStore.addPane(decoded.paneId);
-  const handler = paneOutHandlers.get(String(decoded.paneId));
+  const key = String(decoded.paneId);
+  const handler = paneOutHandlers.get(key);
   if (!handler) {
-    // panel 이 아직 마운트되지 않은 시점에 ring buffer replay 가 도착할 수 있음 —
-    // MVP 는 drop (ADR-0002 D8 의 replay 는 attach 직후 한꺼번에 도착하므로
-    // panel mount 가 그 안에 끝나야 함, R8 F1).
+    // Panel not yet mounted — stash the bytes so the eventual
+    // registerPaneOut call can flush them. The New-Panel flow always
+    // hits this branch for the very first PANE_OUT of the new pane.
+    appendLateBuffer(key, decoded.bytes);
     return;
   }
   handler(decoded.bytes, noop);

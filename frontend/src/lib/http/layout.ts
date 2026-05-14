@@ -251,10 +251,68 @@ async function attemptAppend(
   return { kind: 'fatal', message: `PUT /api/layout returned ${res.status}` };
 }
 
-// ── 미사용 export 제거 (호환성) ────────────────────────────────────────────
-//
-// 기존 `getLayout()` placeholder 는 본 모듈의 fetchLayoutAndHydrate 로 대체되었다.
-// 외부 caller 가 아직 없으므로 export 만 유지하지 않는다.
+// ── PUT /api/layout — commit current store helper ───────────────────────────
+
+/**
+ * Send the *current* panels/groups store snapshot to the server. Used by
+ * the drag-stop handler so a moved panel persists across the next
+ * LAYOUT_CHANGED-driven re-hydrate (SvelteFlow re-renders from the store,
+ * so without this commit the next selection event snaps the panel back
+ * to its pre-drag position).
+ *
+ * 412 (ETag mismatch) is auto-rebased once: fetchLayoutAndHydrate replaces
+ * the local store with the server view, after which the local edits are
+ * lost — the caller should re-issue the move. Higher-level UX is P1+.
+ */
+export async function putLayoutCommitCurrent(token: string): Promise<{ etag: string }> {
+  const firstEtag = layoutStore.etag;
+  let result = await commitCurrent(token, firstEtag);
+  if (result.kind === 'ok') return { etag: result.etag };
+  if (result.kind === 'fatal') throw new Error(result.message);
+  const refreshed = await fetchLayoutAndHydrate(token, null);
+  if (refreshed === null) throw new Error('layout rebase fetch failed');
+  result = await commitCurrent(token, layoutStore.etag);
+  if (result.kind === 'ok') return { etag: result.etag };
+  if (result.kind === 'fatal') throw new Error(result.message);
+  throw new Error('layout PUT 412 after rebase — concurrent writer suspected');
+}
+
+async function commitCurrent(token: string, currentEtag: string | null): Promise<AttemptResult> {
+  const panels = [...panelsStore.panels.values()];
+  const groups = [...groupsStore.groups.values()];
+  const body = JSON.stringify({
+    schema_version: layoutStore.schemaVersion,
+    etag: currentEtag ?? '00000000000000000000000000000000',
+    panels,
+    groups,
+  });
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${token}`,
+  };
+  if (currentEtag !== null) {
+    headers['If-Match'] = `"${currentEtag}"`;
+  }
+  let res: Response;
+  try {
+    res = await fetch('/api/layout', {
+      method: 'PUT',
+      headers,
+      credentials: 'same-origin',
+      body,
+    });
+  } catch (e) {
+    return { kind: 'fatal', message: `PUT /api/layout network failure: ${String(e)}` };
+  }
+  if (res.status === 204) {
+    const etag = stripQuotes(res.headers.get('ETag') ?? '');
+    layoutStore.setEtag(etag);
+    return { kind: 'ok', etag };
+  }
+  if (res.status === 412) return { kind: 'rebase' };
+  return { kind: 'fatal', message: `PUT /api/layout returned ${res.status}` };
+}
 
 // connectionStore 는 향후 fetch 실패 시 banner 트리거에 사용 — 본 task 범위에서는
 // 단순 console.warn 으로 그치고, store 와의 wiring 은 P1+ 의 별도 트랙.
