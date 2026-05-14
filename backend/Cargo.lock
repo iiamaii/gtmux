@@ -515,6 +515,8 @@ dependencies = [
  "gtmux-lifecycle",
  "gtmux-mux-router",
  "gtmux-ws-server",
+ "libc",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

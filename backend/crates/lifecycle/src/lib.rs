@@ -1,5 +1,5 @@
 //! gtmux-lifecycle — dedicated tmux daemon spawn / attach / shutdown +
-//! stale socket cleanup helper + full 5-step teardown.
+//! stale socket cleanup helper + full 5-step teardown + pidfile management.
 //!
 //! Implements ADR-0009 (tmux daemon isolation) D2/D3 (spawn + socket path) and
 //! D6 (5-step teardown: kill-server → unlink socket → unlink state files →
@@ -9,6 +9,16 @@
 //! the CLI's `teardown` subcommand drives. ADR-0001 D1·D11 commit the
 //! control-mode entrypoint argv (`tmux -L gtmux-<session> -S <socket> -C ...`)
 //! that this module reifies into [`TmuxDaemon::spawn`] / [`TmuxDaemon::attach`].
+//!
+//! Sprint 4-D LIFE-3 adds the server pidfile surface: [`write_pidfile`] /
+//! [`pidfile_path_for`] / [`check_pidfile_liveness`] / [`stop_server`] turn
+//! the previously informational `gtmux stop` subcommand into a real graceful
+//! shutdown channel. The pidfile lives at
+//! `${XDG_STATE_HOME:-~/.local/state}/gtmux/<session>.pid` (mode 0600,
+//! parent dir 0700) and is removed by [`teardown`] step 3 alongside the
+//! token + layout artefacts. ADR-0009 D5 is preserved: `gtmux stop`
+//! terminates the *Rust server process* only — the tmux daemon survives so
+//! `gtmux start --session <name>` can re-attach later (D21 c2).
 //!
 //! D21 c2 (Grill report `0010-grill-amendments.md`) requires port-based
 //! reattach to succeed against an already-running daemon. We split that into
@@ -819,6 +829,342 @@ pub async fn teardown(session: &str, opts: TeardownOpts) -> Result<TeardownRepor
 pub fn socket_path_for(session: &str) -> Result<PathBuf> {
     let dir = socket_dir()?;
     Ok(dir.join(format!("{session}.sock")))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Server pidfile — Sprint 4-D LIFE-3
+//
+// The pidfile is the in-band channel `gtmux stop` uses to deliver SIGTERM to
+// the foreground server process. ADR-0009 D5 forbids killing the tmux
+// daemon on `stop` (that's `teardown`'s job), so the pidfile names the Rust
+// server PID — not the daemon's.
+//
+// Path convention: `${XDG_STATE_HOME:-~/.local/state}/gtmux/<session>.pid`
+//   * mode 0600 (only the running user can read / overwrite / unlink)
+//   * parent dir mode 0700 (same as token / layout — sketch §13.3.6)
+//   * format: `<decimal pid>\n` — one line, trailing newline for human use
+//   * atomic write: temp file (same dir) + fsync + rename + dir fsync
+//     (mirrors `gtmux_auth::save_token` so an OS crash mid-write never
+//     leaves a half-written pidfile behind)
+//
+// `teardown` step 3 already enumerates `<session>.pid` for removal — keeping
+// the same `<session>.pid` filename here means a `gtmux teardown` after a
+// crash naturally cleans up a stale pidfile too.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Required mode for the pidfile itself. Sketch §13.3.6: per-session
+/// secrets and PID handles are user-private.
+const PIDFILE_PERM: u32 = 0o600;
+/// Required mode for the pidfile's parent directory (same as the token
+/// directory; we share the same `${XDG_STATE_HOME}/gtmux/` path).
+const PIDFILE_DIR_PERM: u32 = 0o700;
+
+/// Resolve the canonical pidfile path for `session`:
+/// `${XDG_STATE_HOME:-~/.local/state}/gtmux/<session>.pid`.
+///
+/// Errors with [`LifecycleError::BadXdg`] when `XDG_STATE_HOME` is set but
+/// empty, or when both XDG_STATE_HOME and HOME are unset.
+pub fn pidfile_path_for(session: &str) -> Result<PathBuf> {
+    Ok(state_dir_for_gtmux()?.join(format!("{session}.pid")))
+}
+
+/// Liveness verdict for a pidfile read at start time. The CLI's `gtmux start`
+/// path consults this *before* spawning a tmux daemon: a live PID means we
+/// must refuse with exit 4 (port-in-use spirit — duplicate server bind),
+/// while a stale PID means the previous server crashed and we should
+/// overwrite the pidfile silently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PidLiveness {
+    /// No pidfile present — first start on this host or post-teardown.
+    Absent,
+    /// Pidfile present and `kill(pid, 0)` succeeded — server still running.
+    Alive(libc::pid_t),
+    /// Pidfile present but `kill(pid, 0)` returned ESRCH — orphaned file
+    /// from a crashed prior run.
+    Stale(libc::pid_t),
+    /// Pidfile present but contents could not be parsed as a positive
+    /// decimal PID. Treated as `Stale` by callers but kept as a distinct
+    /// variant so the CLI can surface the corruption in logs.
+    Malformed,
+}
+
+/// Probe the pidfile for `session` and report its liveness.
+///
+/// Reads the file (no perm enforcement — a too-wide pidfile is a forensic
+/// warning rather than a fail-closed condition since the contents are not
+/// secret), parses the first non-empty line as a decimal PID, then probes
+/// with `kill(pid, 0)`. Returns [`PidLiveness::Absent`] when the file does
+/// not exist.
+pub fn check_pidfile_liveness(session: &str) -> Result<PidLiveness> {
+    let path = pidfile_path_for(session)?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(PidLiveness::Absent),
+        Err(e) => return Err(LifecycleError::Io(e)),
+    };
+    let Some(pid) = parse_pid(&raw) else {
+        return Ok(PidLiveness::Malformed);
+    };
+    if pid_is_alive(pid) {
+        Ok(PidLiveness::Alive(pid))
+    } else {
+        Ok(PidLiveness::Stale(pid))
+    }
+}
+
+/// Write `std::process::id()` to the pidfile for `session` atomically.
+///
+/// Steps (mirrors `gtmux_auth::save_token`):
+///   1. Resolve `${XDG_STATE_HOME}/gtmux/<session>.pid`.
+///   2. Ensure parent dir at mode 0700 (create if missing).
+///   3. Open a temp file in the same dir with `O_CREAT | O_EXCL` mode 0600.
+///   4. Write `<pid>\n`, fsync.
+///   5. Rename temp → final (atomic on POSIX, same filesystem).
+///   6. fsync the parent dir for durability.
+///
+/// Returns the final pidfile path so callers can log it. Overwrites any
+/// existing pidfile — `gtmux start` is expected to have already routed
+/// through [`check_pidfile_liveness`] and refused on `Alive`.
+pub fn write_pidfile(session: &str) -> Result<PathBuf> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let final_path = pidfile_path_for(session)?;
+    let dir = final_path
+        .parent()
+        .expect("pidfile_path_for always returns a path with a parent");
+    ensure_state_dir(dir)?;
+
+    // Embed the writer's PID in the temp name so two concurrent
+    // `gtmux start` invocations (rare — both should fail one of the
+    // liveness gates above) don't collide on the same `.tmp` inode.
+    let tmp_path = dir.join(format!(
+        "{}.{}.tmp",
+        final_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("pid"),
+        std::process::id()
+    ));
+
+    let write_result = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(PIDFILE_PERM)
+            .open(&tmp_path)?;
+        // Force the mode even when a permissive umask widened it — same
+        // pattern as `save_token`. Token mode is the security floor; the
+        // pidfile inherits it because it lives next to the token.
+        let perm = fs::Permissions::from_mode(PIDFILE_PERM);
+        f.set_permissions(perm)?;
+        writeln!(f, "{}", std::process::id())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(LifecycleError::Io(e));
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, &final_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(LifecycleError::Io(e));
+    }
+
+    // Durability fence on the parent so the rename survives a power loss.
+    // Failure here means the rename may not survive, but the in-memory
+    // state is consistent — we surface the io::Error.
+    if let Err(e) = fsync_dir(dir) {
+        return Err(LifecycleError::Io(e));
+    }
+    Ok(final_path)
+}
+
+/// Ensure the state directory exists at mode 0700. Same contract as
+/// `gtmux_auth::ensure_state_dir` — duplicated here to keep auth's surface
+/// tight (the auth crate intentionally keeps its `ensure_state_dir` private).
+fn ensure_state_dir(dir: &Path) -> Result<()> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
+    let perm = fs::Permissions::from_mode(PIDFILE_DIR_PERM);
+    fs::set_permissions(dir, perm)?;
+    Ok(())
+}
+
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    let d = std::fs::File::open(dir)?;
+    d.sync_all()
+}
+
+/// Parse the first non-empty trimmed line of `raw` as a positive decimal PID.
+/// Anything else (empty file, non-numeric content, zero, negative) returns
+/// `None`.
+fn parse_pid(raw: &str) -> Option<libc::pid_t> {
+    let line = raw.lines().find(|l| !l.trim().is_empty())?.trim();
+    let n: libc::pid_t = line.parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    Some(n)
+}
+
+/// Send signal 0 to `pid` to probe existence.
+///
+/// `kill(pid, 0)` returns 0 on success (process exists and the caller has
+/// permission to signal it), -1 with errno ESRCH if the process does not
+/// exist, and -1 with errno EPERM if the process exists but belongs to
+/// another user. We collapse the latter into "alive" because for our
+/// single-user invariant a foreign-owned PID matching ours is the worst
+/// case to be cautious about (refuse to overwrite, refuse to SIGTERM
+/// blindly).
+fn pid_is_alive(pid: libc::pid_t) -> bool {
+    // SAFETY: `libc::kill` with sig=0 is the canonical "probe" call; no
+    // signal is actually delivered. Inputs are a pid we just parsed and
+    // the constant 0. Failure modes are reported via the return value +
+    // `errno`; nothing else is invalidated.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // SAFETY: `__errno_location` / `errno` is a thread-local on every
+    // libc we target. `io::Error::last_os_error()` wraps that read so we
+    // don't have to call libc directly.
+    let err = io::Error::last_os_error();
+    // `EPERM` (process exists, foreign uid) is "alive" for our purposes —
+    // we won't be able to SIGTERM it, but we also must not pretend it's
+    // gone. Anything else (ESRCH, EINVAL) → "not alive".
+    err.raw_os_error() == Some(libc::EPERM)
+}
+
+/// Outcome of a [`stop_server`] call. The CLI maps this into the user-
+/// visible message + exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// No pidfile present — there is no running server to stop.
+    NoPidfile(PathBuf),
+    /// Pidfile present but unparseable. Caller should warn + best-effort
+    /// remove the file.
+    MalformedPidfile(PathBuf),
+    /// PID parsed but already absent (ESRCH on the initial probe).
+    /// Pidfile is removed so the next `gtmux start` doesn't see a stale
+    /// liveness signal.
+    AlreadyDead { pid: libc::pid_t, path: PathBuf },
+    /// SIGTERM delivered and the server exited within the grace period.
+    Stopped { pid: libc::pid_t, path: PathBuf },
+    /// SIGTERM delivered + SIGKILL fallback fired (only when caller passed
+    /// `force_kill = true`); the server exited after the kill.
+    Killed { pid: libc::pid_t, path: PathBuf },
+    /// SIGTERM delivered but the server did not exit within the grace
+    /// period and `force_kill = false`. Caller should map this to exit 6
+    /// + an instruction to re-run with `--force` or `kill -9` by hand.
+    TimedOut { pid: libc::pid_t, path: PathBuf },
+}
+
+/// Graceful server shutdown driven by the pidfile.
+///
+/// Sequence:
+///   1. Read + parse the pidfile (absent → `NoPidfile`).
+///   2. `kill(pid, 0)` to confirm liveness (ESRCH → `AlreadyDead` + cleanup).
+///   3. `kill(pid, SIGTERM)` and poll `kill(pid, 0)` every 200 ms for up to
+///      `grace`. ESRCH means the server exited — return `Stopped` + cleanup.
+///   4. If `force_kill = true` and the grace expired, send SIGKILL, wait a
+///      further 1 s, then return `Killed` + cleanup. Otherwise return
+///      `TimedOut` and leave the pidfile in place (the caller may want to
+///      retry, and we cannot prove the server is dead).
+///
+/// "Cleanup" = best-effort `remove_file` of the pidfile. We ignore errors
+/// because the file may already have been cleaned up by the dying server
+/// itself in a future refinement — failing on a missing pidfile here would
+/// race the success path.
+pub async fn stop_server(session: &str, grace: Duration, force_kill: bool) -> Result<StopOutcome> {
+    let path = pidfile_path_for(session)?;
+
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StopOutcome::NoPidfile(path)),
+        Err(e) => return Err(LifecycleError::Io(e)),
+    };
+    let Some(pid) = parse_pid(&raw) else {
+        // Best-effort cleanup so a corrupt pidfile doesn't trip future
+        // start-time liveness checks.
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(StopOutcome::MalformedPidfile(path));
+    };
+
+    if !pid_is_alive(pid) {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(StopOutcome::AlreadyDead { pid, path });
+    }
+
+    // Deliver SIGTERM. SAFETY: see `pid_is_alive` — `libc::kill` is the
+    // canonical signal entrypoint and the inputs are a parsed pid and a
+    // constant signal number.
+    let term_rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if term_rc != 0 {
+        let err = io::Error::last_os_error();
+        // ESRCH means the server exited between our liveness probe and
+        // the SIGTERM — treat the same as `AlreadyDead`.
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Ok(StopOutcome::AlreadyDead { pid, path });
+        }
+        // EPERM or anything else is an irrecoverable signal-delivery
+        // failure. Surface the error so the CLI maps it to exit 6.
+        return Err(LifecycleError::Io(err));
+    }
+
+    // Poll for exit. We use a fixed 200 ms cadence so the common case
+    // (fast exit on SIGTERM) returns in tens of milliseconds and the
+    // worst case is at most 200 ms of slop past `grace`.
+    let poll_interval = Duration::from_millis(200);
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        if !pid_is_alive(pid) {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Ok(StopOutcome::Stopped { pid, path });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    if !force_kill {
+        // Grace expired. Leave the pidfile in place — the server is still
+        // alive, the operator may want to retry with `--force` or attach
+        // a debugger before we destroy the evidence.
+        return Ok(StopOutcome::TimedOut { pid, path });
+    }
+
+    // Escalate to SIGKILL. SAFETY: identical to the SIGTERM call above —
+    // a parsed PID and a constant signal number.
+    let kill_rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    if kill_rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            // Server exited between the timeout and the SIGKILL.
+            let _ = tokio::fs::remove_file(&path).await;
+            return Ok(StopOutcome::Killed { pid, path });
+        }
+        return Err(LifecycleError::Io(err));
+    }
+    // Give the kernel a moment to reap the process. SIGKILL is uncatchable
+    // so this should be effectively instant; we still poll up to 1 s.
+    let kill_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < kill_deadline {
+        if !pid_is_alive(pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = tokio::fs::remove_file(&path).await;
+    Ok(StopOutcome::Killed { pid, path })
 }
 
 // ---- internal helpers -------------------------------------------------------
@@ -1760,5 +2106,340 @@ mod tests {
         if socket_path.exists() {
             let _ = cleanup_stale_socket(&socket_path).await;
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Pidfile — Sprint 4-D LIFE-3
+    //
+    // The XDG_STATE_HOME envar drives pidfile placement, so we reuse the
+    // multi-XDG guard from the teardown tests. parse_pid + pid_is_alive
+    // are pure / cheap and tested directly without env scaffolding.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_pid_accepts_decimal_with_newline() {
+        assert_eq!(parse_pid("1234\n"), Some(1234));
+        assert_eq!(parse_pid("  42  "), Some(42));
+        // Multi-line: first non-empty line wins.
+        assert_eq!(parse_pid("\n\n777\nignored"), Some(777));
+    }
+
+    #[test]
+    fn parse_pid_rejects_nonpositive_and_garbage() {
+        assert_eq!(parse_pid(""), None);
+        assert_eq!(parse_pid("\n\n"), None);
+        assert_eq!(parse_pid("0\n"), None);
+        assert_eq!(parse_pid("-5"), None);
+        assert_eq!(parse_pid("abc"), None);
+        assert_eq!(parse_pid("12abc"), None);
+    }
+
+    #[test]
+    fn pid_is_alive_self_is_alive() {
+        // Our own PID must be alive — anything else would imply the OS
+        // forgot about us in the middle of running a test.
+        let me = std::process::id() as libc::pid_t;
+        assert!(pid_is_alive(me));
+    }
+
+    #[test]
+    fn pid_is_alive_max_pid_is_not_alive() {
+        // `libc::pid_t::MAX` is far outside any realistic /proc/sys/
+        // kernel.pid_max value (Linux defaults around 4_194_304; macOS
+        // around 99_998). `kill(MAX, 0)` should produce ESRCH.
+        assert!(!pid_is_alive(libc::pid_t::MAX));
+    }
+
+    #[test]
+    fn pidfile_path_xdg_state_home() {
+        let g = TeardownXdgGuard::new();
+        let p = pidfile_path_for("alpha").unwrap();
+        assert_eq!(p, g.state_gtmux().join("alpha.pid"));
+    }
+
+    #[test]
+    fn pidfile_path_xdg_unset_uses_home_default() {
+        // Clear XDG_STATE_HOME and assert the path falls back to
+        // `$HOME/.local/state/gtmux/<session>.pid`. We reuse the same env
+        // lock the auth tests do.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_state = std::env::var_os("XDG_STATE_HOME");
+        let prev_home = std::env::var_os("HOME");
+        std::env::remove_var("XDG_STATE_HOME");
+        // Force a deterministic HOME so the assertion is portable.
+        let home = tempfile::tempdir().expect("home tmp");
+        std::env::set_var("HOME", home.path());
+        let p = pidfile_path_for("beta").unwrap();
+        // Restore env before the assert so a failure doesn't leak state.
+        match &prev_state {
+            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        match &prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(
+            p,
+            home.path()
+                .join(".local")
+                .join("state")
+                .join("gtmux")
+                .join("beta.pid"),
+        );
+    }
+
+    #[test]
+    fn write_pidfile_creates_file_with_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = TeardownXdgGuard::new();
+        let session = "perm-check";
+        let path = write_pidfile(session).expect("write_pidfile");
+        let meta = std::fs::metadata(&path).expect("stat pidfile");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "pidfile mode must be 0600, got {mode:o}");
+        // Parent must be 0700.
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "parent mode must be 0700, got {dir_mode:o}"
+        );
+        // Contents must round-trip back to our PID.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let parsed = parse_pid(&raw).expect("self-written pidfile must parse");
+        assert_eq!(parsed as u32, std::process::id());
+    }
+
+    #[test]
+    fn write_pidfile_overwrites_atomically() {
+        // After a successful save no `.tmp` siblings must remain — same
+        // contract as auth::save_token. We write the pidfile twice to
+        // ensure overwrite also leaves a clean directory.
+        let _g = TeardownXdgGuard::new();
+        let session = "atomic";
+        write_pidfile(session).unwrap();
+        write_pidfile(session).unwrap();
+        let dir = pidfile_path_for(session).unwrap();
+        let dir = dir.parent().unwrap();
+        let stragglers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.ends_with(".tmp"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            stragglers.is_empty(),
+            "found temp-file residue: {:?}",
+            stragglers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn check_pidfile_liveness_absent() {
+        let _g = TeardownXdgGuard::new();
+        let v = check_pidfile_liveness("never-existed").unwrap();
+        assert_eq!(v, PidLiveness::Absent);
+    }
+
+    #[test]
+    fn check_pidfile_liveness_alive_self() {
+        let _g = TeardownXdgGuard::new();
+        let session = "alive-self";
+        write_pidfile(session).unwrap();
+        let v = check_pidfile_liveness(session).unwrap();
+        match v {
+            PidLiveness::Alive(pid) => {
+                assert_eq!(pid as u32, std::process::id());
+            }
+            other => panic!("expected Alive(self), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_pidfile_liveness_stale() {
+        // pid_t::MAX is guaranteed non-existent (see pid_is_alive_max).
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let _g = TeardownXdgGuard::new();
+        let session = "stale";
+        let path = pidfile_path_for(session).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "{}", libc::pid_t::MAX).unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let v = check_pidfile_liveness(session).unwrap();
+        match v {
+            PidLiveness::Stale(pid) => assert_eq!(pid, libc::pid_t::MAX),
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_pidfile_liveness_malformed() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = TeardownXdgGuard::new();
+        let session = "malformed";
+        let path = pidfile_path_for(session).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(&path, b"not-a-pid").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let v = check_pidfile_liveness(session).unwrap();
+        assert_eq!(v, PidLiveness::Malformed);
+    }
+
+    #[tokio::test]
+    async fn stop_server_no_pidfile_is_friendly() {
+        let _g = TeardownXdgGuard::new();
+        let outcome = stop_server("ghost", Duration::from_millis(200), false)
+            .await
+            .expect("stop_server");
+        match outcome {
+            StopOutcome::NoPidfile(path) => {
+                assert!(
+                    path.ends_with("ghost.pid"),
+                    "expected pidfile path to end with ghost.pid, got {}",
+                    path.display(),
+                );
+                assert!(!path.exists(), "NoPidfile should not have created the file");
+            }
+            other => panic!("expected NoPidfile, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_server_stale_pidfile_returns_already_dead() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let _g = TeardownXdgGuard::new();
+        let session = "stale-stop";
+        let path = pidfile_path_for(session).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "{}", libc::pid_t::MAX).unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let outcome = stop_server(session, Duration::from_millis(200), false)
+            .await
+            .expect("stop_server");
+        match outcome {
+            StopOutcome::AlreadyDead {
+                pid,
+                path: out_path,
+            } => {
+                assert_eq!(pid, libc::pid_t::MAX);
+                assert!(
+                    !out_path.exists(),
+                    "AlreadyDead must remove the stale pidfile"
+                );
+            }
+            other => panic!("expected AlreadyDead, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_server_malformed_pidfile_is_friendly() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = TeardownXdgGuard::new();
+        let session = "mal-stop";
+        let path = pidfile_path_for(session).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(&path, b"garbage\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let outcome = stop_server(session, Duration::from_millis(200), false)
+            .await
+            .expect("stop_server");
+        match outcome {
+            StopOutcome::MalformedPidfile(out_path) => {
+                assert!(
+                    !out_path.exists(),
+                    "MalformedPidfile must remove the corrupt file"
+                );
+            }
+            other => panic!("expected MalformedPidfile, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_removes_pidfile_when_present() {
+        // Seed only the pidfile + token (so the dir exists). Daemon dead,
+        // socket absent → step 3 enumeration must still reach .pid.
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let g = TeardownXdgGuard::new();
+        let session = "td-pid";
+        let token_path = g.write_token(session); // ensures parent dir
+        let pid_path = g.state_gtmux().join(format!("{session}.pid"));
+        let mut f = std::fs::File::create(&pid_path).unwrap();
+        writeln!(f, "{}", libc::pid_t::MAX).unwrap();
+        drop(f);
+        std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(pid_path.exists());
+
+        let report = teardown(session, TeardownOpts::default()).await.unwrap();
+        // Both token and pid should be in the removed list (step 3
+        // iterates over [token, layout, pid]).
+        assert!(
+            report.state_files_removed.iter().any(|p| p == &pid_path),
+            "pidfile should have been removed: {:?}",
+            report.state_files_removed
+        );
+        assert!(!pid_path.exists());
+        assert!(!token_path.exists());
+    }
+
+    #[tokio::test]
+    async fn teardown_skips_pidfile_when_absent() {
+        // No pidfile on disk — step 3 must report it under warnings as
+        // "pid not present" (the existing teardown logic explicitly
+        // warns on absent pidfile because that's the artefact users
+        // notice the most).
+        let g = TeardownXdgGuard::new();
+        let session = "td-no-pid";
+        let _token_path = g.write_token(session);
+        let pid_path = g.state_gtmux().join(format!("{session}.pid"));
+        assert!(!pid_path.exists());
+
+        let report = teardown(session, TeardownOpts::default()).await.unwrap();
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("pid not present")),
+            "expected pid-absent warning, got {:?}",
+            report.warnings
+        );
+        assert!(
+            !report.state_files_removed.iter().any(|p| p == &pid_path),
+            "pidfile must not appear in removed list when absent"
+        );
     }
 }

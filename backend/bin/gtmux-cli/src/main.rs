@@ -1,10 +1,10 @@
 //! gtmux CLI — clap derive entrypoint (D20 subcommand set).
 //!
 //! `start` is wired end-to-end per `docs/reports/0012-bootstrap-smoke.md` §3
-//! P0-CLI-1: config load → daemon spawn → token issue/load (mode-branched per
-//! ADR-0003 D13.1) → axum router mount → bind → first-run banner (D21 c1 +
-//! ADR-0003 D3 token URL) → graceful shutdown that leaves the tmux daemon
-//! alive (ADR-0009 D5 / D21 c5).
+//! P0-CLI-1: pidfile liveness probe → config load → daemon spawn → pidfile
+//! write → token issue/load (mode-branched per ADR-0003 D13.1) → axum router
+//! mount → bind → first-run banner (D21 c1 + ADR-0003 D3 token URL) →
+//! graceful shutdown that leaves the tmux daemon alive (ADR-0009 D5 / D21 c5).
 //!
 //! `teardown` / `rotate-token` / `status` are wired per Sprint 2 P0-CLI-3/4/5
 //! (bootstrap-smoke report §3.1): teardown drives `lifecycle::teardown` and
@@ -12,13 +12,14 @@
 //! and prints a banner that supersedes the prior URL; status enumerates
 //! `${XDG_STATE_HOME}/gtmux/*.token` and probes each daemon via `has-session`.
 //!
-//! `stop` remains an *informational* stub: the live gtmux Server doesn't yet
-//! write a pidfile (P0-CLI-1 currently runs in the foreground), so there is
-//! no in-band channel to deliver SIGTERM through. The handler prints the
-//! supported alternatives and exits 0 — see the `Cmd::Stop` arm below for
-//! the design note. Bringing the real graceful path online requires adding
-//! a pidfile writer to lifecycle::spawn + the CLI start path, which is
-//! scoped out as a Sprint 3 task (P0-LIFE-3 in the follow-up plan).
+//! Sprint 4-D LIFE-3 turns `stop` from an informational stub into a real
+//! graceful-shutdown channel: `gtmux start` writes a pidfile at
+//! `${XDG_STATE_HOME}/gtmux/<session>.pid` immediately after binding the
+//! TCP listener, and `gtmux stop --session <name>` reads that PID, sends
+//! SIGTERM, and waits up to 5 s for the process to exit (escalating to
+//! SIGKILL only when `--force` is passed). ADR-0009 D5 invariant is
+//! preserved — the tmux daemon survives, `gtmux teardown` remains the
+//! single destructive cleanup.
 
 #![forbid(unsafe_code)]
 #![warn(clippy::all)]
@@ -35,8 +36,9 @@ use clap::{Parser, Subcommand};
 use gtmux_auth::{issue_token, load_token, rotate_token, save_token, AuthError, TokenString};
 use gtmux_config::{derive_mode, load as load_config, Config, Mode};
 use gtmux_lifecycle::{
-    run_command_loop, run_event_loop, socket_path_for, LifecycleError, SpawnOptions, TeardownOpts,
-    TeardownReport, TmuxDaemon,
+    check_pidfile_liveness, pidfile_path_for, run_command_loop, run_event_loop, socket_path_for,
+    stop_server, write_pidfile, LifecycleError, PidLiveness, SpawnOptions, StopOutcome,
+    TeardownOpts, TeardownReport, TmuxDaemon,
 };
 use gtmux_ws_server::{Hub, TmuxRequest};
 use tokio::net::TcpListener;
@@ -99,13 +101,19 @@ enum Cmd {
     },
     /// Stop a running gtmux Server (소켓·daemon은 그대로 둔다).
     ///
-    /// MVP scope: until lifecycle writes a pidfile during `start`, this
-    /// subcommand prints the supported alternatives (direct SIGINT / SIGTERM
-    /// to the foreground process, or `gtmux teardown --force`) and exits 0.
-    /// See the module docstring for the full rationale.
+    /// Reads the pidfile at `${XDG_STATE_HOME}/gtmux/<session>.pid`, sends
+    /// SIGTERM, and waits up to 5 s for the process to exit. ADR-0009 D5
+    /// is preserved: the tmux daemon (and therefore session / pane state)
+    /// survives this call so a subsequent `gtmux start --session <name>`
+    /// can re-attach via `new-session -A` (D21 c2).
     Stop {
         #[arg(long)]
         session: String,
+        /// On SIGTERM grace timeout, escalate to SIGKILL instead of
+        /// returning exit 6. Use sparingly — SIGKILL gives the server no
+        /// chance to flush layout state or close WS connections cleanly.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Teardown: ADR-0009 §D6 5-step cleanup (socket·token·layout·pid·config).
     Teardown {
@@ -175,7 +183,7 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => report_start_error(e),
         },
-        Cmd::Stop { session } => stop(&session),
+        Cmd::Stop { session, force } => rt.block_on(stop(&session, force)),
         Cmd::Teardown {
             session,
             force,
@@ -202,22 +210,25 @@ struct StartArgs {
     config_path: Option<PathBuf>,
 }
 
-/// Execute the P0-CLI-1 13-step bootstrap sequence (grill report §3.1).
+/// Execute the P0-CLI-1 14-step bootstrap sequence (grill report §3.1 +
+/// Sprint 4-D LIFE-3 pidfile addition).
 ///
 /// Step matrix (D20 + bootstrap-smoke §3 P0-CLI-1):
-///   1) parse CLI args            — clap above
-///   2) load config               — figment (CLI > Env > TOML > defaults)
-///   3) derive mode               — bind value → Local / Cloud (D22)
-///   4) init tracing              — log_level + log_format (text/json/auto)
-///   5) spawn tmux daemon         — ADR-0009 D2/D3 dedicated daemon
-///   6) issue / load token        — ADR-0003 D13.1 mode-branched
-///   7) build http router         — placeholder mount (real lands in HTTP-1)
-///   8) build ws router           — placeholder mount (real lands in WS-1)
+///   1) parse CLI args             — clap above
+///   2) load config                — figment (CLI > Env > TOML > defaults)
+///      2a) pidfile liveness probe — LIFE-3: refuse duplicate server bind
+///   3) derive mode                — bind value → Local / Cloud (D22)
+///   4) init tracing               — log_level + log_format (text/json/auto)
+///   5) spawn tmux daemon          — ADR-0009 D2/D3 dedicated daemon
+///   6) issue / load token         — ADR-0003 D13.1 mode-branched
+///   7) build http router          — placeholder mount (real lands in HTTP-1)
+///   8) build ws router            — placeholder mount (real lands in WS-1)
 ///   9) merge into a single app
-///  10) bind TCP listener         — `bind` + `port` from config (D2)
-///  11) print first-run banner    — D21 c1 + ADR-0003 D3 token URL
-///  12) install shutdown handlers — SIGINT + SIGTERM → graceful (D5 daemon ⊥)
-///  13) axum::serve(...)          — with_graceful_shutdown
+///  10) bind TCP listener          — `bind` + `port` from config (D2)
+///      10a) write server pidfile  — LIFE-3: in-band channel for `gtmux stop`
+///  11) print first-run banner     — D21 c1 + ADR-0003 D3 token URL
+///  12) install shutdown handlers  — SIGINT + SIGTERM → graceful (D5 daemon ⊥)
+///  13) axum::serve(...)           — with_graceful_shutdown
 async fn start(args: StartArgs) -> anyhow::Result<()> {
     // 2) config — figment chain. The CLI `session` flag overrides the TOML
     //    `[server].session` (config crate spec). When `--port` was provided on
@@ -230,6 +241,42 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         // Honour CLI override exactly once — `bind` itself is not overridable
         // here because the security mode (D22) flips on its value.
         config.server.port = p;
+    }
+
+    // 2a) pidfile liveness — refuse duplicate server bind on the same session
+    //     before we go anywhere near tmux. ADR-0007 D2's 1:1:1 invariant
+    //     forbids two Servers per session; the pidfile is the cheap canonical
+    //     check. Stale pidfiles (server crashed) downgrade to a warning and
+    //     are overwritten in step 10a.
+    match check_pidfile_liveness(&config.server.session) {
+        Ok(PidLiveness::Alive(pid)) => {
+            return Err(StartError::AlreadyRunning {
+                session: config.server.session.clone(),
+                pid,
+            }
+            .into());
+        }
+        Ok(PidLiveness::Stale(pid)) => {
+            warn!(
+                session = %config.server.session,
+                stale_pid = pid,
+                "stale gtmux pidfile detected; previous server appears to have crashed — overwriting on bind"
+            );
+        }
+        Ok(PidLiveness::Malformed) => {
+            warn!(
+                session = %config.server.session,
+                "malformed gtmux pidfile detected; overwriting on bind"
+            );
+        }
+        Ok(PidLiveness::Absent) => {
+            // First start (or post-teardown) — nothing to check.
+        }
+        Err(e) => {
+            // BadXdg / IO error on the pidfile probe is itself a hard failure
+            // because we cannot guarantee uniqueness without it.
+            return Err(anyhow::Error::new(e).context("probing pidfile liveness"));
+        }
     }
 
     // 3) mode is *derived* from `bind`; we capture it so subsequent code can
@@ -351,6 +398,25 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         }
     };
 
+    // 10a) pidfile — write *after* the bind succeeds so a duplicate-bind
+    //      attempt (caught at step 10) doesn't leave a misleading pidfile
+    //      pointing at a process that never actually held the port. The
+    //      pidfile is the in-band channel `gtmux stop` uses to deliver
+    //      SIGTERM (LIFE-3); ADR-0009 D5 keeps this as a *server-only*
+    //      handle — daemon kill is teardown's job.
+    let pidfile_path = match write_pidfile(&config.server.session) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            // Pidfile write failure is non-fatal: the server can still run,
+            // but `gtmux stop` will print a friendly "no pidfile" error
+            // until the operator's environment is fixed (perm on
+            // ${XDG_STATE_HOME}/gtmux/, etc.). We log at WARN so the
+            // anomaly surfaces in stderr / journald.
+            warn!(error = %e, "failed to write gtmux pidfile; `gtmux stop` will be unavailable for this run");
+            None
+        }
+    };
+
     // 11) banner — D21 c1 + ADR-0003 D3. We emit the cleartext token URL
     //    exactly once; subsequent traffic must use Authorization: Bearer or
     //    the WebSocket subprotocol (R(rej)2).
@@ -387,6 +453,21 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
             warn!(error = %e, "control-mode client shutdown reported an error");
         }
     }
+
+    // Remove the pidfile so `gtmux start` on the next run sees `Absent`
+    // instead of `Stale`. Best-effort: a missing pidfile here is fine
+    // (operator may have run `gtmux teardown` concurrently), and any
+    // other error is logged but does not affect the exit status.
+    if let Some(path) = pidfile_path.as_deref() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "failed to remove pidfile on shutdown")
+            }
+        }
+    }
+
     print_farewell(&config.server.session);
 
     serve_result.context("axum::serve")
@@ -580,6 +661,30 @@ impl std::fmt::Display for BindError {
 
 impl std::error::Error for BindError {}
 
+/// Friendly start-time failures that don't fit cleanly into `LifecycleError`
+/// / `AuthError` / `io::Error`. LIFE-3 adds [`StartError::AlreadyRunning`]
+/// so the pidfile liveness gate routes through `EXIT_PORT_IN_USE` with a
+/// targeted message ("use `gtmux stop`" rather than the generic "pick
+/// another --port").
+#[derive(Debug)]
+enum StartError {
+    AlreadyRunning { session: String, pid: libc::pid_t },
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::AlreadyRunning { session, pid } => write!(
+                f,
+                "gtmux server already running for session '{session}' (pid {pid}). \
+                 Use `gtmux stop --session {session}` first, or pick another --session."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StartError {}
+
 /// Print the anyhow chain to stderr and pick the appropriate exit code from
 /// the grill D20 matrix. Errors are inspected via `downcast_ref` so callers
 /// can attach `.context(...)` freely without breaking the routing.
@@ -590,6 +695,9 @@ fn report_start_error(err: anyhow::Error) -> ExitCode {
     eprintln!("gtmux start: {err:#}");
 
     if let Some(BindError::InUse(_)) = err.downcast_ref::<BindError>() {
+        return ExitCode::from(EXIT_PORT_IN_USE);
+    }
+    if let Some(StartError::AlreadyRunning { .. }) = err.downcast_ref::<StartError>() {
         return ExitCode::from(EXIT_PORT_IN_USE);
     }
     if let Some(life) = err.downcast_ref::<LifecycleError>() {
@@ -804,30 +912,92 @@ fn socket_path_display(session: &str) -> String {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// `gtmux stop`  (P0-CLI-2 — informational stub)
+// `gtmux stop`  (P0-CLI-2 — Sprint 4-D LIFE-3 real wiring)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Print the supported alternatives for graceful shutdown and exit 0. See
-/// the module docstring for why this is a stub: there is currently no
-/// pidfile written by `gtmux start`, so we cannot signal the live process
-/// in-band. Routing this through the daemon's control-mode channel is a
-/// Sprint-3 follow-up (P0-LIFE-3 in the plan).
-fn stop(session: &str) -> ExitCode {
-    eprintln!(
-        "gtmux stop: graceful shutdown of a running server is not yet implemented.\n\
-         \n\
-         The current foreground `gtmux start` writes no pidfile, so this CLI has no\n\
-         in-band channel to deliver SIGTERM through. Until that lands (Sprint 3 /\n\
-         P0-LIFE-3), use one of these alternatives:\n\
-         \n\
-           * Press Ctrl-C in the terminal where `gtmux start --session {session}` is\n\
-             running, or `kill <pid>` against that process directly. The Server will\n\
-             flush layout state and close WS connections; the tmux daemon survives.\n\
-           * Run `gtmux teardown --session {session} --force` to kill BOTH the gtmux\n\
-             Server (via socket disconnect) AND the tmux daemon. State + config are\n\
-             also removed unless you pass --keep-state / --keep-config.\n"
-    );
-    ExitCode::SUCCESS
+/// Stop a running gtmux Server gracefully via the pidfile.
+///
+/// Exit-code matrix:
+///   * `Stopped` / `Killed` / `AlreadyDead` → 0 (success — the operator's
+///     mental model is "the server is no longer running", which all three
+///     deliver).
+///   * `NoPidfile` → 1. The friendly message points at `gtmux teardown`
+///     for users who actually wanted to remove tmux state.
+///   * `MalformedPidfile` → 1.
+///   * `TimedOut` → 6 (lifecycle / tmux-domain failure code in the
+///     grill-D20 matrix; the server didn't honour SIGTERM within 5 s).
+async fn stop(session: &str, force: bool) -> ExitCode {
+    use std::time::Duration;
+
+    // We compute the pidfile path up-front so the friendly error message
+    // for `NoPidfile` can mention the exact path operators should look
+    // at. Resolution failures here (XDG_STATE_HOME empty, HOME unset)
+    // surface as exit 1 with a targeted message.
+    let path = match pidfile_path_for(session) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gtmux stop: cannot resolve pidfile path: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+
+    let outcome = match stop_server(session, Duration::from_secs(5), force).await {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "gtmux stop: failed to signal server for session '{session}' \
+                 (pidfile {}): {e}",
+                path.display()
+            );
+            return ExitCode::from(EXIT_TMUX);
+        }
+    };
+
+    match outcome {
+        StopOutcome::NoPidfile(path) => {
+            eprintln!(
+                "gtmux stop: no running gtmux server for session '{session}' \
+                 (pidfile {} not found).\n\
+                 If you intended to remove tmux state, use `gtmux teardown --session {session}`.",
+                path.display()
+            );
+            ExitCode::from(EXIT_FAILURE)
+        }
+        StopOutcome::MalformedPidfile(path) => {
+            eprintln!(
+                "gtmux stop: pidfile at {} could not be parsed as a PID; \
+                 the corrupt file has been removed.",
+                path.display()
+            );
+            ExitCode::from(EXIT_FAILURE)
+        }
+        StopOutcome::AlreadyDead { pid, path } => {
+            println!(
+                "gtmux stop: server (pid {pid}) was already gone; removed stale pidfile {}. \
+                 tmux daemon preserved.",
+                path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        StopOutcome::Stopped { pid, .. } => {
+            println!("gtmux stop: server (pid {pid}) stopped gracefully. tmux daemon preserved.");
+            ExitCode::SUCCESS
+        }
+        StopOutcome::Killed { pid, .. } => {
+            println!(
+                "gtmux stop: server (pid {pid}) did not exit on SIGTERM and was killed (SIGKILL). \
+                 tmux daemon preserved, but in-flight layout writes may have been dropped."
+            );
+            ExitCode::SUCCESS
+        }
+        StopOutcome::TimedOut { pid, .. } => {
+            eprintln!(
+                "gtmux stop: server (pid {pid}) didn't exit after SIGTERM (5 s grace). \
+                 Re-run with `--force` to escalate to SIGKILL, or `kill -9 {pid}` by hand."
+            );
+            ExitCode::from(EXIT_TMUX)
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1302,7 +1472,22 @@ mod tests {
     fn stop_parses() {
         let cli = Cli::parse_from(["gtmux", "stop", "--session", "smoke"]);
         match cli.command {
-            Cmd::Stop { session } => assert_eq!(session, "smoke"),
+            Cmd::Stop { session, force } => {
+                assert_eq!(session, "smoke");
+                assert!(!force, "force defaults to false");
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_parses_force_flag() {
+        let cli = Cli::parse_from(["gtmux", "stop", "--session", "smoke", "--force"]);
+        match cli.command {
+            Cmd::Stop { session, force } => {
+                assert_eq!(session, "smoke");
+                assert!(force, "--force must propagate");
+            }
             other => panic!("expected Stop, got {other:?}"),
         }
     }
@@ -1332,5 +1517,134 @@ mod tests {
         assert_eq!(t.chars().count(), 5);
         assert!(t.starts_with('…'));
         assert!(t.ends_with("ghij"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Sprint 4-D LIFE-3 — `gtmux stop` + start-time pidfile gate.
+    //
+    // These tests mutate `XDG_STATE_HOME` so they must serialise against
+    // each other. The lock is per-binary; concurrent test binaries in
+    // `cargo test --workspace` are independent processes and don't share
+    // this lock — they each have their own env. The actual cross-crate
+    // race surface (gtmux-lifecycle + gtmux-auth + gtmux-cli all touching
+    // XDG_STATE_HOME) is mediated by `cargo test` running each crate's
+    // tests in its own process by default.
+    // ────────────────────────────────────────────────────────────────────
+
+    use std::sync::Mutex;
+
+    static CLI_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CliXdgGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev_state: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+        _state_dir: tempfile::TempDir,
+        _home_dir: tempfile::TempDir,
+    }
+
+    impl CliXdgGuard {
+        fn new() -> Self {
+            let lock = CLI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_state = std::env::var_os("XDG_STATE_HOME");
+            let prev_home = std::env::var_os("HOME");
+            let state_dir = tempfile::tempdir().expect("state tempdir");
+            let home_dir = tempfile::tempdir().expect("home tempdir");
+            std::env::set_var("XDG_STATE_HOME", state_dir.path());
+            std::env::set_var("HOME", home_dir.path());
+            Self {
+                _lock: lock,
+                prev_state,
+                prev_home,
+                _state_dir: state_dir,
+                _home_dir: home_dir,
+            }
+        }
+    }
+
+    impl Drop for CliXdgGuard {
+        fn drop(&mut self) {
+            match &self.prev_state {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// `gtmux stop` against a session that has never been started must
+    /// exit 1 with a friendly message that points at `gtmux teardown` as
+    /// the alternative path.
+    #[tokio::test]
+    async fn stop_missing_pidfile_friendly_error() {
+        let _g = CliXdgGuard::new();
+        let code = stop("never-existed", false).await;
+        // `ExitCode` doesn't expose its numeric value through a stable
+        // API; reconstruct one with the same byte and compare with the
+        // `Debug` output, which prints `ExitCode(unix_exit_status(N))`
+        // on Unix. That formatter is the only public observation point.
+        let want = format!("{:?}", ExitCode::from(EXIT_FAILURE));
+        let got = format!("{code:?}");
+        assert_eq!(got, want, "expected EXIT_FAILURE, got {got}");
+    }
+
+    /// `gtmux stop` against a stale pidfile (PID guaranteed not to
+    /// exist) must succeed (exit 0) and remove the stale file so the
+    /// next `gtmux start` sees a clean `Absent` state.
+    #[tokio::test]
+    async fn stop_stale_pidfile_succeeds() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let _g = CliXdgGuard::new();
+        let session = "stale-cli";
+        let path = pidfile_path_for(session).expect("path");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "{}", libc::pid_t::MAX).unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let code = stop(session, false).await;
+        let want = format!("{:?}", ExitCode::SUCCESS);
+        let got = format!("{code:?}");
+        assert_eq!(got, want, "expected EXIT_SUCCESS, got {got}");
+        assert!(!path.exists(), "stale pidfile must be cleaned up");
+    }
+
+    /// Pidfile liveness gate at start: if a pidfile exists and points at
+    /// a live PID (we use our own), `check_pidfile_liveness` reports
+    /// `Alive` and `Cmd::Start` would return `StartError::AlreadyRunning`.
+    /// We unit-test the gate at the lifecycle boundary because the full
+    /// `start` path requires a real tmux daemon + bind, which is the
+    /// smoke harness's job.
+    #[test]
+    fn start_rejects_when_pidfile_alive() {
+        let _g = CliXdgGuard::new();
+        let session = "alive-cli";
+        let path = write_pidfile(session).expect("write_pidfile");
+        assert!(path.exists());
+        match check_pidfile_liveness(session).expect("liveness") {
+            PidLiveness::Alive(pid) => {
+                assert_eq!(pid as u32, std::process::id());
+                // Round-trip the user-visible error message so the
+                // friendly text doesn't drift silently.
+                let err = StartError::AlreadyRunning {
+                    session: session.to_string(),
+                    pid,
+                };
+                let msg = err.to_string();
+                assert!(msg.contains("already running"), "got: {msg}");
+                assert!(msg.contains("gtmux stop"), "got: {msg}");
+                assert!(msg.contains(session), "got: {msg}");
+            }
+            other => panic!("expected Alive(self), got {other:?}"),
+        }
     }
 }

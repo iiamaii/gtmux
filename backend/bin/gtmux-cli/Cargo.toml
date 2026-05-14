@@ -22,3 +22,10 @@ gtmux-http-api = { path = "../../crates/http-api" }
 gtmux-config = { path = "../../crates/config" }
 gtmux-auth = { path = "../../crates/auth" }
 gtmux-mux-router = { path = "../../crates/mux-router" }
+# libc surfaces `pid_t` for the LIFE-3 pidfile types we accept from the
+# lifecycle crate. No signal delivery happens here — that stays inside
+# `gtmux_lifecycle::stop_server`.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
