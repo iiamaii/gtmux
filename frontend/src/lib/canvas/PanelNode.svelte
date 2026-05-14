@@ -13,11 +13,21 @@
   //   + PUT /api/layout 으로 영속화.
   // - visibility=false → 렌더 X.
 
+  import { getContext } from 'svelte';
   import { NodeResizer } from '@xyflow/svelte';
   import XtermHost from './XtermHost.svelte';
   import { panelsStore } from '$lib/stores/panels.svelte';
   import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
+  import { muxStore } from '$lib/stores/mux.svelte';
   import { putLayoutCommitCurrent } from '$lib/http/layout';
+  import { sendCtrl } from '$lib/ws/ctrl-registry';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
+  import type { WsClient } from '$lib/ws/client';
+
+  interface WsClientHolder {
+    current: WsClient | null;
+  }
+  const wsClientHolder = getContext<WsClientHolder>('wsClient');
 
   interface PanelData {
     id: string;
@@ -96,6 +106,72 @@
       console.warn('[gtmux] resize commit failed:', e);
     });
   }
+
+  // ─ Stage G — close button (S7-FE-CLOSE-GUARD) ──────────────────────────
+  //
+  // CONTEXT.md "Pane lifecycle invariant" — 마지막 살아 있는 child 일 때
+  // close 비활성화. 사후 recovery 가 아닌 사전 prevention.
+  const liveCount = $derived(
+    [...muxStore.panes.values()].filter((p) => p.dead !== true).length
+  );
+
+  // Live count = 1 + this panel's pane is the one alive ⇒ disabled.
+  // We also disable when the underlying pane is not registered yet
+  // (no pane_id) to avoid the close racing the spawn.
+  const paneNumeric = $derived.by(() => {
+    if (typeof data.pane_id !== 'string' || data.pane_id[0] !== '%') return null;
+    const n = Number.parseInt(data.pane_id.slice(1), 10);
+    return Number.isNaN(n) ? null : n;
+  });
+  const closeDisabled = $derived(liveCount <= 1 || paneNumeric === null);
+  const closeTooltip = $derived(
+    closeDisabled && liveCount <= 1
+      ? "Last live pane — use Session shutdown"
+      : "Close panel"
+  );
+
+  let closing = $state(false);
+
+  async function onClose(e: MouseEvent): Promise<void> {
+    e.stopPropagation();
+    if (closeDisabled || closing) return;
+    const client = wsClientHolder?.current;
+    if (!client || paneNumeric === null) {
+      toastStore.show({ message: 'WebSocket not ready', tone: 'error' });
+      return;
+    }
+    closing = true;
+    try {
+      // 1) Remove from layout first — so the visual disappears immediately
+      //    (responsiveness UX). PUT commits the new state to disk.
+      panelsStore.removePanel(data.id);
+      const token = readToken();
+      if (token !== null) {
+        void putLayoutCommitCurrent(token).catch((e) => {
+          console.warn('[gtmux] close commit (layout) failed:', e);
+        });
+      }
+      // 2) Fire CTRL kill-pane — backend kills PTY + child shell,
+      //    broadcasts pane-died NOTIFY → dispatcher updates muxStore.
+      const { response } = sendCtrl(client, 'kill-pane', [String(paneNumeric)], {
+        timeoutMs: 5_000,
+      });
+      const r = await response;
+      if (!r.ok) {
+        toastStore.show({
+          message: `kill-pane failed: ${r.code ?? '?'} ${r.error ?? ''}`,
+          tone: 'error',
+        });
+      }
+    } catch (e) {
+      toastStore.show({
+        message: `Close failed: ${(e as Error).message ?? e}`,
+        tone: 'error',
+      });
+    } finally {
+      closing = false;
+    }
+  }
 </script>
 
 {#if isVisible}
@@ -121,16 +197,32 @@
     />
     <header class="panel-header" aria-label={`Drag handle for ${headerLabel}`}>
       <span class="panel-label">{headerLabel}</span>
-      <span class="panel-badges">
-        {#if isLocked}
-          <span class="badge badge-lock" aria-label="Locked">L</span>
-        {/if}
-        {#if data.minimized === true}
-          <span class="badge badge-min" aria-label="Minimized">M</span>
-        {/if}
-        {#if isInI}
-          <span class="badge badge-input" aria-label="Input target">I</span>
-        {/if}
+      <span class="panel-actions">
+        <span class="panel-badges">
+          {#if isLocked}
+            <span class="badge badge-lock" aria-label="Locked">L</span>
+          {/if}
+          {#if data.minimized === true}
+            <span class="badge badge-min" aria-label="Minimized">M</span>
+          {/if}
+          {#if isInI}
+            <span class="badge badge-input" aria-label="Input target">I</span>
+          {/if}
+        </span>
+        <button
+          type="button"
+          class="panel-close"
+          aria-label={closeTooltip}
+          title={closeTooltip}
+          disabled={closeDisabled || closing}
+          onclick={onClose}
+          onmousedown={(e: MouseEvent) => e.stopPropagation()}
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
       </span>
     </header>
     <div class="panel-body">
@@ -208,9 +300,44 @@
     font-weight: var(--weight-medium);
   }
 
+  .panel-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-4);
+  }
+
   .panel-badges {
     display: inline-flex;
     gap: var(--space-4);
+  }
+
+  /* Close button — 16×16 ghost. disabled 시 opacity 낮춤 + cursor 변경. */
+  .panel-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    border: 0;
+    color: var(--color-fg-muted);
+    cursor: pointer;
+    padding: 0;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing),
+      opacity var(--motion-fast) var(--motion-easing);
+  }
+
+  .panel-close:hover:not(:disabled) {
+    background: var(--color-danger);
+    color: white;
+  }
+
+  .panel-close:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
   }
 
   .badge {

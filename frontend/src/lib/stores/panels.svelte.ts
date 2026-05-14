@@ -35,6 +35,20 @@ class PanelsStore {
     if (!current) return;
     this.panels.set(id, { ...current, x, y, w, h });
   }
+
+  /**
+   * Remove a Panel from the canvas (Stage G — close button).
+   *
+   * The backend Pane (child process) is killed separately via
+   * `CTRL kill-pane`; this method drops the *visual* Panel from layout.
+   * Caller is responsible for following up with `putLayoutCommitCurrent`
+   * so the layout PUT propagates to disk + LAYOUT_CHANGED broadcast.
+   *
+   * Idempotent — calling on an unknown id is a no-op.
+   */
+  removePanel(id: string): void {
+    this.panels.delete(id);
+  }
 }
 
 export const panelsStore = new PanelsStore();
