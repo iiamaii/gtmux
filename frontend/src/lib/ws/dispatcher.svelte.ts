@@ -222,93 +222,38 @@ function handleNotifyMirror(payload: Uint8Array): void {
     return;
   }
   const kind = typeof decoded.body['kind'] === 'string' ? (decoded.body['kind'] as string) : '';
-  // SSoT §2.3 kind 매핑.
+  // Stage-B NOTIFY_MIRROR kinds (ADR-0013 D10 / 0026 §2.5). All
+  // tmux-era kinds (window-add / window-renamed / window-close /
+  // session-changed / layout-change / pane-mode-changed /
+  // subscription-changed / slow-pane) are permanently retired —
+  // the backend never emits them.
   switch (kind) {
+    case 'pane-spawned':
+      // Idempotent — addPane is also called from PANE_OUT first-sight
+      // for the catch-up race. Carry the optional `request_id` to
+      // ctrl-registry if it correlates with a pending request: a
+      // missing request_id is the (more common) broadcast case where
+      // the NOTIFY simply tells every WS subscriber a new pane exists.
+      muxStore.addPane(decoded.paneId);
+      return;
     case 'pane-died':
       // D21 c4 — panel header 의 zombie badge 와 직결.
+      muxStore.killPane(decoded.paneId);
       addZombie(decoded.paneId);
       return;
-    case 'slow-pane':
-      // ADR-0001 D10 — `%pause` 미러 → panel header "느림" 배지.
-      connectionStore.markSlow(decoded.paneId);
+    case 'layout-changed':
+      // The 0x80 LAYOUT_CHANGED envelope is the primary signal —
+      // the NOTIFY_MIRROR carries no additional data. Debug only.
+      console.debug('[ws] NOTIFY layout-changed (0x80 will follow)');
       return;
-    case 'window-add':
-      routeWindowAdd(decoded.body);
-      return;
-    case 'window-renamed':
-      routeWindowRenamed(decoded.body);
-      return;
-    case 'window-close':
-      routeWindowClose(decoded.body);
-      return;
-    case 'session-changed':
-      routeSessionChanged(decoded.body);
-      return;
-    case 'layout-change':
-      routeLayoutChange(decoded.body);
-      return;
-    case 'pane-mode-changed':
-      routePaneModeChanged(decoded.paneId, decoded.body);
-      return;
-    case 'subscription-changed':
-      // SSoT §2.3 — `{name, value}` 형식. mux store 에 currently 저장 슬롯 없음
-      // (백엔드가 subscription 자체를 관리하므로 미러 필요성 미정 — P1+ 평가).
-      console.debug('[gtmux] subscription-changed pane=%d', decoded.paneId);
+    case 'server-ready':
+      // Reserved for boot-complete UX surfacing. No-op for now.
+      console.debug('[ws] NOTIFY server-ready');
       return;
     default:
-      // 미정의 kind 는 SSoT §2.3 forward-compat 에 따라 조용히 무시.
+      // Forward-compat — silently ignore future kinds.
       return;
   }
-}
-
-// ── NOTIFY_MIRROR kind routing helpers ─────────────────────────────────────
-//
-// 각 helper 는 SSoT §2.3 의 추가 JSON 필드를 읽어 mux store 메서드로 위임한다.
-// JSON 필드 누락은 *해당 frame drop* (forward-compat) — 빈 문자열 fallback 도 가능
-// 하지만 store 진실을 noise 로 덮어쓰지 않도록 명시적으로 검증.
-
-function routeWindowAdd(body: Readonly<Record<string, unknown>>): void {
-  const windowId = pickString(body, 'window_id');
-  if (windowId === null) return;
-  const name = pickString(body, 'name') ?? '';
-  muxStore.addWindow(windowId, name);
-}
-
-function routeWindowRenamed(body: Readonly<Record<string, unknown>>): void {
-  const windowId = pickString(body, 'window_id');
-  if (windowId === null) return;
-  const name = pickString(body, 'name') ?? '';
-  muxStore.renameWindow(windowId, name);
-}
-
-function routeWindowClose(body: Readonly<Record<string, unknown>>): void {
-  const windowId = pickString(body, 'window_id');
-  if (windowId === null) return;
-  muxStore.closeWindow(windowId);
-}
-
-function routeSessionChanged(body: Readonly<Record<string, unknown>>): void {
-  const sessionId = pickString(body, 'session_id');
-  if (sessionId === null) return;
-  const name = pickString(body, 'name') ?? '';
-  muxStore.setSession(sessionId, name);
-}
-
-function routeLayoutChange(body: Readonly<Record<string, unknown>>): void {
-  const windowId = pickString(body, 'window_id');
-  if (windowId === null) return;
-  const layout = pickString(body, 'layout') ?? '';
-  muxStore.setLayout(windowId, layout);
-}
-
-function routePaneModeChanged(paneId: number, body: Readonly<Record<string, unknown>>): void {
-  const mode = pickString(body, 'mode') ?? '';
-  muxStore.setPaneMode(paneId, mode);
-}
-
-function pickString(body: Readonly<Record<string, unknown>>, key: string): string | null {
-  const v = body[key];
-  return typeof v === 'string' ? v : null;
 }
 
 // ── 0x01 CTRL response 처리 ────────────────────────────────────────────────

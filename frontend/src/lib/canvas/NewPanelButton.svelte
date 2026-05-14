@@ -1,26 +1,27 @@
 <script lang="ts">
-  // "New Panel" button — Sprint 5-B (S5-FE-NEW-PANEL).
+  // "New Panel" button — Stage-B PTY-direct wire (S7-WS-PAYLOAD-SIMPLIFY).
   //
-  // 흐름 (task spec):
-  //   1. 클릭 → WsClient 로 0x01 CTRL `{cmd: "new-window", args: ["-t", session, "-P",
-  //      "-F", "#{pane_id}"]}` 발사. UUID-v4 id 등록 (ctrl-registry).
-  //   2. backend 가 success ack 를 보낼 때 까지: 본 sprint 의 backend 는 success
-  //      encoder 가 미완 → fallback 으로 mux store 의 `panes` 에 *click 이후 새로
-  //      추가된 첫 pane* 을 captured pane 으로 본다 ($effect 로 SvelteMap 변화 감시).
+  // 흐름:
+  //   1. 클릭 → WsClient 로 0x01 CTRL `{cmd: "new-pane", args: []}` 발사.
+  //      UUID-v4 id 가 NOTIFY_MIRROR `pane-spawned.request_id` 로 echo 되어
+  //      매칭. ADR-0013 D10 / 0026 §2.5 정합.
+  //   2. backend (PtyBackend) 가 PaneId 발급 + `pane-spawned` NOTIFY broadcast.
+  //      Pane 의 첫 출력 (shell prompt) 은 0x02 PANE_OUT 으로 즉시 도착 →
+  //      dispatcher 의 `addPane` first-sight 가 mux store 를 갱신.
   //   3. captured pane_id 로 `putLayoutAppendPanel` — 좌표는 viewport center.
   //   4. 412 시 1회 자동 rebase (putLayoutAppendPanel 내부 처리). 그 이상은 사용자 알림.
   //
   // 정본:
-  // - `docs/ssot/wire-protocol.md` §2.4 (CTRL 요청 shape)
-  // - `docs/adr/0008-single-pane-window-and-group.md` D1 (new-window = pane 생성)
+  // - `docs/adr/0013-pty-direct-no-tmux.md` D10 (BackendCommand allowlist)
+  // - `docs/reports/0026-stage-b-carry-forward.md` §2.5 (envelope mapping)
   // - `docs/ssot/canvas-layout-schema.md` §1 Panel (id pattern `^p[0-9a-zA-Z]{1,32}$`)
   //
   // 의도적 단순화:
   // - viewport center 는 `ephemeralStore.viewport` + container DOM 크기로 계산.
   //   useSvelteFlow 는 SvelteFlow 컴포넌트 내부 컨텍스트 필요 — 본 컴포넌트는
   //   *outside SvelteFlow* 에서 동작하므로 store-derived 좌표만 사용.
-  // - pending action 의 timeout 은 ctrl-registry 가 5s 로 관리. mux fallback
-  //   매칭은 별도 watcher 가 동일 5s 안에 깨어나기를 기대한다.
+  // - pending action 의 timeout 은 ctrl-registry 가 5s 로 관리. PANE_OUT
+  //   first-sight watcher 가 동일 5s 안에 깨어나기를 기대한다.
 
   import { getContext } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
@@ -133,29 +134,20 @@
       errorMessage = 'No auth token';
       return;
     }
-    const sessionName = muxStore.session?.name;
-    if (!sessionName) {
-      // session 정보가 아직 도착하지 않은 시점에 New Panel 을 누른 경우.
-      // backend 는 session-changed 를 boot 직후 broadcast 한다 — 안내만.
-      errorMessage = 'tmux session not ready yet';
-      return;
-    }
     inFlight = true;
     errorMessage = null;
     try {
-      // 1) snapshot 현재 mux pane set — fallback 매칭의 기준점.
+      // 1) snapshot 현재 mux pane set — PANE_OUT first-sight 매칭의 기준점.
       const baseline = new Set<number>(muxStore.panes.keys());
 
-      // 2) CTRL 요청. tmux 의 control-mode stdin 파서는 `#` 를 comment
-      //    시작으로 처리해 `-F #{pane_id}` 가 `-F` 단독으로 잘려 parse error 가
-      //    난다. backend 가 안전한 quoting 을 적용하기 전까지는 -P/-F 를 떼고
-      //    응답 매칭은 PANE_OUT first-sight (waitForNewPane) 한 경로로만
-      //    돌린다. CTRL ack 에 result.pane_id 가 실리는 시점에서 다시 -F 를
-      //    켜는 것이 정공법.
+      // 2) CTRL `new-pane` 요청. Stage B 의 BackendCommand allowlist 에 대응
+      //    (ADR-0013 D10). args 는 비워두면 PtyBackend 가 $SHELL 기본값을
+      //    spawn — gtmux Server 는 Session 1:1 binding 이므로 session-name
+      //    인자는 더 이상 필요하지 않다 (Server 자체가 session).
       const { response } = sendCtrl(
         client,
-        'new-window',
-        ['-t', sessionName],
+        'new-pane',
+        [],
         { timeoutMs: 5_000 },
       );
 

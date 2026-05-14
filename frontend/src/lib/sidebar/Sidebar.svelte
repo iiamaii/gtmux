@@ -120,18 +120,13 @@
     return Number.isNaN(n) ? null : n;
   }
 
-  // Panel 행 표시 라벨 우선순위:
+  // Panel 행 표시 라벨 우선순위 (Stage B 이후 — tmux window 어휘 폐기):
   //   1) Panel.label (사용자 지정)
-  //   2) muxStore.panes.get(N).window_id (e.g. "@0" — 소속 window)
-  //   3) "%${paneNum}" — pane id fallback
+  //   2) "%${paneNum}" — pane id fallback
   function panelDisplayLabel(p: PanelData): string {
     if (p.label != null && p.label.length > 0) return p.label;
     const n = paneNumeric(p.pane_id);
-    if (n !== null) {
-      const m = muxStore.panes.get(n);
-      if (m && m.window_id != null && m.window_id.length > 0) return m.window_id;
-      return `%${n}`;
-    }
+    if (n !== null) return `%${n}`;
     return p.id;
   }
 
