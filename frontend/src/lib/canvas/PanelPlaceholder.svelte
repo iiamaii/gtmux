@@ -39,18 +39,18 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 6px;
-    background: #0a0f1c;
-    color: #94a3b8;
+    gap: var(--space-6);
+    background: var(--color-bg);
+    color: var(--color-fg-muted);
     box-sizing: border-box;
-    padding: 8px;
+    padding: var(--space-8);
     overflow: hidden;
   }
 
   .placeholder-label {
-    font-size: 14px;
-    font-weight: 500;
-    color: #e5e7eb;
+    font-size: var(--text-lg);
+    font-weight: var(--weight-medium);
+    color: var(--color-fg);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -58,8 +58,8 @@
   }
 
   .placeholder-hint {
-    font-size: 11px;
-    color: #64748b;
+    font-size: var(--text-base);
+    color: var(--color-fg-subtle);
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }

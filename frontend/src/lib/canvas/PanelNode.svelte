@@ -136,24 +136,24 @@
   .panel {
     display: flex;
     flex-direction: column;
-    background: #0f172a;
-    color: #e5e7eb;
-    border: 1px solid #1f2937;
-    border-radius: 6px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+    background: var(--color-surface);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
     overflow: hidden;
     box-sizing: border-box;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    font-size: 13px;
+    font-family: var(--font-mono);
+    font-size: var(--text-lg);
   }
 
   .panel.m-active {
-    outline: 2px solid #3b82f6;
-    outline-offset: -2px;
+    outline: 1.5px solid var(--color-accent);
+    outline-offset: 0;
   }
 
   .panel.i-active {
-    border-color: #22c55e;
+    border-color: var(--color-success);
   }
 
   .panel.locked .panel-header {
@@ -164,10 +164,10 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 4px 8px;
+    padding: var(--space-4) var(--space-8);
     height: 24px;
-    background: #1e293b;
-    border-bottom: 1px solid #334155;
+    background: var(--color-surface-2);
+    border-bottom: 1px solid var(--color-border);
     cursor: grab;
     user-select: none;
     flex: 0 0 auto;
@@ -177,42 +177,45 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 12px;
+    font-size: var(--text-md);
   }
 
   .panel-badges {
     display: inline-flex;
-    gap: 4px;
+    gap: var(--space-4);
   }
 
   .badge {
     display: inline-block;
     min-width: 16px;
-    padding: 0 4px;
-    border-radius: 3px;
+    padding: 0 var(--space-4);
+    border-radius: var(--radius-sm);
     text-align: center;
-    font-size: 10px;
+    font-size: var(--text-sm);
     line-height: 16px;
-    background: #334155;
+    background: var(--color-glass-2);
+    color: var(--color-fg-muted);
   }
 
   .badge-lock {
-    background: #6b7280;
+    background: var(--color-fg-subtle);
+    color: var(--color-bg);
   }
 
   .badge-min {
-    background: #ca8a04;
+    background: var(--color-warning);
+    color: var(--color-bg);
   }
 
   .badge-input {
-    background: #22c55e;
-    color: #052e16;
+    background: var(--color-success);
+    color: var(--color-bg);
   }
 
   .panel-body {
     flex: 1 1 auto;
     min-height: 0;
     position: relative;
-    background: #0a0f1c;
+    background: var(--color-bg);
   }
 </style>

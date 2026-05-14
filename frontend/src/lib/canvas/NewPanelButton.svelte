@@ -236,20 +236,21 @@
 <style>
   .new-panel-btn {
     display: inline-block;
-    padding: 4px 10px;
-    background: #1e293b;
-    color: #e5e7eb;
-    border: 1px solid #334155;
-    border-radius: 4px;
+    padding: var(--space-4) var(--space-10);
+    background: var(--color-surface);
+    color: var(--color-fg);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
     font-family: inherit;
-    font-size: 12px;
+    font-size: var(--text-md);
     cursor: pointer;
     line-height: 1.4;
+    box-shadow: var(--shadow-sm);
+    transition: background var(--motion-fast) var(--motion-easing);
   }
 
   .new-panel-btn:hover:not(:disabled) {
-    background: #334155;
-    border-color: #475569;
+    background: var(--color-glass-1);
   }
 
   .new-panel-btn:disabled {
@@ -258,9 +259,9 @@
   }
 
   .new-panel-error {
-    margin-left: 8px;
-    color: #f87171;
-    font-size: 11px;
+    margin-left: var(--space-8);
+    color: var(--color-danger);
+    font-size: var(--text-base);
     line-height: 1.4;
   }
 </style>

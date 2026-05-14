@@ -126,22 +126,8 @@
 </div>
 
 <style>
-  :global(html),
-  :global(body) {
-    margin: 0;
-    padding: 0;
-    height: 100%;
-    background: #020617;
-    color: #e5e7eb;
-    font-family:
-      ui-sans-serif,
-      system-ui,
-      -apple-system,
-      'Segoe UI',
-      Roboto,
-      sans-serif;
-  }
-
+  /* html/body/font 는 styles/global.css 가 token 기반으로 단일 정본.
+   * 본 파일은 layout-level 그리드만 담당. */
   :global(#app) {
     height: 100%;
   }

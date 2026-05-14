@@ -246,41 +246,43 @@
 </aside>
 
 <style>
-  /* Width 280px fixed (P0). resize handle 은 P1+.
-     Background 는 canvas (#020617, +page.svelte body) 보다 한 단계 밝은 톤 — 두 영역 분리 인식. */
+  /* Width 248px fixed (plan 0005 Stage E — floating panel ready, currently
+   * still docked. Background uses --color-surface so it sits one step
+   * brighter than the canvas (--color-bg). */
   .sidebar {
-    flex: 0 0 280px;
-    width: 280px;
-    min-width: 280px;
+    flex: 0 0 var(--layout-sidebar-w);
+    width: var(--layout-sidebar-w);
+    min-width: var(--layout-sidebar-w);
     height: 100%;
     box-sizing: border-box;
     overflow: auto;
-    background: #0b1220;
-    color: #e5e7eb;
-    border-right: 1px solid #1f2937;
-    font-size: 13px;
-    line-height: 1.4;
+    background: var(--color-surface);
+    color: var(--color-fg);
+    border-right: 1px solid var(--color-border);
+    font-size: var(--text-lg);
+    line-height: var(--leading-normal);
     user-select: none;
   }
 
   .sidebar-header {
     position: sticky;
     top: 0;
-    padding: 8px 12px;
-    background: #0b1220;
-    border-bottom: 1px solid #1f2937;
-    font-weight: 600;
-    letter-spacing: 0.04em;
+    padding: var(--space-8) var(--space-12);
+    background: var(--color-surface);
+    border-bottom: 1px solid var(--color-border);
+    font-family: var(--font-mono);
+    font-weight: var(--weight-regular);
+    letter-spacing: 0.6px;
     text-transform: uppercase;
-    font-size: 11px;
-    color: #94a3b8;
+    font-size: var(--text-base);
+    color: var(--color-fg-muted);
     z-index: 1;
   }
 
   .tree {
     list-style: none;
     margin: 0;
-    padding: 4px 0;
+    padding: var(--space-4) 0;
   }
 
   .row {
@@ -297,9 +299,9 @@
   .row-button {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-4);
     flex: 1 1 auto;
-    padding: 2px 8px 2px 0;
+    padding: var(--space-2) var(--space-8) var(--space-2) 0;
     background: transparent;
     border: 0;
     color: inherit;
@@ -309,15 +311,16 @@
   }
 
   .row-button:hover {
-    background: #111827;
+    background: var(--color-glass-1);
   }
 
   .row.selected .row-button {
-    background: #1e293b;
+    background: var(--color-glass-2);
+    color: var(--color-accent);
   }
 
   .row.dead .row-button .label {
-    color: #6b7280;
+    color: var(--color-fg-subtle);
     text-decoration: line-through;
   }
 
@@ -330,7 +333,7 @@
     flex: 0 0 16px;
     display: inline-block;
     text-align: center;
-    color: #94a3b8;
+    color: var(--color-fg-muted);
     cursor: pointer;
     user-select: none;
   }
@@ -351,9 +354,9 @@
     flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    font-size: 11px;
-    color: #94a3b8;
+    gap: var(--space-4);
+    font-size: var(--text-base);
+    color: var(--color-fg-muted);
   }
 
   .icon {
@@ -363,8 +366,8 @@
   }
 
   .empty {
-    padding: 8px 12px;
-    color: #6b7280;
+    padding: var(--space-8) var(--space-12);
+    color: var(--color-fg-subtle);
     font-style: italic;
   }
 </style>
