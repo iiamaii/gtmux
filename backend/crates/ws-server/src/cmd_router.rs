@@ -12,6 +12,7 @@
 //! - `"new-pane"`        → [`BackendCommand::NewPane`]    (request_id = `id`)
 //! - `"kill-pane"`       → [`BackendCommand::KillPane`]   (args = `[pane_id]`)
 //! - `"resize-pane"`     → [`BackendCommand::ResizePane`] (args = `[pane_id, rows, cols]`)
+//! - `"kill-session"`    → [`BackendCommand::KillSession`] (no args)
 //!
 //! Any other `cmd` produces an `ERR_NOT_ALLOWED` reply (compile-time
 //! enforced — a future variant of [`BackendCommand`] would need a new
@@ -28,6 +29,10 @@ pub enum CtrlOutcome {
     /// `PaneId` will be surfaced via a `PaneSpawned` NOTIFY broadcast —
     /// no immediate envelope reply is generated here.
     Ok,
+    /// `KillSession` accepted. WS handler should encode the CTRL `ok`
+    /// reply *and then* raise SIGTERM on itself so axum's graceful
+    /// shutdown future fires (ADR-0014 D7).
+    OkAndExit,
     /// Command rejected — not in the allowlist. WS handler responds with
     /// `ERR_NOT_ALLOWED` keeping the connection alive.
     NotAllowed,
@@ -101,6 +106,15 @@ pub fn dispatch_ctrl(
                 Err(e) => CtrlOutcome::BackendError(e),
             }
         }
+        "kill-session" => {
+            // No args, no validation surface. `KillSession` dispatch is a
+            // no-op at backend level; the OkAndExit signal tells the WS
+            // handler to ack + self-SIGTERM (ADR-0013 D10 amend).
+            match backend.dispatch(BackendCommand::KillSession) {
+                Ok(_) => CtrlOutcome::OkAndExit,
+                Err(e) => CtrlOutcome::BackendError(e),
+            }
+        }
         _ => CtrlOutcome::NotAllowed,
     }
 }
@@ -110,11 +124,15 @@ pub fn dispatch_ctrl(
 /// calling [`dispatch_ctrl`] so the trace logs are explicit about why a
 /// command was refused).
 pub fn is_allowed_ctrl_cmd(cmd: &str) -> bool {
-    matches!(cmd, "new-pane" | "kill-pane" | "resize-pane")
+    matches!(
+        cmd,
+        "new-pane" | "kill-pane" | "resize-pane" | "kill-session"
+    )
 }
 
 /// The full allowlist as a `&[&str]` for tests + future help-text printing.
-pub const ALLOWLISTED_CTRL_CMDS: &[&str] = &["new-pane", "kill-pane", "resize-pane"];
+pub const ALLOWLISTED_CTRL_CMDS: &[&str] =
+    &["new-pane", "kill-pane", "resize-pane", "kill-session"];
 
 /// Parse an argv element into a [`PaneId`]. The frontend serialises pane
 /// ids as decimal strings (e.g. `"5"`); accept that single shape.

@@ -17,9 +17,10 @@
 
   import { setContext, onDestroy, onMount } from 'svelte';
   import Canvas from '$lib/canvas/Canvas.svelte';
-  import Toolbar from '$lib/toolbar/Toolbar.svelte';
+  import Titlebar from '$lib/chrome/Titlebar.svelte';
   import Sidebar from '$lib/sidebar/Sidebar.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
+  import Toast from '$lib/ui/Toast.svelte';
   import { createDispatcher, setLayoutRefetchHandler } from '$lib/ws/dispatcher.svelte';
   import { createLayoutRefetchHandler, fetchLayoutAndHydrate } from '$lib/http/layout';
   import { layoutStore } from '$lib/stores/layout.svelte';
@@ -116,7 +117,7 @@
 
 <div class="app">
   <ReconnectBanner />
-  <Toolbar />
+  <Titlebar />
   <div class="workspace">
     <Sidebar />
     <main class="canvas-pane">
@@ -124,6 +125,7 @@
     </main>
   </div>
 </div>
+<Toast />
 
 <style>
   /* html/body/font 는 styles/global.css 가 token 기반으로 단일 정본.
@@ -153,5 +155,22 @@
     min-width: 0;
     min-height: 0;
     position: relative;
+  }
+
+  /* Responsive breakpoints — narrow viewports collapse the sidebar so
+   * canvas keeps usable real-estate. Real collapsible rail (Stage E)
+   * supersedes this with a user-controlled toggle. */
+  @media (max-width: 800px) {
+    .workspace :global(.sidebar) {
+      width: 180px;
+      flex: 0 0 180px;
+      min-width: 180px;
+    }
+  }
+
+  @media (max-width: 600px) {
+    .workspace :global(.sidebar) {
+      display: none;
+    }
   }
 </style>

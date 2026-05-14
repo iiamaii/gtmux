@@ -21,6 +21,8 @@ tower-http = { workspace = true }
 gtmux-pty-backend = { path = "../pty-backend" }
 gtmux-auth = { path = "../auth" }
 gtmux-config = { path = "../config" }
+# libc::raise for kill-session graceful self-SIGTERM (ADR-0013 D10 amend).
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }

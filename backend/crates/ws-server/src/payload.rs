@@ -142,6 +142,22 @@ pub fn encode_ctrl_error(id: Option<&str>, code: &str, message: &str) -> Vec<u8>
     out
 }
 
+/// Build a `0x01 CTRL` success response inner payload. Used by
+/// `kill-session` (ADR-0013 D10 amend) — the WS handler acks before
+/// raising SIGTERM so the client sees the success frame before the
+/// connection drops.
+pub fn encode_ctrl_success(id: Option<&str>) -> Vec<u8> {
+    let json = json!({
+        "id": id.unwrap_or(""),
+        "ok": true,
+    });
+    let body = json.to_string();
+    let mut out = Vec::with_capacity(1 + body.len());
+    varint::encode_into(0, &mut out);
+    out.extend_from_slice(body.as_bytes());
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

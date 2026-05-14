@@ -55,9 +55,25 @@
     const attempt = connectionStore.attempt;
     switch (code) {
       case 1000:
-        // 정상 종료 — banner 미표시. close 직후 setState('closed')는 grace에 가려지고
-        // 1s 후엔 의도적 종료이므로 사용자 노출 무의미.
-        return null;
+        // 정상 종료. 두 시나리오:
+        //   1) `wsClient.stop()` 호출 (페이지 unmount) — 사용자 노출 무의미
+        //   2) backend graceful_shutdown (Session shutdown 액션의 결과)
+        //      — 사용자에게 "ended" 알림 + 재진입 안내 표시 (ADR-0017 §D3
+        //      step 6). 두 시나리오를 구분할 connection-level 정보가 없으므로
+        //      *항상 표시* 하되 reason 으로 분기 — 정상 종료 사유는 보통
+        //      비어 있거나 "client-stop". backend 가 보낸 1000 은 reason 빈
+        //      문자열로 도착하므로 그쪽만 banner.
+        if (
+          connectionStore.closeReason &&
+          connectionStore.closeReason.length > 0 &&
+          connectionStore.closeReason.startsWith('client-stop')
+        ) {
+          return null;
+        }
+        return {
+          tone: 'warn',
+          text: 'Session ended. Re-run `gtmux start --session <name>` to reconnect.',
+        };
       case 1008:
         return {
           tone: 'error',
@@ -120,10 +136,10 @@
     position: sticky;
     top: 0;
     z-index: var(--z-banner);
-    padding: var(--space-2) var(--space-4);
+    padding: var(--space-8) var(--space-16);
     display: flex;
     align-items: center;
-    gap: var(--space-3);
+    gap: var(--space-12);
     background: var(--banner-warn-bg);
     color: var(--banner-warn-fg);
     border-bottom: 1px solid var(--banner-warn-border);
@@ -156,7 +172,7 @@
 
   .zombie-badge {
     margin-left: auto;
-    padding: 2px var(--space-2);
+    padding: 2px var(--space-8);
     border-radius: 12px;
     background: var(--zombie-bg);
     color: var(--zombie-fg);

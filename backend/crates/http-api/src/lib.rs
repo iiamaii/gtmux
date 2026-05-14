@@ -515,7 +515,7 @@ async fn bootstrap_handler(
     // hop that mirrors the token into sessionStorage and then replaces the
     // URL with the redirect target. The cookie still rides along for
     // tower-http ServeDir requests that some user flows depend on.
-    let body = render_bootstrap_landing(&presented, &target);
+    let body = render_bootstrap_landing(&presented, &target, &state.config.server.session);
 
     let mut resp = Response::builder()
         .status(StatusCode::OK)
@@ -541,13 +541,14 @@ async fn bootstrap_handler(
 /// JSON-encoded so any character set (including future formats) ends up
 /// in a safe JavaScript string literal; `</` is rewritten as `<\/` so a
 /// pathological target cannot terminate the inline `<script>` early.
-fn render_bootstrap_landing(token: &str, target: &str) -> String {
+fn render_bootstrap_landing(token: &str, target: &str, session: &str) -> String {
     fn js_literal(value: &str) -> String {
         let json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
         json.replace("</", "<\\/")
     }
     let token_js = js_literal(token);
     let target_js = js_literal(target);
+    let session_js = js_literal(session);
     format!(
         r#"<!doctype html>
 <meta charset="utf-8">
@@ -555,6 +556,7 @@ fn render_bootstrap_landing(token: &str, target: &str) -> String {
 <script>
 (function () {{
   try {{ sessionStorage.setItem('gtmux_token', {token_js}); }} catch (e) {{}}
+  try {{ sessionStorage.setItem('gtmux_session', {session_js}); }} catch (e) {{}}
   window.location.replace({target_js});
 }})();
 </script>
@@ -1312,7 +1314,7 @@ mod tests {
         // Direct unit-level pin on `render_bootstrap_landing` — exercising
         // the renderer with values that *would* close `<script>` early if
         // we ever stopped rewriting `</` to `<\/` inside JS string literals.
-        let body = render_bootstrap_landing("abc-token", "/path</script><b>oops");
+        let body = render_bootstrap_landing("abc-token", "/path</script><b>oops", "smoke");
         assert!(
             !body.contains("</script><b>oops"),
             "raw </script> leaked into HTML: {body}"

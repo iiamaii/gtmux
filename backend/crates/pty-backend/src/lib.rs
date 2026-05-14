@@ -206,6 +206,12 @@ pub enum BackendCommand {
     KillPane { id: PaneId },
     /// Resize an existing Pane (`TIOCSWINSZ` → SIGWINCH).
     ResizePane { id: PaneId, rows: u16, cols: u16 },
+    /// Graceful Server shutdown (ADR-0013 D10 amend, 2026-05-15).
+    /// Backend acknowledges (CTRL `ok`) and then raises SIGTERM on itself
+    /// so axum's `with_graceful_shutdown` future fires — Drop of the
+    /// `PtyBackend` then reaps every child shell (ADR-0014 D5/D7). The
+    /// command carries no payload; intent is unambiguous (Server quits).
+    KillSession,
 }
 
 fn default_rows() -> u16 {
@@ -539,6 +545,13 @@ impl PtyBackend {
                 self.resize(id, rows, cols)?;
                 Ok(None)
             }
+            BackendCommand::KillSession => {
+                // No-op at the backend layer — the WS router owns the SIGTERM
+                // self-raise after acking the CTRL. Backend dropping happens
+                // naturally via axum graceful_shutdown → main() drops the
+                // PtyBackend (ADR-0014 D7).
+                Ok(None)
+            }
         }
     }
 
@@ -735,7 +748,7 @@ fn spawn_inner(
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
         let Some(k) = k.to_str() else { continue };
-        if NOISY_ENV_KEYS.iter().any(|nk| *nk == k) {
+        if NOISY_ENV_KEYS.contains(&k) {
             continue;
         }
         cmd.env(k, v);

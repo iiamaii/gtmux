@@ -21,7 +21,10 @@
 //!   a [`gtmux_pty_backend::BackendNotify`] broadcast for lifecycle
 //!   events, and a 16-byte ETag broadcast for layout changes.
 
-#![forbid(unsafe_code)]
+// `deny(unsafe_code)` (not `forbid`) so the single `libc::raise(SIGTERM)`
+// in the kill-session handler can locally `allow` — ADR-0013 D10 amend
+// (2026-05-15). All other modules in this crate stay unsafe-free.
+#![deny(unsafe_code)]
 #![deny(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
@@ -702,6 +705,23 @@ async fn handle_client_envelope(
             }
             match dispatch_ctrl(backend, ctrl.id.clone(), &ctrl.cmd, &ctrl.args) {
                 CtrlOutcome::Ok => {}
+                CtrlOutcome::OkAndExit => {
+                    // Acknowledge the kill-session request, then raise SIGTERM
+                    // on ourselves so axum::serve's graceful_shutdown future
+                    // fires and main() drops the PtyBackend (ADR-0014 D7).
+                    let body = payload::encode_ctrl_success(ctrl.id.as_deref());
+                    let ack = Envelope::new(FrameType::Ctrl, Bytes::from(body));
+                    if let Ok(buf) = ack.encode() {
+                        let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                    }
+                    // SAFETY: libc::raise with a constant signal number is
+                    // sound. Process self-signal is the canonical way to
+                    // trigger graceful shutdown matching external SIGTERM.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        libc::raise(libc::SIGTERM);
+                    }
+                }
                 CtrlOutcome::NotAllowed => {
                     let body = payload::encode_ctrl_error(
                         ctrl.id.as_deref(),

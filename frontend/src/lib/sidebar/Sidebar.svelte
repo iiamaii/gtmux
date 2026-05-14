@@ -199,11 +199,37 @@
             >
               <span class="label">{groupDisplayLabel(g)}</span>
               <span class="icons">
-                <span class="icon" title="Visibility" aria-label="Visibility">
-                  {g.visibility === false ? '\u{1F441}\u{200B}⊘' : '\u{1F441}'}
+                <span class="icon" class:on={g.visibility === false} title="Visibility" aria-label="Visibility">
+                  {#if g.visibility === false}
+                    <!-- EyeOff (lucide path) -->
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/>
+                      <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/>
+                      <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/>
+                      <line x1="2" y1="2" x2="22" y2="22"/>
+                    </svg>
+                  {:else}
+                    <!-- Eye -->
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/>
+                      <circle cx="12" cy="12" r="3"/>
+                    </svg>
+                  {/if}
                 </span>
-                <span class="icon" title="Locked" aria-label="Locked">
-                  {g.locked === true ? '\u{1F512}' : '\u{1F513}'}
+                <span class="icon" class:on={g.locked === true} title="Locked" aria-label="Locked">
+                  {#if g.locked === true}
+                    <!-- Lock -->
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="3" y="11" width="18" height="11" rx="2"/>
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                  {:else}
+                    <!-- Unlock -->
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="3" y="11" width="18" height="11" rx="2"/>
+                      <path d="M7 11V7a5 5 0 0 1 9.9-1"/>
+                    </svg>
+                  {/if}
                 </span>
               </span>
             </button>
@@ -229,11 +255,33 @@
           >
             <span class="label">{panelDisplayLabel(p)}{dead ? ' (Dead)' : ''}</span>
             <span class="icons">
-              <span class="icon" title="Visibility" aria-label="Visibility">
-                {p.visibility === false ? '\u{1F441}\u{200B}⊘' : '\u{1F441}'}
+              <span class="icon" class:on={p.visibility === false} title="Visibility" aria-label="Visibility">
+                {#if p.visibility === false}
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/>
+                    <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/>
+                    <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/>
+                    <line x1="2" y1="2" x2="22" y2="22"/>
+                  </svg>
+                {:else}
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/>
+                    <circle cx="12" cy="12" r="3"/>
+                  </svg>
+                {/if}
               </span>
-              <span class="icon" title="Locked" aria-label="Locked">
-                {p.locked === true ? '\u{1F512}' : '\u{1F513}'}
+              <span class="icon" class:on={p.locked === true} title="Locked" aria-label="Locked">
+                {#if p.locked === true}
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="3" y="11" width="18" height="11" rx="2"/>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                  </svg>
+                {:else}
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="3" y="11" width="18" height="11" rx="2"/>
+                    <path d="M7 11V7a5 5 0 0 1 9.9-1"/>
+                  </svg>
+                {/if}
               </span>
             </span>
           </button>
@@ -384,9 +432,26 @@
   }
 
   .icon {
-    display: inline-block;
-    width: 14px;
-    text-align: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: var(--radius-sm);
+    color: var(--color-fg-muted);
+    transition: background var(--motion-fast) var(--motion-easing);
+  }
+
+  .icon:hover {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
+  }
+
+  /* `.on` 상태 (visibility=false / locked=true) — 호버 없이 항상 표시 +
+   * 약간 강조. parent `.icons` 의 opacity 0 default 를 override. */
+  .icons :global(.icon.on) {
+    opacity: 1;
+    color: var(--color-fg);
   }
 
   .empty {
