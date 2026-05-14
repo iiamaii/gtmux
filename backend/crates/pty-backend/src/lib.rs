@@ -36,7 +36,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -60,9 +60,13 @@ use tracing::{debug, info, warn};
 /// ring buffer below). Higher values smooth bursts at the cost of RSS.
 pub const BROADCAST_CAPACITY: usize = 512;
 
-/// Per-pane ring buffer capacity in bytes. Matches the historical ADR-0001
-/// D7 / Grill D15 value so the UX (~last screen of scrollback at boot or
-/// reconnect) stays identical to the tmux era.
+/// Per-pane ring buffer capacity in bytes. Backend-side late-mount
+/// buffer (ADR-0013 D3 2026-05-14 amend): catches PTY output emitted
+/// *between Pane spawn and the next WS subscribe*. Distinct from the
+/// frontend dispatcher's 256 KiB late-mount buffer (0022 L-12), which
+/// guards the *Panel* race (PANE_OUT arriving before XtermHost's
+/// registerPaneOut). Both layers protect different race windows —
+/// see ADR-0013 D3 for the boundary.
 pub const RING_CAPACITY: usize = 128 * 1024;
 
 /// SIGTERM grace period before SIGKILL escalation (ADR-0014 D7 + O1).
@@ -109,18 +113,19 @@ impl std::fmt::Display for PaneId {
 
 #[derive(Debug, Error)]
 pub enum PtyBackendError {
+    /// Pane is not (or no longer) in the supervisor's map. Covers both
+    /// "never existed" and "child exited; auto-cleanup removed it"
+    /// (ADR-0013 R3 amend — wait thread self-removes on natural exit).
     #[error("pane {0} not found")]
     PaneNotFound(PaneId),
-    /// Pane died between command lookup and dispatch — the operation is
-    /// not retriable; caller should surface this to the user as a
-    /// pane-died notification.
-    #[error("pane {0} no longer alive")]
-    PaneGone(PaneId),
     #[error("spawn failed: {0}")]
     SpawnFailed(#[source] anyhow::Error),
     #[error("resize failed: {0}")]
     ResizeFailed(#[source] anyhow::Error),
-    /// Input mpsc channel was closed (writer thread exited).
+    /// Input mpsc channel was closed (writer thread exited). Visible
+    /// only inside the tiny race window between the writer thread
+    /// detecting a broken master fd and the wait thread's auto-cleanup
+    /// completing — practically the same as PaneNotFound.
     #[error("input channel closed for pane {0}")]
     ChannelClosed(PaneId),
 }
@@ -201,17 +206,6 @@ pub enum BackendCommand {
     KillPane { id: PaneId },
     /// Resize an existing Pane (`TIOCSWINSZ` → SIGWINCH).
     ResizePane { id: PaneId, rows: u16, cols: u16 },
-    /// Change the working directory of an existing Pane. Pending in
-    /// MVP — child shells own their cwd, this is reserved for future
-    /// `cd` automation against a freshly spawned pane.
-    SetCwd { id: PaneId, path: PathBuf },
-    /// Set an environment variable on a *future* spawn. Reserved for
-    /// the same automation surface as `SetCwd`.
-    SetEnv {
-        id: PaneId,
-        key: String,
-        value: String,
-    },
 }
 
 fn default_rows() -> u16 {
@@ -252,9 +246,13 @@ pub enum BackendNotify {
     /// Currently not used by [`PtyBackend`] itself — present so the
     /// frontend dispatcher table can be exhaustive.
     LayoutChanged,
-    /// Server bootstrap completed; mirror of the legacy
-    /// `daemon-started` notification. Reserved for the auto-mount path.
-    DaemonStarted,
+    /// Server bootstrap completed. The kebab wire name `server-ready`
+    /// aligns with ADR-0014 D1 (no daemon process — *gtmux Server itself*
+    /// is the owner). Supersedes the ADR-0013 D10 example `daemon-started`,
+    /// which leaked from pre-ADR-0014 vocabulary. Reserved for the
+    /// auto-mount bootstrap path (frontend wants a single "now you may
+    /// attach" signal after WS upgrade).
+    ServerReady,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -289,9 +287,14 @@ struct PaneHandle {
     stall_count: Arc<AtomicU64>,
     /// Background thread handles. Held so [`PaneHandle::drop`] can join
     /// them after closing the input channel + signalling the child.
+    ///
+    /// Note: the *wait thread* is intentionally detached (no JoinHandle
+    /// stored). On natural child exit it self-removes the pane from
+    /// the supervisor's `DashMap` (auto-cleanup, ADR-0013 R3 amend); a
+    /// stored join handle would deadlock when the wait thread itself
+    /// triggers the removal that calls `PaneHandle::drop`.
     reader_join: Option<JoinHandle<()>>,
     writer_join: Option<JoinHandle<()>>,
-    wait_join: Option<JoinHandle<()>>,
 }
 
 impl PaneHandle {
@@ -335,8 +338,10 @@ impl PaneHandle {
 impl Drop for PaneHandle {
     /// Cooperative teardown. Sends SIGTERM → waits the grace period →
     /// escalates to SIGKILL → reaps via `child.wait()` → joins the
-    /// background threads. Called by [`PtyBackend::kill`] and by
-    /// [`PtyBackend::drop`] for graceful server shutdown.
+    /// reader / writer threads. The wait thread is detached (see
+    /// struct docs) and converges on its own once the child reaps.
+    /// Called by [`PtyBackend::kill`] and by [`PtyBackend::drop`] for
+    /// graceful server shutdown.
     fn drop(&mut self) {
         // 1) Close the input channel *first* — the writer thread sees
         //    `recv()` return None and exits. Without this the
@@ -347,19 +352,10 @@ impl Drop for PaneHandle {
         // 2) SIGTERM, then grace, then SIGKILL.
         terminate_child(&self.child);
 
-        // 3) Reap. We do not synchronously block forever — the wait
-        //    thread already drives `child.wait()` and broadcasts
-        //    `pane-died` when the kernel reaps. Joining the wait thread
-        //    here is the synchronisation point.
-        if let Some(j) = self.wait_join.take() {
-            let _ = j.join();
-        }
+        // 3) Reap. The reader thread exits when the master fd EOFs
+        //    (after the child is reaped). The writer thread exits when
+        //    the mpsc sender is dropped (step 1 above).
         if let Some(j) = self.reader_join.take() {
-            // The reader thread exits when the master fd EOFs — which
-            // happens automatically once the child is reaped + we drop
-            // the master clone below. Join with a short timeout via
-            // try_join would be ideal; std::thread doesn't offer it,
-            // so we rely on the EOF being prompt after reap.
             let _ = j.join();
         }
         if let Some(j) = self.writer_join.take() {
@@ -483,7 +479,7 @@ impl PtyBackend {
     }
 
     /// Subscribe to backend-level notifications (spawned / died /
-    /// layout / daemon-started). Independent of any single Pane.
+    /// layout / server-ready). Independent of any single Pane.
     pub fn subscribe_notify(&self) -> broadcast::Receiver<BackendNotify> {
         self.inner.notify_tx.subscribe()
     }
@@ -541,23 +537,6 @@ impl PtyBackend {
             }
             BackendCommand::ResizePane { id, rows, cols } => {
                 self.resize(id, rows, cols)?;
-                Ok(None)
-            }
-            BackendCommand::SetCwd { id, path } => {
-                // Reserved for future automation against a freshly
-                // spawned shell. For now we simply verify the pane
-                // exists so the caller gets a useful error.
-                if !self.inner.panes.contains_key(&id) {
-                    return Err(PtyBackendError::PaneNotFound(id));
-                }
-                debug!(pane = %id, path = %path.display(), "set-cwd is a no-op in MVP");
-                Ok(None)
-            }
-            BackendCommand::SetEnv { id, key, value } => {
-                if !self.inner.panes.contains_key(&id) {
-                    return Err(PtyBackendError::PaneNotFound(id));
-                }
-                debug!(pane = %id, key = %key, value = %value, "set-env is a no-op in MVP");
                 Ok(None)
             }
         }
@@ -847,30 +826,42 @@ fn spawn_inner(
         })
         .map_err(|e| PtyBackendError::SpawnFailed(anyhow::anyhow!(e)))?;
 
-    // ─── child-wait thread ──────────────────────────────────────────
+    // ─── child-wait thread (detached, auto-cleanup) ────────────────
+    //
+    // On natural child exit (`exit`, ctrl-D, external kill) the wait
+    // thread broadcasts `PaneDied` then self-removes the pane from
+    // the supervisor's `DashMap`. This converts the API contract
+    // "pane in map ↔ alive" into an invariant — `send_input`/`resize`
+    // after natural death returns `PaneNotFound` instead of silently
+    // queueing into a doomed channel.
+    //
+    // Cycle avoidance: we hold a `Weak<PtyBackendInner>` so this
+    // closure does not extend the supervisor's lifetime. When the
+    // supervisor is itself being dropped, `Weak::upgrade` returns
+    // `None` and we skip the removal — `PtyBackendInner::drop` is
+    // already tearing everything down.
+    //
+    // Self-join avoidance: this thread is *not* stored in
+    // `PaneHandle.wait_join` (struct field removed). If we removed
+    // the pane from the map and happened to hold the last
+    // `Arc<PaneHandle>` reference, `PaneHandle::drop` would run on
+    // this very stack — but it does not try to join the wait thread,
+    // so no deadlock.
+    //
+    // Spawn order: wait thread *before* the handle insertion so a
+    // thread-creation failure does not strand the handle in the map.
     let wait_id = id;
     let wait_child = child.clone();
     let wait_notify = inner.notify_tx.clone();
-    let wait_join = std::thread::Builder::new()
+    let wait_inner: Weak<PtyBackendInner> = Arc::downgrade(inner);
+    std::thread::Builder::new()
         .name(format!("pty-wait-{}", id.0))
         .spawn(move || {
-            // Block on the child handle. We hold the mutex across
-            // wait() — that is OK because no other code path needs the
-            // child handle (kill uses libc::kill directly via the pid,
-            // and SIGKILL fallback in the teardown path uses try_wait
-            // which only fires after this thread already returned).
-            // Actually: `terminate_child` *does* lock + try_wait, and
-            // it must succeed during the grace window. Holding the
-            // mutex across blocking wait would deadlock that path. So
-            // we drop the lock after extracting a clone-able pid then
-            // wait via a polling loop on try_wait — same effect but
-            // never holds the lock across a blocking syscall.
+            // Poll-based wait: we drop the mutex between polls so
+            // `terminate_child`'s grace-window `try_wait` can interleave.
             let exit_status = loop {
                 let res = {
                     let Ok(mut child) = wait_child.lock() else {
-                        // Poisoned — give up; the supervisor will see
-                        // the broadcast never arrive but the pane is
-                        // already getting dropped.
                         warn!(pane = %wait_id, "child mutex poisoned in wait thread");
                         return;
                     };
@@ -897,6 +888,13 @@ fn spawn_inner(
                 code,
                 signal,
             });
+            // Auto-cleanup: remove ourselves from the DashMap so the
+            // API contract "pane in map iff alive" holds. Weak upgrade
+            // fails when the supervisor itself is being dropped — in
+            // that case `PtyBackendInner::drop` is doing the cleanup.
+            if let Some(inner) = wait_inner.upgrade() {
+                inner.panes.remove(&wait_id);
+            }
         })
         .map_err(|e| PtyBackendError::SpawnFailed(anyhow::anyhow!(e)))?;
 
@@ -909,7 +907,6 @@ fn spawn_inner(
         stall_count: stall,
         reader_join: Some(reader_join),
         writer_join: Some(writer_join),
-        wait_join: Some(wait_join),
     });
     inner.panes.insert(id, handle);
 
@@ -941,8 +938,14 @@ fn exit_code_signal(exit_code: u32) -> (Option<i32>, Option<i32>) {
     }
 }
 
-/// ADR-0014 D10 — strip noisy env keys before spawning the child shell
-/// so we don't accidentally nest inside an outer tmux / mux session.
+/// ADR-0014 D10 — *2nd-layer* defense against outer-tmux nesting and
+/// TERM_PROGRAM-family escape-sequence drift. The *1st-layer* defense
+/// lives in `bin/gtmux-cli` (refuse to start with exit 4 when `TMUX`
+/// env is detected — fast-fail per 0022 L-17 prevention principle).
+/// This list is belt-and-suspenders: if the 1st layer is bypassed
+/// (e.g., partial outer-mux env left behind), scrubbing these keys
+/// prevents child shells from emitting iTerm/Apple Terminal-specific
+/// escape sequences that xterm.js does not understand.
 const NOISY_ENV_KEYS: &[&str] = &[
     "TMUX",
     "TMUX_PANE",

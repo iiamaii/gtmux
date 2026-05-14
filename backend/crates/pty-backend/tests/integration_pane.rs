@@ -214,9 +214,32 @@ async fn gate4_shell_exit_emits_pane_died_no_zombie() {
         died.is_some(),
         "PaneDied notification not received within budget"
     );
-    // After the wait thread observed exit, the dashmap entry remains
-    // (kill() / Drop is what removes it). The pane count drop is verified
-    // by the multi_pane_race test below.
+
+    // Auto-cleanup (ADR-0013 R3 amend): the wait thread self-removes
+    // the pane from the supervisor map after broadcasting. Give it a
+    // small grace window (the wait thread polls at 50 ms cadence and
+    // performs the remove right after the broadcast).
+    let cleaned = timeout(Duration::from_secs(2), async {
+        loop {
+            if backend.pane_count() == 0 {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        cleaned,
+        "auto-cleanup did not remove the pane from the supervisor map"
+    );
+    // Subsequent API calls against the (now-gone) id surface as
+    // PaneNotFound — the contract the auto-cleanup enforces.
+    let res = backend.send_input(id, b"after-death\n".to_vec());
+    assert!(matches!(
+        res,
+        Err(gtmux_pty_backend::PtyBackendError::PaneNotFound(_))
+    ));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
