@@ -28,6 +28,14 @@ export interface WsClientOptions {
   readonly onStateChange: (state: ConnectionState, attempt: number) => void;
   /** 선택적 에러 콜백 — WebSocket `onerror` 의 raw event 를 그대로 전달. */
   readonly onError?: (e: unknown) => void;
+  /**
+   * WebSocket close 이벤트의 (code, reason). ReconnectBanner 가 1008/1011/4001
+   * 분기 메시지를 그릴 때 사용. dispatcher 가 connectionStore.setCloseInfo 로 어댑팅.
+   *
+   * 정상 stop() (CLOSE_NORMAL=1000) 경로도 동일하게 호출된다 — banner 측에서
+   * 1000 은 noise 로 무시 (R8 F6 정합).
+   */
+  readonly onClose?: (code: number, reason: string) => void;
 }
 
 // ── 상수 ────────────────────────────────────────────────────────────────────
@@ -194,6 +202,13 @@ export class WsClient {
 
     ws.onclose = (ev: CloseEvent) => {
       this.#ws = null;
+      // close code/reason 은 stop() 여부와 무관하게 onClose 로 전달 — banner 가
+      // 1000 (normal) 을 noise 로 무시할지는 그쪽 책임.
+      try {
+        this.#opts.onClose?.(ev.code, ev.reason);
+      } catch (e) {
+        console.error('[ws] onClose handler threw', e);
+      }
       // 정상 종료 + stop() 발생: 재연결 없음.
       if (this.#stopped) {
         this.#transition('closed');

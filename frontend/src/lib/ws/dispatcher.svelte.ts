@@ -64,12 +64,17 @@ export function unregisterPaneOut(paneId: string): void {
 // ── 외부에서 layoutStore 갱신을 트리거하는 hook ──────────────────────────
 //
 // `0x80 LAYOUT_CHANGED` 수신 시 dispatcher 는 store 의 etag 만 갱신하고, 실제
-// HTTP `GET /api/layout` re-fetch 는 *다른 모듈* (R8 F5 의 HTTPClient) 의 책임.
+// HTTP `GET /api/layout` re-fetch 는 *다른 모듈* (`$lib/http/layout`) 의 책임.
 // 그 모듈이 본 hook 을 등록해 fan-out 의 마지막 단계를 처리한다.
 //
-// MVP 단계에서 미등록인 경우 (FE-2 미착수): warn + drop.
+// 시그니처: `(etag: Uint8Array) => Promise<void> | void`. 인자 etag 는 broadcast
+// 페이로드의 raw 16B — handler 가 그 값을 If-Match 로 흘려 412 rebase 를 구현할
+// 수 있도록 전달한다 (현재 GET 경로는 응답 ETag 를 권위로 삼아 인자를 사용하지
+// 않으나, 시그니처는 미래 안정.)
+//
+// 미등록 시 (bootstrap 이전): warn + drop.
 
-type LayoutRefetchHandler = () => void;
+export type LayoutRefetchHandler = (etag: Uint8Array) => Promise<void> | void;
 let layoutRefetchHandler: LayoutRefetchHandler | null = null;
 
 export function setLayoutRefetchHandler(handler: LayoutRefetchHandler | null): void {
@@ -87,6 +92,8 @@ export interface DispatcherOptions {
   readonly onMessage?: WsClientOptions['onMessage'];
   /** Optional override for state change (테스트 격리용). */
   readonly onStateChange?: WsClientOptions['onStateChange'];
+  /** Optional override for close info (테스트 격리용). */
+  readonly onClose?: WsClientOptions['onClose'];
 }
 
 /**
@@ -100,6 +107,7 @@ export function createDispatcher(opts: DispatcherOptions): WsClient {
     token: opts.token,
     onMessage: opts.onMessage ?? dispatch,
     onStateChange: opts.onStateChange ?? adaptStateChange,
+    onClose: opts.onClose ?? adaptClose,
   });
 }
 
@@ -162,13 +170,31 @@ function handleNotifyMirror(payload: Uint8Array): void {
     return;
   }
   const kind = typeof decoded.body['kind'] === 'string' ? (decoded.body['kind'] as string) : '';
-  // D21 c4 — pane-died: panel header 의 zombie badge 와 직결.
-  if (kind === 'pane-died') {
-    addZombie(decoded.paneId);
+  // SSoT §2.3 kind 매핑.
+  switch (kind) {
+    case 'pane-died':
+      // D21 c4 — panel header 의 zombie badge 와 직결.
+      addZombie(decoded.paneId);
+      return;
+    case 'slow-pane':
+      // ADR-0001 D10 — `%pause` 미러 → panel header "느림" 배지.
+      connectionStore.markSlow(decoded.paneId);
+      return;
+    case 'window-add':
+    case 'window-renamed':
+    case 'window-close':
+    case 'session-changed':
+    case 'layout-change':
+    case 'subscription-changed':
+    case 'pane-mode-changed':
+      // FE-4 의 fetchLayout 트리거가 일부 (window-add/close/layout-change) 흡수 —
+      // P1+ 에서 mux mirror 모듈로 위임 예정. 현재는 debug log only.
+      console.debug('[gtmux] notify kind=%s pane=%d', kind, decoded.paneId);
+      return;
+    default:
+      // 미정의 kind 는 SSoT §2.3 forward-compat 에 따라 조용히 무시.
+      return;
   }
-  // 기타 kind (`window-add` / `layout-change` / `session-changed` / etc.) 는
-  // MVP dispatcher 에선 trigger 로만 사용 — 추후 mux mirror 모듈이 본 hook 을
-  // 확장. forward-compat 정책 (SSoT §2.3) 에 따라 silently 무시.
 }
 
 function handleLayoutChanged(payload: Uint8Array): void {
@@ -180,8 +206,18 @@ function handleLayoutChanged(payload: Uint8Array): void {
   // ETag hex 직렬화 — store 가 string 으로 보관해 If-Match 헤더에 그대로 쓰기 위함
   // (canvas-layout-schema.md §2 의 ETag 정규화: WS 구간 raw 16B, HTTP 구간 hex).
   layoutStore.setEtag(bytesToHex(decoded.etag));
-  // Pull-through-notify: re-fetch 는 HTTPClient (FE-2) 책임. 미등록이면 MVP scope.
-  layoutRefetchHandler?.();
+  // Pull-through-notify: re-fetch 는 `$lib/http/layout` 책임. 미등록이면 MVP scope.
+  // handler 가 Promise 를 반환해도 dispatcher 는 await 하지 않는다 — fan-out 은
+  // non-blocking, fetch 결과는 store hydrate 로 도달.
+  const handler = layoutRefetchHandler;
+  if (handler) {
+    const result = handler(decoded.etag);
+    if (result instanceof Promise) {
+      result.catch((e: unknown) => {
+        console.warn('[gtmux] layout refetch failed', e);
+      });
+    }
+  }
 }
 
 function handleMChanged(payload: Uint8Array): void {
@@ -233,6 +269,12 @@ function adaptStateChange(state: ConnectionState, attempt: number): void {
   if (state !== 'open') {
     connectionStore.attempt = attempt;
   }
+}
+
+function adaptClose(code: number, reason: string): void {
+  // FE-5 — banner derived 가 closeCode/closeReason 을 보고 1008/1011/4001 분기를
+  // 그린다. 1000 (normal stop) 은 banner 가 자체적으로 noise 로 무시.
+  connectionStore.setCloseInfo(code, reason);
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────

@@ -4,37 +4,66 @@
   // Lifecycle (R8 F1 + R2 F11):
   // 1. $effect mount: new Terminal(SECURE_XTERM_OPTIONS) + loadAddon(FitAddon) +
   //    loadAddon(Unicode11Addon) + unicode.activeVersion='11' + term.open(containerEl)
-  //    + fitAddon.fit() (1회) + WS dispatcher에 PaneId 등록.
-  // 2. 사용자 키 입력: term.onData → WS PANE_IN (0x03) 송신 (현재 dispatcher 인터페이스가
-  //    PaneOut 한 방향만 구현되어 있어, MVP 단계는 console.debug에 입력 바이트만 기록.
-  //    실제 송신은 ws/client.ts 가 sendPaneInput을 노출하는 시점에 배선).
-  // 3. 컨테이너 ResizeObserver → debounce 150ms (R2 F8) → fit() + 변경된 cols/rows를
-  //    WS PANE_RESIZE (0x04) 로 송신 (MVP는 fit만 — 실제 송신은 client.ts 의존).
-  // 4. $effect cleanup: dispatcher unregister + term.dispose (R2 F11 — 모든 리스너·DOM·
-  //    내부 버퍼 해제).
+  //    + fitAddon.fit() (1회) + WS dispatcher 에 PaneId 등록.
+  // 2. 사용자 키 입력: term.onData → WS PANE_IN (0x03) 송신 (ADR-0004 D4 — UTF-8
+  //    바이트 그대로, 디코드/이스케이프 없음). WsClient 가 connected 가 아니면
+  //    silently drop — 별도 buffering 없음 (D8 reconnect-then-resync 정합).
+  // 3. 컨테이너 ResizeObserver → debounce 150ms (R2 F8 — fit() 폭주 방지) → fit() +
+  //    fit() 결과 (cols, rows) 가 직전 송신값과 다르면 PANE_RESIZE (0x04) 송신
+  //    (ADR-0004 D5). 송신 debounce 100ms 는 fit() debounce 와 별개 — fit() 직후
+  //    의 미세 rebound 가 추가 송신을 만들지 않게 *per-pane lastSent dedup* 가 1차
+  //    필터, 100ms debounce 가 2차 filter.
+  // 4. $effect cleanup: dispatcher unregister + term.dispose (R2 F11 — 모든 리스너·
+  //    DOM·내부 버퍼 해제) + resize/input debounce timer 해제.
   //
-  // D16 Panel Streaming State: visibility=false 또는 minimized=true 면 PanelNode가 본
-  // 컴포넌트를 *마운트조차 하지 않는다* — 본 컴포넌트는 *Streaming 상태에서만 살아 있음*
-  // 가정. unmount = Suspended 진입 (xterm 인스턴스 자체가 사라짐). 재진입 시 ring buffer
-  // replay (D15)로 catch-up. P1+에서 *retain (display:none)* 패턴 검토 (R8 §F8 sketch
-  // 주석 + R8-O3 측정 결과 따라).
+  // D16 Panel Streaming State: visibility=false 또는 minimized=true 면 PanelNode 가
+  // 본 컴포넌트를 *마운트조차 하지 않는다* — 본 컴포넌트는 *Streaming 상태에서만
+  // 살아 있음* 가정. unmount = Suspended 진입 (xterm 인스턴스 자체가 사라짐). 재진입
+  // 시 ring buffer replay (D15) 로 catch-up.
+  //
+  // WsClient 주입 경로: `+page.svelte` 가 `setContext('wsClient', wsClient)` 로 단일
+  // 인스턴스를 등록. 본 컴포넌트는 `getContext` 로 꺼내 사용 — PanelNode 가 prop 으로
+  // threading 하지 않아 sub-tree 깊이와 무관하게 동작.
 
+  import { getContext } from 'svelte';
   import { Terminal } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import { Unicode11Addon } from '@xterm/addon-unicode11';
   import { SECURE_XTERM_OPTIONS } from '$lib/xterm/options';
   import { registerPaneOut, unregisterPaneOut } from '$lib/ws/dispatcher.svelte';
+  import { encodePaneIn, encodePaneResize, FRAME_TYPE } from '$lib/ws/decode';
+  import type { WsClient } from '$lib/ws/client';
 
   let { paneId }: { paneId: string } = $props();
 
   let containerEl: HTMLDivElement | undefined = $state(undefined);
 
-  // R2 F8 resize debounce — 150ms. fit() 폭주 방지.
+  // R2 F8 resize debounce — 150ms. fit() 폭주 방지 (DOM 측정 → reflow 비용).
   const RESIZE_DEBOUNCE_MS = 150;
+  // FE-2 송신 debounce — fit() 직후의 미세 rebound 흡수. lastSent dedup 과 함께 작동.
+  const RESIZE_SEND_DEBOUNCE_MS = 100;
+
+  // WS PANE_IN/RESIZE 송신 채널 — `+page.svelte` 의 setContext('wsClient', …) 가
+  // 단일 진실. setContext 는 컴포넌트 init 시점에 단 한 번이라 *holder 객체*로
+  // 간접 참조 → onMount 에서 채워진 wsClient 를 send 시점에 lazy lookup.
+  // 미설정(테스트/SSR) 환경에서는 holder 가 null → 송신 skip.
+  interface WsClientHolder { current: WsClient | null }
+  const wsClientHolder = getContext<WsClientHolder | undefined>('wsClient') ?? null;
+
+  // paneId 는 "37" 같은 정수 문자열 (PanelNode 가 SSoT pane_id 의 정수 부분만 전달).
+  // wire 변환 시 number 로 캐스팅 — `Number.parseInt(…, 10)` 으로 명시.
+  const paneIdNum = $derived(Number.parseInt(paneId, 10));
+
+  // Single-byte encoder reuse — `term.onData` 가 키 입력마다 호출되므로 매번 새
+  // TextEncoder 를 만들지 않는다.
+  const encoder = new TextEncoder();
 
   $effect(() => {
     // containerEl 이 아직 bind 되지 않은 첫 tick 보호.
     if (!containerEl) return;
+    // paneId 가 정수 파싱 실패 (NaN) 면 송신 채널을 disable — 입력은 무시.
+    const paneIdNumLocal = paneIdNum;
+    const paneIdValid = Number.isInteger(paneIdNumLocal) && paneIdNumLocal > 0;
 
     const term = new Terminal(SECURE_XTERM_OPTIONS);
     const fitAddon = new FitAddon();
@@ -46,41 +75,93 @@
     try {
       fitAddon.fit();
     } catch (e) {
-      // fit() 은 컨테이너가 0×0이면 throw 가능 — 디버그 로그만 남기고 진행.
-      console.debug('xterm initial fit failed', e);
+      // fit() 은 컨테이너가 0×0 이면 throw 가능 — 디버그 로그만 남기고 진행.
+      console.debug('[gtmux] xterm initial fit failed', e);
     }
 
-    // PaneOut 등록 — WS dispatcher가 이 paneId로 도착한 PANE_OUT(0x02)을 본 핸들러로
-    // 라우팅. `cb`는 R2 F4 백프레셔 watermark 갱신 콜백 (term.write가 내부 buffer
-    // 플러시 후 호출).
+    // PaneOut 등록 — WS dispatcher 가 이 paneId 로 도착한 PANE_OUT(0x02) 을 본
+    // 핸들러로 라우팅. `cb` 는 R2 F4 백프레셔 watermark 갱신 콜백 (term.write 가
+    // 내부 buffer 플러시 후 호출).
     registerPaneOut(paneId, (buf, cb) => term.write(buf, cb));
 
-    // 사용자 키 입력 → PANE_IN (0x03). WS client의 sendPaneInput 인터페이스가
-    // 정의되기 전까지는 console.debug 로 stub.
+    // ── FE-1: 사용자 키 입력 → PANE_IN (0x03) ───────────────────────────────
+    // ADR-0004 D4: UTF-8 바이트 그대로 송신. WsClient 가 connected 가 아니면
+    // 내부에서 drop — buffering 하지 않는다 (재연결 후 서버 상태가 권위).
     const dataDisposable = term.onData((data) => {
-      console.debug('pane input', paneId, data.length);
+      const client = wsClientHolder?.current ?? null;
+      if (!client || !paneIdValid) return;
+      const bytes = encoder.encode(data);
+      client.sendFrame(FRAME_TYPE.PANE_IN, encodePaneIn(paneIdNumLocal, bytes));
     });
 
-    // 컨테이너 ResizeObserver — 디바운스된 fit().
-    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    // ── FE-2: ResizeObserver → fit() → debounced PANE_RESIZE (0x04) ────────
+    // 단계:
+    //   ResizeObserver fire → 150ms fit() debounce → fitAddon.fit() →
+    //   (cols, rows) 가 lastSent 와 다르면 100ms send debounce → PANE_RESIZE.
+    //
+    // lastSent dedup 가 1차 필터, send debounce 가 2차 필터. 두 단계는 직렬.
+    let lastSentCols: number | null = null;
+    let lastSentRows: number | null = null;
+    let fitTimer: ReturnType<typeof setTimeout> | null = null;
+    let sendTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingCols: number | null = null;
+    let pendingRows: number | null = null;
+
+    function flushResize(): void {
+      if (pendingCols === null || pendingRows === null) return;
+      const client = wsClientHolder?.current ?? null;
+      if (!client || !paneIdValid) {
+        // 송신 채널 없으면 dedup state 만 갱신.
+        lastSentCols = pendingCols;
+        lastSentRows = pendingRows;
+        pendingCols = null;
+        pendingRows = null;
+        return;
+      }
+      const cols = pendingCols;
+      const rows = pendingRows;
+      pendingCols = null;
+      pendingRows = null;
+      // dedup: send 시점 다시 확인 — debounce 동안 rebound 로 동일값 회귀 가능.
+      if (cols === lastSentCols && rows === lastSentRows) return;
+      lastSentCols = cols;
+      lastSentRows = rows;
+      client.sendFrame(FRAME_TYPE.PANE_RESIZE, encodePaneResize(paneIdNumLocal, cols, rows));
+    }
+
     const ro = new ResizeObserver(() => {
-      if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        resizeTimer = null;
+      if (fitTimer) clearTimeout(fitTimer);
+      fitTimer = setTimeout(() => {
+        fitTimer = null;
         try {
           fitAddon.fit();
-          console.debug('pane resize', paneId, term.cols, term.rows);
         } catch (e) {
-          console.debug('xterm fit on resize failed', e);
+          console.debug('[gtmux] xterm fit on resize failed', e);
+          return;
         }
+        const cols = term.cols;
+        const rows = term.rows;
+        // dedup 1차: 직전 송신값과 동일하면 send debounce 도 arm 하지 않음.
+        if (cols === lastSentCols && rows === lastSentRows) return;
+        pendingCols = cols;
+        pendingRows = rows;
+        if (sendTimer) clearTimeout(sendTimer);
+        sendTimer = setTimeout(() => {
+          sendTimer = null;
+          flushResize();
+        }, RESIZE_SEND_DEBOUNCE_MS);
       }, RESIZE_DEBOUNCE_MS);
     });
     ro.observe(containerEl);
 
     return () => {
-      if (resizeTimer) {
-        clearTimeout(resizeTimer);
-        resizeTimer = null;
+      if (fitTimer) {
+        clearTimeout(fitTimer);
+        fitTimer = null;
+      }
+      if (sendTimer) {
+        clearTimeout(sendTimer);
+        sendTimer = null;
       }
       ro.disconnect();
       dataDisposable.dispose();
@@ -95,8 +176,8 @@
 <style>
   /* xterm.js DOM 렌더러는 측정 시점에 *0 × 0* 컨테이너에서 ColMeasure 가 무효 (R2 F7).
      panel-body 측 flex: 1 + min-height: 0 이 본 컨테이너를 가시 크기로 끌어준다.
-     `nowheel` / `nodrag` 클래스는 SvelteFlow의 휠/드래그 인터셉터 차단 — 터미널 안에서
-     마우스 휠 스크롤(scrollback), 드래그(선택)이 캔버스 pan/drag와 충돌하지 않도록. */
+     `nowheel` / `nodrag` 클래스는 SvelteFlow 의 휠/드래그 인터셉터 차단 — 터미널 안에서
+     마우스 휠 스크롤(scrollback), 드래그(선택)이 캔버스 pan/drag 와 충돌하지 않도록. */
   .xterm-host {
     width: 100%;
     height: 100%;
