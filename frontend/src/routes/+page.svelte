@@ -23,6 +23,7 @@
   import { createDispatcher, setLayoutRefetchHandler } from '$lib/ws/dispatcher.svelte';
   import { createLayoutRefetchHandler, fetchLayoutAndHydrate } from '$lib/http/layout';
   import { layoutStore } from '$lib/stores/layout.svelte';
+  import { themeStore } from '$lib/stores/theme.svelte';
   import type { WsClient } from '$lib/ws/client';
 
   const TOKEN_STORAGE_KEY = 'gtmux_token';
@@ -72,6 +73,13 @@
   setContext<WsClientHolder>('wsClient', wsClientHolder);
 
   onMount(() => {
+    // Theme — re-apply on mount so the in-memory state and <html class>
+    // converge after Svelte hydrates. The inline FOUC-guard in index.html
+    // already set the class for first paint; this is the idempotent
+    // follow-up that also handles the (rare) case where localStorage
+    // changed in another tab between page-load and hydration.
+    themeStore.apply();
+
     const token = acquireToken();
     if (token === null) {
       console.debug('[gtmux] no token — bootstrap skipped');

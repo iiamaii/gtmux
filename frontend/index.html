@@ -4,6 +4,31 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>gtmux</title>
+    <script>
+      // FOUC guard — apply theme before Svelte hydrates so the first paint
+      // never flashes the wrong theme. Mirrors `$lib/stores/theme.svelte.ts`
+      // resolveInitial() priority chain: localStorage → prefers-color-scheme
+      // → dark fallback. Runs synchronously at <head> parse time.
+      (function () {
+        try {
+          var stored = localStorage.getItem('gtmux-theme');
+          if (stored !== 'light' && stored !== 'dark') {
+            stored =
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: light)').matches
+                ? 'light'
+                : 'dark';
+          }
+          if (stored === 'dark') {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) {
+          // localStorage / matchMedia inaccessible — default to dark by
+          // adding the class so the canvas-friendly palette wins.
+          document.documentElement.classList.add('dark');
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="app"></div>
