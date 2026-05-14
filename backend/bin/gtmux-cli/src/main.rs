@@ -34,7 +34,7 @@ use anyhow::{anyhow, Context};
 use axum::Router;
 use clap::{Parser, Subcommand};
 use gtmux_auth::{issue_token, load_token, rotate_token, save_token, AuthError, TokenString};
-use gtmux_config::{derive_mode, load as load_config, Config, Mode};
+use gtmux_config::{derive_mode, load_with_overrides as load_config, Config, Mode};
 use gtmux_lifecycle::{
     check_pidfile_liveness, pidfile_path_for, run_command_loop, run_event_loop, socket_path_for,
     stop_server, write_pidfile, LifecycleError, PidLiveness, SpawnOptions, StopOutcome,
@@ -230,18 +230,14 @@ struct StartArgs {
 ///  12) install shutdown handlers  — SIGINT + SIGTERM → graceful (D5 daemon ⊥)
 ///  13) axum::serve(...)           — with_graceful_shutdown
 async fn start(args: StartArgs) -> anyhow::Result<()> {
-    // 2) config — figment chain. The CLI `session` flag overrides the TOML
-    //    `[server].session` (config crate spec). When `--port` was provided on
-    //    the CLI we apply it after load so ADR-0007 D2's "immutable after
-    //    bind" stays intact: we only mutate `server.port` *before* the first
-    //    listener call.
-    let mut config =
-        load_config(args.config_path.as_deref(), &args.session).context("loading gtmux config")?;
-    if let Some(p) = args.port {
-        // Honour CLI override exactly once — `bind` itself is not overridable
-        // here because the security mode (D22) flips on its value.
-        config.server.port = p;
-    }
+    // 2) config — figment chain. CLI `--session` and `--port` are passed in as
+    //    figment overrides so they win against TOML / env *before* validation
+    //    runs. Mutating `config.server.port` after load is the old path; it
+    //    fails when the TOML omits `[server].port` because the sentinel 0 dies
+    //    in `validate()` before the CLI ever gets a chance to speak. `bind`
+    //    is intentionally not overridable here (security mode D22 flips on it).
+    let config = load_config(args.config_path.as_deref(), &args.session, args.port)
+        .context("loading gtmux config")?;
 
     // 2a) pidfile liveness — refuse duplicate server bind on the same session
     //     before we go anywhere near tmux. ADR-0007 D2's 1:1:1 invariant

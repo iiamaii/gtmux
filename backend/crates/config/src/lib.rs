@@ -219,6 +219,19 @@ impl From<figment::Error> for ConfigError {
 /// 선행순위 — `Serialized::defaults(...)` (빌트인) ◀ TOML ◀ Env ◀ CLI override.
 /// figment merge 순서가 뒤로 갈수록 우선이므로 코드 순서도 동일.
 pub fn load(path: Option<&Path>, session: &str) -> Result<Config, ConfigError> {
+    load_with_overrides(path, session, None)
+}
+
+/// `load`와 동일하지만 CLI `--port` override를 figment chain의 마지막 layer로
+/// 합류시킨 뒤 validation을 돌린다. TOML이 없거나 `[server].port`가 비어 있어
+/// 빌트인 sentinel(port=0)이 살아남는 경우에도, CLI에서 명시한 port가 있으면
+/// 그 값이 validate를 통과한다 — 그렇지 않으면 `--port 9999`를 줘도 load
+/// 단계에서 `port must be in [1024, 65535], got 0`으로 죽는다.
+pub fn load_with_overrides(
+    path: Option<&Path>,
+    session: &str,
+    port_override: Option<u16>,
+) -> Result<Config, ConfigError> {
     // 1) 빌트인 디폴트 — runtime / security 만 안전 디폴트 보유, server는 사용자
     //    명시 필수라 dummy로 채워두고 검증에서 잡는다.
     let defaults = DefaultsSeed {
@@ -252,6 +265,13 @@ pub fn load(path: Option<&Path>, session: &str) -> Result<Config, ConfigError> {
     //    "override 없음" 신호로 해석.
     if !session.is_empty() {
         figment = figment.merge(Serialized::default("server.session", session));
+    }
+
+    // 5) CLI port override — `--port 9999` 가 figment 안에서 모두를 이긴다.
+    //    validate() 가 본 단계 이후에 돌기 때문에 port sentinel(0)을 무사
+    //    통과시킨다. None이면 layer를 추가하지 않아 기존 동작 그대로.
+    if let Some(p) = port_override {
+        figment = figment.merge(Serialized::default("server.port", p));
     }
 
     let cfg: Config = figment.extract()?;
@@ -442,7 +462,22 @@ impl Config {
         if !self.security.cors_origins.is_empty() {
             return self.security.cors_origins.clone();
         }
-        vec![format!("http://{}:{}", self.server.bind, self.server.port)]
+        let port = self.server.port;
+        let bind = self.server.bind.as_str();
+        // Loopback alias 셋 — bind가 `127.0.0.1` / `::1` / `localhost` 어느 쪽이든
+        // 브라우저 사용자는 셋 중 임의 호스트로 same-origin 접속할 수 있다.
+        // ADR-0003 D3 (정확 일치 화이트리스트)와의 정합은 *명시* 화이트리스트가
+        // 비어 있을 때만 본 alias 셋을 노출함으로써 유지된다 — cloud 모드/외부
+        // hostname은 본 fallback에 닿지 않고, 사용자가 cors_origins를 채워야 한다.
+        let bind_lower = bind.to_ascii_lowercase();
+        if bind_lower == "127.0.0.1" || bind_lower == "::1" || bind_lower == "localhost" {
+            return vec![
+                format!("http://127.0.0.1:{port}"),
+                format!("http://localhost:{port}"),
+                format!("http://[::1]:{port}"),
+            ];
+        }
+        vec![format!("http://{bind}:{port}")]
     }
 }
 
@@ -677,15 +712,73 @@ bind = "127.0.0.1"
     }
 
     #[test]
-    fn effective_cors_origins_synthesises_from_bind_and_port() {
-        // 빈 cors_origins → http://<bind>:<port> 1개 합성 (G1).
+    fn effective_cors_origins_synthesises_loopback_alias_set() {
+        // 빈 cors_origins + loopback bind → 127.0.0.1 / localhost / [::1] 3개
+        // alias 합성. 브라우저가 localhost로 접속해도 origin_forbidden로 차단
+        // 되지 않게 한다 (G1 + localhost ↔ 127.0.0.1 mismatch fix).
         Jail::expect_with(|jail| {
             jail.clear_env();
             jail.create_file("gtmux.toml", minimal_toml())?;
             let cfg = load(Some(Path::new("gtmux.toml")), "").unwrap();
             assert!(cfg.security.cors_origins.is_empty(), "precondition");
             let origins = cfg.effective_cors_origins();
-            assert_eq!(origins, vec!["http://127.0.0.1:9001".to_string()]);
+            assert_eq!(origins.len(), 3);
+            assert!(origins.contains(&"http://127.0.0.1:9001".to_string()));
+            assert!(origins.contains(&"http://localhost:9001".to_string()));
+            assert!(origins.contains(&"http://[::1]:9001".to_string()));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn effective_cors_origins_non_loopback_bind_synthesises_single() {
+        // bind가 loopback이 아니면 alias 확장 없음 — cloud 모드는 사용자가
+        // cors_origins를 직접 채워야 한다는 ADR-0003 D3 의도 유지. 본 테스트는
+        // 그 fallback 동작만 본다 (cloud section은 별도 검증).
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "gtmux.toml",
+                r#"schema_version = 1
+[server]
+session = "alpha"
+port = 9001
+bind = "192.168.1.10"
+[cloud]
+tls_cert = "/etc/gtmux/cert.pem"
+tls_key  = "/etc/gtmux/key.pem"
+rate_limit_auth_failures_per_minute = 10
+"#,
+            )?;
+            let cfg = load(Some(Path::new("gtmux.toml")), "").unwrap();
+            let origins = cfg.effective_cors_origins();
+            assert_eq!(origins, vec!["http://192.168.1.10:9001".to_string()]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn load_with_port_override_passes_validation_for_empty_port() {
+        // TOML / env 어느 쪽도 port를 채우지 않은 상태에서 CLI `--port 9999`만
+        // 줬을 때 validate가 통과해야 한다 — `--port` 옵션이 실제로 동작하는지
+        // 검증. 본 테스트가 fail하면 사용자가 `gtmux start --port 9999` 했을 때
+        // "server.port must be in [1024, 65535], got 0" 오류로 죽는다.
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "gtmux.toml",
+                r#"schema_version = 1
+[server]
+session = "alpha"
+bind = "127.0.0.1"
+"#,
+            )?;
+            // port_override None이면 sentinel 0이 살아 validation에서 실패해야 한다.
+            let err = load_with_overrides(Some(Path::new("gtmux.toml")), "", None).unwrap_err();
+            assert!(matches!(err, ConfigError::Validation(_)));
+            // port_override Some(9999)이면 validation 통과.
+            let cfg = load_with_overrides(Some(Path::new("gtmux.toml")), "", Some(9999)).unwrap();
+            assert_eq!(cfg.server.port, 9999);
             Ok(())
         });
     }
