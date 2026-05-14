@@ -23,6 +23,18 @@ class PanelsStore {
     if (!current) return;
     this.panels.set(id, { ...current, x, y });
   }
+
+  /**
+   * Commit a Panel resize delta into the store. NodeResizer's `onResizeEnd`
+   * calls this; same controlled-snap rationale as `movePanel`. Position is
+   * passed alongside size because NodeResizer's top-/left-anchored handles
+   * shift the origin.
+   */
+  resizePanel(id: string, x: number, y: number, w: number, h: number): void {
+    const current = this.panels.get(id);
+    if (!current) return;
+    this.panels.set(id, { ...current, x, y, w, h });
+  }
 }
 
 export const panelsStore = new PanelsStore();

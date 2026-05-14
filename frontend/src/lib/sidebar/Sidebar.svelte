@@ -310,13 +310,23 @@
     font: inherit;
   }
 
+  .row-button {
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing),
+      box-shadow var(--motion-fast) var(--motion-easing);
+  }
+
   .row-button:hover {
     background: var(--color-glass-1);
   }
 
+  /* Figma-style selected — accent text + accent-tint background + 2px
+   * border-left indicator on the row inner. */
   .row.selected .row-button {
-    background: var(--color-glass-2);
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
     color: var(--color-accent);
+    box-shadow: inset 2px 0 0 var(--color-accent);
   }
 
   .row.dead .row-button .label {
@@ -350,6 +360,13 @@
     white-space: nowrap;
   }
 
+  /* Icons (visibility / lock) — Figma 컨벤션:
+   *   - 평소엔 숨김 (opacity 0)
+   *   - row hover 시 모두 표시
+   *   - .on 상태 (locked/hidden) 는 호버 없어도 항상 표시 — 사용자에게
+   *     *현재 활성 토글* 을 가시화
+   * 현 마크업은 toggle handler 미배선 (read-only v0) 이라 .on 분기는
+   * P1+ 에서 lock/vis 토글 wire 시 row 에 직접 클래스로 적용. */
   .icons {
     flex: 0 0 auto;
     display: inline-flex;
@@ -357,6 +374,13 @@
     gap: var(--space-4);
     font-size: var(--text-base);
     color: var(--color-fg-muted);
+    opacity: 0;
+    transition: opacity var(--motion-fast) var(--motion-easing);
+  }
+
+  .row:hover .icons,
+  .row.selected .icons {
+    opacity: 1;
   }
 
   .icon {

@@ -1,23 +1,24 @@
 <script lang="ts">
-  // Svelte Flow custom node — Panel + placeholder 분기 (R8 §F8 zoom-blur 정책 (b)).
+  // Svelte Flow custom node — Panel chrome + xterm body.
   //
   // 책임:
-  // - `data` (NodeProps의 data prop) = PanelData (canvas-layout-schema §1 Panel JSON).
-  // - 헤더 바 = drag handle. label 표시 + M/lock badge.
-  // - 본문 = zoom-blur 분기:
-  //     * `|zoom - 1| < 0.02` (R8 §F8 ε) → XtermHost mount
-  //     * 그 외 → PanelPlaceholder (xterm DOM 비가시, 데이터 흐름은 unmount로 정지 —
-  //       D16 Suspended와 *별개 차원*. zoom 복귀 시 재 mount에서 ring buffer replay
-  //       (D15)가 catch-up — 본 R8-O3 측정 대상).
-  // - visibility=false → 렌더하지 않음 (Svelte Flow Node.hidden=true도 검토할 수 있으나
-  //   본 노드 수준 분기로 단순화).
-  // - D6 manipulation/input은 캔버스 측에서 store에 반영. PanelNode는 store 구독만.
+  // - `data` (NodeProps의 data prop) = PanelData (canvas-layout-schema §1 Panel JSON) +
+  //   Canvas.svelte 가 추가로 주입한 m_multi 플래그 (M.size > 1).
+  // - 헤더 바 = drag handle. label + badges (L/M/Min/I).
+  // - 본문 = XtermHost.
+  // - 선택 시각 (M):
+  //     * single  (.m-single) → solid 1.5px accent outline (Figma 정합)
+  //     * multi   (.m-multi)  → dashed 2px accent outline + 헤더 색조 변화
+  // - resize : NodeResizer (corner + edge handles). onResizeEnd 시 panelsStore
+  //   + PUT /api/layout 으로 영속화.
+  // - visibility=false → 렌더 X.
 
+  import { NodeResizer } from '@xyflow/svelte';
   import XtermHost from './XtermHost.svelte';
-  import PanelPlaceholder from './PanelPlaceholder.svelte';
+  import { panelsStore } from '$lib/stores/panels.svelte';
   import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
+  import { putLayoutCommitCurrent } from '$lib/http/layout';
 
-  // Panel JSON shape — Canvas.svelte 와 동일한 잠정 정의 (코드젠 정본 도착 전까지).
   interface PanelData {
     id: string;
     pane_id?: string;
@@ -30,13 +31,10 @@
     minimized?: boolean;
     locked?: boolean;
     label?: string | null;
+    /** Canvas.svelte 가 주입 — 현재 M 선택 개수가 2 이상이면 true. */
+    m_multi?: boolean;
   }
 
-  // SvelteFlow NodeProps — `data` 는 generic이라 `Record<string, unknown>`으로 들어옴.
-  // 본 컴포넌트는 그 안에 PanelData가 들어 있음을 *Canvas.svelte 가 보장*한 입력 계약으로
-  // 가정 (`type: 'panel'` 로 매핑된 노드만 본 컴포넌트로 라우팅).
-  // SvelteFlow가 전달하는 다른 NodeProps 필드(id, selected, dragging 등)는 본 컴포넌트
-  // 입장에서 옵셔널로 받는다.
   let {
     data,
     selected = false
@@ -58,54 +56,73 @@
     parentId?: string;
   } = $props();
 
-  // Zoom-blur placeholder (R8 §F8 policy b) 임시 폐기 — 사용자 demo 시
-  // zoom != 1 에서도 xterm 가시 유지 필요. WebGL cell metric 캐시 비용은
-  // 50 pane × 빠른 zoom step 시점에 재평가 (별도 task). 본 derived 는
-  // 항상 true 로 픽스해 PanelPlaceholder 분기를 사실상 비활성화.
-  const isAtUnitZoom = $derived(true);
-
-  // schema 정합: visibility=false면 렌더 X. 단 SvelteFlow는 이미 nodes 배열을 필터링하지
-  // 않으므로 본 컴포넌트가 무화면 분기를 직접 처리 (Node.hidden 대신).
   const isVisible = $derived(data.visibility !== false);
-
-  // Streaming State (D16): visibility=hidden 또는 minimized=true → Suspended.
-  // xterm 인스턴스를 *마운트조차 하지 않음* — 데이터 흐름은 server 측이 pause로 막음
-  // (별도 트랙). 본 컴포넌트는 *렌더만* 차단.
   const isStreaming = $derived(isVisible && data.minimized !== true);
-
-  // 헤더 라벨: label > pane_id > id 폴백.
   const headerLabel = $derived(data.label ?? data.pane_id ?? data.id);
 
-  // M selection 표시 — `selected` (Svelte Flow가 ephemeralStore.m 기반으로 전달, Canvas
-  // 측에서 매핑) 이 진실. 단 본 컴포넌트는 추가 검증으로 store 직접 구독도 한다 (M 직접
-  // 갱신 시 SvelteFlow 노드 selected가 즉시 반영되지 않을 수 있음).
   const isInM = $derived(selected || ephemeralStore.m.has(data.id));
+  const isMultiM = $derived(isInM && data.m_multi === true);
+  const isSingleM = $derived(isInM && data.m_multi !== true);
 
-  // I (Input Target) — 단일. pane_id 매칭. D6 직교.
   const isInI = $derived(
     typeof data.pane_id === 'string' && ephemeralStore.i === data.pane_id
   );
 
-  // panel width/height — schema의 w/h 우선, 미지정 시 디폴트 (R8 F1 60-col × 24-row 추정에
-  // 맞춰 480×320). pane_id 미지정 (불완전 hydration) 경우에도 안전.
   const panelW = $derived(data.w ?? 480);
   const panelH = $derived(data.h ?? 320);
+  const isLocked = $derived(data.locked === true);
+
+  const TOKEN_STORAGE_KEY = 'gtmux_token';
+  function readToken(): string | null {
+    try {
+      return sessionStorage.getItem(TOKEN_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  // NodeResizer onResizeEnd — { event, params: { x, y, width, height } }.
+  // Resize 도중에는 SvelteFlow 가 controlled width/height 를 자체 업데이트
+  // 하므로 본 핸들러는 *최종 값만* store + disk 로 commit (drag 와 동일 패턴).
+  type ResizeParams = { x: number; y: number; width: number; height: number };
+  function onResizeEnd(_event: unknown, params: ResizeParams) {
+    panelsStore.resizePanel(data.id, params.x, params.y, params.width, params.height);
+    const token = readToken();
+    if (token === null) {
+      console.warn('[gtmux] resize commit skipped: no auth token');
+      return;
+    }
+    void putLayoutCommitCurrent(token).catch((e) => {
+      console.warn('[gtmux] resize commit failed:', e);
+    });
+  }
 </script>
 
 {#if isVisible}
   <div
     class="panel"
-    class:m-active={isInM}
+    class:m-single={isSingleM}
+    class:m-multi={isMultiM}
     class:i-active={isInI}
-    class:locked={data.locked === true}
+    class:locked={isLocked}
     style="width: {panelW}px; height: {panelH}px;"
     role="group"
     aria-label={`Panel ${headerLabel}`}
   >
+    <NodeResizer
+      nodeId={data.id}
+      isVisible={isInM && !isLocked}
+      minWidth={240}
+      minHeight={140}
+      color="var(--color-accent)"
+      handleClass="panel-resize-handle"
+      lineClass="panel-resize-line"
+      {onResizeEnd}
+    />
     <header class="panel-header" aria-label={`Drag handle for ${headerLabel}`}>
       <span class="panel-label">{headerLabel}</span>
       <span class="panel-badges">
-        {#if data.locked === true}
+        {#if isLocked}
           <span class="badge badge-lock" aria-label="Locked">L</span>
         {/if}
         {#if data.minimized === true}
@@ -117,14 +134,8 @@
       </span>
     </header>
     <div class="panel-body">
-      {#if isStreaming && isAtUnitZoom && typeof data.pane_id === 'string'}
-        <!-- SSoT pane_id is `%N` (string). XtermHost / dispatcher's
-             registerPaneOut key both use the integer part as a decimal
-             string ("N"), so we strip the leading `%` here at the
-             single source of truth. -->
+      {#if isStreaming && typeof data.pane_id === 'string'}
         <XtermHost paneId={data.pane_id.replace(/^%/, '')} />
-      {:else}
-        <PanelPlaceholder label={headerLabel} reason={isStreaming ? 'zoom' : 'suspended'} />
       {/if}
     </div>
   </div>
@@ -145,9 +156,24 @@
     font-size: var(--text-lg);
   }
 
-  .panel.m-active {
+  /* Single-select — solid 1.5px accent (Figma signature). */
+  .panel.m-single {
     outline: 1.5px solid var(--color-accent);
     outline-offset: 0;
+  }
+  .panel.m-single .panel-header {
+    background: color-mix(in srgb, var(--color-accent) 12%, var(--color-surface-2));
+    border-bottom-color: var(--color-accent);
+  }
+
+  /* Multi-select — dashed 2px accent + 헤더 색조 강화. */
+  .panel.m-multi {
+    outline: 2px dashed var(--color-accent);
+    outline-offset: 0;
+  }
+  .panel.m-multi .panel-header {
+    background: color-mix(in srgb, var(--color-accent) 22%, var(--color-surface-2));
+    border-bottom-color: var(--color-accent);
   }
 
   .panel.i-active {
@@ -169,6 +195,9 @@
     cursor: grab;
     user-select: none;
     flex: 0 0 auto;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      border-color var(--motion-fast) var(--motion-easing);
   }
 
   .panel-label {
@@ -176,6 +205,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: var(--text-md);
+    font-weight: var(--weight-medium);
   }
 
   .panel-badges {
@@ -215,5 +245,17 @@
     min-height: 0;
     position: relative;
     background: var(--color-bg);
+  }
+
+  /* NodeResizer handle / line styling (Figma white-fill with accent border). */
+  :global(.panel-resize-handle) {
+    background: var(--color-bg) !important;
+    border: 1.5px solid var(--color-accent) !important;
+    width: 7px !important;
+    height: 7px !important;
+    border-radius: 1px !important;
+  }
+  :global(.panel-resize-line) {
+    border-color: var(--color-accent) !important;
   }
 </style>

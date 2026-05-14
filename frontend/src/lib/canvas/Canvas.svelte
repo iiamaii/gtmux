@@ -6,18 +6,15 @@
   //   `$derived`로 entry-level fine-grain reactivity (R8 §F3).
   // - viewport (`ephemeralStore.viewport`) bind — pan/zoom (D14 0x83 VIEWPORT_CHANGED
   //   broadcast는 dispatcher가 store 갱신 → 본 컴포넌트는 store 구독만).
-  // - 노드 드래그 → 위치 갱신 (현재 store는 read-only placeholder이므로 onnodedragstop의
-  //   target node position만 console.debug에 기록 — store mutation API 미배선까지의
-  //   임시 동작. 실제 D11 G-hybrid drag-delta 처리는 panels.svelte.ts에 movePanel
-  //   action이 노출되는 시점에 본 핸들러에서 연동).
-  // - 노드 클릭 → M selection 토글 (D6 manipulation, D23 elevate z-on-select).
-  //   `ephemeralStore.m` 직접 mutation은 SvelteSet add/delete 사용.
-  // - zoom-blur 처리 (ADR-0012 O1, R8 §F8 정책 (b)): zoom != 1 (|zoom - 1| >= 0.02) 시
-  //   PanelNode 내부 xterm을 placeholder로 교체. 본 Canvas는 store 갱신만 담당하고
-  //   placeholder 분기는 PanelNode 내부에서 isAtUnitZoom 으로 판단.
+  // - 노드 드래그 → 위치 갱신 (panelsStore.movePanel + PUT /api/layout).
+  // - 노드 클릭 → M selection 갱신.
+  //     * plain click       : M = [id] (single — Figma 컨벤션)
+  //     * Cmd / Ctrl + click : M.toggle(id) (multi-select 추가/제거)
+  //     * Shift + click      : M.toggle(id) 도 허용 (cross-platform 친화)
+  // - 캔버스 dot grid 는 token-driven (--canvas-bg, --canvas-grid).
   // - panOnDrag = [1, 2] — middle/right 마우스 버튼만 pan (left는 selection/drag용).
 
-  import { SvelteFlow, Background } from '@xyflow/svelte';
+  import { SvelteFlow, Background, BackgroundVariant } from '@xyflow/svelte';
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import { panelsStore } from '$lib/stores/panels.svelte';
@@ -38,7 +35,6 @@
   // Panel JSON shape — `docs/ssot/canvas-layout-schema.md` §1 `$defs/Panel`의 부분 view.
   // 코드젠된 `$lib/types/canvas-layout.d.ts`가 정본이 되기 전까지의 잠정 정의 — 정본
   // 산출 후 본 타입은 `import type { Panel } from '$lib/types/canvas-layout'`로 교체.
-  // 본 모듈만의 사용이므로 inline 유지 (4개 canvas 컴포넌트 각각 동일한 잠정 정의).
   interface PanelData {
     id: string;
     pane_id?: string;
@@ -57,58 +53,59 @@
   // 'panel' = gtmux Panel custom node. 다른 type은 사용하지 않음 (single node type, MVP).
   const nodeTypes = { panel: PanelNode };
 
+  // M cardinality — PanelNode 가 single/multi 분기를 위해 참조.
+  const isMultiSelection = $derived(ephemeralStore.m.size > 1);
+
   // Panel store → SvelteFlow nodes 매핑.
-  // SvelteMap entry-level fine-grain (R8 §F3): 단일 entry 변경 시 영향받는 derived만
-  // 재실행. 본 derived는 *전체 array 재생성*이라 50 Panel 전체가 한 번에 다시
-  // 만들어질 수 있다 — 위반 시 (R8-O1) keyed each 패턴으로 전환.
   const nodes = $derived<Node[]>(
     Array.from(panelsStore.panels.values() as Iterable<PanelData>).map((p) => ({
       id: p.id,
       type: 'panel',
       position: { x: p.x ?? 0, y: p.y ?? 0 },
-      data: p as unknown as Record<string, unknown>,
-      // Panel.locked = self만 — effective lock은 ancestor OR 누적이지만 본 노드 수준에서는
-      // self만 draggable 차단. Group 트리 OR cascade는 PanelNode 안에서 effective 계산.
+      data: {
+        ...(p as unknown as Record<string, unknown>),
+        // PanelNode 가 자기 자신만으로는 *전체 M 의 크기* 를 알 수 없으므로
+        // Canvas 에서 미리 계산해 data 에 주입. `selected` 와 함께 사용.
+        m_multi: isMultiSelection,
+      },
       draggable: p.locked !== true,
-      // D23: M selection에 들어가면 elevateNodesOnSelect=true가 z-index 들어올림.
       selected: ephemeralStore.m.has(p.id),
-      // schema의 z 필드는 ZIndexMode prop와 별개로 Node-level zIndex로 매핑.
       zIndex: p.z ?? 0,
       width: p.w,
       height: p.h
     }))
   );
 
-  // viewport는 ephemeral broadcast (0x83) 대상이지만 본 task 범위(FE-2)는 캔버스 mount까지.
-  // WS 송신은 dispatcher 트랙. 본 컴포넌트는 viewport 변경 시 store에 commit만 한다
-  // (PanelNode의 `isAtUnitZoom` derived가 placeholder 토글을 위해 매 frame 봐야 하므로
-  // debounce 없이 즉시 갱신).
   function onmove(_event: MouseEvent | TouchEvent | null, viewport: Viewport): void {
     ephemeralStore.viewport = { x: viewport.x, y: viewport.y, zoom: viewport.zoom };
   }
 
-  // 노드 클릭 → M selection 토글. 단일 클릭은 *추가/제거* (Set semantics).
-  // 빈 캔버스 클릭 시 M 비우는 동작은 `onpaneclick`으로 별도 처리.
-  function onnodeclick({ node }: { node: Node }) {
+  // 노드 클릭 → M 갱신.
+  //   plain    : single (clear + add)
+  //   meta/ctrl/shift : toggle in/out
+  function onnodeclick({ node, event }: { node: Node; event: MouseEvent | TouchEvent }) {
     const id = node.id;
-    if (ephemeralStore.m.has(id)) {
-      ephemeralStore.m.delete(id);
+    const isModifierClick =
+      event instanceof MouseEvent &&
+      (event.metaKey || event.ctrlKey || event.shiftKey);
+    if (isModifierClick) {
+      if (ephemeralStore.m.has(id)) {
+        ephemeralStore.m.delete(id);
+      } else {
+        ephemeralStore.m.add(id);
+      }
     } else {
+      ephemeralStore.m.clear();
       ephemeralStore.m.add(id);
     }
   }
 
-  // 캔버스 빈 영역 클릭 → M 클리어 (Figma 컨벤션).
   function onpaneclick() {
     if (ephemeralStore.m.size > 0) {
       ephemeralStore.m.clear();
     }
   }
 
-  // 노드 드래그 종료 → 1) store 에 새 위치 commit (다음 derived 재계산 시 회귀
-  // 방지) 2) backend PUT /api/layout 으로 영속화. SvelteFlow 는 controlled mode
-  // 라 `nodes` prop 가 store derived 인데, store 가 갱신되지 않으면 다음
-  // selection / click 이벤트가 derived 를 다시 돌릴 때 원래 위치로 snap back 한다.
   function onnodedragstop({ targetNode }: { targetNode: Node | null }) {
     if (!targetNode) return;
     const { id, position } = targetNode;
@@ -144,7 +141,13 @@
     onlyRenderVisibleElements={true}
     proOptions={{ hideAttribution: true }}
   >
-    <Background />
+    <Background
+      variant={BackgroundVariant.Dots}
+      gap={24}
+      size={1}
+      bgColor="var(--canvas-bg)"
+      patternColor="var(--canvas-grid)"
+    />
   </SvelteFlow>
 </div>
 
@@ -154,18 +157,26 @@
     height: 100%;
     min-height: 0;
     position: relative;
+    background: var(--canvas-bg);
   }
 
-  /* 캔버스 좌상단에 overlay — SvelteFlow 의 pan/zoom 영역을 가리지 않도록 절대 위치
-     + pointer-events 는 자식 버튼에만 활성. */
+  /* SvelteFlow 의 컨트롤 / 미니맵 / 백그라운드의 default color 를 토큰으로 override.
+     xyflow CSS custom properties — @xyflow/svelte/dist/style.css 정의. */
+  .canvas-root :global(.svelte-flow) {
+    background: var(--canvas-bg);
+    --xy-background-color-default: var(--canvas-bg);
+    --xy-background-pattern-color-default: var(--canvas-grid);
+  }
+
+  /* 캔버스 좌상단에 overlay. */
   .canvas-toolbar {
     position: absolute;
-    top: 8px;
-    left: 8px;
+    top: var(--space-8);
+    left: var(--space-8);
     z-index: 5;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-8);
     pointer-events: none;
   }
 
