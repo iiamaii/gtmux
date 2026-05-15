@@ -534,6 +534,162 @@ pub async fn attach_confirm_handler(
         .into_response()
 }
 
+/// `POST /api/sessions/:name/terminals` — Stage 5-D path P2. Create a
+/// fresh terminal *initiated by the user* (the `[New Terminal]` button
+/// path). The handler:
+///   1. checks the caller's cookie still holds this session's flock
+///      (403 `not_attached` otherwise — same policy as
+///      `attach_confirm_handler`)
+///   2. computes a default cascade coordinate from the current layout
+///   3. mints a fresh UUID and calls
+///      [`crate::AppState::spawn_terminal_with_uuid`] (this publishes the
+///      `0x88 TERMINAL_SPAWNED` UUID↔PaneId binding to every WS)
+///   4. publishes `0x86 MOUNT_CASCADE` so the *trigger session's* webpage
+///      appends a fresh `TerminalItem` at the computed coordinates
+///   5. publishes `0x87 TERMINAL_LIST_UPDATE` so *other sessions'*
+///      webpages refresh their Terminal-list sidebar
+///   6. returns 200 `{ terminal_id, pane_id, x, y, w, h }` so the caller
+///      can correlate with the inbound WS frames if needed
+///
+/// **Persistence is FE-side.** The BE does not write the new item into
+/// the session layout — the FE's `handleMountCascade` calls
+/// `mutateLayout` which round-trips through `PUT /api/sessions/:name/layout`.
+/// See `docs/reports/0037-backend-review-action-items.md` §6.4 for the
+/// rationale (race-free for the common single-tab case; multi-tab race
+/// is the same window as any concurrent PUT).
+///
+/// Body: ignored for MVP (`{}` is fine). A future amend can accept
+/// `{label, x, y, w, h}` overrides; for now BE picks default coords.
+pub async fn create_terminal_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(name): AxumPath<String>,
+    req: Request<Body>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    if let Err(e) = validate_session_name(&name) {
+        return SessionError::Workspace(e).into_response();
+    }
+    if state.hub.is_none() {
+        return service_unavailable("hub_not_configured");
+    }
+
+    let cookie = crate::auth::extract_session_cookie(req.headers())
+        .unwrap_or_else(|| "_unknown".to_string());
+    {
+        let by_cookie = state.session_locks_by_cookie.lock().await;
+        let owns = matches!(by_cookie.get(&cookie), Some(n) if n == &name);
+        if !owns {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "not_attached",
+                    "message": "cookie does not hold an attach for this session",
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let (x, y, w, h) = match next_mount_cascade_coords(&state, wm, &name).await {
+        Ok(coords) => coords,
+        Err(e) => return e.into_response(),
+    };
+
+    let uuid = crate::terminal_map::fresh_terminal_uuid();
+    let pane = match state.spawn_terminal_with_uuid(uuid.clone()).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "create_terminal: spawn_terminal_with_uuid failed"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "spawn_failed", "message": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    // hub.is_none() guarded above; hub is present here.
+    if let Some(hub) = state.hub.as_ref() {
+        hub.publish_mount_cascade(gtmux_ws_server::MountCascadeEvent {
+            trigger_session: std::sync::Arc::from(name.as_str()),
+            terminal_id: std::sync::Arc::from(uuid.as_str()),
+            x,
+            y,
+            w,
+            h,
+        });
+        hub.publish_terminal_list_change(&name, &[uuid.clone()], &[]);
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "terminal_id": uuid,
+            "pane_id": pane.0,
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+        })),
+    )
+        .into_response()
+}
+
+/// Default coordinate policy for Stage 5-D P2 `[New Terminal]` spawns.
+/// Empty layout → `(80, 80, 720, 420)`. Otherwise the bottom-right-most
+/// existing terminal's `(x, y)` plus a `+32` cascade offset, with the
+/// default `w/h`. Race window: if two `POST /terminals` calls land
+/// concurrently before either FE has PUT the resulting layout, they may
+/// pick the same coordinates — the user can move the panel. Tracking
+/// that race in BE would require a write lock on the session_cache for
+/// the entire spawn+publish path, which is not worth the complexity at
+/// MVP scale (single-attach makes the race essentially impossible in
+/// practice).
+async fn next_mount_cascade_coords(
+    state: &crate::AppState,
+    wm: &Arc<crate::WorkspaceManager>,
+    name: &str,
+) -> Result<(f64, f64, f64, f64), SessionError> {
+    const DEFAULT_W: f64 = 720.0;
+    const DEFAULT_H: f64 = 420.0;
+    const CASCADE_OFFSET: f64 = 32.0;
+    const FALLBACK_X: f64 = 80.0;
+    const FALLBACK_Y: f64 = 80.0;
+
+    let entry = state.session_cache.get_or_load(wm.as_ref(), name).await?;
+    let guard = entry.read().await;
+    let mut max_x = 0.0_f64;
+    let mut max_y = 0.0_f64;
+    let mut any = false;
+    for item in &guard.layout.items {
+        if let crate::schema::Item::Terminal { common } = item {
+            if !any {
+                max_x = common.x;
+                max_y = common.y;
+                any = true;
+            } else {
+                max_x = max_x.max(common.x);
+                max_y = max_y.max(common.y);
+            }
+        }
+    }
+    if any {
+        Ok((
+            max_x + CASCADE_OFFSET,
+            max_y + CASCADE_OFFSET,
+            DEFAULT_W,
+            DEFAULT_H,
+        ))
+    } else {
+        Ok((FALLBACK_X, FALLBACK_Y, DEFAULT_W, DEFAULT_H))
+    }
+}
+
 async fn classify_layout_terminals(
     state: &crate::AppState,
     wm: &Arc<crate::WorkspaceManager>,

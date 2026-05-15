@@ -613,6 +613,10 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             axum::routing::post(sessions::attach_confirm_handler),
         )
         .route(
+            "/api/sessions/{name}/terminals",
+            axum::routing::post(sessions::create_terminal_handler),
+        )
+        .route(
             "/api/sessions/{name}/items/{id}",
             axum::routing::delete(sessions::delete_item_handler),
         )
@@ -3420,6 +3424,189 @@ mod tests {
         let table = SessionTable::new(std::time::Duration::from_secs(60));
         let live = gtmux_ws_server::CookieValidator::validate(&table, "nope").await;
         assert!(!live, "unknown cookie must not validate");
+    }
+
+    // ── Stage 5-D path P2: POST /terminals + 0x86 MOUNT_CASCADE ──
+
+    #[tokio::test]
+    async fn create_terminal_publishes_mount_cascade_and_terminal_list_change() {
+        // The endpoint is the centerpiece of 5-D P2 — verify that one
+        // POST publishes BOTH the trigger-session frame (0x86 mount-cascade)
+        // and the other-session frame (0x87 terminal-list-change), with
+        // matching UUID + coordinates.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let app = router_with_state(state);
+        let cookie = "p2-cookie";
+        create_session(&app, &token, "p2demo").await;
+
+        // Take the attach so the create_terminal handler sees the cookie
+        // as the lock holder.
+        let attach = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/p2demo/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attach.status(), StatusCode::OK);
+
+        let mut cascade_rx = hub.subscribe_mount_cascade();
+        let mut list_rx = hub.subscribe_terminal_list_change();
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/p2demo/terminals")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let uuid = v["terminal_id"].as_str().expect("terminal_id").to_string();
+        assert!(v["pane_id"].as_u64().is_some());
+        // Empty layout → fallback coords (80, 80, 720, 420).
+        assert_eq!(v["x"], 80.0);
+        assert_eq!(v["y"], 80.0);
+        assert_eq!(v["w"], 720.0);
+        assert_eq!(v["h"], 420.0);
+
+        let cascade = tokio::time::timeout(std::time::Duration::from_millis(500), cascade_rx.recv())
+            .await
+            .expect("cascade timeout")
+            .expect("cascade recv");
+        assert_eq!(&*cascade.trigger_session, "p2demo");
+        assert_eq!(&*cascade.terminal_id, uuid);
+        assert_eq!(cascade.x, 80.0);
+        assert_eq!(cascade.y, 80.0);
+
+        let list = tokio::time::timeout(std::time::Duration::from_millis(500), list_rx.recv())
+            .await
+            .expect("list timeout")
+            .expect("list recv");
+        assert_eq!(&*list.trigger_session, "p2demo");
+        assert_eq!(list.added.len(), 1);
+        assert_eq!(&*list.added[0], &uuid);
+        assert_eq!(list.removed.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_terminal_403_when_not_attached() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let app = router_with_state(state);
+        create_session(&app, &token, "p2na").await;
+
+        // Skip attach — POST /terminals must 403 not_attached.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/p2na/terminals")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn create_terminal_cascade_offsets_from_existing_max() {
+        // With one terminal at (200, 150), the next default is (232, 182).
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let existing_uuid = "11111111-2222-4333-8444-666666666700";
+        state
+            .terminal_map
+            .register(existing_uuid.into(), PaneId(50))
+            .await
+            .unwrap();
+        std::fs::write(
+            workspace_dir.join("p2cas.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [{
+                    "id": existing_uuid,
+                    "type": "terminal",
+                    "parent_id": null,
+                    "x": 200.0, "y": 150.0, "w": 640.0, "h": 400.0, "z": 0,
+                    "visibility": "visible", "locked": false, "minimized": false
+                }],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state);
+        let cookie = "p2cas-cookie";
+        let attach = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/p2cas/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attach.status(), StatusCode::OK);
+
+        let mut cascade_rx = hub.subscribe_mount_cascade();
+
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/p2cas/terminals")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["x"], 232.0);
+        assert_eq!(v["y"], 182.0);
+
+        let cascade = tokio::time::timeout(std::time::Duration::from_millis(500), cascade_rx.recv())
+            .await
+            .expect("cascade timeout")
+            .expect("cascade recv");
+        assert_eq!(cascade.x, 232.0);
+        assert_eq!(cascade.y, 182.0);
     }
 
     // ── FE Issue C unblock: spawn_terminal_with_uuid publishes 0x88 binding ──

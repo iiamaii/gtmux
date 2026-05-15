@@ -54,8 +54,8 @@ mod varint;
 
 pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTED_CTRL_CMDS};
 pub use hub::{
-    CookieValidator, Hub, ManipulationEvent, TerminalDiedEvent, TerminalListChangeEvent,
-    TerminalSpawnedEvent, HUB_BROADCAST_CAPACITY,
+    CookieValidator, Hub, ManipulationEvent, MountCascadeEvent, TerminalDiedEvent,
+    TerminalListChangeEvent, TerminalSpawnedEvent, HUB_BROADCAST_CAPACITY,
 };
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
 
@@ -140,6 +140,13 @@ pub enum FrameType {
     /// D1), so all attached webpages must see the death. Inner payload:
     /// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","reason":"exit"|"killed"}`.
     TerminalDied = 0x85,
+    /// `0x86 MOUNT_CASCADE` (Stage 5-D path P2, ADR-0021 D3). Trigger-only
+    /// auto-mount hint emitted on `POST /api/sessions/:name/terminals` so
+    /// the originating webpage appends a fresh `TerminalItem` to its
+    /// canvas at the server-provided coordinates. Other sessions receive
+    /// `0x87 TERMINAL_LIST_UPDATE` instead. Inner payload: `varint 0 +
+    /// UTF-8 JSON {"terminal_id":"<uuid>","x":<num>,"y":<num>,"w":<num>,"h":<num>}`.
+    MountCascade = 0x86,
     /// `0x87 TERMINAL_LIST_UPDATE` (Stage 5-D path P1, ADR-0021 D3). Pool
     /// delta hint emitted on *attach_confirm* spawn — every webpage
     /// **outside** the triggering session sees `{ added: [...], removed: [] }`
@@ -148,11 +155,6 @@ pub enum FrameType {
     /// [`Hub::session_for_cookie`]: the trigger session itself does not
     /// receive this frame (its layout already reflects the spawn). Inner
     /// payload: `varint 0 + UTF-8 JSON {"added":["<uuid>",…],"removed":[…]}`.
-    ///
-    /// 0x86 MOUNT_CASCADE (the trigger-session companion frame in
-    /// path P2 — `[New Terminal]` button) is *reserved by FE decoder*
-    /// (`decode.ts:517`) but not yet emitted by BE; see
-    /// `docs/reports/0035-be-fe-coordination-stage-5.md` §3.2.
     TerminalListUpdate = 0x87,
     /// `0x88 TERMINAL_SPAWNED` (FE Issue C unblock — 0036(FE) §4). Carries
     /// the UUID ↔ PaneId binding that `AppState::spawn_terminal_with_uuid`
@@ -180,6 +182,7 @@ impl FrameType {
             0x83 => Self::ViewportChanged,
             0x84 => Self::FocusMode,
             0x85 => Self::TerminalDied,
+            0x86 => Self::MountCascade,
             0x87 => Self::TerminalListUpdate,
             0x88 => Self::TerminalSpawned,
             _ => return None,
@@ -511,6 +514,7 @@ async fn handle_socket(
     let mut terminal_list_change_rx = hub.subscribe_terminal_list_change();
     let mut terminal_spawned_rx = hub.subscribe_terminal_spawned();
     let mut manipulation_rx = hub.subscribe_manipulation();
+    let mut mount_cascade_rx = hub.subscribe_mount_cascade();
 
     // Send the initial LAYOUT_CHANGED hello so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -775,6 +779,50 @@ async fn handle_socket(
                         // / viewport / focus state). The next event refreshes
                         // the snapshot — warn but keep the connection alive.
                         warn!(skipped = n, "ws manipulation subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — other arms will hit Closed too.
+                    }
+                }
+            }
+            cascade = mount_cascade_rx.recv() => {
+                match cascade {
+                    Ok(event) => {
+                        // Stage 5-D P2: trigger-only delivery. Subscribers
+                        // whose cookie maps to the trigger session emit the
+                        // 0x86 envelope; all others drop. Cookies with no
+                        // session attach also drop (race window: WS open
+                        // before /attach).
+                        let Some(cookie) = cookie_value.as_deref() else {
+                            continue;
+                        };
+                        let Some(my_session) = hub.session_for_cookie(cookie) else {
+                            continue;
+                        };
+                        if my_session.as_str() != event.trigger_session.as_ref() {
+                            continue;
+                        }
+                        let env = Envelope::new(
+                            FrameType::MountCascade,
+                            Bytes::from(payload::encode_mount_cascade(
+                                &event.terminal_id,
+                                event.x,
+                                event.y,
+                                event.w,
+                                event.h,
+                            )),
+                        );
+                        if let Ok(buf) = env.encode() {
+                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // A dropped mount-cascade is recoverable — the FE's
+                        // next attach or /api/terminals refresh repaints
+                        // the canvas. Warn but keep the connection alive.
+                        warn!(skipped = n, "ws mount-cascade subscriber lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Hub dropped — other arms will hit Closed too.
@@ -1131,7 +1179,8 @@ async fn handle_client_envelope(
         | FrameType::NotifyMirror
         | FrameType::TerminalDied
         | FrameType::TerminalListUpdate
-        | FrameType::TerminalSpawned => {
+        | FrameType::TerminalSpawned
+        | FrameType::MountCascade => {
             let _ = sink
                 .send(close_frame(
                     close_codes::POLICY_VIOLATION,
@@ -1330,16 +1379,14 @@ mod tests {
     #[test]
     fn frame_type_from_u8_covers_all() {
         for &b in &[
-            0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x87,
-            0x88,
+            0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86,
+            0x87, 0x88,
         ] {
             let ft = FrameType::from_u8(b).expect("known frame");
             assert_eq!(ft.as_u8(), b);
         }
-        // 0x86 stays unknown to BE for now — reserved by FE for Stage 5-D
-        // path P2 (`MOUNT_CASCADE`) which is still gated on FE/BE
-        // coordination per `docs/reports/0035-be-fe-coordination-stage-5.md`.
-        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x86, 0x89, 0x8F, 0xFE, 0xFF] {
+        // 0x89 is the first unassigned slot above 0x88 TerminalSpawned.
+        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x89, 0x8F, 0xFE, 0xFF] {
             assert!(FrameType::from_u8(b).is_none(), "byte 0x{b:02x} leaked");
         }
     }
@@ -1354,8 +1401,10 @@ mod tests {
         // splits "real-time pane I/O" from "schema metadata" will use the
         // marker.
         assert!(FrameType::TerminalDied.is_web_domain());
-        // 0x87 TerminalListUpdate is also web-domain; same marker rule.
+        // 0x86 / 0x87 / 0x88 all share the high-bit marker.
+        assert!(FrameType::MountCascade.is_web_domain());
         assert!(FrameType::TerminalListUpdate.is_web_domain());
+        assert!(FrameType::TerminalSpawned.is_web_domain());
     }
 
     // ── BackendNotify → Envelope mapping ─────────────────────────────────
@@ -1781,6 +1830,141 @@ bind = "127.0.0.1"
             }
         }
         None
+    }
+
+    /// Read frames until a `0x86 MOUNT_CASCADE` arrives or timeout. Drains
+    /// other frame types so the test can assert on the cascade body
+    /// unambiguously.
+    async fn expect_mount_cascade(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        timeout: std::time::Duration,
+    ) -> Option<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(TM::Binary(buf)))) => {
+                    let Ok((env, _)) = Envelope::decode(buf.as_ref()) else {
+                        continue;
+                    };
+                    if env.kind != FrameType::MountCascade {
+                        continue;
+                    }
+                    if env.payload.is_empty() || env.payload[0] != 0x00 {
+                        continue;
+                    }
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&env.payload[1..]).ok()?;
+                    return Some(json);
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    // ── Stage 5-D path P2: 0x86 MOUNT_CASCADE trigger-only routing ──
+
+    #[tokio::test]
+    async fn mount_cascade_delivered_to_trigger_session_only() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        hub.set_session_for_cookie("cookie-A", "alpha");
+        hub.set_session_for_cookie("cookie-B", "beta");
+
+        let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
+        let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
+        drain_initial(&mut ws_a, std::time::Duration::from_millis(50)).await;
+        drain_initial(&mut ws_b, std::time::Duration::from_millis(50)).await;
+
+        hub.publish_mount_cascade(MountCascadeEvent {
+            trigger_session: std::sync::Arc::from("alpha"),
+            terminal_id: std::sync::Arc::from("11111111-2222-4333-8444-555555555555"),
+            x: 80.0,
+            y: 96.0,
+            w: 720.0,
+            h: 420.0,
+        });
+
+        // A (trigger) must receive.
+        let body = expect_mount_cascade(&mut ws_a, std::time::Duration::from_millis(500))
+            .await
+            .expect("trigger session must receive 0x86");
+        assert_eq!(body["terminal_id"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(body["x"], 80.0);
+        assert_eq!(body["y"], 96.0);
+        assert_eq!(body["w"], 720.0);
+        assert_eq!(body["h"], 420.0);
+
+        // B (other) must NOT receive.
+        let leak = expect_mount_cascade(&mut ws_b, std::time::Duration::from_millis(150)).await;
+        assert!(
+            leak.is_none(),
+            "non-trigger session must not receive 0x86: {leak:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mount_cascade_skipped_when_cookie_unattached() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        // No session binding for the cookie.
+        let mut ws = connect_authed_with_cookie(addr, &token, "cookie-orphan").await;
+        drain_initial(&mut ws, std::time::Duration::from_millis(50)).await;
+
+        hub.publish_mount_cascade(MountCascadeEvent {
+            trigger_session: std::sync::Arc::from("alpha"),
+            terminal_id: std::sync::Arc::from("uuid"),
+            x: 80.0,
+            y: 80.0,
+            w: 720.0,
+            h: 420.0,
+        });
+
+        let leak = expect_mount_cascade(&mut ws, std::time::Duration::from_millis(150)).await;
+        assert!(leak.is_none(), "unattached cookie must not receive 0x86");
+    }
+
+    #[tokio::test]
+    async fn client_origin_mount_cascade_closes_1008() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, _hub) = spawn_test_server(token.clone()).await;
+        let mut ws = connect_authed(addr, &token).await;
+        drain_initial(&mut ws, std::time::Duration::from_millis(50)).await;
+
+        let bad = Envelope::new(
+            FrameType::MountCascade,
+            Bytes::from(payload::encode_mount_cascade("u", 0.0, 0.0, 1.0, 1.0)),
+        )
+        .encode()
+        .unwrap();
+        ws.send(TM::Binary(bad.to_vec().into())).await.unwrap();
+
+        let mut got_policy_close = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(TM::Close(Some(cf))))) => {
+                    assert_eq!(u16::from(cf.code), close_codes::POLICY_VIOLATION);
+                    got_policy_close = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            got_policy_close,
+            "client-origin 0x86 must be policy-violation closed"
+        );
     }
 
     // ── Stage 5-C: echo-minus-sender + session-scoped manipulation routing ──

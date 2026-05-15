@@ -84,6 +84,11 @@ const TERMINAL_SPAWNED_BROADCAST_CAPACITY: usize = 64;
 /// and continues — the next event refreshes the state.
 const MANIPULATION_BROADCAST_CAPACITY: usize = 256;
 
+/// Fan-out channel depth for Stage 5-D P2 mount-cascade events. One
+/// event per `POST /api/sessions/:name/terminals` call — same
+/// low-frequency profile as terminal-spawned.
+const MOUNT_CASCADE_BROADCAST_CAPACITY: usize = 64;
+
 /// Payload of a `TerminalDied` broadcast. `uuid` is the schema-side
 /// terminal id; `reason` is `"exit"` (process self-exited) or `"killed"`
 /// (signal-driven exit). `Arc<str>` over `String` so the broadcast clone
@@ -124,6 +129,26 @@ pub struct TerminalListChangeEvent {
 pub struct TerminalSpawnedEvent {
     pub terminal_id: Arc<str>,
     pub pane_id: u64,
+}
+
+/// Payload of a `MountCascade` broadcast (Stage 5-D path P2).
+/// Emitted by `POST /api/sessions/:name/terminals` after the terminal
+/// spawns and its UUID↔PaneId binding has been published. Routed to the
+/// trigger session **only** — other attached webpages receive a
+/// `TerminalListChange` instead (P1 pool refresh path).
+///
+/// Coordinates are server-determined defaults; the FE's
+/// `handleMountCascade` appends a fresh `TerminalItem` at these values
+/// and then PUTs the updated layout (BE itself does not persist the
+/// item — see `docs/reports/0037-backend-review-action-items.md` §6.4).
+#[derive(Clone, Debug)]
+pub struct MountCascadeEvent {
+    pub trigger_session: Arc<str>,
+    pub terminal_id: Arc<str>,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
 }
 
 /// Payload of a `Manipulation` broadcast (Stage 5-C echo-minus-sender,
@@ -210,6 +235,12 @@ pub struct Hub {
     /// `0x88 TERMINAL_SPAWNED` envelope so the FE can update its local
     /// UUID→PaneId map ahead of the next `GET /api/terminals` poll.
     terminal_spawned_events: broadcast::Sender<TerminalSpawnedEvent>,
+    /// Mount-cascade broadcast (Stage 5-D path P2). Published by
+    /// `POST /api/sessions/:name/terminals` to direct the trigger
+    /// session's webpage to append a fresh `TerminalItem` at the
+    /// server-provided coordinates. Subscribers filter by
+    /// `hub.session_for_cookie(my_cookie) == event.trigger_session`.
+    mount_cascade_events: broadcast::Sender<MountCascadeEvent>,
     /// Manipulation broadcast (Stage 5-C, ADR-0021 D5). Published by the
     /// inbound 0x81..=0x84 dispatch path once it knows the sender's
     /// session. Each subscriber filters by `sender_conn_id` and
@@ -240,6 +271,8 @@ impl Hub {
             broadcast::channel(TERMINAL_SPAWNED_BROADCAST_CAPACITY);
         let (manipulation_events, _) =
             broadcast::channel(MANIPULATION_BROADCAST_CAPACITY);
+        let (mount_cascade_events, _) =
+            broadcast::channel(MOUNT_CASCADE_BROADCAST_CAPACITY);
 
         let mux_backend = backend.clone();
         let mux_tx = pane_output.clone();
@@ -259,6 +292,7 @@ impl Hub {
             terminal_list_change_events,
             terminal_spawned_events,
             manipulation_events,
+            mount_cascade_events,
             cookie_validator: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -493,6 +527,19 @@ impl Hub {
         self.manipulation_events.subscribe()
     }
 
+    /// Broadcast a mount-cascade event (Stage 5-D path P2). Called by
+    /// `POST /api/sessions/:name/terminals` after a successful spawn.
+    /// Per-subscriber filter (only trigger session receives) runs in the
+    /// WS dispatcher's `mount_cascade_rx` arm.
+    pub fn publish_mount_cascade(&self, event: MountCascadeEvent) {
+        let _ = self.mount_cascade_events.send(event);
+    }
+
+    /// Subscribe to mount-cascade events.
+    pub fn subscribe_mount_cascade(&self) -> broadcast::Receiver<MountCascadeEvent> {
+        self.mount_cascade_events.subscribe()
+    }
+
     /// Register the cookie validator (Stage 5 D10 α). Called once at boot
     /// from the http-api wiring layer so the WS handshake can accept
     /// cookie-based auth as an alternative to the subprotocol bearer.
@@ -708,6 +755,41 @@ mod tests {
             frame_type: 0x81,
             payload: Bytes::from_static(&[0x00]),
         });
+    }
+
+    #[tokio::test]
+    async fn mount_cascade_publish_silent_without_subscribers() {
+        let hub = Hub::new(PtyBackend::new());
+        hub.publish_mount_cascade(MountCascadeEvent {
+            trigger_session: Arc::from("alpha"),
+            terminal_id: Arc::from("uuid"),
+            x: 80.0,
+            y: 80.0,
+            w: 720.0,
+            h: 420.0,
+        });
+    }
+
+    #[tokio::test]
+    async fn mount_cascade_subscriber_receives_event() {
+        let hub = Hub::new(PtyBackend::new());
+        let mut rx = hub.subscribe_mount_cascade();
+        hub.publish_mount_cascade(MountCascadeEvent {
+            trigger_session: Arc::from("alpha"),
+            terminal_id: Arc::from("11111111-2222-4333-8444-555555555555"),
+            x: 96.0,
+            y: 112.0,
+            w: 720.0,
+            h: 420.0,
+        });
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert_eq!(&*got.trigger_session, "alpha");
+        assert_eq!(&*got.terminal_id, "11111111-2222-4333-8444-555555555555");
+        assert_eq!(got.x, 96.0);
+        assert_eq!(got.y, 112.0);
     }
 
     #[tokio::test]

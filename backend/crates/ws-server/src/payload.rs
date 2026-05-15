@@ -59,6 +59,31 @@ pub fn encode_terminal_died(uuid: &str, reason: &str) -> Vec<u8> {
     out
 }
 
+/// `0x86 MOUNT_CASCADE` (Stage 5-D path P2) inner =
+/// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","x":<num>,"y":<num>,"w":<num>,"h":<num>}`.
+///
+/// Emitted by `POST /api/sessions/:name/terminals` to the *trigger
+/// session* only (other sessions get `0x87 TERMINAL_LIST_UPDATE`). FE
+/// `decodeMountCascade` (decode.ts) validates `w > 0` and `h > 0`.
+/// Coordinates are server-determined defaults (cascade offset from the
+/// session's current max x/y, fallback to `(80, 80, 720, 420)` for empty
+/// layout — see http-api `sessions::next_mount_cascade_coords`).
+pub fn encode_mount_cascade(terminal_id: &str, x: f64, y: f64, w: f64, h: f64) -> Vec<u8> {
+    let body = json!({
+        "terminal_id": terminal_id,
+        "x": x,
+        "y": y,
+        "w": w,
+        "h": h,
+    })
+    .to_string();
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(1 + bytes.len());
+    varint::encode_into(0, &mut out);
+    out.extend_from_slice(bytes);
+    out
+}
+
 /// `0x87 TERMINAL_LIST_UPDATE` (Stage 5-D path P1) inner =
 /// `varint 0 + UTF-8 JSON {"added":["<uuid>",…],"removed":["<uuid>",…]}`.
 ///
@@ -289,6 +314,24 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
         assert_eq!(json["added"], serde_json::json!(["u1", "u2"]));
         assert_eq!(json["removed"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn mount_cascade_round_trip() {
+        let inner = encode_mount_cascade(
+            "11111111-2222-4333-8444-555555555555",
+            80.0,
+            96.0,
+            720.0,
+            420.0,
+        );
+        assert_eq!(inner[0], 0x00);
+        let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
+        assert_eq!(json["terminal_id"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(json["x"], 80.0);
+        assert_eq!(json["y"], 96.0);
+        assert_eq!(json["w"], 720.0);
+        assert_eq!(json["h"], 420.0);
     }
 
     #[test]
