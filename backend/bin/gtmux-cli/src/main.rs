@@ -456,6 +456,12 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     // automation / CLI scripts that pass only the token keep working.
     hub.set_cookie_validator(app_state.session_table.clone());
 
+    // 0040 §5 option A: terminal UUID provider so the WS catch-up replays
+    // alive UUID↔PaneId bindings as `0x88 TERMINAL_SPAWNED` frames on every
+    // new handshake. Closes the reload / WS reconnect gap where the FE
+    // `XtermHost` would otherwise stay on the "connecting" placeholder.
+    hub.set_terminal_uuid_provider(app_state.terminal_map.clone());
+
     let state_for_disconnect = app_state.clone();
     let _disconnect_task = tokio::spawn(async move {
         while let Some(cookie) = disconnect_rx.recv().await {

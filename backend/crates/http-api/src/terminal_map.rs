@@ -29,7 +29,9 @@
 //!     concurrent same-UUID spawn race and clean up the duplicate.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use gtmux_pty_backend::PaneId;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -130,6 +132,22 @@ impl TerminalMap {
     /// `true` when the map holds no bindings.
     pub async fn is_empty(&self) -> bool {
         self.inner.read().await.by_uuid.is_empty()
+    }
+}
+
+/// 0040 §5 option A — supply UUID↔PaneId bindings to the ws-server catch-up
+/// replay. The handshake calls `alive_bindings()` once on every new connection
+/// and emits a `0x88 TERMINAL_SPAWNED` frame per binding *before* the regular
+/// pane-spawned NOTIFY / PANE_OUT replay, so reload / reconnect restores the
+/// FE `terminalPool.paneIdByUuid` map without a `GET /api/terminals` poll.
+#[async_trait]
+impl gtmux_ws_server::TerminalUuidProvider for TerminalMap {
+    async fn alive_bindings(&self) -> Vec<(u64, Arc<str>)> {
+        let g = self.inner.read().await;
+        g.by_uuid
+            .iter()
+            .map(|(uuid, pane)| (pane.0, Arc::<str>::from(uuid.as_str())))
+            .collect()
     }
 }
 
@@ -270,5 +288,46 @@ mod tests {
         assert_eq!(parts[4].len(), 12);
         // Version nibble = 4.
         assert!(parts[2].starts_with('4'));
+    }
+
+    // ── TerminalUuidProvider impl (0040 §5 option A) ─────────────────────
+
+    #[tokio::test]
+    async fn uuid_provider_empty_when_no_bindings() {
+        use gtmux_ws_server::TerminalUuidProvider;
+        let map = TerminalMap::new();
+        let got = map.alive_bindings().await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn uuid_provider_returns_all_bindings() {
+        use gtmux_ws_server::TerminalUuidProvider;
+        let map = TerminalMap::new();
+        map.register("uuid-a".into(), PaneId(1)).await.unwrap();
+        map.register("uuid-b".into(), PaneId(2)).await.unwrap();
+        map.register("uuid-c".into(), PaneId(7)).await.unwrap();
+        let mut got = map.alive_bindings().await;
+        got.sort_by_key(|(p, _)| *p);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].0, 1);
+        assert_eq!(got[0].1.as_ref(), "uuid-a");
+        assert_eq!(got[1].0, 2);
+        assert_eq!(got[1].1.as_ref(), "uuid-b");
+        assert_eq!(got[2].0, 7);
+        assert_eq!(got[2].1.as_ref(), "uuid-c");
+    }
+
+    #[tokio::test]
+    async fn uuid_provider_unregister_drops_from_snapshot() {
+        use gtmux_ws_server::TerminalUuidProvider;
+        let map = TerminalMap::new();
+        map.register("u1".into(), PaneId(1)).await.unwrap();
+        map.register("u2".into(), PaneId(2)).await.unwrap();
+        map.unregister_pane(PaneId(1)).await;
+        let got = map.alive_bindings().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 2);
+        assert_eq!(got[0].1.as_ref(), "u2");
     }
 }

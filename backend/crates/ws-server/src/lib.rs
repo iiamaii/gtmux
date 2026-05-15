@@ -55,7 +55,8 @@ mod varint;
 pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTED_CTRL_CMDS};
 pub use hub::{
     CookieValidator, Hub, ManipulationEvent, MountCascadeEvent, TerminalDiedEvent,
-    TerminalListChangeEvent, TerminalSpawnedEvent, HUB_BROADCAST_CAPACITY,
+    TerminalListChangeEvent, TerminalSpawnedEvent, TerminalUuidProvider,
+    HUB_BROADCAST_CAPACITY,
 };
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
 
@@ -531,6 +532,36 @@ async fn handle_socket(
         {
             debug!("ws hello send failed; peer hung up early");
             return;
+        }
+    }
+
+    // Catch-up: terminal UUID ↔ PaneId bindings (0040 §5 option A). A
+    // freshly-connected client (page reload, WS auto-reconnect) needs the
+    // mapping table re-populated so its `XtermHost` can leave the
+    // "connecting" placeholder. We emit `0x88 TERMINAL_SPAWNED` *before*
+    // the pane-spawned NOTIFY / PANE_OUT replay so the FE handler binds
+    // the PaneId before the bytes arrive (the bytes are routed by numeric
+    // PaneId via `paneOutHandlers`, but the panel can only mount after
+    // `terminalPool.paneIdFor(uuid)` resolves). Missing provider (legacy
+    // boot, tests) leaves the catch-up unchanged — fresh-spawn 0x88 frames
+    // still cover the normal path.
+    if let Some(provider) = hub.terminal_uuid_provider() {
+        let bindings = provider.alive_bindings().await;
+        for (pane_id, uuid) in bindings {
+            let env = Envelope::new(
+                FrameType::TerminalSpawned,
+                Bytes::from(payload::encode_terminal_spawned(&uuid, pane_id)),
+            );
+            if let Ok(buf) = env.encode() {
+                if sink
+                    .send(Message::Binary(buf.to_vec().into()))
+                    .await
+                    .is_err()
+                {
+                    debug!("ws catch-up terminal-spawned send failed; peer hung up");
+                    return;
+                }
+            }
         }
     }
 
@@ -1868,6 +1899,119 @@ bind = "127.0.0.1"
                 Err(_) => return None,
             }
         }
+    }
+
+    // ── 0040 §5 option A: catch-up 0x88 emission via TerminalUuidProvider ──
+
+    /// Stub provider for catch-up tests — owns a fixed (pane_id, uuid) list.
+    struct CatchupStubProvider(Vec<(u64, &'static str)>);
+
+    #[async_trait::async_trait]
+    impl CookieValidator for CatchupStubProvider {
+        async fn validate(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TerminalUuidProvider for CatchupStubProvider {
+        async fn alive_bindings(&self) -> Vec<(u64, std::sync::Arc<str>)> {
+            self.0
+                .iter()
+                .map(|(pid, uuid)| (*pid, std::sync::Arc::from(*uuid)))
+                .collect()
+        }
+    }
+
+    /// Drain frames after handshake and collect every `0x88 TERMINAL_SPAWNED`
+    /// envelope arriving within `timeout`. Used to assert the catch-up
+    /// replay covers all alive bindings.
+    async fn collect_terminal_spawned_burst(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        timeout: std::time::Duration,
+    ) -> Vec<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut out = Vec::new();
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return out;
+            }
+            let remaining = deadline - now;
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(TM::Binary(buf)))) => {
+                    let Ok((env, _)) = Envelope::decode(buf.as_ref()) else {
+                        continue;
+                    };
+                    if env.kind != FrameType::TerminalSpawned {
+                        continue;
+                    }
+                    if env.payload.is_empty() || env.payload[0] != 0x00 {
+                        continue;
+                    }
+                    if let Ok(json) =
+                        serde_json::from_slice::<serde_json::Value>(&env.payload[1..])
+                    {
+                        out.push(json);
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => return out,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn catchup_emits_terminal_spawned_for_every_alive_binding() {
+        // The reload/reconnect scenario from 0040 §1.2 — provider returns 3
+        // bindings, the handshake's catch-up must surface all of them as
+        // 0x88 frames *before* the per-pane NOTIFY/PANE_OUT replay.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        let bindings = vec![
+            (1u64, "11111111-2222-4333-8444-aaaaaaaaaaaa"),
+            (2u64, "11111111-2222-4333-8444-bbbbbbbbbbbb"),
+            (3u64, "11111111-2222-4333-8444-cccccccccccc"),
+        ];
+        hub.set_terminal_uuid_provider(std::sync::Arc::new(CatchupStubProvider(bindings)));
+
+        let mut ws = connect_authed(addr, &token).await;
+        let burst =
+            collect_terminal_spawned_burst(&mut ws, std::time::Duration::from_millis(500)).await;
+        let ids: std::collections::HashSet<String> = burst
+            .iter()
+            .filter_map(|v| v["terminal_id"].as_str().map(String::from))
+            .collect();
+        assert!(
+            ids.contains("11111111-2222-4333-8444-aaaaaaaaaaaa"),
+            "got: {ids:?}"
+        );
+        assert!(
+            ids.contains("11111111-2222-4333-8444-bbbbbbbbbbbb"),
+            "got: {ids:?}"
+        );
+        assert!(
+            ids.contains("11111111-2222-4333-8444-cccccccccccc"),
+            "got: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catchup_skips_terminal_spawned_when_provider_unset() {
+        // Test parity: existing tests run with no provider — the catch-up
+        // path must stay silent (no 0x88 fired) so legacy code does not
+        // accidentally see ghost bindings.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, _hub) = spawn_test_server(token.clone()).await;
+        let mut ws = connect_authed(addr, &token).await;
+        let burst =
+            collect_terminal_spawned_burst(&mut ws, std::time::Duration::from_millis(150)).await;
+        assert!(
+            burst.is_empty(),
+            "no provider registered → no 0x88 expected, got: {burst:?}"
+        );
     }
 
     // ── Stage 5-D path P2: 0x86 MOUNT_CASCADE trigger-only routing ──

@@ -51,6 +51,25 @@ pub trait CookieValidator: Send + Sync {
     async fn validate(&self, cookie_value: &str) -> bool;
 }
 
+/// Dependency injection seam for the http-api layer's UUID ↔ PaneId bridge
+/// (`TerminalMap`). The WS handshake's catch-up replay calls this to re-emit
+/// `0x88 TERMINAL_SPAWNED` frames for *every alive terminal* — so a freshly
+/// connected client (page reload, WS auto-reconnect) immediately learns the
+/// numeric PaneId for every UUID on the canvas. Without this, `0x88` would
+/// only fire on *fresh* spawns and the FE `XtermHost` of any pre-existing
+/// terminal item would be stuck on the "Terminal stream connecting…"
+/// placeholder until the user spawns a new terminal.
+///
+/// See `docs/reports/0040-terminal-panel-integration-verification.md` §1.2
+/// for the gap analysis and §5 for the recommended option-A fix.
+#[async_trait]
+pub trait TerminalUuidProvider: Send + Sync {
+    /// Snapshot of every alive `(pane_id, terminal_uuid)` binding. Order is
+    /// unspecified. Implementations should be lock-free / `Arc::clone`-cheap
+    /// — the catch-up replay calls this once per WS handshake.
+    async fn alive_bindings(&self) -> Vec<(u64, Arc<str>)>;
+}
+
 /// Fan-out channel depth for the multiplexed pane output stream. Sized
 /// for 50-pane × occasional-burst (mirrors the legacy `HUB_BROADCAST_CAPACITY`
 /// value before §2.4 of `docs/reports/0026-stage-b-carry-forward.md` —
@@ -255,6 +274,12 @@ pub struct Hub {
     /// token. `None` (test paths and pre-wired boot phase) leaves auth at
     /// the legacy bearer-only path.
     cookie_validator: Arc<std::sync::Mutex<Option<Arc<dyn CookieValidator>>>>,
+    /// Terminal UUID provider (Stage 5 / 0040 §5). Set once at boot — the WS
+    /// handshake snapshots this on every new connection to re-emit `0x88
+    /// TERMINAL_SPAWNED` frames for the catch-up replay. `None` (test paths
+    /// + pre-wired boot phase) leaves the catch-up unchanged — fresh-spawn
+    /// `0x88` frames still arrive via [`publish_terminal_spawned`].
+    terminal_uuid_provider: Arc<std::sync::Mutex<Option<Arc<dyn TerminalUuidProvider>>>>,
 }
 
 impl Hub {
@@ -294,6 +319,7 @@ impl Hub {
             manipulation_events,
             mount_cascade_events,
             cookie_validator: Arc::new(std::sync::Mutex::new(None)),
+            terminal_uuid_provider: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -557,6 +583,24 @@ impl Hub {
     /// rationale documented above.
     pub fn cookie_validator(&self) -> Option<Arc<dyn CookieValidator>> {
         self.cookie_validator.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// Register the terminal UUID provider (0040 §5 option A). Called once
+    /// at boot from the http-api wiring layer so the WS handshake can emit
+    /// catch-up `0x88 TERMINAL_SPAWNED` frames for every alive binding.
+    /// Replaces any previously-registered provider; safe to call multiple
+    /// times. Mirrors the [`set_cookie_validator`] pattern.
+    pub fn set_terminal_uuid_provider(&self, provider: Arc<dyn TerminalUuidProvider>) {
+        if let Ok(mut slot) = self.terminal_uuid_provider.lock() {
+            *slot = Some(provider);
+        }
+    }
+
+    /// Snapshot of the current terminal UUID provider. The WS handshake
+    /// clones this once per upgrade so a provider registered mid-flight is
+    /// honoured only by subsequent handshakes.
+    pub fn terminal_uuid_provider(&self) -> Option<Arc<dyn TerminalUuidProvider>> {
+        self.terminal_uuid_provider.lock().ok().and_then(|s| s.clone())
     }
 
     /// Live subscriber count on the multiplexed pane-output channel.
@@ -898,5 +942,69 @@ mod tests {
         assert_eq!(h2.session_for_cookie("c1"), Some("demo".to_string()));
         h2.clear_session_for_cookie("c1");
         assert_eq!(h1.session_for_cookie("c1"), None);
+    }
+
+    // ── TerminalUuidProvider (0040 §5 option A) ──────────────────────────
+
+    struct StubUuidProvider(Vec<(u64, &'static str)>);
+
+    #[async_trait]
+    impl TerminalUuidProvider for StubUuidProvider {
+        async fn alive_bindings(&self) -> Vec<(u64, Arc<str>)> {
+            self.0
+                .iter()
+                .map(|(p, u)| (*p, Arc::<str>::from(*u)))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_uuid_provider_unset_by_default() {
+        let hub = Hub::new(PtyBackend::new());
+        assert!(hub.terminal_uuid_provider().is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_uuid_provider_set_then_get() {
+        let hub = Hub::new(PtyBackend::new());
+        let provider = Arc::new(StubUuidProvider(vec![(7, "uuid-a"), (8, "uuid-b")]));
+        hub.set_terminal_uuid_provider(provider);
+        let got = hub
+            .terminal_uuid_provider()
+            .expect("provider set")
+            .alive_bindings()
+            .await;
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|(p, u)| *p == 7 && u.as_ref() == "uuid-a"));
+        assert!(got.iter().any(|(p, u)| *p == 8 && u.as_ref() == "uuid-b"));
+    }
+
+    #[tokio::test]
+    async fn terminal_uuid_provider_set_replaces_existing() {
+        let hub = Hub::new(PtyBackend::new());
+        hub.set_terminal_uuid_provider(Arc::new(StubUuidProvider(vec![(1, "first")])));
+        hub.set_terminal_uuid_provider(Arc::new(StubUuidProvider(vec![(2, "second")])));
+        let got = hub
+            .terminal_uuid_provider()
+            .expect("provider set")
+            .alive_bindings()
+            .await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 2);
+        assert_eq!(got[0].1.as_ref(), "second");
+    }
+
+    #[tokio::test]
+    async fn terminal_uuid_provider_clones_share_state() {
+        let h1 = Hub::new(PtyBackend::new());
+        let h2 = h1.clone();
+        h1.set_terminal_uuid_provider(Arc::new(StubUuidProvider(vec![(42, "shared")])));
+        let got = h2
+            .terminal_uuid_provider()
+            .expect("provider visible via clone")
+            .alive_bindings()
+            .await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], (42, Arc::<str>::from("shared")));
     }
 }

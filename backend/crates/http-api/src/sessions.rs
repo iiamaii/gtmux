@@ -355,6 +355,44 @@ pub async fn attach_handler(
     let cookie = crate::auth::extract_session_cookie(req.headers())
         .unwrap_or_else(|| "_unknown".to_string());
 
+    // ADR-0019 D3 single-attach invariant — implicit detach-on-reattach.
+    // If this cookie already holds a *different* session's lock (e.g. user
+    // switched session in WorkspaceSwitcher without an explicit DELETE
+    // attach), release it before acquiring the new one. Without this,
+    // the previous session stays `active=true` indefinitely (the cookie's
+    // reverse-map entry would simply be overwritten further down and the
+    // old flock would leak in `session_locks` until process exit).
+    //
+    // Same-name reattach is an idempotent no-op — the cleanup branch is
+    // skipped and the rest of this handler short-circuits via the
+    // `holders.contains_key(&name)` check immediately below.
+    let previous_session: Option<String> = {
+        let by_cookie = state.session_locks_by_cookie.lock().await;
+        by_cookie
+            .get(&cookie)
+            .filter(|prev| prev.as_str() != name)
+            .cloned()
+    };
+    if let Some(prev_name) = previous_session {
+        let mut by_cookie = state.session_locks_by_cookie.lock().await;
+        by_cookie.remove(&cookie);
+        drop(by_cookie);
+        let mut holders = state.session_locks.lock().await;
+        if let Some(mut guard) = holders.remove(&prev_name) {
+            tracing::info!(
+                cookie_len = cookie.len(),
+                prev_session = %prev_name,
+                next_session = %name,
+                "session_lock: implicit detach on cookie switch"
+            );
+            guard.release();
+        }
+        drop(holders);
+        if let Some(hub) = state.hub.as_ref() {
+            hub.clear_session_for_cookie(&cookie);
+        }
+    }
+
     // Same-server serialisation (D6.6) — only one attach attempt at a time
     // per session name from *this* process.
     let mut holders = state.session_locks.lock().await;
