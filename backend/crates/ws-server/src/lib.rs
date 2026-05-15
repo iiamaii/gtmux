@@ -54,7 +54,8 @@ mod varint;
 
 pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTED_CTRL_CMDS};
 pub use hub::{
-    CookieValidator, Hub, TerminalDiedEvent, TerminalListChangeEvent, HUB_BROADCAST_CAPACITY,
+    CookieValidator, Hub, TerminalDiedEvent, TerminalListChangeEvent, TerminalSpawnedEvent,
+    HUB_BROADCAST_CAPACITY,
 };
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
 
@@ -141,6 +142,14 @@ pub enum FrameType {
     /// (`decode.ts:517`) but not yet emitted by BE; see
     /// `docs/reports/0035-be-fe-coordination-stage-5.md` §3.2.
     TerminalListUpdate = 0x87,
+    /// `0x88 TERMINAL_SPAWNED` (FE Issue C unblock — 0036(FE) §4). Carries
+    /// the UUID ↔ PaneId binding that `AppState::spawn_terminal_with_uuid`
+    /// just minted, so the FE can build its `terminalId → paneId` map
+    /// without an extra `GET /api/terminals` roundtrip. Server-wide
+    /// broadcast — every attached webpage potentially mirrors the new
+    /// terminal in its sidebar / layout (ADR-0021 D1). Inner payload:
+    /// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","pane_id":<u64>}`.
+    TerminalSpawned = 0x88,
 }
 
 impl FrameType {
@@ -160,6 +169,7 @@ impl FrameType {
             0x84 => Self::FocusMode,
             0x85 => Self::TerminalDied,
             0x87 => Self::TerminalListUpdate,
+            0x88 => Self::TerminalSpawned,
             _ => return None,
         })
     }
@@ -477,6 +487,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
     let mut output_rx = hub.subscribe_pane_output();
     let mut terminal_died_rx = hub.subscribe_terminal_died();
     let mut terminal_list_change_rx = hub.subscribe_terminal_list_change();
+    let mut terminal_spawned_rx = hub.subscribe_terminal_spawned();
 
     // Send the initial LAYOUT_CHANGED hello so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -691,6 +702,37 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
                         // stale UUID disappear from the next `GET /api/terminals`
                         // poll, so warn but do not tear down the connection.
                         warn!(skipped = n, "ws terminal-died subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — other arms will hit Closed too.
+                    }
+                }
+            }
+            spawned = terminal_spawned_rx.recv() => {
+                match spawned {
+                    Ok(event) => {
+                        // Server-wide broadcast — every attached webpage
+                        // potentially mirrors the new terminal. No cookie
+                        // filter; the FE decides per-instance whether to
+                        // wire an `XtermHost` subscriber against the new
+                        // PaneId.
+                        let env = Envelope::new(
+                            FrameType::TerminalSpawned,
+                            Bytes::from(payload::encode_terminal_spawned(
+                                &event.terminal_id,
+                                event.pane_id,
+                            )),
+                        );
+                        if let Ok(buf) = env.encode() {
+                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // FE will catch up via the next /api/terminals poll,
+                        // same fallback as the terminal-list-change arm.
+                        warn!(skipped = n, "ws terminal-spawned subscriber lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Hub dropped — other arms will hit Closed too.
@@ -976,7 +1018,8 @@ async fn handle_client_envelope(
         FrameType::PaneOutput
         | FrameType::NotifyMirror
         | FrameType::TerminalDied
-        | FrameType::TerminalListUpdate => {
+        | FrameType::TerminalListUpdate
+        | FrameType::TerminalSpawned => {
             let _ = sink
                 .send(close_frame(
                     close_codes::POLICY_VIOLATION,
@@ -1135,10 +1178,10 @@ mod tests {
         // 0x86 (MOUNT_CASCADE) is *reserved* by the FE decoder
         // (`decode.ts`) for Stage 5-D path P2 but not yet emitted by BE,
         // so the wire codec still rejects it here. The first *fully*
-        // unassigned slot is 0x88.
-        let mut buf = vec![0x88u8];
+        // unassigned slot is 0x89.
+        let mut buf = vec![0x89u8];
         buf.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x88)));
+        assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x89)));
     }
 
     #[test]
@@ -1176,6 +1219,7 @@ mod tests {
     fn frame_type_from_u8_covers_all() {
         for &b in &[
             0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x87,
+            0x88,
         ] {
             let ft = FrameType::from_u8(b).expect("known frame");
             assert_eq!(ft.as_u8(), b);
@@ -1183,7 +1227,7 @@ mod tests {
         // 0x86 stays unknown to BE for now — reserved by FE for Stage 5-D
         // path P2 (`MOUNT_CASCADE`) which is still gated on FE/BE
         // coordination per `docs/reports/0035-be-fe-coordination-stage-5.md`.
-        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x86, 0x88, 0x8F, 0xFE, 0xFF] {
+        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x86, 0x89, 0x8F, 0xFE, 0xFF] {
             assert!(FrameType::from_u8(b).is_none(), "byte 0x{b:02x} leaked");
         }
     }
@@ -1327,6 +1371,246 @@ bind = "127.0.0.1"
             .insert(SEC_WEBSOCKET_PROTOCOL, proto.parse().unwrap());
         let (ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
         ws
+    }
+
+    /// Connect to `/ws` with bearer auth + an arbitrary `gtmux_auth` cookie.
+    /// Useful for the 0x87 routing matrix (Stage 5-D P1) where each WS in
+    /// the test must carry a distinct cookie that the hub session_table
+    /// has been pre-bound to a session name.
+    async fn connect_authed_with_cookie(
+        addr: SocketAddr,
+        token: &TokenString,
+        cookie: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let url = format!("ws://{addr}/ws");
+        let mut req = url.into_client_request().unwrap();
+        let proto = format!("gtmux.v1, bearer.{}", token.0);
+        req.headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, proto.parse().unwrap());
+        req.headers_mut().insert(
+            http::header::COOKIE,
+            format!("gtmux_auth={cookie}").parse().unwrap(),
+        );
+        let (ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        ws
+    }
+
+    /// Drain the initial LAYOUT_CHANGED hello + any catch-up PaneSpawned
+    /// NOTIFY / PaneOutput envelopes that the server emits before its
+    /// `select!` loop starts processing fresh broadcasts. Returns once
+    /// `idle_after` elapses without any further frame. The routing tests
+    /// below need the socket to be in a quiescent state before publishing
+    /// the event-under-test so the receive path is unambiguous.
+    async fn drain_initial(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        idle_after: std::time::Duration,
+    ) {
+        loop {
+            match tokio::time::timeout(idle_after, ws.next()).await {
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => break, // idle window elapsed — assume quiescent
+            }
+        }
+    }
+
+    /// Read frames until a `0x87 TERMINAL_LIST_UPDATE` arrives or the timeout
+    /// elapses. Non-0x87 frames are silently dropped so the test focuses on
+    /// the envelope under inspection. Returns the decoded JSON body.
+    async fn expect_terminal_list_update(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        timeout: std::time::Duration,
+    ) -> Option<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(TM::Binary(buf)))) => {
+                    let Ok((env, _)) = Envelope::decode(buf.as_ref()) else {
+                        continue;
+                    };
+                    if env.kind != FrameType::TerminalListUpdate {
+                        continue;
+                    }
+                    // Inner = varint 0 + UTF-8 JSON. Strip the leading varint
+                    // (single byte 0x00 because pane_id = 0 for web-domain
+                    // frames) and parse the body.
+                    if env.payload.is_empty() || env.payload[0] != 0x00 {
+                        continue;
+                    }
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&env.payload[1..]).ok()?;
+                    return Some(json);
+                }
+                Ok(Some(Ok(_))) => continue, // other frame types — ignore
+                Ok(Some(Err(_))) | Ok(None) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    // ── Stage 5-D P1: 0x87 TERMINAL_LIST_UPDATE per-connection routing ──
+
+    #[tokio::test]
+    async fn terminal_list_update_delivered_to_other_session_only() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+
+        // Two cookies, bound to different sessions before the WS upgrade so
+        // the dispatcher arm has a stable lookup when the publish lands.
+        hub.set_session_for_cookie("cookie-A", "alpha");
+        hub.set_session_for_cookie("cookie-B", "beta");
+
+        let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
+        let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
+        drain_initial(&mut ws_a, std::time::Duration::from_millis(50)).await;
+        drain_initial(&mut ws_b, std::time::Duration::from_millis(50)).await;
+
+        // Publish from session α's POV — A is trigger (skipped), B is other.
+        hub.publish_terminal_list_change(
+            "alpha",
+            &["11111111-2222-4333-8444-555555555555".to_string()],
+            &[],
+        );
+
+        // B must receive the frame; payload must carry the spawned UUID.
+        let body = expect_terminal_list_update(&mut ws_b, std::time::Duration::from_millis(500))
+            .await
+            .expect("session β should receive the fan-out");
+        assert_eq!(
+            body["added"],
+            serde_json::json!(["11111111-2222-4333-8444-555555555555"])
+        );
+        assert_eq!(body["removed"], serde_json::json!([]));
+
+        // A must NOT receive a 0x87 — drain for a window and require silence
+        // on that frame type. Other frames (heartbeat / hello) are ignored.
+        let echo = expect_terminal_list_update(&mut ws_a, std::time::Duration::from_millis(150))
+            .await;
+        assert!(
+            echo.is_none(),
+            "trigger session must not receive its own 0x87 echo: {echo:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_list_update_skipped_when_cookie_absent() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+
+        // Bind only cookie-B; ws_no_cookie connects without any cookie at all.
+        hub.set_session_for_cookie("cookie-B", "beta");
+
+        let url = format!("ws://{addr}/ws");
+        let mut req = url.into_client_request().unwrap();
+        let proto = format!("gtmux.v1, bearer.{}", token.0);
+        req.headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, proto.parse().unwrap());
+        let (mut ws_no_cookie, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        drain_initial(&mut ws_no_cookie, std::time::Duration::from_millis(50)).await;
+
+        hub.publish_terminal_list_change("alpha", &["uuid".to_string()], &[]);
+
+        let echo = expect_terminal_list_update(
+            &mut ws_no_cookie,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(echo.is_none(), "WS without cookie must not receive 0x87");
+    }
+
+    #[tokio::test]
+    async fn terminal_list_update_skipped_for_unattached_cookie() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+
+        // cookie-orphan is intentionally NOT bound to any session — its WS
+        // attached BEFORE attach (a normal race window) and must not see
+        // any 0x87 until /attach binds it.
+        let mut ws_orphan = connect_authed_with_cookie(addr, &token, "cookie-orphan").await;
+        drain_initial(&mut ws_orphan, std::time::Duration::from_millis(50)).await;
+
+        hub.publish_terminal_list_change("alpha", &["uuid".to_string()], &[]);
+
+        let echo =
+            expect_terminal_list_update(&mut ws_orphan, std::time::Duration::from_millis(200))
+                .await;
+        assert!(
+            echo.is_none(),
+            "cookie with no session_for_cookie binding must not receive 0x87"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_origin_terminal_list_update_closes_1008() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, _hub) = spawn_test_server(token.clone()).await;
+        let mut ws = connect_authed(addr, &token).await;
+        drain_initial(&mut ws, std::time::Duration::from_millis(50)).await;
+
+        // A client trying to spoof a 0x87 must be cut with a policy-violation
+        // close — the frame is strictly server-origin (server-only) and the
+        // dispatcher returns true from `handle_client_envelope` for it.
+        let bad = Envelope::new(
+            FrameType::TerminalListUpdate,
+            Bytes::from(payload::encode_terminal_list_update(&[], &[])),
+        )
+        .encode()
+        .unwrap();
+        ws.send(TM::Binary(bad.to_vec().into())).await.unwrap();
+
+        let mut got_policy_close = false;
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(TM::Close(Some(cf))))) => {
+                    assert_eq!(u16::from(cf.code), close_codes::POLICY_VIOLATION);
+                    got_policy_close = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            got_policy_close,
+            "client-origin 0x87 must be policy-violation closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_list_update_carries_removed_field() {
+        // P1 only emits added; this guards the wire shape for the future
+        // path that emits {removed: [...]} (kill via http-api would publish
+        // a similar event). The decoder must surface both fields.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        hub.set_session_for_cookie("cookie-B", "beta");
+
+        let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
+        drain_initial(&mut ws_b, std::time::Duration::from_millis(50)).await;
+
+        hub.publish_terminal_list_change(
+            "alpha",
+            &["u-added".to_string()],
+            &["u-removed".to_string()],
+        );
+        let body = expect_terminal_list_update(&mut ws_b, std::time::Duration::from_millis(500))
+            .await
+            .expect("receive");
+        assert_eq!(body["added"], serde_json::json!(["u-added"]));
+        assert_eq!(body["removed"], serde_json::json!(["u-removed"]));
     }
 
     #[tokio::test]

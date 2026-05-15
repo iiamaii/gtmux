@@ -346,6 +346,12 @@ impl AppState {
         match self.terminal_map.register(uuid.clone(), pane).await {
             Ok(()) => {
                 self.terminal_meta.record_spawn(&uuid).await;
+                // FE Issue C unblock — publish the fresh UUID↔PaneId
+                // binding so any attached webpage can wire an `XtermHost`
+                // subscriber against `pane` without polling
+                // `GET /api/terminals` first. Server-wide broadcast (cookie
+                // filter belongs to session-scoped frames like 0x87).
+                hub.publish_terminal_spawned(&uuid, pane.0);
                 Ok(pane)
             }
             Err(TerminalMapError::UuidAlreadyBound { existing_pane, .. }) => {
@@ -3414,6 +3420,61 @@ mod tests {
         let table = SessionTable::new(std::time::Duration::from_secs(60));
         let live = gtmux_ws_server::CookieValidator::validate(&table, "nope").await;
         assert!(!live, "unknown cookie must not validate");
+    }
+
+    // ── FE Issue C unblock: spawn_terminal_with_uuid publishes 0x88 binding ──
+
+    #[tokio::test]
+    async fn spawn_terminal_with_uuid_publishes_terminal_spawned() {
+        // Direct invocation: hub must observe the UUID↔PaneId binding so the
+        // WS dispatcher can fan it out as 0x88 TERMINAL_SPAWNED. This is the
+        // path FE relies on to switch XtermHost into "terminal" mode without
+        // polling /api/terminals.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, _) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let uuid = "11111111-2222-4333-8444-66666666666e";
+        let mut rx = hub.subscribe_terminal_spawned();
+        let pane = state
+            .spawn_terminal_with_uuid(uuid.to_string())
+            .await
+            .expect("spawn");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("publish must arrive")
+            .expect("recv");
+        assert_eq!(&*event.terminal_id, uuid);
+        assert_eq!(event.pane_id, pane.0);
+    }
+
+    #[tokio::test]
+    async fn spawn_terminal_with_uuid_does_not_double_publish_on_idempotent_path() {
+        // Same UUID twice → fast-path returns the existing PaneId without
+        // re-registering. The binding event was already emitted on the
+        // first call, so the second call must stay silent.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, _) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let uuid = "11111111-2222-4333-8444-66666666666f";
+        let mut rx = hub.subscribe_terminal_spawned();
+        let _first = state
+            .spawn_terminal_with_uuid(uuid.to_string())
+            .await
+            .expect("spawn 1");
+        let _drain = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("first publish")
+            .expect("recv");
+        // Re-spawn the same UUID — fast-path lookup, no fresh broadcast.
+        let _second = state
+            .spawn_terminal_with_uuid(uuid.to_string())
+            .await
+            .expect("spawn 2");
+        let racy = tokio::time::timeout(std::time::Duration::from_millis(80), rx.recv()).await;
+        assert!(
+            racy.is_err(),
+            "idempotent re-spawn must not publish a second binding, got: {racy:?}"
+        );
     }
 
     // ── Stage 5-D path P1: attach_confirm publishes terminal-list-change ──

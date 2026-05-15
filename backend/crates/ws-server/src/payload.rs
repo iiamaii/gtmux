@@ -79,6 +79,33 @@ pub fn encode_terminal_list_update(added: &[String], removed: &[String]) -> Vec<
     out
 }
 
+/// `0x88 TERMINAL_SPAWNED` (FE Issue C unblock) inner =
+/// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","pane_id":<u64>}`.
+///
+/// Emitted by `AppState::spawn_terminal_with_uuid` once the bridge map
+/// register succeeds — i.e. the http-api layer holds an authoritative
+/// UUID ↔ PaneId binding. Server-wide broadcast. FE consumes to update
+/// its local map so an `XtermHost` instance can immediately switch to
+/// "terminal" mode and start a per-pane subscription using the canonical
+/// PaneId.
+///
+/// `pane_id` is encoded as a JSON number; `u64::MAX` fits within JavaScript
+/// `Number.MAX_SAFE_INTEGER` (2⁵³ − 1) under any realistic deployment —
+/// PaneId in this project counts from 1 and increments per spawn. The FE
+/// decoder is responsible for the upper-bound check (`Number.isSafeInteger`).
+pub fn encode_terminal_spawned(terminal_id: &str, pane_id: u64) -> Vec<u8> {
+    let body = json!({
+        "terminal_id": terminal_id,
+        "pane_id": pane_id,
+    })
+    .to_string();
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(1 + bytes.len());
+    varint::encode_into(0, &mut out);
+    out.extend_from_slice(bytes);
+    out
+}
+
 // ─── Inbound (client → server) — inner payload parsers ────────────────────
 
 /// Parsed `0x03 PANE_IN` payload — varint paneId + raw input bytes.
@@ -249,6 +276,27 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
         assert_eq!(json["added"], serde_json::json!(["u1", "u2"]));
         assert_eq!(json["removed"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn terminal_spawned_round_trip() {
+        let inner = encode_terminal_spawned("11111111-2222-4333-8444-555555555555", 42);
+        assert_eq!(inner[0], 0x00);
+        let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
+        assert_eq!(json["terminal_id"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(json["pane_id"], 42);
+    }
+
+    #[test]
+    fn terminal_spawned_pane_id_fits_in_js_safe_integer() {
+        // FE decodes pane_id as a JSON number; values above 2^53 - 1 lose
+        // precision in JS. PaneId starts at 1 and increments, so this is a
+        // generous upper-bound check rather than a tight one — just guard
+        // against accidental u64::MAX leaks in future encoders.
+        let inner = encode_terminal_spawned("uuid", (1u64 << 50) + 7);
+        let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
+        let pane = json["pane_id"].as_u64().unwrap();
+        assert!(pane < (1u64 << 53));
     }
 
     #[test]

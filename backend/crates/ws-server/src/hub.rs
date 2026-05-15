@@ -71,6 +71,11 @@ const TERMINAL_DIED_BROADCAST_CAPACITY: usize = 32;
 /// attach_confirm batch.
 const TERMINAL_LIST_CHANGE_BROADCAST_CAPACITY: usize = 32;
 
+/// Fan-out channel depth for terminal-spawned UUID↔PaneId binding events.
+/// One event per spawn (attach_confirm batches and future 5-D P2
+/// `POST /api/sessions/:name/terminals`) — same low-frequency profile.
+const TERMINAL_SPAWNED_BROADCAST_CAPACITY: usize = 64;
+
 /// Payload of a `TerminalDied` broadcast. `uuid` is the schema-side
 /// terminal id; `reason` is `"exit"` (process self-exited) or `"killed"`
 /// (signal-driven exit). `Arc<str>` over `String` so the broadcast clone
@@ -96,6 +101,21 @@ pub struct TerminalListChangeEvent {
     pub trigger_session: Arc<str>,
     pub added: Arc<[Arc<str>]>,
     pub removed: Arc<[Arc<str>]>,
+}
+
+/// Payload of a `TerminalSpawned` broadcast (FE Issue C unblock).
+/// Emitted by `AppState::spawn_terminal_with_uuid` immediately after the
+/// terminal_map register succeeds. The binding lets the FE switch its
+/// `XtermHost` from legacy-paneId mode to terminal-UUID mode without an
+/// extra `GET /api/terminals` roundtrip.
+///
+/// Server-wide broadcast — any attached webpage may mirror the new
+/// terminal in its sidebar / future layout PUT, so all subscribers should
+/// see the binding.
+#[derive(Clone, Debug)]
+pub struct TerminalSpawnedEvent {
+    pub terminal_id: Arc<str>,
+    pub pane_id: u64,
 }
 
 /// `Hub` is cheap to clone — internal state is `Arc<…>` + broadcast senders.
@@ -155,6 +175,12 @@ pub struct Hub {
     /// `session_table` to filter out the trigger session and emit
     /// `0x87 TERMINAL_LIST_UPDATE` only to *other* sessions' webpages.
     terminal_list_change_events: broadcast::Sender<TerminalListChangeEvent>,
+    /// Terminal-spawned UUID↔PaneId binding broadcast (FE Issue C unblock).
+    /// Published by `AppState::spawn_terminal_with_uuid` immediately after
+    /// register succeeds. Server-wide — all WS subscribers receive a
+    /// `0x88 TERMINAL_SPAWNED` envelope so the FE can update its local
+    /// UUID→PaneId map ahead of the next `GET /api/terminals` poll.
+    terminal_spawned_events: broadcast::Sender<TerminalSpawnedEvent>,
     /// Cookie validator hook (Stage 5 D10 α / ADR-0020 D10 additive). When
     /// set, the WS handshake accepts a request whose `gtmux_auth` cookie
     /// validates here as an **alternative** to the subprotocol bearer
@@ -173,6 +199,8 @@ impl Hub {
         let (terminal_died_events, _) = broadcast::channel(TERMINAL_DIED_BROADCAST_CAPACITY);
         let (terminal_list_change_events, _) =
             broadcast::channel(TERMINAL_LIST_CHANGE_BROADCAST_CAPACITY);
+        let (terminal_spawned_events, _) =
+            broadcast::channel(TERMINAL_SPAWNED_BROADCAST_CAPACITY);
 
         let mux_backend = backend.clone();
         let mux_tx = pane_output.clone();
@@ -190,6 +218,7 @@ impl Hub {
             session_table: Arc::new(std::sync::RwLock::new(HashMap::new())),
             terminal_died_events,
             terminal_list_change_events,
+            terminal_spawned_events,
             cookie_validator: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -394,6 +423,22 @@ impl Hub {
         self.terminal_list_change_events.subscribe()
     }
 
+    /// Broadcast a UUID↔PaneId binding event (FE Issue C unblock). Called
+    /// by `AppState::spawn_terminal_with_uuid` right after register
+    /// succeeds. Server-wide — all WS subscribers receive
+    /// `0x88 TERMINAL_SPAWNED`.
+    pub fn publish_terminal_spawned(&self, terminal_id: &str, pane_id: u64) {
+        let _ = self.terminal_spawned_events.send(TerminalSpawnedEvent {
+            terminal_id: Arc::from(terminal_id),
+            pane_id,
+        });
+    }
+
+    /// Subscribe to UUID↔PaneId binding events.
+    pub fn subscribe_terminal_spawned(&self) -> broadcast::Receiver<TerminalSpawnedEvent> {
+        self.terminal_spawned_events.subscribe()
+    }
+
     /// Register the cookie validator (Stage 5 D10 α). Called once at boot
     /// from the http-api wiring layer so the WS handshake can accept
     /// cookie-based auth as an alternative to the subprotocol bearer.
@@ -592,6 +637,25 @@ mod tests {
         assert_eq!(&*got.added[1], "u2");
         assert_eq!(got.removed.len(), 1);
         assert_eq!(&*got.removed[0], "u3");
+    }
+
+    #[tokio::test]
+    async fn terminal_spawned_publish_silent_without_subscribers() {
+        let hub = Hub::new(PtyBackend::new());
+        hub.publish_terminal_spawned("uuid", 42);
+    }
+
+    #[tokio::test]
+    async fn terminal_spawned_subscriber_receives_event() {
+        let hub = Hub::new(PtyBackend::new());
+        let mut rx = hub.subscribe_terminal_spawned();
+        hub.publish_terminal_spawned("11111111-2222-4333-8444-555555555555", 7);
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert_eq!(&*got.terminal_id, "11111111-2222-4333-8444-555555555555");
+        assert_eq!(got.pane_id, 7);
     }
 
     #[tokio::test]
