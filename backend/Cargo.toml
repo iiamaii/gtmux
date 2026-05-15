@@ -43,6 +43,7 @@ futures = "0.3"
 base64 = "0.22"
 dashmap = "6"
 atomic-write-file = "0.3"
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 # Release profile (R7 §8) — 단일 정적 바이너리 최적화.
 [profile.release]

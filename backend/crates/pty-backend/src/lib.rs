@@ -454,6 +454,11 @@ struct PtyBackendInner {
     /// [`BackendNotify`] values; the ws-server router serialises them
     /// to `0x07` envelopes.
     notify_tx: broadcast::Sender<BackendNotify>,
+    /// Session marker injected into every child shell's environment
+    /// (ADR-0014 D11). `GTMUX_SESSION=<this>` is the boot-time scanner's
+    /// signal that a stray process belongs to our gtmux. `None` in
+    /// unit tests where the marker is irrelevant.
+    session_marker: Option<String>,
 }
 
 impl std::fmt::Debug for PaneHandle {
@@ -472,14 +477,27 @@ impl Default for PtyBackend {
 }
 
 impl PtyBackend {
-    /// Construct an empty backend — no panes, no live processes.
+    /// Construct an empty backend — no panes, no live processes. No
+    /// session marker (env injection is skipped). Convenience for tests
+    /// and pre-Stage-K builds.
     pub fn new() -> Self {
+        Self::with_session(None)
+    }
+
+    /// Construct an empty backend tagged with a *session marker* —
+    /// every child shell spawned via `spawn()` will have
+    /// `GTMUX_SESSION=<marker>` + `GTMUX_SERVER_PID=<pid>` injected
+    /// (ADR-0014 D11). The boot-time orphan scanner uses these
+    /// markers to identify stray processes from a crashed prior
+    /// Server instance.
+    pub fn with_session(session_marker: Option<String>) -> Self {
         let (notify_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
             inner: Arc::new(PtyBackendInner {
                 panes: DashMap::new(),
                 next_id: AtomicU64::new(1),
                 notify_tx,
+                session_marker,
             }),
         }
     }
@@ -755,6 +773,17 @@ fn spawn_inner(
     }
     // Sensible default for `$TERM` (POC parity).
     cmd.env("TERM", "xterm-256color");
+
+    // Stage K (ADR-0014 D11) — orphan-discovery markers. Boot-time
+    // scanner reads these via `sysinfo::Process::environ()` to identify
+    // stray children from a previous crashed Server. Injected before
+    // user-supplied env so the user can intentionally override (though
+    // doing so weakens the cleanup guarantee).
+    if let Some(session) = inner.session_marker.as_deref() {
+        cmd.env("GTMUX_SESSION", session);
+    }
+    cmd.env("GTMUX_SERVER_PID", std::process::id().to_string());
+
     // User-supplied env overrides anything inherited.
     for (k, v) in &spec.env {
         cmd.env(k, v);

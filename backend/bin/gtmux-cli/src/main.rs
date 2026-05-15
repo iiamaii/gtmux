@@ -26,6 +26,7 @@
 #![deny(unsafe_code)]
 #![warn(clippy::all)]
 
+mod process_audit;
 mod state_files;
 
 use std::io::IsTerminal;
@@ -301,11 +302,29 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         "gtmux start booting",
     );
 
+    // 4a) Boot-time orphan reap (ADR-0014 D11) — scan all live processes
+    //     for `GTMUX_SESSION=<our-session>` from a *previous* gtmux Server
+    //     run (`GTMUX_SERVER_PID != our pid`). Common on graceful boot
+    //     this returns 0 candidates in milliseconds. After a crash
+    //     (SIGKILL / OOM / panic) it cleans up the orphaned shells.
+    let audit = process_audit::reap_orphans(&config.server.session);
+    if !audit.candidates.is_empty() {
+        info!(
+            reaped = audit.candidates.len(),
+            "process_audit: cleaned up {} orphan(s) from previous session",
+            audit.candidates.len()
+        );
+    }
+
     // 5) PtyBackend — Stage B (ADR-0013 D1, ADR-0014 D1): we own every
     //    PTY pair + child shell directly. No daemon to spawn — `new()` is
     //    instant + infallible, and the per-pane reader / writer / wait
     //    threads come into existence lazily on the first `spawn()` call.
-    let backend = PtyBackend::new();
+    //    `with_session(...)` tags every spawned child with
+    //    `GTMUX_SESSION=<session>` + `GTMUX_SERVER_PID=<pid>` so the
+    //    boot-time orphan scanner (ADR-0014 D11) can identify strays
+    //    from a previous crashed Server.
+    let backend = PtyBackend::with_session(Some(config.server.session.clone()));
     info!("pty backend ready (ADR-0013 + ADR-0014 supervisor model)");
 
     // 6) token — ADR-0003 D13.1:

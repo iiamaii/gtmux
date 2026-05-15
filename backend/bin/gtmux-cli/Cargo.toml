@@ -26,6 +26,10 @@ thiserror = { workspace = true }
 # logic in `state_files.rs` (inlined from the pre-Stage-B lifecycle crate
 # after ADR-0013 made the tmux-specific parts of that crate obsolete).
 libc = "0.2"
+# sysinfo — Boot-time orphan scanner (ADR-0014 D11). Process iteration +
+# environ() inspection for child shells that survived a crashed prior
+# Server instance.
+sysinfo = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

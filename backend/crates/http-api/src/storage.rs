@@ -118,7 +118,7 @@ impl LayoutStore {
             return LayoutSnapshot::empty();
         }
 
-        let body: Value = match serde_json::from_slice(&raw) {
+        let mut body: Value = match serde_json::from_slice(&raw) {
             Ok(v) => v,
             Err(e) => {
                 warn!(
@@ -165,6 +165,37 @@ impl LayoutStore {
             );
             self.quarantine_corrupt("schema-rule-violation");
             return LayoutSnapshot::empty();
+        }
+
+        // ADR-0006 D14 (2026-05-15 amend) — *strip panels[] on boot*.
+        //
+        // PTY-direct era (ADR-0013): every Pane is a child process and
+        // dies with the Server (ADR-0014 D5). On Server restart the new
+        // PtyBackend allocates fresh PaneIds starting at 1 — the
+        // persisted `Panel.pane_id` strings (`%2`, `%3`, ...) reference
+        // *stale* panes that no longer exist. Rather than ship orphan
+        // Panels with disconnected xterms (jarring UX), we drop the
+        // panels[] array on load. groups[] + schema_version + future
+        // canvas viewport state survive.
+        //
+        // Trade-off: sketch §6.7 promised Panel-coord persistence; that
+        // promise belongs to the tmux era. The PTY-direct era trades
+        // Panel persistence for process-lifecycle clarity. User-facing
+        // recovery is the explicit "New Panel" action.
+        let panels_before = body
+            .get("panels")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if panels_before > 0 {
+            if let Some(panels) = body.get_mut("panels") {
+                *panels = Value::Array(Vec::new());
+            }
+            tracing::info!(
+                path = %self.path.display(),
+                stripped = panels_before,
+                "layout: stripped {panels_before} stale Panel(s) on boot (ADR-0006 D14, PTY-direct era)"
+            );
         }
 
         // ETag is recomputed from the canonical serialisation of the loaded
