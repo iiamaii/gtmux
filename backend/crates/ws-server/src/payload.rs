@@ -40,6 +40,25 @@ pub fn encode_layout_changed(etag: &[u8; 16]) -> Vec<u8> {
     out
 }
 
+/// `0x85 TERMINAL_DIED` (Stage 5-B) inner =
+/// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","reason":"exit"|"killed"}`.
+///
+/// The leading varint paneId is fixed at zero because this frame is
+/// terminal-scoped (UUID), not pane-scoped — the SSoT-wide convention
+/// for web-domain frames that have no PaneId.
+pub fn encode_terminal_died(uuid: &str, reason: &str) -> Vec<u8> {
+    let body = json!({
+        "terminal_id": uuid,
+        "reason": reason,
+    })
+    .to_string();
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(1 + bytes.len());
+    varint::encode_into(0, &mut out);
+    out.extend_from_slice(bytes);
+    out
+}
+
 // ─── Inbound (client → server) — inner payload parsers ────────────────────
 
 /// Parsed `0x03 PANE_IN` payload — varint paneId + raw input bytes.
@@ -182,6 +201,23 @@ mod tests {
         // Leading 0x00 + JSON body.
         assert_eq!(inner[0], 0x00);
         assert_eq!(&inner[1..], b"{\"kind\":\"slow-pane\"}");
+    }
+
+    #[test]
+    fn terminal_died_carries_uuid_and_reason() {
+        let inner = encode_terminal_died("11111111-2222-4333-8444-555555555555", "exit");
+        // Leading pane-id varint = 0.
+        assert_eq!(inner[0], 0x00);
+        let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
+        assert_eq!(json["terminal_id"], "11111111-2222-4333-8444-555555555555");
+        assert_eq!(json["reason"], "exit");
+    }
+
+    #[test]
+    fn terminal_died_supports_killed_reason() {
+        let inner = encode_terminal_died("uuid", "killed");
+        let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
+        assert_eq!(json["reason"], "killed");
     }
 
     #[test]

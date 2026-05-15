@@ -473,8 +473,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         use gtmux_pty_backend::BackendNotify;
         loop {
             match notify_rx.recv().await {
-                Ok(BackendNotify::PaneDied { id, .. }) => {
-                    state_for_pane_died.handle_pane_died(id).await;
+                Ok(BackendNotify::PaneDied { id, signal, .. }) => {
+                    state_for_pane_died.handle_pane_died(id, signal).await;
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {

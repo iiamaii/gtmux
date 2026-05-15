@@ -53,7 +53,7 @@ mod ring;
 mod varint;
 
 pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTED_CTRL_CMDS};
-pub use hub::{Hub, HUB_BROADCAST_CAPACITY};
+pub use hub::{Hub, TerminalDiedEvent, HUB_BROADCAST_CAPACITY};
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,6 +118,13 @@ pub enum FrameType {
     InputTarget = 0x82,
     ViewportChanged = 0x83,
     FocusMode = 0x84,
+    /// `0x85 TERMINAL_DIED` (Stage 5-B, ADR-0021 D5). UUID-carrying death
+    /// notification published by the http-api `handle_pane_died` consumer
+    /// for every backend `PaneDied` event. Server-wide broadcast — a
+    /// single terminal can be mirrored into multiple sessions (ADR-0021
+    /// D1), so all attached webpages must see the death. Inner payload:
+    /// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","reason":"exit"|"killed"}`.
+    TerminalDied = 0x85,
 }
 
 impl FrameType {
@@ -135,6 +142,7 @@ impl FrameType {
             0x82 => Self::InputTarget,
             0x83 => Self::ViewportChanged,
             0x84 => Self::FocusMode,
+            0x85 => Self::TerminalDied,
             _ => return None,
         })
     }
@@ -423,6 +431,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
     let mut notify_rx = hub.subscribe_notify();
     let mut layout_rx = hub.subscribe_layout();
     let mut output_rx = hub.subscribe_pane_output();
+    let mut terminal_died_rx = hub.subscribe_terminal_died();
 
     // Send the initial LAYOUT_CHANGED hello so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -612,6 +621,31 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(skipped = n, "ws layout subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — other arms will hit Closed too.
+                    }
+                }
+            }
+            died = terminal_died_rx.recv() => {
+                match died {
+                    Ok(event) => {
+                        let env = Envelope::new(
+                            FrameType::TerminalDied,
+                            Bytes::from(payload::encode_terminal_died(&event.uuid, event.reason)),
+                        );
+                        if let Ok(buf) = env.encode() {
+                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Lagged here means a terminal-died event was dropped
+                        // for this subscriber. The FE will eventually see the
+                        // stale UUID disappear from the next `GET /api/terminals`
+                        // poll, so warn but do not tear down the connection.
+                        warn!(skipped = n, "ws terminal-died subscriber lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Hub dropped — other arms will hit Closed too.
@@ -838,7 +872,7 @@ async fn handle_client_envelope(
             );
             false
         }
-        FrameType::PaneOutput | FrameType::NotifyMirror => {
+        FrameType::PaneOutput | FrameType::NotifyMirror | FrameType::TerminalDied => {
             let _ = sink
                 .send(close_frame(
                     close_codes::POLICY_VIOLATION,
@@ -994,9 +1028,12 @@ mod tests {
         let mut buf = vec![0x08u8];
         buf.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x08)));
-        let mut buf = vec![0x85u8];
+        // 0x86 is the first unassigned slot above the Stage 5-B TerminalDied
+        // (0x85). Pre-Stage-5 this same assertion used 0x85; it migrates up
+        // every time a new frame type lands.
+        let mut buf = vec![0x86u8];
         buf.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x85)));
+        assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x86)));
     }
 
     #[test]
@@ -1033,12 +1070,12 @@ mod tests {
     #[test]
     fn frame_type_from_u8_covers_all() {
         for &b in &[
-            0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80, 0x81, 0x82, 0x83, 0x84,
+            0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85,
         ] {
             let ft = FrameType::from_u8(b).expect("known frame");
             assert_eq!(ft.as_u8(), b);
         }
-        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x85, 0x8F, 0xFE, 0xFF] {
+        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x86, 0x8F, 0xFE, 0xFF] {
             assert!(FrameType::from_u8(b).is_none(), "byte 0x{b:02x} leaked");
         }
     }
@@ -1048,6 +1085,11 @@ mod tests {
         assert!(!FrameType::PaneOutput.is_web_domain());
         assert!(FrameType::LayoutChanged.is_web_domain());
         assert!(FrameType::ManipulationSelection.is_web_domain());
+        // 0x85 TerminalDied keeps the high-bit web-domain marker — the WS
+        // dispatcher does not special-case it, but a future router that
+        // splits "real-time pane I/O" from "schema metadata" will use the
+        // marker.
+        assert!(FrameType::TerminalDied.is_web_domain());
     }
 
     // ── BackendNotify → Envelope mapping ─────────────────────────────────

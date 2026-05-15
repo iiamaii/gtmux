@@ -23,6 +23,7 @@
 //! the ring snapshot. Putting the catch-up in Hub would force per-subscriber
 //! state that the broadcast model would never naturally express.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -39,6 +40,21 @@ pub const HUB_BROADCAST_CAPACITY: usize = 256;
 /// Fan-out channel depth for the layout-changed signal. 16 is generous —
 /// the layout PUT is human-paced.
 const LAYOUT_BROADCAST_CAPACITY: usize = 16;
+
+/// Fan-out channel depth for the terminal-died signal (Stage 5-B). A pane
+/// dying is a low-frequency event (~one per kill or process exit), so a
+/// small queue is enough; same order-of-magnitude as the layout broadcast.
+const TERMINAL_DIED_BROADCAST_CAPACITY: usize = 32;
+
+/// Payload of a `TerminalDied` broadcast. `uuid` is the schema-side
+/// terminal id; `reason` is `"exit"` (process self-exited) or `"killed"`
+/// (signal-driven exit). `Arc<str>` over `String` so the broadcast clone
+/// per WS subscriber is a refcount bump, not a heap copy.
+#[derive(Clone, Debug)]
+pub struct TerminalDiedEvent {
+    pub uuid: Arc<str>,
+    pub reason: &'static str,
+}
 
 /// `Hub` is cheap to clone — internal state is `Arc<…>` + broadcast senders.
 #[derive(Clone)]
@@ -71,6 +87,26 @@ pub struct Hub {
     /// field — keeping the modal expiry hint accurate without blocking the
     /// OS-flock truth.
     heartbeat_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    /// Cookie → session_name registry (Stage 5-A / ADR-0021 D5). The
+    /// http-api `attach_handler` writes here after a successful flock + cookie
+    /// reverse-map insert; `detach_handler` (and the WS-disconnect-driven
+    /// `release_lock_for_cookie`) clears the entry. The WS handler consults
+    /// this map when routing session-scoped envelopes (5-C) so a frame
+    /// emitted on session A is never delivered to a subscriber whose cookie
+    /// is attached to session B.
+    ///
+    /// `std::sync::RwLock` over `tokio::sync::RwLock`: every operation here
+    /// is a sub-microsecond hash-table touch with no `.await` point inside
+    /// the critical section — mirrors the existing sink pattern above.
+    session_table: Arc<std::sync::RwLock<HashMap<String, String>>>,
+    /// UUID-carrying terminal-death broadcast (Stage 5-B / ADR-0021 D5).
+    /// Published by the http-api `handle_pane_died` consumer once the
+    /// matching UUID has been resolved from [`crate::ring`]'s map. Each WS
+    /// subscriber turns one event into one `0x85 TERMINAL_DIED` envelope.
+    /// Always server-wide — a terminal can be mirrored into multiple
+    /// sessions (ADR-0021 D1), and routing-by-session belongs to the
+    /// session-scoped frame family (5-C), not here.
+    terminal_died_events: broadcast::Sender<TerminalDiedEvent>,
 }
 
 impl Hub {
@@ -80,6 +116,7 @@ impl Hub {
     pub fn new(backend: PtyBackend) -> Self {
         let (pane_output, _) = broadcast::channel(HUB_BROADCAST_CAPACITY);
         let (layout_events, _) = broadcast::channel(LAYOUT_BROADCAST_CAPACITY);
+        let (terminal_died_events, _) = broadcast::channel(TERMINAL_DIED_BROADCAST_CAPACITY);
 
         let mux_backend = backend.clone();
         let mux_tx = pane_output.clone();
@@ -94,6 +131,8 @@ impl Hub {
             _mux_task: Arc::new(mux_task),
             disconnect_tx: Arc::new(std::sync::Mutex::new(None)),
             heartbeat_tx: Arc::new(std::sync::Mutex::new(None)),
+            session_table: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            terminal_died_events,
         }
     }
 
@@ -131,6 +170,79 @@ impl Hub {
         self.heartbeat_tx.lock().ok().and_then(|s| s.clone())
     }
 
+    /// Record that `cookie` is currently attached to `session_name`
+    /// (Stage 5-A / ADR-0021 D5). Called by the http-api `attach_handler`
+    /// after a successful flock + cookie reverse-map insert. Idempotent:
+    /// re-attaching the same cookie to a different session replaces the
+    /// entry; re-attaching to the same session is a no-op write.
+    ///
+    /// A poisoned [`std::sync::RwLock`] is treated as a soft failure: the
+    /// update is dropped and a warn-level trace fires. The kernel-level
+    /// session lock is the source of truth — this table only steers WS
+    /// frame routing, so a missed update degrades to "session-scoped frame
+    /// behaves like server-wide" until the next attach refreshes it.
+    pub fn set_session_for_cookie(&self, cookie: &str, session_name: &str) {
+        match self.session_table.write() {
+            Ok(mut t) => {
+                t.insert(cookie.to_string(), session_name.to_string());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    cookie_len = cookie.len(),
+                    "hub session_table: write poisoned; skipping set_session_for_cookie"
+                );
+            }
+        }
+    }
+
+    /// Drop the cookie → session_name binding for `cookie`. Called by the
+    /// http-api `detach_handler` and by the WS-disconnect-driven
+    /// `release_lock_for_cookie`. Idempotent: a missing entry is a no-op.
+    pub fn clear_session_for_cookie(&self, cookie: &str) {
+        match self.session_table.write() {
+            Ok(mut t) => {
+                t.remove(cookie);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    cookie_len = cookie.len(),
+                    "hub session_table: write poisoned; skipping clear_session_for_cookie"
+                );
+            }
+        }
+    }
+
+    /// Look up the session that `cookie` is currently attached to.
+    /// Returns `None` when the cookie has no active attach or the table is
+    /// poisoned. Used by the WS dispatcher (Stage 5-C) to decide whether
+    /// a session-scoped envelope is in-scope for a given connection.
+    pub fn session_for_cookie(&self, cookie: &str) -> Option<String> {
+        self.session_table
+            .read()
+            .ok()
+            .and_then(|t| t.get(cookie).cloned())
+    }
+
+    /// Remove every cookie entry currently pointing at `session_name`.
+    /// Called by the http-api `detach_handler`, which mirrors the same
+    /// `retain(|_, v| v != name)` behaviour on `session_locks_by_cookie` —
+    /// the two maps must stay in lock-step or the WS dispatcher would
+    /// surface stale "still attached" routing for cookies that just
+    /// detached.
+    pub fn clear_sessions_by_name(&self, session_name: &str) {
+        match self.session_table.write() {
+            Ok(mut t) => {
+                t.retain(|_, v| v != session_name);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session = %session_name,
+                    "hub session_table: write poisoned; skipping clear_sessions_by_name"
+                );
+            }
+        }
+    }
+
     /// Borrow the underlying [`PtyBackend`]. The WS handler uses this for
     /// `send_input` / `resize` / `kill` / `spawn` / `subscribe_output`
     /// (ring snapshot for catch-up replay).
@@ -165,6 +277,23 @@ impl Hub {
     /// Subscribe to the layout-change broadcast.
     pub fn subscribe_layout(&self) -> broadcast::Receiver<[u8; 16]> {
         self.layout_events.subscribe()
+    }
+
+    /// Broadcast a UUID-carrying terminal-died event (Stage 5-B). Called by
+    /// `AppState::handle_pane_died` once the kernel/SIGCHLD-driven death
+    /// has been resolved to a schema UUID. The send is silent on
+    /// "no subscribers" — that's the normal idle state, identical to
+    /// [`publish_layout_changed`].
+    pub fn publish_terminal_died(&self, uuid: &str, reason: &'static str) {
+        let _ = self.terminal_died_events.send(TerminalDiedEvent {
+            uuid: Arc::from(uuid),
+            reason,
+        });
+    }
+
+    /// Subscribe to the UUID-carrying terminal-died broadcast.
+    pub fn subscribe_terminal_died(&self) -> broadcast::Receiver<TerminalDiedEvent> {
+        self.terminal_died_events.subscribe()
     }
 
     /// Live subscriber count on the multiplexed pane-output channel.
@@ -277,5 +406,103 @@ mod tests {
             .expect("timeout")
             .expect("recv");
         assert_eq!(got, etag);
+    }
+
+    #[tokio::test]
+    async fn terminal_died_publish_silent_without_subscribers() {
+        let hub = Hub::new(PtyBackend::new());
+        // Must not panic / error.
+        hub.publish_terminal_died("uuid", "exit");
+    }
+
+    #[tokio::test]
+    async fn terminal_died_subscriber_receives_event() {
+        let hub = Hub::new(PtyBackend::new());
+        let mut rx = hub.subscribe_terminal_died();
+        hub.publish_terminal_died("11111111-2222-4333-8444-555555555555", "killed");
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert_eq!(&*got.uuid, "11111111-2222-4333-8444-555555555555");
+        assert_eq!(got.reason, "killed");
+    }
+
+    #[tokio::test]
+    async fn terminal_died_broadcasts_to_multiple_subscribers() {
+        let hub = Hub::new(PtyBackend::new());
+        let mut r1 = hub.subscribe_terminal_died();
+        let mut r2 = hub.subscribe_terminal_died();
+        hub.publish_terminal_died("uuid", "exit");
+        let a = tokio::time::timeout(std::time::Duration::from_millis(100), r1.recv())
+            .await
+            .expect("t1")
+            .expect("r1");
+        let b = tokio::time::timeout(std::time::Duration::from_millis(100), r2.recv())
+            .await
+            .expect("t2")
+            .expect("r2");
+        assert_eq!(&*a.uuid, "uuid");
+        assert_eq!(&*b.uuid, "uuid");
+    }
+
+    #[tokio::test]
+    async fn session_table_empty_by_default() {
+        let hub = Hub::new(PtyBackend::new());
+        assert_eq!(hub.session_for_cookie("anybody"), None);
+    }
+
+    #[tokio::test]
+    async fn session_table_set_then_lookup() {
+        let hub = Hub::new(PtyBackend::new());
+        hub.set_session_for_cookie("c1", "demo");
+        assert_eq!(hub.session_for_cookie("c1"), Some("demo".to_string()));
+        assert_eq!(hub.session_for_cookie("c2"), None);
+    }
+
+    #[tokio::test]
+    async fn session_table_set_replaces_existing() {
+        let hub = Hub::new(PtyBackend::new());
+        hub.set_session_for_cookie("c1", "demo");
+        hub.set_session_for_cookie("c1", "other");
+        assert_eq!(hub.session_for_cookie("c1"), Some("other".to_string()));
+    }
+
+    #[tokio::test]
+    async fn session_table_clear_is_idempotent() {
+        let hub = Hub::new(PtyBackend::new());
+        // Clearing a non-existent entry must not panic / error.
+        hub.clear_session_for_cookie("nobody");
+        hub.set_session_for_cookie("c1", "demo");
+        hub.clear_session_for_cookie("c1");
+        assert_eq!(hub.session_for_cookie("c1"), None);
+        // Second clear is still a no-op.
+        hub.clear_session_for_cookie("c1");
+        assert_eq!(hub.session_for_cookie("c1"), None);
+    }
+
+    #[tokio::test]
+    async fn session_table_clear_by_name_drops_matching_cookies() {
+        let hub = Hub::new(PtyBackend::new());
+        hub.set_session_for_cookie("c1", "demo");
+        hub.set_session_for_cookie("c2", "demo");
+        hub.set_session_for_cookie("c3", "other");
+        hub.clear_sessions_by_name("demo");
+        assert_eq!(hub.session_for_cookie("c1"), None);
+        assert_eq!(hub.session_for_cookie("c2"), None);
+        assert_eq!(hub.session_for_cookie("c3"), Some("other".to_string()));
+    }
+
+    #[tokio::test]
+    async fn session_table_clones_share_state() {
+        // Hub clones share the same Arc-backed session_table — required so
+        // the WS handler clone (used in handshake) sees writes performed
+        // by the http-api handler clone.
+        let h1 = Hub::new(PtyBackend::new());
+        let h2 = h1.clone();
+        h1.set_session_for_cookie("c1", "demo");
+        assert_eq!(h2.session_for_cookie("c1"), Some("demo".to_string()));
+        h2.clear_session_for_cookie("c1");
+        assert_eq!(h1.session_for_cookie("c1"), None);
     }
 }

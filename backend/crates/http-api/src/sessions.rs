@@ -409,6 +409,12 @@ pub async fn attach_handler(
         // here is the safer choice.
         by_cookie.insert(cookie.clone(), name.clone());
     }
+    // Stage 5-A: mirror the cookie ↔ session binding into the WS hub so the
+    // dispatcher (5-C) can route session-scoped envelopes only to the
+    // matching webpage. Skip when no hub is wired (unit-test paths).
+    if let Some(hub) = state.hub.as_ref() {
+        hub.set_session_for_cookie(&cookie, &name);
+    }
     // Drop the same-server serialisation lock before doing layout I/O — the
     // attach itself is committed by the flock acquire above; further work
     // is a per-cookie read of the session record and a non-mutating scan
@@ -561,6 +567,13 @@ async fn release_attach(state: &crate::AppState, name: &str, cookie: &str) {
     if matches!(by_cookie.get(cookie), Some(v) if v == name) {
         by_cookie.remove(cookie);
     }
+    // Stage 5-A: keep the WS hub's cookie ↔ session_name map in lock-step
+    // with the http-api reverse-index. The hub method is a no-op on missing
+    // entries, so a failed-attach cleanup path that never wrote anything
+    // here is still safe.
+    if let Some(hub) = state.hub.as_ref() {
+        hub.clear_session_for_cookie(cookie);
+    }
 }
 
 /// `DELETE /api/sessions/:name/attach` — release the lock held by this
@@ -582,6 +595,12 @@ pub async fn detach_handler(
     {
         let mut by_cookie = state.session_locks_by_cookie.lock().await;
         by_cookie.retain(|_, v| v != &name);
+    }
+    // Stage 5-A: mirror the prune into the WS hub so the dispatcher does
+    // not keep routing session-scoped envelopes to cookies that just
+    // detached from this session.
+    if let Some(hub) = state.hub.as_ref() {
+        hub.clear_sessions_by_name(&name);
     }
     (StatusCode::OK, Json(json!({ "name": name, "released": true }))).into_response()
 }

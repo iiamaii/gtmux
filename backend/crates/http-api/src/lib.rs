@@ -269,11 +269,25 @@ impl AppState {
     /// (ADR-0021 D10.1 lazy fresh-spawn). Metadata is forgotten only on
     /// the *explicit* user paths (DELETE item with `kill_terminal=true`,
     /// `POST /api/terminals/:id/kill`). Idempotent on missing entries.
-    pub async fn handle_pane_died(&self, pane: gtmux_pty_backend::PaneId) {
+    ///
+    /// Stage 5-B: also broadcasts a UUID-carrying `terminal-died` WS frame
+    /// via the hub so attached webpages can mark the matching schema item
+    /// as dangling without polling `GET /api/terminals`. `signal=Some(_)`
+    /// maps to `"killed"`, `signal=None` maps to `"exit"`.
+    pub async fn handle_pane_died(
+        &self,
+        pane: gtmux_pty_backend::PaneId,
+        signal: Option<i32>,
+    ) {
         if let Some(uuid) = self.terminal_map.unregister_pane(pane).await {
+            let reason = if signal.is_some() { "killed" } else { "exit" };
+            if let Some(hub) = self.hub.as_ref() {
+                hub.publish_terminal_died(&uuid, reason);
+            }
             tracing::debug!(
                 pane = ?pane,
                 uuid = %uuid,
+                reason,
                 "terminal: unregistered after BackendNotify::PaneDied (metadata preserved)"
             );
         }
@@ -297,6 +311,12 @@ impl AppState {
                 "session_lock: auto-released on WS disconnect"
             );
             guard.release();
+        }
+        // Stage 5-A: mirror the auto-release into the hub's cookie ↔
+        // session table so a fresh WS reconnect doesn't see this cookie
+        // as still session-attached.
+        if let Some(hub) = self.hub.as_ref() {
+            hub.clear_session_for_cookie(cookie);
         }
     }
 
@@ -2708,7 +2728,7 @@ mod tests {
         state.terminal_meta.record_spawn(uuid).await;
         let before_created = state.terminal_meta.get(uuid).await.unwrap().created_at;
         assert!(state.terminal_map.lookup_pane(uuid).await.is_some());
-        state.handle_pane_died(PaneId(42)).await;
+        state.handle_pane_died(PaneId(42), None).await;
         // Map entry is gone (Pane is dead) but metadata is preserved so a
         // follow-up respawn keeps `created_at` + `label` (ADR-0021 D10.1).
         assert!(state.terminal_map.lookup_pane(uuid).await.is_none());
@@ -2722,7 +2742,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (state, _, _) = make_state_with_workspace(&dir);
         // No entry — must not panic.
-        state.handle_pane_died(PaneId(999)).await;
+        state.handle_pane_died(PaneId(999), None).await;
         assert!(state.terminal_map.is_empty().await);
     }
 
@@ -2746,7 +2766,7 @@ mod tests {
         let original_created_at = state.terminal_meta.get(uuid).await.unwrap().created_at;
 
         // Kernel-driven death (the consumer path).
-        state.handle_pane_died(PaneId(101)).await;
+        state.handle_pane_died(PaneId(101), None).await;
         // Sleep across a whole-second boundary so a buggy re-init of
         // created_at would visibly drift.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
@@ -3373,5 +3393,248 @@ mod tests {
 
         let status = attach(&app, &token, "delta").await;
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    // ── Stage 5-B: handle_pane_died publishes terminal-died via hub ──
+
+    #[tokio::test]
+    async fn handle_pane_died_publishes_exit_reason_when_no_signal() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, _) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let uuid = "11111111-2222-4333-8444-66666666666b";
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(70))
+            .await
+            .unwrap();
+        let mut rx = hub.subscribe_terminal_died();
+        state.handle_pane_died(PaneId(70), None).await;
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("publish must arrive")
+            .expect("recv");
+        assert_eq!(&*event.uuid, uuid);
+        assert_eq!(event.reason, "exit");
+    }
+
+    #[tokio::test]
+    async fn handle_pane_died_publishes_killed_reason_when_signal_set() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, _) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let uuid = "11111111-2222-4333-8444-66666666666c";
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(71))
+            .await
+            .unwrap();
+        let mut rx = hub.subscribe_terminal_died();
+        state.handle_pane_died(PaneId(71), Some(15)).await;
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("publish must arrive")
+            .expect("recv");
+        assert_eq!(&*event.uuid, uuid);
+        assert_eq!(event.reason, "killed");
+    }
+
+    #[tokio::test]
+    async fn handle_pane_died_does_not_publish_for_unknown_pane() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, _) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let mut rx = hub.subscribe_terminal_died();
+        state.handle_pane_died(PaneId(9999), None).await;
+        // Nothing was bound, so nothing must be published.
+        let race = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(race.is_err(), "expected no publish, got: {race:?}");
+    }
+
+    // ── Stage 5-A: cookie ↔ session mirror into the WS hub ──
+
+    #[tokio::test]
+    async fn attach_mirrors_cookie_to_hub_session_table() {
+        // attach_handler must update hub.session_for_cookie so the WS
+        // dispatcher (5-C) can route session-scoped envelopes. Verifies
+        // both the success-path write and that detach/cleanup later
+        // unwinds it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        // Empty layout — match-or-spawn just returns matched=[]/unmatched=[].
+        std::fs::write(
+            workspace_dir.join("mirror.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state);
+        let cookie_value = "mirror-cookie-aaa";
+        // Pre-condition: hub knows nothing about this cookie.
+        assert_eq!(hub.session_for_cookie(cookie_value), None);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/mirror/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // attach must have mirrored the cookie binding into the hub.
+        assert_eq!(
+            hub.session_for_cookie(cookie_value),
+            Some("mirror".to_string())
+        );
+
+        // DELETE /attach must clear the mirror.
+        let detach = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/mirror/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detach.status(), StatusCode::OK);
+        assert_eq!(hub.session_for_cookie(cookie_value), None);
+    }
+
+    #[tokio::test]
+    async fn release_lock_for_cookie_clears_hub_session() {
+        // The WS-disconnect-driven release path must also clear the hub
+        // mirror, otherwise a fresh WS reconnect for the same cookie
+        // would see itself as still session-attached.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        std::fs::write(
+            workspace_dir.join("auto.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state_clone = state.clone();
+        let app = router_with_state(state);
+        let cookie_value = "release-cookie-bbb";
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/auto/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            hub.session_for_cookie(cookie_value),
+            Some("auto".to_string())
+        );
+
+        // Drive the WS-disconnect path directly.
+        state_clone.release_lock_for_cookie(cookie_value).await;
+        assert_eq!(hub.session_for_cookie(cookie_value), None);
+    }
+
+    #[tokio::test]
+    async fn detach_clears_all_cookies_for_session_in_hub() {
+        // detach_handler clears `session_locks_by_cookie` by *name* — the
+        // hub mirror must follow the same semantics so multiple webpages
+        // sharing a session (a configuration ADR-0019 D3 forbids today
+        // but the table tolerates) all drop their bindings together.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        std::fs::write(
+            workspace_dir.join("multi.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Seed two cookies pointing at "multi" directly on the hub side
+        // (the same-server flock guard forbids two cookies actually
+        // attaching at once; we still want the clear-by-name semantic
+        // to be unambiguous).
+        hub.set_session_for_cookie("cookie-A", "multi");
+        hub.set_session_for_cookie("cookie-B", "multi");
+        hub.set_session_for_cookie("cookie-C", "other");
+
+        let app = router_with_state(state);
+        // Real attach to acquire the flock under cookie-A so DELETE can
+        // succeed against `session_locks`. The set_session_for_cookie
+        // above for cookie-A gets overwritten with the same value by the
+        // attach handler — still "multi".
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/multi/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, "gtmux_auth=cookie-A")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let detach = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/multi/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detach.status(), StatusCode::OK);
+        assert_eq!(hub.session_for_cookie("cookie-A"), None);
+        assert_eq!(hub.session_for_cookie("cookie-B"), None);
+        // Cookie-C pointed at a different session; must survive.
+        assert_eq!(hub.session_for_cookie("cookie-C"), Some("other".into()));
     }
 }
