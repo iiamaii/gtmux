@@ -260,17 +260,21 @@ impl AppState {
         }
     }
 
-    /// Drop the bridge-map + metadata entry for the Terminal at `pane`
+    /// Drop the bridge-map binding for the Terminal at `pane`
     /// (Stage 4-E hygiene). Called from the CLI's `BackendNotify::PaneDied`
     /// consumer so a dead Pane never sits in [`TerminalMap`] as a stale
-    /// alive binding. Idempotent on missing entries.
+    /// alive binding. The metadata store is **not** touched — a kernel-
+    /// driven death may be followed by an explicit respawn, and the
+    /// user-visible `created_at` / `label` should survive that round-trip
+    /// (ADR-0021 D10.1 lazy fresh-spawn). Metadata is forgotten only on
+    /// the *explicit* user paths (DELETE item with `kill_terminal=true`,
+    /// `POST /api/terminals/:id/kill`). Idempotent on missing entries.
     pub async fn handle_pane_died(&self, pane: gtmux_pty_backend::PaneId) {
         if let Some(uuid) = self.terminal_map.unregister_pane(pane).await {
-            self.terminal_meta.forget(&uuid).await;
             tracing::debug!(
                 pane = ?pane,
                 uuid = %uuid,
-                "terminal: unregistered after BackendNotify::PaneDied"
+                "terminal: unregistered after BackendNotify::PaneDied (metadata preserved)"
             );
         }
     }
@@ -587,6 +591,10 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             axum::routing::delete(sessions::delete_item_handler),
         )
         .route("/api/terminals", get(terminals::list_handler))
+        .route(
+            "/api/terminals/{id}",
+            axum::routing::patch(terminals::patch_handler),
+        )
         .route(
             "/api/terminals/{id}/kill",
             axum::routing::post(terminals::kill_handler),
@@ -2687,7 +2695,7 @@ mod tests {
     // ── Stage 4-E: BackendNotify::PaneDied auto-unregister ──
 
     #[tokio::test]
-    async fn handle_pane_died_drops_map_and_metadata() {
+    async fn handle_pane_died_drops_map_but_keeps_metadata() {
         use gtmux_pty_backend::PaneId;
         let dir = tempfile::TempDir::new().unwrap();
         let (state, _, _) = make_state_with_workspace(&dir);
@@ -2698,10 +2706,14 @@ mod tests {
             .await
             .unwrap();
         state.terminal_meta.record_spawn(uuid).await;
+        let before_created = state.terminal_meta.get(uuid).await.unwrap().created_at;
         assert!(state.terminal_map.lookup_pane(uuid).await.is_some());
         state.handle_pane_died(PaneId(42)).await;
+        // Map entry is gone (Pane is dead) but metadata is preserved so a
+        // follow-up respawn keeps `created_at` + `label` (ADR-0021 D10.1).
         assert!(state.terminal_map.lookup_pane(uuid).await.is_none());
-        assert!(state.terminal_meta.get(uuid).await.is_none());
+        let after = state.terminal_meta.get(uuid).await.expect("metadata kept");
+        assert_eq!(after.created_at, before_created);
     }
 
     #[tokio::test]
@@ -2712,6 +2724,137 @@ mod tests {
         // No entry — must not panic.
         state.handle_pane_died(PaneId(999)).await;
         assert!(state.terminal_map.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn pane_died_then_respawn_round_trip_preserves_created_at() {
+        // Regression for smoke-9: ensure the kill → respawn cycle does not
+        // reset `created_at`. We simulate respawn by re-registering the
+        // same UUID with a fresh PaneId and calling record_spawn again
+        // (the idempotent path of TerminalMetadataStore::record_spawn
+        // preserves created_at when the entry already exists).
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, _) = make_state_with_workspace(&dir);
+        let uuid = "11111111-2222-4333-8444-555555555559";
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(101))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn(uuid).await;
+        let original_created_at = state.terminal_meta.get(uuid).await.unwrap().created_at;
+
+        // Kernel-driven death (the consumer path).
+        state.handle_pane_died(PaneId(101)).await;
+        // Sleep across a whole-second boundary so a buggy re-init of
+        // created_at would visibly drift.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        // Respawn — fresh PaneId, same UUID.
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(202))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn(uuid).await;
+
+        let post = state.terminal_meta.get(uuid).await.unwrap();
+        assert_eq!(
+            post.created_at, original_created_at,
+            "created_at must survive a death/respawn round-trip"
+        );
+    }
+
+    // ── Stage 4 cleanup: PATCH /api/terminals/:id (BE-8 label) ──
+
+    #[tokio::test]
+    async fn patch_terminal_sets_label_when_uuid_known() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace(&dir);
+        let uuid = "11111111-2222-4333-8444-55555555555a";
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(1))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn(uuid).await;
+
+        let body = serde_json::to_vec(&json!({ "label": "build watch" })).unwrap();
+        let app = router_with_state(state.clone());
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/terminals/{uuid}"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state.terminal_meta.get(uuid).await.unwrap().label,
+            "build watch"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_terminal_404_for_unknown_uuid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace(&dir);
+        let body = serde_json::to_vec(&json!({ "label": "x" })).unwrap();
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PATCH)
+                    .uri("/api/terminals/11111111-2222-4333-8444-55555555555b")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn patch_terminal_400_when_label_too_long() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace(&dir);
+        let uuid = "11111111-2222-4333-8444-55555555555c";
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(1))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn(uuid).await;
+
+        let too_long = "x".repeat(crate::terminals::MAX_LABEL_BYTES + 1);
+        let body = serde_json::to_vec(&json!({ "label": too_long })).unwrap();
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/terminals/{uuid}"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ── Stage 4-D: DELETE items + terminal kill / respawn ──

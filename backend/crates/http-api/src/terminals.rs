@@ -27,11 +27,16 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::RwLock;
 
 use crate::schema::{Item, Layout};
+
+/// Hard cap on label byte length — matches `ItemCommon.label` (4 KiB,
+/// ADR-0018 D8). Enforced by [`patch_handler`] before the label hits
+/// the metadata store.
+pub const MAX_LABEL_BYTES: usize = 4096;
 
 /// Per-terminal metadata stored alongside the [`crate::TerminalMap`].
 /// Created when a spawn registers a UUID, dropped when the same UUID
@@ -87,6 +92,20 @@ impl TerminalMetadataStore {
     /// Read one entry. `None` if absent.
     pub async fn get(&self, uuid: &str) -> Option<TerminalMetadata> {
         self.inner.read().await.get(uuid).cloned()
+    }
+
+    /// Set the label on an existing entry. Returns `false` when the UUID
+    /// is unknown — callers map that to 404 so the FE does not silently
+    /// race with a terminal deletion.
+    pub async fn set_label(&self, uuid: &str, label: String) -> bool {
+        let mut g = self.inner.write().await;
+        match g.get_mut(uuid) {
+            Some(m) => {
+                m.label = label;
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -245,6 +264,11 @@ pub async fn kill_handler(
             .into_response();
     }
     crate::sessions::kill_and_unregister_terminal(&state, &id).await;
+    // Explicit user kill — drop metadata as well so the row disappears
+    // from `GET /api/terminals`. Compare to `respawn_handler`, which
+    // keeps metadata to preserve `created_at` + `label` across the
+    // transient death (ADR-0021 D10.1).
+    state.terminal_meta.forget(&id).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -280,6 +304,50 @@ pub async fn respawn_handler(
     }
 }
 
+/// Body for [`patch_handler`].
+#[derive(Debug, Deserialize)]
+pub struct PatchTerminalBody {
+    /// New free-form label. Cap = [`MAX_LABEL_BYTES`].
+    pub label: String,
+}
+
+/// `PATCH /api/terminals/:id` — update the user-supplied label on an
+/// existing Terminal metadata entry (BE-8). Returns:
+///   * 204 on success
+///   * 400 when the label exceeds [`MAX_LABEL_BYTES`]
+///   * 404 when the UUID is not in the metadata store (either never
+///     spawned or already removed via `/kill` / `DELETE item`)
+pub async fn patch_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<PatchTerminalBody>,
+) -> Response {
+    if body.label.len() > MAX_LABEL_BYTES {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "label_too_long",
+                "message": format!(
+                    "label length {} exceeds cap {MAX_LABEL_BYTES}",
+                    body.label.len()
+                ),
+            })),
+        )
+            .into_response();
+    }
+    if !state.terminal_meta.set_label(&id, body.label).await {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "terminal_not_found",
+                "message": format!("terminal '{id}' has no metadata entry"),
+            })),
+        )
+            .into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 fn service_unavailable(code: &'static str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -313,6 +381,19 @@ mod tests {
         store.record_spawn("uuid-a").await;
         store.forget("uuid-a").await;
         assert!(store.get("uuid-a").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn set_label_updates_only_existing_uuid() {
+        let store = TerminalMetadataStore::new();
+        // Unknown UUID — false (handler maps to 404).
+        assert!(!store.set_label("missing", "x".into()).await);
+        store.record_spawn("uuid-a").await;
+        assert!(store.set_label("uuid-a", "build watch".into()).await);
+        assert_eq!(
+            store.get("uuid-a").await.unwrap().label,
+            "build watch"
+        );
     }
 
     #[tokio::test]

@@ -759,6 +759,9 @@ pub async fn delete_item_handler(
     if q.kill_terminal {
         if let Some(uuid) = removed_terminal_id {
             kill_and_unregister_terminal(&state, &uuid).await;
+            // The schema item is gone for good — drop metadata too so
+            // `GET /api/terminals` does not surface a phantom row.
+            state.terminal_meta.forget(&uuid).await;
         }
     }
 
@@ -785,10 +788,15 @@ fn item_id(item: &crate::schema::Item) -> &str {
     }
 }
 
-/// Best-effort: SIGTERM the Terminal bound to `uuid` and unregister it from
-/// the bridge map + metadata store. Idempotent — a UUID that's not in the
-/// map is a no-op; a kill that fails because the Pane is already dead just
-/// logs at debug.
+/// Best-effort: SIGTERM the Terminal bound to `uuid` and unregister it
+/// from the bridge map. The metadata store is **not** touched here so
+/// `created_at` and `label` survive a transient kill → respawn cycle
+/// (ADR-0021 D10.1 lazy fresh-spawn). Callers that intend to forget the
+/// UUID for good (DELETE item with `kill_terminal=true`, explicit
+/// `POST /api/terminals/:id/kill`) follow this call with
+/// `state.terminal_meta.forget(uuid)`. Idempotent — a UUID that's not in
+/// the map is a no-op; a kill that fails because the Pane is already
+/// dead just logs at debug.
 pub(crate) async fn kill_and_unregister_terminal(state: &crate::AppState, uuid: &str) {
     let pane = match state.terminal_map.lookup_pane(uuid).await {
         Some(p) => p,
@@ -805,7 +813,6 @@ pub(crate) async fn kill_and_unregister_terminal(state: &crate::AppState, uuid: 
         }
     }
     state.terminal_map.unregister_uuid(uuid).await;
-    state.terminal_meta.forget(uuid).await;
 }
 
 /// `GET /api/sessions/:name/layout` — current snapshot + ETag.
