@@ -93,6 +93,16 @@ pub struct Config {
     /// `gtmux start` 시 `GTMUX_FRONTEND_DIST` env 또는 TOML 필드로 지정.
     #[serde(default)]
     pub frontend_dist: Option<std::path::PathBuf>,
+    /// Workspace storage 디렉터리의 절대 경로 (ADR-0019 D2). `None` 이면
+    /// boot 시 `${XDG_DATA_HOME:-~/.local/share}/gtmux/workspace/` 가 기본값.
+    /// CLI `--workspace <path>` 는 본 필드보다 우선 — runtime 변경 불가
+    /// (ADR-0019 D11, boot-immutable).
+    #[serde(default)]
+    pub workspace_path: Option<std::path::PathBuf>,
+    /// Cookie-기반 인증 lifecycle 설정 (ADR-0020). 생략 시 default —
+    /// `token` mode, 7d rolling, rate limit 5/5min.
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 /// `[server]` 섹션 — Server identity 영역.
@@ -145,6 +155,43 @@ pub struct SecurityConfig {
     pub cors_origins: Vec<String>,
     /// `Host` 헤더 화이트리스트. 비어 있으면 startup에서 bind 호스트로 보강.
     pub host_allowlist: Vec<String>,
+}
+
+/// `[auth]` 섹션 — Cookie 기반 인증 lifecycle (ADR-0020).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// `"token"` 또는 `"password"`. Default: `"token"` (현 정책 유지, ADR-0020 D1).
+    #[serde(default = "default_auth_mode")]
+    pub mode: String,
+    /// Cookie 의 max-age in days (ADR-0020 D2/D3). Default 7, range 1–30.
+    /// Rolling renewal: 매 valid request 마다 `last_seen` + `expires_at` 갱신.
+    #[serde(default = "default_cookie_max_age_days")]
+    pub cookie_max_age_days: u32,
+    /// Per-IP rate limit (실패 시도 / 5분) — Password mode 의 brute-force 방어
+    /// (ADR-0020 D5). Default 5.
+    #[serde(default = "default_rate_limit_per_5min")]
+    pub rate_limit_per_5min: u32,
+}
+
+fn default_auth_mode() -> String {
+    "token".to_string()
+}
+fn default_cookie_max_age_days() -> u32 {
+    7
+}
+fn default_rate_limit_per_5min() -> u32 {
+    5
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_auth_mode(),
+            cookie_max_age_days: default_cookie_max_age_days(),
+            rate_limit_per_5min: default_rate_limit_per_5min(),
+        }
+    }
 }
 
 /// `[cloud]` 섹션 — Cloud 모드에서만 의미가 있는 키. Local 모드는 `None`.
@@ -241,6 +288,8 @@ pub fn load_with_overrides(
         security: SecurityConfig::default(),
         cloud: None,
         frontend_dist: None,
+        workspace_path: None,
+        auth: AuthConfig::default(),
     };
 
     let mut figment = Figment::from(Serialized::defaults(defaults));
@@ -336,6 +385,8 @@ struct DefaultsSeed {
     security: SecurityConfig,
     cloud: Option<CloudConfig>,
     frontend_dist: Option<std::path::PathBuf>,
+    workspace_path: Option<std::path::PathBuf>,
+    auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]

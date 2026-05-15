@@ -58,6 +58,19 @@ pub struct Hub {
     /// existing per-pane broadcasts have all closed — i.e. when
     /// [`PtyBackend`]'s last clone is dropped).
     _mux_task: Arc<tokio::task::JoinHandle<()>>,
+    /// Optional disconnect sink (ADR-0019 D6 + ADR-0021 D6). The WS handler
+    /// emits each closing connection's cookie value here so a downstream
+    /// consumer (the http-api layer) can release the cross-server session
+    /// lock automatically. `None` when no consumer has registered — the
+    /// channel is then a no-op and the lock is released only via explicit
+    /// `DELETE /api/sessions/:name/attach`.
+    disconnect_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    /// Optional heartbeat sink (ADR-0019 D6.2). The WS handler emits the
+    /// connection's cookie value on every Ping/Pong receive so the http-api
+    /// layer can refresh the matching `.lock` file's `lease_until_unix`
+    /// field — keeping the modal expiry hint accurate without blocking the
+    /// OS-flock truth.
+    heartbeat_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
 }
 
 impl Hub {
@@ -79,7 +92,43 @@ impl Hub {
             pane_output,
             layout_events,
             _mux_task: Arc::new(mux_task),
+            disconnect_tx: Arc::new(std::sync::Mutex::new(None)),
+            heartbeat_tx: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Register a sink that receives the cookie value of every closing WS
+    /// connection (ADR-0019 D6 / ADR-0021 D6). The http-api layer uses this
+    /// to auto-release any cross-server session lock the cookie still holds.
+    /// Replaces a previously-registered sink; safe to call multiple times.
+    pub fn set_disconnect_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        if let Ok(mut slot) = self.disconnect_tx.lock() {
+            *slot = Some(tx);
+        }
+    }
+
+    /// Register a sink that receives the cookie value of every Ping/Pong on
+    /// any live WS connection (ADR-0019 D6.2). The http-api layer uses this
+    /// to refresh the `.lock` file's `lease_until_unix` body.
+    pub fn set_heartbeat_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        if let Ok(mut slot) = self.heartbeat_tx.lock() {
+            *slot = Some(tx);
+        }
+    }
+
+    /// Snapshot of the current disconnect sink. The WS handler clones this
+    /// so a freshly-registered sink that arrives mid-connection is honoured
+    /// only by subsequent connections — never an in-flight one (avoids a
+    /// half-state where a new sink misses a "closing" event from a socket
+    /// whose snapshot still pointed at the old sink).
+    pub fn disconnect_sink(&self) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+        self.disconnect_tx.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// Snapshot of the current heartbeat sink. See [`disconnect_sink`] for
+    /// the cloning rationale.
+    pub fn heartbeat_sink(&self) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+        self.heartbeat_tx.lock().ok().and_then(|s| s.clone())
     }
 
     /// Borrow the underlying [`PtyBackend`]. The WS handler uses this for

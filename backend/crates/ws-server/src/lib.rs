@@ -70,12 +70,18 @@ pub const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 /// Envelope header: 1-byte type + 4-byte little-endian length.
 const HEADER_LEN: usize = 5;
 
-/// Heartbeat ping cadence.
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Heartbeat ping cadence (ADR-0021 D6 / ADR-0019 D6.2). The server pings
+/// every 15s; clients are expected to reply with Pong frames before the
+/// next ping. Cross-server session-attach leases are refreshed in lock-step
+/// with this cadence so a dead webpage releases its session within
+/// `PONG_TIMEOUT` after going silent.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Pong-grace timeout. If no pong arrives within this window after a ping,
-/// the connection is considered dead and closed with code 1011 (Internal).
-const PONG_TIMEOUT: Duration = Duration::from_secs(60);
+/// Pong-grace timeout (ADR-0021 D6). If no pong arrives within this window
+/// after the *most recent* ping, the connection is considered dead and the
+/// socket is closed with code 1011 (Internal). 30s is the explicit value
+/// in ADR-0019 D6.2 / ADR-0021 D6.
+const PONG_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-connection pause/resume debounce window (legacy `ADR-0001 D8` +
 /// `0010-grill-amendments.md` D16). Identical bytes-on-the-wire to the
@@ -352,12 +358,44 @@ async fn ws_handler(
         return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
     }
 
+    // ADR-0019 D6 / D6.2: capture the gtmux_auth cookie value (if present)
+    // so the per-connection lifecycle can announce its identity to the
+    // http-api layer on close, which then auto-releases any session lock
+    // the cookie still holds. WS authentication itself remains the
+    // subprotocol bearer flow above — the cookie is *only* for
+    // disconnect-notification routing, never for trust.
+    let cookie_value = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            raw.split(';').find_map(|pair| {
+                let pair = pair.trim();
+                pair.strip_prefix("gtmux_auth=")
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string())
+            })
+        });
+
     let echo = state.echo_protocol.clone();
     let hub = state.hub.clone();
     let mut response = ws
         .protocols(["gtmux.v1"])
         .on_upgrade(move |socket| async move {
-            handle_socket(socket, hub).await;
+            handle_socket(socket, hub.clone(), cookie_value.clone()).await;
+            if let Some(cookie) = cookie_value {
+                if let Some(sink) = hub.disconnect_sink() {
+                    // Errors here only mean "no consumer registered" —
+                    // the http-api layer hasn't wired its receiver yet
+                    // (boot ordering) or has already shut down. Either
+                    // way the session lock will be released by the
+                    // server-shutdown path; warn for visibility only.
+                    if sink.send(cookie).is_err() {
+                        tracing::debug!(
+                            "ws disconnect sink closed; auto-release skipped"
+                        );
+                    }
+                }
+            }
         });
     response
         .headers_mut()
@@ -370,9 +408,15 @@ async fn ws_handler(
 /// by the matching `pane-spawned` NOTIFY so the frontend knows the id
 /// is live), then enters the live fan-out: backend notifications +
 /// multiplexed pane outputs + layout broadcasts.
-async fn handle_socket(socket: WebSocket, hub: Hub) {
+async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>) {
     let (mut sink, mut stream) = socket.split();
     let backend = hub.backend().clone();
+
+    // Snapshot the heartbeat sink once at upgrade time so a sink registered
+    // mid-connection only takes effect for subsequent sockets (matches the
+    // disconnect-sink behaviour and avoids a half-state where a new sink
+    // misses earlier liveness signals from this conn).
+    let heartbeat_sink = hub.heartbeat_sink();
 
     // Subscribe BEFORE catch-up replay so events that arrive while we
     // are flushing snapshots are not lost.
@@ -481,9 +525,13 @@ async fn handle_socket(socket: WebSocket, hub: Hub) {
                         )).await;
                         return;
                     }
-                    Ok(Message::Pong(_)) => { last_pong = Instant::now(); }
+                    Ok(Message::Pong(_)) => {
+                        last_pong = Instant::now();
+                        emit_heartbeat(&heartbeat_sink, cookie_value.as_deref());
+                    }
                     Ok(Message::Ping(p)) => {
                         let _ = sink.send(Message::Pong(p)).await;
+                        emit_heartbeat(&heartbeat_sink, cookie_value.as_deref());
                     }
                     Ok(Message::Close(_)) => {
                         let _ = sink.send(close_frame(
@@ -817,6 +865,18 @@ fn debounce_pause(state: &mut HashMap<PaneId, Instant>, pane_id: PaneId) -> bool
             false
         }
     }
+}
+
+/// Forward a heartbeat signal to the registered sink, if any. Send errors
+/// (sink closed) are silently absorbed — they signify "the consumer task
+/// exited", which can happen during graceful shutdown and isn't a fault.
+fn emit_heartbeat(
+    sink: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    cookie: Option<&str>,
+) {
+    let Some(cookie) = cookie else { return };
+    let Some(tx) = sink else { return };
+    let _ = tx.send(cookie.to_string());
 }
 
 fn close_frame(code: u16, reason: &'static str) -> Message {

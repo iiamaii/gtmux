@@ -43,9 +43,32 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod auth;
+mod schema;
+mod session_lock;
+mod sessions;
 mod storage;
+mod terminal_map;
+mod terminals;
+mod workspace;
 
+pub use auth::{
+    default_password_hash_path, default_rate_limiter, default_session_table, hash_password,
+    load_password_hash, save_password_hash, verify_password, AuthError, AuthMode, RateLimiter,
+    SessionTable,
+};
+pub use schema::{
+    detect_shape, migrate_v1_to_v2, validate as validate_layout_v2, Group, Item, ItemCommon,
+    Layout, Point, SchemaShape, ValidationError, Viewport, Visibility, SCHEMA_VERSION,
+};
+pub use session_lock::{fresh_server_id, Lease, LockError, LockGuard, LockState};
+pub use sessions::{SessionCache, SessionError, SessionLayout};
 pub use storage::{LayoutStore, StorageError};
+pub use terminal_map::{fresh_terminal_uuid, MapError as TerminalMapError, TerminalMap};
+pub use terminals::{TerminalInfo, TerminalMetadata, TerminalMetadataStore};
+pub use workspace::{
+    validate_session_name, BootMigrationReport, SessionInfo, WorkspaceError, WorkspaceManager,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,7 +82,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Json;
 use axum::Router;
-use gtmux_auth::{verify_token, TokenString};
+use gtmux_auth::TokenString;
 use gtmux_config::{Config, Mode};
 use ring::digest::{digest, SHA256};
 use serde::Deserialize;
@@ -133,20 +156,211 @@ pub struct AppState {
     /// broadcasting `LAYOUT_CHANGED` (ADR-0006 D13 5-step). `None` in tests
     /// that exercise the HTTP surface without touching disk.
     pub store: Option<Arc<LayoutStore>>,
+    /// Per-Server workspace handle — the multi-session storage root (ADR-0019
+    /// D1/D2). When `Some`, the `/api/sessions[/<name>[/layout]]` routes are
+    /// wired and accept requests; when `None` those routes return 503.
+    pub workspace: Option<Arc<WorkspaceManager>>,
+    /// In-memory cache of loaded session layouts. Always present so handler
+    /// code can borrow it without an `Option` gate; lookups in it are no-ops
+    /// when `workspace` is `None`.
+    pub session_cache: Arc<SessionCache>,
+    /// Server-side cookie session table (ADR-0020 D2). In-memory; entries
+    /// expire on a rolling `cookie_max_age_days` window.
+    pub session_table: Arc<SessionTable>,
+    /// Per-IP rate limiter for `POST /auth/login` (ADR-0020 D5).
+    pub rate_limiter: Arc<RateLimiter>,
+    /// PHC-encoded Argon2id hash for password-mode auth (ADR-0020 D5). `None`
+    /// in token mode or when the password file doesn't exist yet (login then
+    /// 503s with a hint to run `gtmux set-password`).
+    pub password_hash: Option<Arc<String>>,
+    /// UUID v4 minted once per server boot (ADR-0019 D6.1). Written into
+    /// `.locks/<name>.lock` bodies so other servers can disambiguate
+    /// holders that happen to share a PID.
+    pub server_id: Arc<str>,
+    /// Locks currently held by *this* server, keyed by session name. The
+    /// outer Mutex protects the map; each [`LockGuard`] inside is itself
+    /// the OS-level flock. Serialises same-server attach attempts on the
+    /// same session name (D6.6).
+    pub session_locks: Arc<tokio::sync::Mutex<std::collections::HashMap<String, LockGuard>>>,
+    /// Reverse index: cookie value → session name. Populated when an attach
+    /// succeeds against a known cookie; consulted on WS-close to find the
+    /// matching `session_locks` entry to release (ADR-0019 D6 §heartbeat).
+    /// Manipulated *only* while `session_locks` is held to keep the two
+    /// maps consistent — never under contention from a different path.
+    pub session_locks_by_cookie: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// UUID ↔ PaneId bridge for the schema v2 terminal-item model (ADR-0018
+    /// D2). Every spawn that surfaces through the HTTP API registers here;
+    /// every detected death unregisters. The `pty-backend` / `ws-server`
+    /// crates remain UUID-blind — only this crate crosses the boundary.
+    pub terminal_map: Arc<TerminalMap>,
+    /// Per-terminal label + created_at, keyed by the same UUID as
+    /// `terminal_map`. In-memory only — recreated each boot (Stage 4-B).
+    pub terminal_meta: Arc<TerminalMetadataStore>,
 }
 
 impl AppState {
     /// Assemble shared state with a fresh empty layout snapshot.
     /// `hub` is `None`; production callers must use [`AppState::with_hub`].
     pub fn new(config: Config, token: TokenString) -> Self {
+        let session_table = default_session_table(config.auth.cookie_max_age_days);
         Self {
+            session_table,
+            rate_limiter: default_rate_limiter(),
+            password_hash: None,
+            server_id: Arc::from(fresh_server_id()),
+            session_locks: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            terminal_map: Arc::new(TerminalMap::new()),
+            terminal_meta: Arc::new(TerminalMetadataStore::new()),
             config: Arc::new(config),
             token: Arc::new(token),
             layout: Arc::new(RwLock::new(LayoutSnapshot::empty())),
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
             hub: None,
             store: None,
+            workspace: None,
+            session_cache: Arc::new(SessionCache::new()),
         }
+    }
+
+    /// Attach a pre-loaded Argon2id password hash (read from the file
+    /// produced by `gtmux set-password`). Without this `POST /auth/login`
+    /// returns 503 in password mode.
+    pub fn with_password_hash(mut self, hash: String) -> Self {
+        self.password_hash = Some(Arc::new(hash));
+        self
+    }
+
+    /// Refresh the lease body of the session lock currently held by
+    /// `cookie` (ADR-0019 D6.2). Called from the WS heartbeat consumer task
+    /// on every Ping/Pong. Bumps the `lease_until_unix` field so a peeking
+    /// modal sees a fresh expected expiry. The kernel flock is unaffected
+    /// — this is purely a diagnostic refresh.
+    ///
+    /// Idempotent. A cookie that holds no lock is a no-op.
+    pub async fn refresh_lease_for_cookie(&self, cookie: &str) {
+        let by_cookie = self.session_locks_by_cookie.lock().await;
+        let Some(name) = by_cookie.get(cookie).cloned() else {
+            return;
+        };
+        drop(by_cookie);
+        let mut holders = self.session_locks.lock().await;
+        if let Some(guard) = holders.get_mut(&name) {
+            if let Err(e) = guard.refresh_lease(cookie) {
+                tracing::warn!(
+                    session = %name,
+                    error = %e,
+                    "session_lock: lease refresh failed"
+                );
+            }
+        }
+    }
+
+    /// Drop the bridge-map + metadata entry for the Terminal at `pane`
+    /// (Stage 4-E hygiene). Called from the CLI's `BackendNotify::PaneDied`
+    /// consumer so a dead Pane never sits in [`TerminalMap`] as a stale
+    /// alive binding. Idempotent on missing entries.
+    pub async fn handle_pane_died(&self, pane: gtmux_pty_backend::PaneId) {
+        if let Some(uuid) = self.terminal_map.unregister_pane(pane).await {
+            self.terminal_meta.forget(&uuid).await;
+            tracing::debug!(
+                pane = ?pane,
+                uuid = %uuid,
+                "terminal: unregistered after BackendNotify::PaneDied"
+            );
+        }
+    }
+
+    /// Release any cross-server session lock currently held by `cookie`
+    /// (ADR-0019 D6). Called from the WS disconnect consumer task on close.
+    /// Idempotent — a cookie that never attached is a no-op.
+    pub async fn release_lock_for_cookie(&self, cookie: &str) {
+        // Locks are taken in a fixed order (locks_by_cookie → session_locks)
+        // anywhere two maps are touched together, so a same-cookie attach
+        // racing with a disconnect cannot deadlock.
+        let mut by_cookie = self.session_locks_by_cookie.lock().await;
+        let Some(name) = by_cookie.remove(cookie) else {
+            return;
+        };
+        let mut holders = self.session_locks.lock().await;
+        if let Some(mut guard) = holders.remove(&name) {
+            tracing::info!(
+                session = %name,
+                "session_lock: auto-released on WS disconnect"
+            );
+            guard.release();
+        }
+    }
+
+    /// Spawn a fresh Terminal in the PTY backend and bind it to `uuid` in
+    /// the [`TerminalMap`] (Stage 4-A / ADR-0018 D6 *fresh spawn* arm).
+    ///
+    /// Idempotent on the UUID axis: if `uuid` is already mapped to an alive
+    /// PaneId the existing binding is returned with no side effect. Two
+    /// concurrent calls for the same UUID will at worst spawn one extra
+    /// PaneId that gets killed immediately when its `register` loses the
+    /// race — both callers still see the same winning PaneId.
+    ///
+    /// Returns `Err(SpawnTerminalError::HubUnavailable)` when called without
+    /// a hub attached (e.g. unit tests that exercise the HTTP surface in
+    /// isolation).
+    pub async fn spawn_terminal_with_uuid(
+        &self,
+        uuid: String,
+    ) -> Result<gtmux_pty_backend::PaneId, SpawnTerminalError> {
+        if let Some(existing) = self.terminal_map.lookup_pane(&uuid).await {
+            return Ok(existing);
+        }
+        let hub = self.hub.as_ref().ok_or(SpawnTerminalError::HubUnavailable)?;
+        let pane = hub
+            .backend()
+            .spawn(gtmux_pty_backend::SpawnSpec::default_shell())?;
+        match self.terminal_map.register(uuid.clone(), pane).await {
+            Ok(()) => {
+                self.terminal_meta.record_spawn(&uuid).await;
+                Ok(pane)
+            }
+            Err(TerminalMapError::UuidAlreadyBound { existing_pane, .. }) => {
+                // Lost a same-UUID race against another concurrent attach.
+                // Kill the duplicate Pane we just spawned and return the
+                // winner — the caller observes a single bound PaneId.
+                if let Err(e) = hub.backend().kill(pane) {
+                    tracing::warn!(
+                        pane = ?pane,
+                        error = %e,
+                        "terminal_map: failed to kill duplicate spawn after register race"
+                    );
+                }
+                Ok(existing_pane)
+            }
+            Err(e @ TerminalMapError::PaneAlreadyBound { .. }) => {
+                // Internal consistency violation — fresh PaneIds are never
+                // reused by the backend, so this should be unreachable. Log
+                // and surface as an error rather than silently corrupting
+                // the map.
+                tracing::error!(error = %e, "terminal_map: fresh PaneId collision");
+                if let Err(kill_err) = hub.backend().kill(pane) {
+                    tracing::warn!(
+                        pane = ?pane,
+                        error = %kill_err,
+                        "terminal_map: failed to kill orphan after pane-collision"
+                    );
+                }
+                Err(SpawnTerminalError::Map(e))
+            }
+        }
+    }
+
+    /// Attach a [`WorkspaceManager`] so the multi-session routes
+    /// (`/api/sessions...`) start serving requests. `self` is returned by
+    /// value to allow chaining with [`AppState::with_hub`] / [`AppState::with_hub_and_path`].
+    pub fn with_workspace(mut self, workspace: WorkspaceManager) -> Self {
+        self.workspace = Some(Arc::new(workspace));
+        self
     }
 
     /// Assemble shared state and attach a WS broadcast hub so PUT-driven
@@ -154,6 +368,19 @@ impl AppState {
     pub fn with_hub(config: Config, token: TokenString, hub: gtmux_ws_server::Hub) -> Self {
         let mut me = Self::new(config, token);
         me.hub = Some(hub);
+        me
+    }
+
+    /// Like [`with_hub`](Self::with_hub) plus a workspace handle. Convenience
+    /// for `gtmux start`'s boot wiring.
+    pub fn with_hub_and_workspace(
+        config: Config,
+        token: TokenString,
+        hub: gtmux_ws_server::Hub,
+        workspace: WorkspaceManager,
+    ) -> Self {
+        let mut me = Self::with_hub(config, token, hub);
+        me.workspace = Some(Arc::new(workspace));
         me
     }
 
@@ -170,15 +397,48 @@ impl AppState {
     ) -> Self {
         let store = LayoutStore::new(layout_path);
         let snapshot = store.load();
+        let session_table = default_session_table(config.auth.cookie_max_age_days);
         Self {
+            session_table,
+            rate_limiter: default_rate_limiter(),
+            password_hash: None,
+            server_id: Arc::from(fresh_server_id()),
+            session_locks: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            terminal_map: Arc::new(TerminalMap::new()),
+            terminal_meta: Arc::new(TerminalMetadataStore::new()),
             config: Arc::new(config),
             token: Arc::new(token),
             layout: Arc::new(RwLock::new(snapshot)),
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
             hub: Some(hub),
             store: Some(Arc::new(store)),
+            workspace: None,
+            session_cache: Arc::new(SessionCache::new()),
         }
     }
+}
+
+/// Errors from [`AppState::spawn_terminal_with_uuid`]. Distinct from
+/// [`HttpApiError`] so callers (handlers in Batch 4-B/C) can map each
+/// variant to their own HTTP shape — 503 for `HubUnavailable`, 500 for
+/// `Backend` / `Map` (internal consistency).
+#[derive(Debug, Error)]
+pub enum SpawnTerminalError {
+    /// No PTY hub is attached to this [`AppState`] — typically a unit-test
+    /// construction; production paths always wire a hub.
+    #[error("hub_unavailable")]
+    HubUnavailable,
+    /// The backend failed to spawn (resource exhaustion, fork failure, …).
+    #[error("backend: {0}")]
+    Backend(#[from] gtmux_pty_backend::PtyBackendError),
+    /// Internal terminal_map invariant violation (e.g. PaneId collision).
+    #[error("terminal_map: {0}")]
+    Map(TerminalMapError),
 }
 
 /// Errors produced by the HTTP API surface. Each variant maps to a stable
@@ -301,6 +561,40 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             "/api/layout",
             get(layout_get_handler).put(layout_put_handler),
         )
+        .route(
+            "/api/sessions",
+            get(sessions::list_handler).post(sessions::create_handler),
+        )
+        .route(
+            "/api/sessions/{name}",
+            axum::routing::delete(sessions::delete_handler),
+        )
+        .route(
+            "/api/sessions/{name}/layout",
+            get(sessions::layout_get_handler).put(sessions::layout_put_handler),
+        )
+        .route(
+            "/api/sessions/{name}/attach",
+            axum::routing::post(sessions::attach_handler)
+                .delete(sessions::detach_handler),
+        )
+        .route(
+            "/api/sessions/{name}/attach/confirm",
+            axum::routing::post(sessions::attach_confirm_handler),
+        )
+        .route(
+            "/api/sessions/{name}/items/{id}",
+            axum::routing::delete(sessions::delete_item_handler),
+        )
+        .route("/api/terminals", get(terminals::list_handler))
+        .route(
+            "/api/terminals/{id}/kill",
+            axum::routing::post(terminals::kill_handler),
+        )
+        .route(
+            "/api/terminals/{id}/respawn",
+            axum::routing::post(terminals::respawn_handler),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             bearer_auth_middleware,
@@ -308,6 +602,12 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
 
     let mut router = Router::new()
         .merge(api)
+        // Auth subtree — ADR-0020. The legacy `/auth/bootstrap` is kept as a
+        // 302-style redirect to `/auth?token=…` for backwards compat with
+        // bookmarks; the inline-script HTML it used to serve is gone.
+        .route("/auth", get(auth::auth_page_handler))
+        .route("/auth/login", axum::routing::post(auth::auth_login_handler))
+        .route("/auth/logout", axum::routing::post(auth::auth_logout_handler))
         .route("/auth/bootstrap", get(bootstrap_handler))
         .route("/healthz", get(healthz_handler));
 
@@ -352,7 +652,12 @@ async fn origin_check_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    if path == "/healthz" || path == "/auth/bootstrap" {
+    if path == "/healthz"
+        || path == "/auth/bootstrap"
+        || path == "/auth"
+        || path == "/auth/login"
+        || path == "/auth/logout"
+    {
         return next.run(req).await;
     }
     if let Some(origin) = req.headers().get(header::ORIGIN) {
@@ -396,77 +701,36 @@ async fn host_check_middleware(
     next.run(req).await
 }
 
-/// Bearer / cookie authentication (ADR-0003 D6).
+/// Bearer / cookie authentication (ADR-0003 D6 + ADR-0020 D2).
 ///
 /// Accepts either:
-///   * `Authorization: Bearer <token>` header, or
-///   * `Cookie: gtmux_auth=<token>` (set by the bootstrap exchange).
+///   * `Authorization: Bearer <token>` — the *stable* server token from
+///     `gtmux start`. Constant-time compared. Always accepted (CLI/scripted
+///     access).
+///   * `Cookie: gtmux_auth=<opaque>` — an opaque session-id minted by
+///     `/auth*` and stored in [`SessionTable`]. Validation bumps the rolling
+///     expiry (ADR-0020 D3).
 ///
-/// Failure increments `state.auth_failure_counter` so a future rate-limit
-/// middleware can throttle without coupling. The cleartext token is *never*
-/// logged — only the failure count and the route path.
+/// Failure increments `state.auth_failure_counter` so a future
+/// rate-limit middleware can throttle without coupling.
 async fn bearer_auth_middleware(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Response {
-    let presented = extract_presented_token(req.headers());
-    let Some(presented) = presented else {
-        state.auth_failure_counter.fetch_add(1, Ordering::Relaxed);
-        return HttpApiError::Unauthorized.into_response();
-    };
-    if !verify_token(&presented, &state.token) {
-        state.auth_failure_counter.fetch_add(1, Ordering::Relaxed);
-        return HttpApiError::Unauthorized.into_response();
-    }
-    next.run(req).await
-}
-
-fn extract_presented_token(headers: &HeaderMap) -> Option<String> {
-    // 1. Authorization: Bearer <token>
-    if let Some(auth) = headers.get(header::AUTHORIZATION) {
-        if let Ok(v) = auth.to_str() {
-            if let Some(rest) = v.strip_prefix("Bearer ") {
-                let trimmed = rest.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
+    match auth::authenticate(&state, req.headers()).await {
+        Ok(()) => next.run(req).await,
+        Err(()) => {
+            state.auth_failure_counter.fetch_add(1, Ordering::Relaxed);
+            HttpApiError::Unauthorized.into_response()
         }
     }
-    // 2. Cookie: gtmux_auth=<token>
-    if let Some(cookie_header) = headers.get(header::COOKIE) {
-        if let Ok(v) = cookie_header.to_str() {
-            for pair in v.split(';') {
-                let pair = pair.trim();
-                if let Some(value) = pair.strip_prefix(concat!(COOKIE_NAME!(), "=")) {
-                    if !value.is_empty() {
-                        return Some(value.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
-// `concat!` cannot consume a `const &str`, so the cookie name is exposed via
-// a macro that expands to a literal. Keeps the name single-sourced.
-macro_rules! COOKIE_NAME {
-    () => {
-        "gtmux_auth"
-    };
-}
-pub(crate) use COOKIE_NAME;
-
-/// Cookie name issued by the bootstrap exchange (ADR-0003 D6 / SSoT §1.3).
-///
-/// Exposed for tests and external smoke scripts. Note that the bootstrap
-/// exchange uses `gtmux_auth` rather than the SSoT default `gtmux_session`
-/// because the bootstrap exchange has different lifetime semantics from the
-/// future cloud-mode `gtmux_session` cookie — and the contract document for
-/// this task names `gtmux_auth` explicitly.
-pub const COOKIE_NAME_STR: &str = COOKIE_NAME!();
+/// Cookie name issued by the auth flow (ADR-0020 D2). Exposed for tests
+/// and external smoke scripts so they can assert on the `Set-Cookie` header
+/// without re-hard-coding the literal.
+pub const COOKIE_NAME_STR: &str = "gtmux_auth";
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Handlers
@@ -489,117 +753,49 @@ struct BootstrapQuery {
     redirect: Option<String>,
 }
 
+/// Legacy bootstrap route — ADR-0020 D8 obsoleted the inline-script flow.
+/// We keep the URL alive so existing bookmarks still work, but the body is
+/// now a 303 to the canonical `/auth?token=…` endpoint. The token query
+/// itself is verified (and cookie issued) by `auth_page_handler`.
 async fn bootstrap_handler(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Query(q): Query<BootstrapQuery>,
 ) -> Response {
-    let Some(presented) = q.token.filter(|t| !t.is_empty()) else {
+    let Some(token) = q.token.filter(|t| !t.is_empty()) else {
         return HttpApiError::MissingToken.into_response();
     };
-    if !verify_token(&presented, &state.token) {
-        state.auth_failure_counter.fetch_add(1, Ordering::Relaxed);
-        return HttpApiError::Unauthorized.into_response();
-    }
-
-    // Normalise redirect target — only host-relative paths are honoured.
-    let target = normalise_redirect_target(q.redirect.as_deref());
-
-    // Build cookie. `Secure` only in Cloud mode (Local is plain HTTP — a
-    // Secure cookie there would be silently dropped by the browser).
-    let secure_flag = matches!(state.config.mode(), Mode::Cloud);
-    let cookie = build_session_cookie(&presented, secure_flag);
-
-    // The cookie is HttpOnly (XSS hardening) so JavaScript cannot read the
-    // token. The SPA needs the token for the WS Sec-WebSocket-Protocol
-    // header, however, which JS *does* compose — so we ship a one-shot HTML
-    // hop that mirrors the token into sessionStorage and then replaces the
-    // URL with the redirect target. The cookie still rides along for
-    // tower-http ServeDir requests that some user flows depend on.
-    let body = render_bootstrap_landing(&presented, &target, &state.config.server.session);
-
-    let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::SET_COOKIE, cookie)
-        // Tell intermediaries (and the browser) never to cache the landing
-        // page — the inline token must not be replayed from disk on the
-        // next demo session.
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(body))
-        .unwrap_or_else(|_| {
-            // Builder errors only when header values contain CRLF — our inputs
-            // are all server-generated, so this is unreachable. We still avoid
-            // panicking by returning a generic 500 if it ever does.
-            (StatusCode::INTERNAL_SERVER_ERROR, "").into_response()
-        });
-    apply_security_headers(resp.headers_mut(), state.config.mode());
-    resp
-}
-
-/// Render the minimal landing page that copies the token into
-/// sessionStorage and then redirects to `target`. Token + target are
-/// JSON-encoded so any character set (including future formats) ends up
-/// in a safe JavaScript string literal; `</` is rewritten as `<\/` so a
-/// pathological target cannot terminate the inline `<script>` early.
-fn render_bootstrap_landing(token: &str, target: &str, session: &str) -> String {
-    fn js_literal(value: &str) -> String {
-        let json = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
-        json.replace("</", "<\\/")
-    }
-    let token_js = js_literal(token);
-    let target_js = js_literal(target);
-    let session_js = js_literal(session);
-    format!(
-        r#"<!doctype html>
-<meta charset="utf-8">
-<title>gtmux — authenticating</title>
-<script>
-(function () {{
-  try {{ sessionStorage.setItem('gtmux_token', {token_js}); }} catch (e) {{}}
-  try {{ sessionStorage.setItem('gtmux_session', {session_js}); }} catch (e) {{}}
-  window.location.replace({target_js});
-}})();
-</script>
-<noscript>JavaScript is required to complete gtmux authentication.</noscript>
-"#
-    )
-}
-
-fn build_session_cookie(token_value: &str, secure: bool) -> String {
-    // We intentionally do not set Max-Age in this MVP — the session cookie
-    // lives until the browser closes. ADR-0003 D13.1 (local on-start rotation)
-    // means a new server boot invalidates anything older anyway.
-    let mut parts = Vec::with_capacity(5);
-    parts.push(format!("{}={}", COOKIE_NAME_STR, token_value));
-    parts.push("Path=/".to_string());
-    parts.push("HttpOnly".to_string());
-    parts.push("SameSite=Strict".to_string());
-    if secure {
-        parts.push("Secure".to_string());
-    }
-    parts.join("; ")
-}
-
-fn normalise_redirect_target(raw: Option<&str>) -> String {
-    let Some(raw) = raw else {
-        return "/".to_string();
+    // Re-encode token + redirect so a path-traversal-shaped redirect from a
+    // stale bookmark isn't laundered into a header-splitting payload.
+    let target = match q.redirect.as_deref() {
+        Some(r) => format!(
+            "/auth?token={}&redirect={}",
+            urlencode_query(&token),
+            urlencode_query(r)
+        ),
+        None => format!("/auth?token={}", urlencode_query(&token)),
     };
-    // Block schemes (`http://...`), protocol-relative (`//...`), and
-    // backslash variants (`/\evil.example`). Only `/<path-char>` survives.
-    let bytes = raw.as_bytes();
-    if bytes.first() != Some(&b'/') {
-        return "/".to_string();
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, target)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .expect("static headers")
+}
+
+fn urlencode_query(s: &str) -> String {
+    // Tiny inline encoder — only escapes the bytes the URL grammar reserves
+    // for query separators (`&`, `=`, `+`, `#`) plus whitespace and CR/LF.
+    // The legacy bootstrap caller is server-internal; this is belt-and-braces.
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
     }
-    if bytes.get(1) == Some(&b'/') || bytes.get(1) == Some(&b'\\') {
-        return "/".to_string();
-    }
-    // Reject CR/LF (response-splitting belt-and-braces; axum would also catch
-    // this when building the header value, but we'd rather fall back cleanly
-    // than 500).
-    if raw.contains('\r') || raw.contains('\n') {
-        return "/".to_string();
-    }
-    raw.to_string()
+    out
 }
 
 async fn layout_get_handler(State(state): State<AppState>, req: Request) -> Response {
@@ -751,7 +947,7 @@ async fn layout_put_handler(State(state): State<AppState>, req: Request) -> Resp
 
 /// Apply the SSoT §1.5 security headers to every response. STS is only
 /// emitted in Cloud mode (SSoT line for STS).
-fn apply_security_headers(headers: &mut HeaderMap, mode: Mode) {
+pub(crate) fn apply_security_headers(headers: &mut HeaderMap, mode: Mode) {
     static NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
     static REFERRER: HeaderValue = HeaderValue::from_static("no-referrer");
     static COOP: HeaderValue = HeaderValue::from_static("same-origin");
@@ -918,6 +1114,8 @@ mod tests {
             },
             cloud: None,
             frontend_dist: None,
+            workspace_path: None,
+            auth: gtmux_config::AuthConfig::default(),
         }
     }
 
@@ -1238,39 +1436,26 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    // ── ADR-0020: token-mode entry → opaque session cookie + 303 ──
+    //
+    // The legacy `/auth/bootstrap` route now redirects to the canonical
+    // `/auth?token=…` endpoint (ADR-0020 D8). Tests below cover both routes
+    // since existing bookmarks must keep working until the FE migrates.
+
     #[tokio::test]
-    async fn bootstrap_success_sets_cookie_and_returns_landing_html() {
+    async fn auth_page_token_query_issues_cookie_and_redirects() {
         let (app, token) = make_app();
-        let uri = format!("/auth/bootstrap?token={}", token.0);
         let resp = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri(&uri)
+                    .uri(format!("/auth?token={}", token.0))
                     .header(header::HOST, TEST_HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let content_type = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .expect("content-type set")
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(
-            content_type.starts_with("text/html"),
-            "expected text/html landing, got {content_type}"
-        );
-        let cache_control = resp
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .expect("cache-control set")
-            .to_str()
-            .unwrap();
-        assert_eq!(cache_control, "no-store");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         let set_cookie = resp
             .headers()
             .get(header::SET_COOKIE)
@@ -1278,67 +1463,37 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(
-            set_cookie.starts_with(&format!("{}=", COOKIE_NAME_STR)),
-            "cookie must start with {}=, got: {set_cookie}",
-            COOKIE_NAME_STR,
-        );
+        assert!(set_cookie.starts_with(&format!("{COOKIE_NAME_STR}=")));
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Strict"));
-        assert!(set_cookie.contains("Path=/"));
-        // Local mode → no Secure flag (TLS-less HTTP would drop it).
-        assert!(!set_cookie.contains("Secure"));
-
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024)
-            .await
+        // Cookie value must NOT be the raw bearer token — it's an opaque
+        // session-id from `SessionTable::issue`.
+        let cookie_value = set_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix(&format!("{COOKIE_NAME_STR}="))
+            .unwrap()
+            .to_string();
+        assert_ne!(cookie_value, token.0, "cookie must be opaque session-id, not bearer token");
+        // Location → "/" (default redirect target).
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
             .unwrap();
-        let body = std::str::from_utf8(&body_bytes).unwrap().to_string();
-        // Token is mirrored into sessionStorage so the SPA can read it for
-        // the WS Sec-WebSocket-Protocol path.
-        assert!(
-            body.contains(&format!(
-                "sessionStorage.setItem('gtmux_token', \"{}\"",
-                token.0
-            )),
-            "landing must inject sessionStorage token, got: {body}"
-        );
-        // And the user lands on `/` (or any normalised target).
-        assert!(
-            body.contains("window.location.replace(\"/\")"),
-            "landing must replace location to '/', got: {body}"
-        );
-    }
-
-    #[test]
-    fn bootstrap_landing_escapes_inline_script_terminator() {
-        // Direct unit-level pin on `render_bootstrap_landing` — exercising
-        // the renderer with values that *would* close `<script>` early if
-        // we ever stopped rewriting `</` to `<\/` inside JS string literals.
-        let body = render_bootstrap_landing("abc-token", "/path</script><b>oops", "smoke");
-        assert!(
-            !body.contains("</script><b>oops"),
-            "raw </script> leaked into HTML: {body}"
-        );
-        assert!(
-            body.contains("<\\/script>"),
-            "expected escaped <\\/script>, got: {body}"
-        );
-        // And the token still lands intact in the JS string literal.
-        assert!(
-            body.contains("sessionStorage.setItem('gtmux_token', \"abc-token\")"),
-            "token must be present in landing body: {body}"
-        );
+        assert_eq!(location, "/");
     }
 
     #[tokio::test]
-    async fn bootstrap_wrong_token() {
+    async fn auth_page_invalid_token_returns_html_error() {
         let (app, _token) = make_app();
-        // 43-char base64url-no-pad shape but wrong content.
         let wrong = "A".repeat(43);
         let resp = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri(format!("/auth/bootstrap?token={wrong}"))
+                    .uri(format!("/auth?token={wrong}"))
                     .header(header::HOST, TEST_HOST)
                     .body(Body::empty())
                     .unwrap(),
@@ -1347,6 +1502,53 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_page_without_token_renders_landing() {
+        let (app, _token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth")
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.starts_with("text/html"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_legacy_route_redirects_to_auth() {
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/auth/bootstrap?token={}", token.0))
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(location.starts_with("/auth?token="));
     }
 
     #[tokio::test]
@@ -1366,69 +1568,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_redirect_target_rejects_external() {
-        // The redirect lives inside the inline landing JS now (no Location
-        // header). External / protocol-relative inputs must still be
-        // normalised down to "/" before they reach the JS string literal.
+    async fn auth_redirect_target_rejects_external() {
         for evil in [
             "https://evil.example/x",
             "//evil.example",
             "/\\evil.example",
         ] {
             let (app, token) = make_app();
-            let uri = format!("/auth/bootstrap?token={}&redirect={evil}", token.0);
             let resp = app
                 .oneshot(
                     HttpRequest::builder()
-                        .uri(&uri)
+                        .uri(format!("/auth?token={}&redirect={evil}", token.0))
                         .header(header::HOST, TEST_HOST)
                         .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            let body_bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024)
-                .await
+            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+            let location = resp
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
                 .unwrap();
-            let body = std::str::from_utf8(&body_bytes).unwrap().to_string();
-            assert!(
-                body.contains("window.location.replace(\"/\")"),
-                "evil input {evil} must normalise to '/', got: {body}"
-            );
-            assert!(
-                !body.contains("evil.example"),
-                "evil host leaked into landing for input {evil}: {body}"
-            );
+            assert_eq!(location, "/", "evil input {evil:?} must normalise to '/'");
         }
     }
 
     #[tokio::test]
-    async fn cookie_auth_works_after_bootstrap() {
+    async fn cookie_auth_works_after_login() {
         let (app, token) = make_app();
-        // 1. Bootstrap to obtain the cookie.
-        let bootstrap_resp = app
+        let auth_resp = app
             .clone()
             .oneshot(
                 HttpRequest::builder()
-                    .uri(format!("/auth/bootstrap?token={}", token.0))
+                    .uri(format!("/auth?token={}", token.0))
                     .header(header::HOST, TEST_HOST)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        let set_cookie = bootstrap_resp
+        let name_value = auth_resp
             .headers()
             .get(header::SET_COOKIE)
             .unwrap()
             .to_str()
             .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
             .to_string();
-        // Extract the `name=value` part for the next request.
-        let name_value = set_cookie.split(';').next().unwrap().trim().to_string();
 
-        // 2. GET /api/layout with the cookie — no Authorization header.
         let resp = app
             .oneshot(
                 HttpRequest::builder()
@@ -1443,8 +1636,112 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "cookie auth must satisfy the bearer middleware",
+            "session cookie must satisfy the auth middleware"
         );
+    }
+
+    #[tokio::test]
+    async fn auth_logout_clears_cookie_and_revokes() {
+        let (app, token) = make_app();
+        let auth_resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/auth?token={}", token.0))
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let name_value = auth_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // POST /auth/logout with the cookie — must succeed.
+        let logout = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/logout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &name_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        let clear = logout
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(clear.contains("Max-Age=0"), "clear cookie expected: {clear}");
+
+        // Subsequent request with the now-revoked cookie must 401.
+        let after = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &name_value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_login_token_mode_returns_set_cookie_on_success() {
+        let (app, token) = make_app();
+        let body = serde_json::to_vec(&json!({ "token": token.0 })).unwrap();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/login")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn auth_login_token_mode_rejects_wrong_token() {
+        let (app, _token) = make_app();
+        let body = serde_json::to_vec(&json!({ "token": "A".repeat(43) })).unwrap();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/login")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
 
     // ── pure-function unit tests for the helpers ──
@@ -1468,15 +1765,19 @@ mod tests {
 
     #[test]
     fn normalise_redirect_blocks_open_redirect() {
-        assert_eq!(normalise_redirect_target(None), "/");
-        assert_eq!(normalise_redirect_target(Some("//evil")), "/");
-        assert_eq!(normalise_redirect_target(Some("/\\evil")), "/");
-        assert_eq!(normalise_redirect_target(Some("https://evil")), "/");
-        assert_eq!(normalise_redirect_target(Some("evil")), "/");
-        // Legitimate host-relative paths survive.
-        assert_eq!(normalise_redirect_target(Some("/canvas")), "/canvas");
-        // CR/LF rejected to prevent header-splitting.
-        assert_eq!(normalise_redirect_target(Some("/x\r\nSet-Cookie: ev")), "/");
+        // The helper lives in `auth.rs` now (ADR-0020 D8 relocation). The
+        // unit-level coverage there is authoritative; this stub keeps a
+        // breadcrumb so a future move stays traceable.
+        assert_eq!(crate::auth::normalise_redirect_target(None), "/");
+        assert_eq!(crate::auth::normalise_redirect_target(Some("//evil")), "/");
+        assert_eq!(crate::auth::normalise_redirect_target(Some("/\\evil")), "/");
+        assert_eq!(crate::auth::normalise_redirect_target(Some("https://evil")), "/");
+        assert_eq!(crate::auth::normalise_redirect_target(Some("evil")), "/");
+        assert_eq!(crate::auth::normalise_redirect_target(Some("/canvas")), "/canvas");
+        assert_eq!(
+            crate::auth::normalise_redirect_target(Some("/x\r\nSet-Cookie: ev")),
+            "/"
+        );
     }
 
     // ── S7-PERSISTENCE-MINIMAL (ADR-0006) — disk-backed PUT flow ──
@@ -1493,6 +1794,20 @@ mod tests {
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
             hub: None,
             store: Some(Arc::new(store)),
+            workspace: None,
+            session_cache: Arc::new(crate::sessions::SessionCache::new()),
+            session_table: crate::auth::default_session_table(7),
+            rate_limiter: crate::auth::default_rate_limiter(),
+            password_hash: None,
+            server_id: Arc::from(crate::session_lock::fresh_server_id()),
+            session_locks: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            terminal_map: Arc::new(TerminalMap::new()),
+            terminal_meta: Arc::new(TerminalMetadataStore::new()),
         };
         let app = router_with_state(state);
         (app, token, layout_path)
@@ -1666,6 +1981,20 @@ mod tests {
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
             hub: None,
             store: Some(Arc::new(store)),
+            workspace: None,
+            session_cache: Arc::new(crate::sessions::SessionCache::new()),
+            session_table: crate::auth::default_session_table(7),
+            rate_limiter: crate::auth::default_rate_limiter(),
+            password_hash: None,
+            server_id: Arc::from(crate::session_lock::fresh_server_id()),
+            session_locks: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            terminal_map: Arc::new(TerminalMap::new()),
+            terminal_meta: Arc::new(TerminalMetadataStore::new()),
         };
         let app2 = router_with_state(state);
         let etag2 = current_etag(&app2, &token).await;
@@ -1688,6 +2017,20 @@ mod tests {
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
             hub: None,
             store: Some(Arc::new(store)),
+            workspace: None,
+            session_cache: Arc::new(crate::sessions::SessionCache::new()),
+            session_table: crate::auth::default_session_table(7),
+            rate_limiter: crate::auth::default_rate_limiter(),
+            password_hash: None,
+            server_id: Arc::from(crate::session_lock::fresh_server_id()),
+            session_locks: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            terminal_map: Arc::new(TerminalMap::new()),
+            terminal_meta: Arc::new(TerminalMetadataStore::new()),
         };
         let app = router_with_state(state);
         let resp = app
@@ -1713,5 +2056,1179 @@ mod tests {
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
         assert!(has_sidecar, "corrupt file must be quarantined");
+    }
+
+    // ── Multi-session HTTP surface (Stage 1, ADR-0019 + ADR-0018) ──
+
+    fn make_app_with_workspace(
+        dir: &tempfile::TempDir,
+    ) -> (Router, TokenString, std::path::PathBuf) {
+        let token = issue_token().expect("token");
+        let cfg = test_config();
+        let workspace_dir = dir.path().to_path_buf();
+        let wm = WorkspaceManager::from_path(workspace_dir.clone()).expect("workspace");
+        let state = AppState::new(cfg, token.clone()).with_workspace(wm);
+        let app = router_with_state(state);
+        (app, token, workspace_dir)
+    }
+
+    #[tokio::test]
+    async fn sessions_list_empty_on_fresh_workspace() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, json!([]));
+    }
+
+    #[tokio::test]
+    async fn sessions_create_then_list_then_layout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, workspace_dir) = make_app_with_workspace(&dir);
+
+        // POST /api/sessions { name: "demo" } → 201
+        let create_body = serde_json::to_vec(&json!({ "name": "demo" })).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // File must exist on disk.
+        assert!(workspace_dir.join("demo.json").exists());
+
+        // GET /api/sessions lists it.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, json!([{ "name": "demo", "active": false }]));
+
+        // GET /api/sessions/demo/layout returns an empty v2 layout.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions/demo/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp.headers().get(header::ETAG).cloned();
+        assert!(etag.is_some(), "ETag header must be present");
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let layout: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(layout["schema_version"], 2);
+        assert_eq!(layout["groups"].as_array().unwrap().len(), 0);
+        assert_eq!(layout["items"].as_array().unwrap().len(), 0);
+        assert!(layout["viewport"].is_object());
+    }
+
+    #[tokio::test]
+    async fn sessions_create_rejects_duplicate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let body = || serde_json::to_vec(&json!({ "name": "twin" })).unwrap();
+        let make_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/api/sessions")
+                .header(header::HOST, TEST_HOST)
+                .header(header::AUTHORIZATION, bearer(&token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body()))
+                .unwrap()
+        };
+        let r1 = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::CREATED);
+        let r2 = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn sessions_create_rejects_invalid_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        for bad in ["", "../etc", "a/b", "has space"] {
+            let body = serde_json::to_vec(&json!({ "name": bad })).unwrap();
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri("/api/sessions")
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::AUTHORIZATION, bearer(&token))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "name {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_layout_put_etag_cas() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let create_body = serde_json::to_vec(&json!({ "name": "demo" })).unwrap();
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // GET to fetch current ETag.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions/demo/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Stale If-Match → 412.
+        let put_body = serde_json::to_vec(&json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        }))
+        .unwrap();
+        let stale = "\"00000000000000000000000000000000\"";
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri("/api/sessions/demo/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::IF_MATCH, stale)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(put_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        assert!(resp.headers().contains_key(header::ETAG));
+
+        // Fresh If-Match → 204 + new ETag.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri("/api/sessions/demo/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::IF_MATCH, etag)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(put_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(resp.headers().contains_key(header::ETAG));
+    }
+
+    #[tokio::test]
+    async fn sessions_delete_removes_file_and_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, workspace_dir) = make_app_with_workspace(&dir);
+        let create_body = serde_json::to_vec(&json!({ "name": "doomed" })).unwrap();
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(workspace_dir.join("doomed.json").exists());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/doomed")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(!workspace_dir.join("doomed.json").exists());
+
+        // GET layout after delete → 404.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions/doomed/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sessions_endpoints_503_without_workspace() {
+        let (app, token) = make_app();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn sessions_require_bearer_auth() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, _token, _) = make_app_with_workspace(&dir);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Stage 4-B: GET /api/terminals (ADR-0021 D7 + ADR-0018 D2) ──
+
+    fn make_state_with_workspace(
+        dir: &tempfile::TempDir,
+    ) -> (AppState, TokenString, std::path::PathBuf) {
+        let token = issue_token().expect("token");
+        let cfg = test_config();
+        let workspace_dir = dir.path().to_path_buf();
+        let wm = WorkspaceManager::from_path(workspace_dir.clone()).expect("workspace");
+        let state = AppState::new(cfg, token.clone()).with_workspace(wm);
+        (state, token, workspace_dir)
+    }
+
+    #[tokio::test]
+    async fn terminals_list_empty_when_pool_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace(&dir);
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/terminals")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, json!([]));
+    }
+
+    #[tokio::test]
+    async fn terminals_list_503_without_workspace() {
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/terminals")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn terminals_list_joins_pool_metadata_and_session_refs() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace(&dir);
+
+        // Two UUIDs in the pool, with metadata.
+        state
+            .terminal_map
+            .register("uuid-aaa".into(), PaneId(1))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn("uuid-aaa").await;
+        state
+            .terminal_map
+            .register("uuid-bbb".into(), PaneId(2))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn("uuid-bbb").await;
+
+        // Two on-disk session files: one references uuid-aaa; the other
+        // references both.
+        let session_a = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [
+                {
+                    "id": "uuid-aaa", "type": "terminal",
+                    "parent_id": null,
+                    "x": 0.0, "y": 0.0, "w": 640.0, "h": 400.0, "z": 0,
+                    "visibility": "visible", "locked": false,
+                    "minimized": false
+                }
+            ],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        let session_b = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [
+                {
+                    "id": "uuid-aaa", "type": "terminal",
+                    "parent_id": null,
+                    "x": 0.0, "y": 0.0, "w": 640.0, "h": 400.0, "z": 0,
+                    "visibility": "visible", "locked": false,
+                    "minimized": false
+                },
+                {
+                    "id": "uuid-bbb", "type": "terminal",
+                    "parent_id": null,
+                    "x": 0.0, "y": 0.0, "w": 640.0, "h": 400.0, "z": 0,
+                    "visibility": "visible", "locked": false,
+                    "minimized": false
+                }
+            ],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        std::fs::write(
+            workspace_dir.join("alpha.json"),
+            serde_json::to_vec(&session_a).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            workspace_dir.join("beta.json"),
+            serde_json::to_vec(&session_b).unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/terminals")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = body.as_array().expect("array");
+        assert_eq!(rows.len(), 2);
+
+        // Pull rows by id; ordering on created_at is identical (same wall
+        // clock second), so we look them up by id rather than by index.
+        let row_a = rows
+            .iter()
+            .find(|r| r["id"] == "uuid-aaa")
+            .expect("uuid-aaa row");
+        let row_b = rows
+            .iter()
+            .find(|r| r["id"] == "uuid-bbb")
+            .expect("uuid-bbb row");
+
+        assert_eq!(row_a["alive"], true);
+        assert_eq!(row_a["label"], "");
+        assert_eq!(row_a["attach_count"], 2);
+        let names_a: Vec<String> = row_a["attached_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(names_a.contains(&"alpha".into()));
+        assert!(names_a.contains(&"beta".into()));
+
+        assert_eq!(row_b["alive"], true);
+        assert_eq!(row_b["attach_count"], 1);
+        let names_b: Vec<String> = row_b["attached_sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names_b, vec!["beta".to_string()]);
+    }
+
+    // ── Stage 4-C: match-or-spawn on attach (ADR-0018 D6) ──
+
+    #[tokio::test]
+    async fn attach_returns_matched_and_unmatched_split() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace(&dir);
+
+        // Pre-populate the pool with one of the two UUIDs the layout
+        // references — that one must come back as `matched`; the other
+        // must show up as `unmatched`.
+        state
+            .terminal_map
+            .register("11111111-2222-4333-8444-555555555555".into(), PaneId(1))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn("11111111-2222-4333-8444-555555555555").await;
+
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [
+                    {
+                        "id": "11111111-2222-4333-8444-555555555555", "type": "terminal",
+                        "parent_id": null,
+                        "x": 0.0, "y": 0.0, "w": 640.0, "h": 400.0, "z": 0,
+                        "visibility": "visible", "locked": false,
+                        "minimized": false
+                    },
+                    {
+                        "id": "66666666-7777-4888-8999-aaaaaaaaaaaa", "type": "terminal",
+                        "parent_id": null,
+                        "x": 0.0, "y": 0.0, "w": 640.0, "h": 400.0, "z": 0,
+                        "visibility": "visible", "locked": false,
+                        "minimized": false
+                    }
+                ],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/demo/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["name"], "demo");
+        assert_eq!(body["attached"], true);
+        assert_eq!(body["matched"], json!(["11111111-2222-4333-8444-555555555555"]));
+        assert_eq!(body["unmatched"], json!(["66666666-7777-4888-8999-aaaaaaaaaaaa"]));
+    }
+
+    #[tokio::test]
+    async fn attach_confirm_503_without_hub() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/demo/attach/confirm")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn attach_confirm_403_when_not_attached() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let token = issue_token().expect("token");
+        let cfg = test_config();
+        let workspace_dir = dir.path().to_path_buf();
+        let wm = WorkspaceManager::from_path(workspace_dir.clone()).expect("workspace");
+        let backend = gtmux_pty_backend::PtyBackend::new();
+        let hub = gtmux_ws_server::Hub::new(backend);
+        let state = AppState::with_hub_and_workspace(cfg, token.clone(), hub, wm);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+        // No prior /attach — confirm must 403.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/demo/attach/confirm")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── Stage 4-E: BackendNotify::PaneDied auto-unregister ──
+
+    #[tokio::test]
+    async fn handle_pane_died_drops_map_and_metadata() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, _) = make_state_with_workspace(&dir);
+        let uuid = "11111111-2222-4333-8444-555555555558";
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(42))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn(uuid).await;
+        assert!(state.terminal_map.lookup_pane(uuid).await.is_some());
+        state.handle_pane_died(PaneId(42)).await;
+        assert!(state.terminal_map.lookup_pane(uuid).await.is_none());
+        assert!(state.terminal_meta.get(uuid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn handle_pane_died_is_idempotent_for_unknown_pane() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, _) = make_state_with_workspace(&dir);
+        // No entry — must not panic.
+        state.handle_pane_died(PaneId(999)).await;
+        assert!(state.terminal_map.is_empty().await);
+    }
+
+    // ── Stage 4-D: DELETE items + terminal kill / respawn ──
+
+    fn make_state_with_workspace_and_hub(
+        dir: &tempfile::TempDir,
+    ) -> (AppState, TokenString, std::path::PathBuf) {
+        let token = issue_token().expect("token");
+        let cfg = test_config();
+        let workspace_dir = dir.path().to_path_buf();
+        let wm = WorkspaceManager::from_path(workspace_dir.clone()).expect("workspace");
+        let backend = gtmux_pty_backend::PtyBackend::new();
+        let hub = gtmux_ws_server::Hub::new(backend);
+        let state = AppState::with_hub_and_workspace(cfg, token.clone(), hub, wm);
+        (state, token, workspace_dir)
+    }
+
+    fn make_layout_with_one_terminal(uuid: &str) -> Value {
+        json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [
+                {
+                    "id": uuid, "type": "terminal",
+                    "parent_id": null,
+                    "x": 0.0, "y": 0.0, "w": 640.0, "h": 400.0, "z": 0,
+                    "visibility": "visible", "locked": false,
+                    "minimized": false
+                }
+            ],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        })
+    }
+
+    #[tokio::test]
+    async fn delete_item_removes_panel_only_by_default() {
+        use gtmux_pty_backend::PaneId;
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+
+        // Bind the UUID in the pool so we can verify it survives the
+        // panel-only delete.
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(1))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn(uuid).await;
+
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&make_layout_with_one_terminal(uuid)).unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state.clone());
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/sessions/demo/items/{uuid}"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            resp.headers().get(header::ETAG).is_some(),
+            "ETag must accompany the 204"
+        );
+
+        // The terminal is still in the pool (panel-only delete).
+        assert!(state.terminal_map.lookup_pane(uuid).await.is_some());
+        assert!(state.terminal_meta.get(uuid).await.is_some());
+
+        // The item is gone from the on-disk layout.
+        let bytes = std::fs::read(workspace_dir.join("demo.json")).unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_item_with_kill_terminal_drops_pool_entry() {
+        use gtmux_pty_backend::PaneId;
+        let uuid = "11111111-2222-4333-8444-555555555556";
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(2))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn(uuid).await;
+
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&make_layout_with_one_terminal(uuid)).unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state.clone());
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/sessions/demo/items/{uuid}?kill_terminal=true"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The terminal is no longer in the pool.
+        assert!(state.terminal_map.lookup_pane(uuid).await.is_none());
+        assert!(state.terminal_meta.get(uuid).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_item_404_when_id_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace(&dir);
+        let layout = make_layout_with_one_terminal("11111111-2222-4333-8444-555555555557");
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/demo/items/00000000-0000-4000-8000-000000000000")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn terminal_kill_404_when_not_in_pool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let backend = gtmux_pty_backend::PtyBackend::new();
+        let hub = gtmux_ws_server::Hub::new(backend);
+        let state = AppState::with_hub(test_config(), token.clone(), hub);
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/kill")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn terminal_kill_503_without_hub() {
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/kill")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn terminal_respawn_503_without_hub() {
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/respawn")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── Stage 3: cross-server session attach lock (ADR-0019 D3/D6) ──
+
+    async fn create_session(app: &Router, token: &TokenString, name: &str) {
+        let body = serde_json::to_vec(&json!({ "name": name })).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    async fn attach(app: &Router, token: &TokenString, name: &str) -> StatusCode {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/sessions/{name}/attach"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    async fn detach(app: &Router, token: &TokenString, name: &str) -> StatusCode {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/sessions/{name}/attach"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    #[tokio::test]
+    async fn attach_404_when_session_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let status = attach(&app, &token, "absent").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attach_then_detach_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "alpha").await;
+        assert_eq!(attach(&app, &token, "alpha").await, StatusCode::OK);
+        assert_eq!(detach(&app, &token, "alpha").await, StatusCode::OK);
+        // Second detach is still 200 (idempotent).
+        assert_eq!(detach(&app, &token, "alpha").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn attach_active_flag_appears_in_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "beta").await;
+
+        // Before attach: active = false
+        let list_before = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(list_before.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, json!([{ "name": "beta", "active": false }]));
+
+        // Attach.
+        assert_eq!(attach(&app, &token, "beta").await, StatusCode::OK);
+
+        // After attach: active = true
+        let list_after = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(list_after.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, json!([{ "name": "beta", "active": true }]));
+
+        // Cleanup so the TempDir Drop doesn't trip the held flock cleanup.
+        assert_eq!(detach(&app, &token, "beta").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn attach_409_when_already_held_same_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "gamma").await;
+        assert_eq!(attach(&app, &token, "gamma").await, StatusCode::OK);
+        // Same server, same session — second attach must 409 (no takeover).
+        assert_eq!(attach(&app, &token, "gamma").await, StatusCode::CONFLICT);
+        assert_eq!(detach(&app, &token, "gamma").await, StatusCode::OK);
+        // After release the lock is free again.
+        assert_eq!(attach(&app, &token, "gamma").await, StatusCode::OK);
+        assert_eq!(detach(&app, &token, "gamma").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn release_lock_for_cookie_drops_the_attach() {
+        // ADR-0019 D6 + ADR-0021 D6: a WS-close event must auto-release the
+        // session lock the cookie still holds, with no need for an explicit
+        // DELETE.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, workspace_dir) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "auto-rel").await;
+
+        // Attach with a known cookie so we can drive release-by-cookie.
+        let cookie_value = "test-cookie-XYZ";
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/auto-rel/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(workspace_dir.join(".locks/auto-rel.lock").exists());
+
+        // Reach into the AppState behind the router to invoke the release
+        // path. We can't easily get the AppState back from `router_with_state`
+        // so we reconstruct one against the same workspace dir + simulate.
+        // The unit-level coverage of release_lock_for_cookie is via the
+        // standalone test below; here we verify the *integration* surface.
+        // Second attach (same cookie) must still 409 because takeover is
+        // forbidden — the auto-release path is the only way the lock goes
+        // away (apart from explicit DELETE).
+        let again = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/auto-rel/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn refresh_lease_for_cookie_bumps_lease_until() {
+        // ADR-0019 D6.2: each Ping/Pong drives a lease refresh so peeking
+        // modals don't see a stale "expected expiry" hint.
+        let dir = tempfile::TempDir::new().unwrap();
+        let token = issue_token().expect("token");
+        let cfg = test_config();
+        let wm = WorkspaceManager::from_path(dir.path().to_path_buf()).expect("ws");
+        let state = AppState::new(cfg, token).with_workspace(wm);
+
+        let cookie_value = "refresh-cookie";
+        let locks_dir = dir.path().join(".locks");
+        std::fs::create_dir_all(&locks_dir).unwrap();
+        let server_id = state.server_id.clone();
+        let guard = tokio::task::spawn_blocking({
+            let locks_dir = locks_dir.clone();
+            move || crate::session_lock::acquire(&locks_dir, "refresh", server_id, cookie_value)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        state
+            .session_locks
+            .lock()
+            .await
+            .insert("refresh".to_string(), guard);
+        state
+            .session_locks_by_cookie
+            .lock()
+            .await
+            .insert(cookie_value.to_string(), "refresh".to_string());
+
+        let path = locks_dir.join("refresh.lock");
+        let lease_before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let before_until = lease_before["lease_until_unix"].as_u64().unwrap();
+
+        // Sleep past the 1s resolution of unix-seconds so the new lease
+        // can demonstrably differ.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        state.refresh_lease_for_cookie(cookie_value).await;
+
+        let lease_after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let after_until = lease_after["lease_until_unix"].as_u64().unwrap();
+        assert!(
+            after_until > before_until,
+            "lease must extend on refresh: before={before_until} after={after_until}"
+        );
+
+        // Idempotent — refresh for a cookie with no lock is a no-op.
+        state.refresh_lease_for_cookie("absent-cookie").await;
+    }
+
+    #[tokio::test]
+    async fn release_lock_for_cookie_directly_on_appstate() {
+        // Direct unit test of `AppState::release_lock_for_cookie` (the
+        // method the WS-close consumer task calls).
+        let dir = tempfile::TempDir::new().unwrap();
+        let token = issue_token().expect("token");
+        let cfg = test_config();
+        let wm = WorkspaceManager::from_path(dir.path().to_path_buf()).expect("ws");
+        let state = AppState::new(cfg, token).with_workspace(wm);
+
+        // Manually populate both maps as the attach handler would have.
+        let cookie_value = "manual-cookie";
+        {
+            let workspace_dir = dir.path();
+            let locks_dir = workspace_dir.join(".locks");
+            std::fs::create_dir_all(&locks_dir).unwrap();
+            let server_id = state.server_id.clone();
+            let guard = tokio::task::spawn_blocking(move || {
+                crate::session_lock::acquire(&locks_dir, "manual", server_id, cookie_value)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            state
+                .session_locks
+                .lock()
+                .await
+                .insert("manual".to_string(), guard);
+            state
+                .session_locks_by_cookie
+                .lock()
+                .await
+                .insert(cookie_value.to_string(), "manual".to_string());
+        }
+        assert!(dir.path().join(".locks/manual.lock").exists());
+
+        // Release-by-cookie must drop both maps and the lock file.
+        state.release_lock_for_cookie(cookie_value).await;
+        assert!(state.session_locks.lock().await.is_empty());
+        assert!(state.session_locks_by_cookie.lock().await.is_empty());
+        assert!(!dir.path().join(".locks/manual.lock").exists());
+
+        // Idempotent — second call on an absent cookie is a no-op.
+        state.release_lock_for_cookie(cookie_value).await;
+    }
+
+    #[tokio::test]
+    async fn attach_409_when_another_server_holds_flock() {
+        // Simulate a *different* server holding the cross-workspace flock by
+        // grabbing it directly via the session_lock primitives, then attempting
+        // an attach through the handler — handler must report 409.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, workspace_dir) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "delta").await;
+
+        let locks_dir = workspace_dir.join(".locks");
+        let other_server_id: Arc<str> = crate::session_lock::fresh_server_id().into();
+        let _other = tokio::task::spawn_blocking(move || {
+            crate::session_lock::acquire(&locks_dir, "delta", other_server_id, "ext-conn")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let status = attach(&app, &token, "delta").await;
+        assert_eq!(status, StatusCode::CONFLICT);
     }
 }

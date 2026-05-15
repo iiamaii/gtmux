@@ -20,8 +20,12 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 ring = { workspace = true }
 atomic-write-file = { workspace = true }
+argon2 = { workspace = true }
+base64 = { workspace = true }
+fs2 = { workspace = true }
 gtmux-auth = { path = "../auth" }
 gtmux-config = { path = "../config" }
+gtmux-pty-backend = { path = "../pty-backend" }
 gtmux-ws-server = { path = "../ws-server" }
 
 [dev-dependencies]

@@ -101,6 +101,11 @@ enum Cmd {
         /// + env-only — useful for first-run / smoke contexts.
         #[arg(long = "config", value_name = "PATH")]
         config_path: Option<PathBuf>,
+        /// Workspace storage directory (ADR-0019 D2 / D11, boot-immutable).
+        /// Overrides the TOML `workspace_path` field. When neither is set the
+        /// default is `${XDG_DATA_HOME:-~/.local/share}/gtmux/workspace/`.
+        #[arg(long = "workspace", value_name = "PATH")]
+        workspace_path: Option<PathBuf>,
     },
     /// Stop a running gtmux Server (소켓·daemon은 그대로 둔다).
     ///
@@ -155,6 +160,15 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Set or replace the password used by ADR-0020 password-mode auth.
+    /// Prompts twice on the TTY (or reads from stdin in non-interactive
+    /// environments) and writes an Argon2id PHC hash to
+    /// `${XDG_STATE_HOME:-~/.local/state}/gtmux/password.argon2` (mode 0600).
+    SetPassword,
+    /// Remove the password hash file. Equivalent to `rm -f
+    /// ${XDG_STATE_HOME}/gtmux/password.argon2` but goes through the same
+    /// path resolution as `set-password` so XDG overrides apply.
+    ResetPassword,
 }
 
 fn main() -> ExitCode {
@@ -178,10 +192,12 @@ fn main() -> ExitCode {
             session,
             port,
             config_path,
+            workspace_path,
         } => match rt.block_on(start(StartArgs {
             session,
             port,
             config_path,
+            workspace_override: workspace_path,
         })) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => report_start_error(e),
@@ -200,6 +216,8 @@ fn main() -> ExitCode {
         })),
         Cmd::RotateToken { session } => rotate_token_cmd(&session),
         Cmd::Status { session } => rt.block_on(status_cmd(session.as_deref())),
+        Cmd::SetPassword => set_password_cmd(),
+        Cmd::ResetPassword => reset_password_cmd(),
     }
 }
 
@@ -211,6 +229,9 @@ struct StartArgs {
     session: String,
     port: Option<u16>,
     config_path: Option<PathBuf>,
+    /// `--workspace <path>` override (ADR-0019 D2 / D11). Beats the TOML
+    /// `workspace_path` field; both unset → XDG_DATA_HOME default.
+    workspace_override: Option<PathBuf>,
 }
 
 /// Execute the P0-CLI-1 14-step bootstrap sequence (grill report §3.1 +
@@ -348,14 +369,60 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         },
     };
 
-    // 6a) layout file path — S7-PERSISTENCE-MINIMAL / ADR-0006.
-    //     Resolved up-front so the AppState constructor can attempt the
-    //     boot-time load (D10 7-state table) before the router is wired.
-    //     XDG-path errors are fatal: without a usable state dir we cannot
-    //     guarantee post-PUT persistence and the 0006 contract breaks
-    //     silently.
+    // 6a) layout file path — S7-PERSISTENCE-MINIMAL / ADR-0006 (legacy
+    //     `/api/layout`). The multi-session storage (ADR-0019) lives in a
+    //     *different* directory; the legacy file remains for backwards
+    //     compatibility with the singular `/api/layout` route.
     let layout_path = layout_path_for(&config.server.session)
         .context("resolving layout file path under XDG_STATE_HOME")?;
+
+    // 6b) workspace — ADR-0019 D2 / D11 boot-immutable bind. Precedence:
+    //     CLI `--workspace` > TOML `workspace_path` > XDG_DATA_HOME default.
+    //     The boot-time v1→v2 migration scans the resolved dir for legacy
+    //     records (ADR-0018 D5 / ADR-0006 D15) and rewrites them in place.
+    let workspace = gtmux_http_api::WorkspaceManager::resolve(
+        args.workspace_override.clone(),
+        config.workspace_path.clone(),
+    )
+    .context("resolving workspace directory")?;
+    let migration = workspace
+        .boot_migration_v1_to_v2()
+        .context("workspace boot migration v1→v2")?;
+    if migration.migrated > 0 || migration.quarantined > 0 {
+        info!(
+            migrated = migration.migrated,
+            quarantined = migration.quarantined,
+            workspace = %workspace.path().display(),
+            "workspace: boot migration complete"
+        );
+    }
+
+    // 6c) password hash — ADR-0020 D5. Loaded eagerly when `auth.mode =
+    //     "password"` so a missing file fails fast at boot rather than at
+    //     first login attempt. In token mode we leave it unset.
+    let password_hash: Option<String> = if config.auth.mode == "password" {
+        let path = gtmux_http_api::default_password_hash_path()
+            .context("resolving password hash path")?;
+        match gtmux_http_api::load_password_hash(&path) {
+            Ok(h) => {
+                info!(path = %path.display(), "auth: loaded password hash");
+                Some(h)
+            }
+            Err(gtmux_http_api::AuthError::HashFileMissing(p)) => {
+                warn!(
+                    path = %p.display(),
+                    "auth: password mode is configured but no hash file exists yet; \
+                     run `gtmux set-password` before any client tries to log in"
+                );
+                None
+            }
+            Err(e) => {
+                return Err(anyhow!("loading password hash: {e}"));
+            }
+        }
+    } else {
+        None
+    };
 
     // 7+8+9) router — HTTP API (layout, bootstrap, healthz) + WebSocket (/ws).
     //   The Hub wraps the PtyBackend (ADR-0013 D11 trivial multi-attach mirror
@@ -363,13 +430,65 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //   `docs/reports/0026-stage-b-carry-forward.md` §2.4). HTTP / WS share
     //   Origin/Host invariants but have independent middleware stacks.
     let hub = Hub::new(backend.clone());
-    let app = build_app(
+
+    // ADR-0019 D6 / ADR-0021 D6: wire two cookie-tagged signal channels
+    // from the WS layer to the http-api lock table.
+    //   * `disconnect` — emitted on WS close; releases the session lock.
+    //   * `heartbeat`  — emitted on every Ping/Pong; refreshes the lease
+    //     body so peeking modals see an accurate expected-expiry hint.
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    hub.set_disconnect_sink(disconnect_tx);
+    hub.set_heartbeat_sink(heartbeat_tx);
+
+    let app_state = build_app_state(
         &config,
         &token,
         hub.clone(),
         layout_path,
-        config.frontend_dist.as_deref(),
+        workspace,
+        password_hash,
     );
+
+    let state_for_disconnect = app_state.clone();
+    let _disconnect_task = tokio::spawn(async move {
+        while let Some(cookie) = disconnect_rx.recv().await {
+            state_for_disconnect.release_lock_for_cookie(&cookie).await;
+        }
+    });
+    let state_for_heartbeat = app_state.clone();
+    let _heartbeat_task = tokio::spawn(async move {
+        while let Some(cookie) = heartbeat_rx.recv().await {
+            state_for_heartbeat.refresh_lease_for_cookie(&cookie).await;
+        }
+    });
+
+    // Stage 4-E hygiene: keep `TerminalMap` consistent with the alive pool
+    // by reacting to BackendNotify::PaneDied (a kernel SIGCHLD or an
+    // explicit kill). Without this consumer, killed Panes would linger in
+    // the map and confuse the match-or-spawn algorithm on the next attach.
+    let state_for_pane_died = app_state.clone();
+    let mut notify_rx = hub.subscribe_notify();
+    let _pane_died_task = tokio::spawn(async move {
+        use gtmux_pty_backend::BackendNotify;
+        loop {
+            match notify_rx.recv().await {
+                Ok(BackendNotify::PaneDied { id, .. }) => {
+                    state_for_pane_died.handle_pane_died(id).await;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        lagged = n,
+                        "pane_died consumer fell behind broadcast; resuming"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let app = build_router(app_state, &config, &token, hub.clone());
 
     // 10) bind — TCP only for now (unix socket variant lives behind
     //    `bind = "unix:/..."` and is a planned alt-path; surface a friendly
@@ -450,25 +569,50 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     serve_result.context("axum::serve")
 }
 
-fn build_app(
+fn build_app_state(
     config: &Config,
     token: &TokenString,
     hub: Hub,
     layout_path: PathBuf,
-    frontend_dist: Option<&std::path::Path>,
-) -> Router {
-    // AppState gets a hub clone so layout_put_handler can broadcast
-    // LAYOUT_CHANGED to live WS subscribers right after a successful PUT,
-    // plus the layout file path so the PUT-time atomic write + boot-time
-    // ADR-0006 D10 7-state load run against the canonical state-dir file.
-    let app_state = gtmux_http_api::AppState::with_hub_and_path(
+    workspace: gtmux_http_api::WorkspaceManager,
+    password_hash: Option<String>,
+) -> gtmux_http_api::AppState {
+    // AppState wires four side-channels into the HTTP router:
+    //  * `hub` so `layout_put_handler` broadcasts LAYOUT_CHANGED to WS
+    //    subscribers right after a successful PUT.
+    //  * `layout_path` so the legacy `/api/layout` endpoint persists per
+    //    ADR-0006 (boot-time load + atomic-write swap).
+    //  * `workspace` so the multi-session `/api/sessions[/<name>[/layout]]`
+    //    routes (ADR-0018 / ADR-0019) start serving — 503 otherwise.
+    //  * `password_hash` so password-mode logins (ADR-0020 D5) can verify
+    //    against the on-disk Argon2id hash.
+    let mut app_state = gtmux_http_api::AppState::with_hub_and_path(
         config.clone(),
         token.clone(),
-        hub.clone(),
+        hub,
         layout_path,
-    );
-    gtmux_http_api::router_with_app_state(app_state, frontend_dist)
-        .merge(gtmux_ws_server::router(config, token, hub))
+    )
+    .with_workspace(workspace);
+    if let Some(h) = password_hash {
+        app_state = app_state.with_password_hash(h);
+    }
+    app_state
+}
+
+fn build_router(
+    app_state: gtmux_http_api::AppState,
+    config: &Config,
+    token: &TokenString,
+    hub: Hub,
+) -> Router {
+    let frontend_dist = app_state
+        .config
+        .frontend_dist
+        .as_deref()
+        .map(|p| p.to_path_buf());
+    let http = gtmux_http_api::router_with_app_state(app_state, frontend_dist.as_deref());
+    let ws = gtmux_ws_server::router(config, token, hub);
+    http.merge(ws)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1008,6 +1152,107 @@ fn rotate_token_cmd(session: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// `gtmux set-password` / `gtmux reset-password` — ADR-0020 D5
+// ────────────────────────────────────────────────────────────────────────────
+
+fn set_password_cmd() -> ExitCode {
+    use std::io::IsTerminal;
+    let path = match gtmux_http_api::default_password_hash_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gtmux set-password: cannot resolve hash path: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+
+    // Read the password twice. Interactive: rpassword (no echo). Otherwise
+    // we read one line from stdin and skip the confirmation (CI pipes / docker
+    // exec) — *only* when stdin is genuinely not a TTY so that an operator at
+    // a terminal never bypasses the confirmation by accident.
+    let (first, confirm) = if std::io::stdin().is_terminal() {
+        let p1 = match rpassword::prompt_password("New gtmux password: ") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("gtmux set-password: read failed: {e}");
+                return ExitCode::from(EXIT_FAILURE);
+            }
+        };
+        let p2 = match rpassword::prompt_password("Confirm new password: ") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("gtmux set-password: read failed: {e}");
+                return ExitCode::from(EXIT_FAILURE);
+            }
+        };
+        (p1, p2)
+    } else {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_line(&mut buf) {
+            eprintln!("gtmux set-password: stdin read failed: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+        let trimmed = buf.trim_end_matches('\n').to_string();
+        (trimmed.clone(), trimmed)
+    };
+
+    if first != confirm {
+        eprintln!("gtmux set-password: passwords did not match.");
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    if first.len() < 8 {
+        eprintln!("gtmux set-password: password must be at least 8 characters (ADR-0020 D5).");
+        return ExitCode::from(EXIT_FAILURE);
+    }
+
+    let hash = match gtmux_http_api::hash_password(&first) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("gtmux set-password: hash failed: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    if let Err(e) = gtmux_http_api::save_password_hash(&path, &hash) {
+        eprintln!("gtmux set-password: write failed: {e}");
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    println!();
+    println!("gtmux password saved at {} (mode 0600).", path.display());
+    println!("Switch `[auth] mode = \"password\"` in your config and restart `gtmux start`.");
+    println!();
+    ExitCode::SUCCESS
+}
+
+fn reset_password_cmd() -> ExitCode {
+    let path = match gtmux_http_api::default_password_hash_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gtmux reset-password: cannot resolve hash path: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!("gtmux: removed password hash at {}.", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "gtmux reset-password: no password set ({} is absent).",
+                path.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!(
+                "gtmux reset-password: failed to remove {}: {e}",
+                path.display()
+            );
+            ExitCode::from(EXIT_FAILURE)
+        }
+    }
+}
+
 /// Best-effort: peek into `${XDG_CONFIG_HOME}/gtmux/<session>.config.toml`
 /// for the bound host + port and build a clickable URL. We don't go through
 /// the full figment chain because rotate-token is offline-tolerant — env
@@ -1279,10 +1524,12 @@ mod tests {
                 session,
                 port,
                 config_path,
+                workspace_path,
             } => {
                 assert_eq!(session, "alpha");
                 assert!(port.is_none());
                 assert!(config_path.is_none());
+                assert!(workspace_path.is_none());
             }
             other => panic!("expected Start, got {other:?}"),
         }
@@ -1299,18 +1546,25 @@ mod tests {
             "9999",
             "--config",
             "/tmp/x.toml",
+            "--workspace",
+            "/tmp/ws",
         ]);
         match cli.command {
             Cmd::Start {
                 session,
                 port,
                 config_path,
+                workspace_path,
             } => {
                 assert_eq!(session, "beta");
                 assert_eq!(port, Some(9999));
                 assert_eq!(
                     config_path.as_deref(),
                     Some(std::path::Path::new("/tmp/x.toml"))
+                );
+                assert_eq!(
+                    workspace_path.as_deref(),
+                    Some(std::path::Path::new("/tmp/ws"))
                 );
             }
             other => panic!("expected Start, got {other:?}"),

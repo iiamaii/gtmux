@@ -30,6 +30,8 @@ libc = "0.2"
 # environ() inspection for child shells that survived a crashed prior
 # Server instance.
 sysinfo = { workspace = true }
+# Read a password from the TTY without echoing it.
+rpassword = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -44,6 +44,9 @@ base64 = "0.22"
 dashmap = "6"
 atomic-write-file = "0.3"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+argon2 = "0.5"
+rpassword = "=7.3.1"
+fs2 = "0.4"
 
 # Release profile (R7 §8) — 단일 정적 바이너리 최적화.
 [profile.release]
