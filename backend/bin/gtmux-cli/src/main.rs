@@ -450,6 +450,12 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         password_hash,
     );
 
+    // Stage 5 D10 α: register the cookie validator so the WS handshake
+    // accepts cookie auth as an alternative to the subprotocol bearer
+    // (ADR-0020 D10 additive). The legacy bearer path stays in place —
+    // automation / CLI scripts that pass only the token keep working.
+    hub.set_cookie_validator(app_state.session_table.clone());
+
     let state_for_disconnect = app_state.clone();
     let _disconnect_task = tokio::spawn(async move {
         while let Some(cookie) = disconnect_rx.recv().await {

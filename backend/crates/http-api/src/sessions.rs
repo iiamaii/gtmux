@@ -510,6 +510,18 @@ pub async fn attach_confirm_handler(
         }
     }
 
+    // Stage 5-D path P1: hint other sessions' webpages that the alive pool
+    // has grown. The trigger session itself is skipped at the WS
+    // dispatcher (its layout already references the spawned UUIDs, so a
+    // refresh would be redundant). Only publish when a spawn actually
+    // landed — the empty case would create a wakeup for every subscriber
+    // to no purpose.
+    if !spawned.is_empty() {
+        if let Some(hub) = state.hub.as_ref() {
+            hub.publish_terminal_list_change(&name, &spawned, &[]);
+        }
+    }
+
     (
         StatusCode::OK,
         Json(json!({

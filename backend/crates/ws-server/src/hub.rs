@@ -26,10 +26,30 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use gtmux_pty_backend::{BackendNotify, PaneId, PtyBackend};
 use tokio::sync::broadcast;
 use tracing::debug;
+
+/// Async cookie validation interface used by the WS handshake (D10 α —
+/// ADR-0020 D10 *additive* path). Implementations return `true` when the
+/// cookie value identifies a live auth session. Decoupled from
+/// [`gtmux_http_api::auth::SessionTable`] so this crate does not depend
+/// on `gtmux-http-api` — keeps the dep graph acyclic.
+///
+/// Stage 5 D10 α: cookie auth is *additive* — the WS handshake accepts a
+/// request if **either** the subprotocol `bearer.<token>` validates **or**
+/// the validator returns true for the cookie. The deprecated path
+/// (D10 β / γ) will retire the bearer over time; this trait survives
+/// both transitions.
+#[async_trait]
+pub trait CookieValidator: Send + Sync {
+    /// `true` when `cookie_value` maps to a live, non-expired auth session.
+    /// Errors / lock poisoning / missing entries all collapse to `false` —
+    /// the WS handshake then falls back to the bearer path.
+    async fn validate(&self, cookie_value: &str) -> bool;
+}
 
 /// Fan-out channel depth for the multiplexed pane output stream. Sized
 /// for 50-pane × occasional-burst (mirrors the legacy `HUB_BROADCAST_CAPACITY`
@@ -46,6 +66,11 @@ const LAYOUT_BROADCAST_CAPACITY: usize = 16;
 /// small queue is enough; same order-of-magnitude as the layout broadcast.
 const TERMINAL_DIED_BROADCAST_CAPACITY: usize = 32;
 
+/// Fan-out channel depth for terminal-list-change deltas (Stage 5-D P1).
+/// Same characteristic as TERMINAL_DIED: low-frequency, one event per
+/// attach_confirm batch.
+const TERMINAL_LIST_CHANGE_BROADCAST_CAPACITY: usize = 32;
+
 /// Payload of a `TerminalDied` broadcast. `uuid` is the schema-side
 /// terminal id; `reason` is `"exit"` (process self-exited) or `"killed"`
 /// (signal-driven exit). `Arc<str>` over `String` so the broadcast clone
@@ -54,6 +79,23 @@ const TERMINAL_DIED_BROADCAST_CAPACITY: usize = 32;
 pub struct TerminalDiedEvent {
     pub uuid: Arc<str>,
     pub reason: &'static str,
+}
+
+/// Payload of a `TerminalListChange` broadcast (Stage 5-D path P1).
+/// Emitted by `attach_confirm_handler` after a successful spawn batch.
+/// The WS dispatcher filters per-connection:
+///   * subscribers whose `cookie → session_name` matches `trigger_session`
+///     → frame **suppressed** (their layout already reflects the spawn)
+///   * subscribers whose cookie has no session or maps to a different
+///     session → 0x87 TERMINAL_LIST_UPDATE envelope
+///
+/// `Arc<[Arc<str>]>` so the broadcast clone per WS subscriber is a single
+/// refcount bump regardless of how many UUIDs were added in the batch.
+#[derive(Clone, Debug)]
+pub struct TerminalListChangeEvent {
+    pub trigger_session: Arc<str>,
+    pub added: Arc<[Arc<str>]>,
+    pub removed: Arc<[Arc<str>]>,
 }
 
 /// `Hub` is cheap to clone — internal state is `Arc<…>` + broadcast senders.
@@ -107,6 +149,18 @@ pub struct Hub {
     /// sessions (ADR-0021 D1), and routing-by-session belongs to the
     /// session-scoped frame family (5-C), not here.
     terminal_died_events: broadcast::Sender<TerminalDiedEvent>,
+    /// Terminal-list change broadcast (Stage 5-D path P1 / ADR-0021 D3).
+    /// Published by the http-api `attach_confirm_handler` after each
+    /// spawn batch. Routing is per-WS-subscriber: matches against
+    /// `session_table` to filter out the trigger session and emit
+    /// `0x87 TERMINAL_LIST_UPDATE` only to *other* sessions' webpages.
+    terminal_list_change_events: broadcast::Sender<TerminalListChangeEvent>,
+    /// Cookie validator hook (Stage 5 D10 α / ADR-0020 D10 additive). When
+    /// set, the WS handshake accepts a request whose `gtmux_auth` cookie
+    /// validates here as an **alternative** to the subprotocol bearer
+    /// token. `None` (test paths and pre-wired boot phase) leaves auth at
+    /// the legacy bearer-only path.
+    cookie_validator: Arc<std::sync::Mutex<Option<Arc<dyn CookieValidator>>>>,
 }
 
 impl Hub {
@@ -117,6 +171,8 @@ impl Hub {
         let (pane_output, _) = broadcast::channel(HUB_BROADCAST_CAPACITY);
         let (layout_events, _) = broadcast::channel(LAYOUT_BROADCAST_CAPACITY);
         let (terminal_died_events, _) = broadcast::channel(TERMINAL_DIED_BROADCAST_CAPACITY);
+        let (terminal_list_change_events, _) =
+            broadcast::channel(TERMINAL_LIST_CHANGE_BROADCAST_CAPACITY);
 
         let mux_backend = backend.clone();
         let mux_tx = pane_output.clone();
@@ -133,6 +189,8 @@ impl Hub {
             heartbeat_tx: Arc::new(std::sync::Mutex::new(None)),
             session_table: Arc::new(std::sync::RwLock::new(HashMap::new())),
             terminal_died_events,
+            terminal_list_change_events,
+            cookie_validator: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -296,6 +354,65 @@ impl Hub {
         self.terminal_died_events.subscribe()
     }
 
+    /// Broadcast a terminal-list change delta (Stage 5-D path P1). Called
+    /// by `attach_confirm_handler` once a spawn batch lands; the WS
+    /// dispatcher decides per-connection whether to emit a
+    /// `0x87 TERMINAL_LIST_UPDATE` envelope based on the trigger session.
+    /// `added`/`removed` are passed by slice so callers don't need to
+    /// pre-build the `Arc<[Arc<str>]>` payload — the helper interns them.
+    pub fn publish_terminal_list_change(
+        &self,
+        trigger_session: &str,
+        added: &[String],
+        removed: &[String],
+    ) {
+        let added_arc: Arc<[Arc<str>]> = added
+            .iter()
+            .map(|s| Arc::<str>::from(s.as_str()))
+            .collect::<Vec<_>>()
+            .into();
+        let removed_arc: Arc<[Arc<str>]> = removed
+            .iter()
+            .map(|s| Arc::<str>::from(s.as_str()))
+            .collect::<Vec<_>>()
+            .into();
+        let _ = self
+            .terminal_list_change_events
+            .send(TerminalListChangeEvent {
+                trigger_session: Arc::from(trigger_session),
+                added: added_arc,
+                removed: removed_arc,
+            });
+    }
+
+    /// Subscribe to terminal-list change deltas. Each WS connection pulls
+    /// from this channel and filters via [`Hub::session_for_cookie`] —
+    /// see WS handler's `terminal_list_change_rx` select arm.
+    pub fn subscribe_terminal_list_change(
+        &self,
+    ) -> broadcast::Receiver<TerminalListChangeEvent> {
+        self.terminal_list_change_events.subscribe()
+    }
+
+    /// Register the cookie validator (Stage 5 D10 α). Called once at boot
+    /// from the http-api wiring layer so the WS handshake can accept
+    /// cookie-based auth as an alternative to the subprotocol bearer.
+    /// Replaces any previously-registered validator; safe to call
+    /// multiple times. Mirrors the [`set_disconnect_sink`] pattern.
+    pub fn set_cookie_validator(&self, validator: Arc<dyn CookieValidator>) {
+        if let Ok(mut slot) = self.cookie_validator.lock() {
+            *slot = Some(validator);
+        }
+    }
+
+    /// Snapshot of the current cookie validator. The WS handshake clones
+    /// this once per upgrade so a validator registered mid-flight is
+    /// honoured only by subsequent handshakes — matches the sink-snapshot
+    /// rationale documented above.
+    pub fn cookie_validator(&self) -> Option<Arc<dyn CookieValidator>> {
+        self.cookie_validator.lock().ok().and_then(|s| s.clone())
+    }
+
     /// Live subscriber count on the multiplexed pane-output channel.
     /// Used in tests + future operational dashboards.
     pub fn subscriber_count(&self) -> usize {
@@ -444,6 +561,52 @@ mod tests {
             .expect("r2");
         assert_eq!(&*a.uuid, "uuid");
         assert_eq!(&*b.uuid, "uuid");
+    }
+
+    #[tokio::test]
+    async fn terminal_list_change_publish_silent_without_subscribers() {
+        let hub = Hub::new(PtyBackend::new());
+        hub.publish_terminal_list_change(
+            "demo",
+            &["u1".to_string()],
+            &[],
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_list_change_subscriber_receives_event() {
+        let hub = Hub::new(PtyBackend::new());
+        let mut rx = hub.subscribe_terminal_list_change();
+        hub.publish_terminal_list_change(
+            "demo",
+            &["u1".to_string(), "u2".to_string()],
+            &["u3".to_string()],
+        );
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert_eq!(&*got.trigger_session, "demo");
+        assert_eq!(got.added.len(), 2);
+        assert_eq!(&*got.added[0], "u1");
+        assert_eq!(&*got.added[1], "u2");
+        assert_eq!(got.removed.len(), 1);
+        assert_eq!(&*got.removed[0], "u3");
+    }
+
+    #[tokio::test]
+    async fn terminal_list_change_supports_empty_deltas() {
+        // Wire layer always emits both arrays (possibly empty); the hub
+        // event must round-trip that contract without coercing to None.
+        let hub = Hub::new(PtyBackend::new());
+        let mut rx = hub.subscribe_terminal_list_change();
+        hub.publish_terminal_list_change("demo", &[], &[]);
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert_eq!(got.added.len(), 0);
+        assert_eq!(got.removed.len(), 0);
     }
 
     #[tokio::test]

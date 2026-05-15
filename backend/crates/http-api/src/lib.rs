@@ -3395,6 +3395,153 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
+    // ── Stage 5 D10 α: SessionTable implements CookieValidator ──
+
+    #[tokio::test]
+    async fn session_table_cookie_validator_returns_true_for_live_session() {
+        // The CookieValidator impl delegates to SessionTable::validate;
+        // a freshly-issued cookie must read back as valid.
+        use crate::auth::{AuthMode, SessionTable};
+        let table = SessionTable::new(std::time::Duration::from_secs(60));
+        let cookie = table.issue(AuthMode::Token).await.expect("issue");
+        let live = gtmux_ws_server::CookieValidator::validate(&table, &cookie).await;
+        assert!(live, "freshly issued cookie must validate");
+    }
+
+    #[tokio::test]
+    async fn session_table_cookie_validator_returns_false_for_unknown() {
+        use crate::auth::SessionTable;
+        let table = SessionTable::new(std::time::Duration::from_secs(60));
+        let live = gtmux_ws_server::CookieValidator::validate(&table, "nope").await;
+        assert!(!live, "unknown cookie must not validate");
+    }
+
+    // ── Stage 5-D path P1: attach_confirm publishes terminal-list-change ──
+
+    #[tokio::test]
+    async fn attach_confirm_publishes_terminal_list_change_when_spawn_succeeds() {
+        // After a spawn batch lands the hub must broadcast a
+        // TerminalListChangeEvent so other sessions' webpages can refresh
+        // their pool ahead of the 5-s poll. trigger_session = the session
+        // being attached to.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let uuid = "11111111-2222-4333-8444-666666666777";
+        std::fs::write(
+            workspace_dir.join("ttlc.json"),
+            serde_json::to_vec(&make_layout_with_one_terminal(uuid)).unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state);
+        let cookie = "ttlc-cookie";
+        // /attach acquires the lock + binds the cookie to "ttlc".
+        let attach_resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/ttlc/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attach_resp.status(), StatusCode::OK);
+
+        let mut rx = hub.subscribe_terminal_list_change();
+
+        let confirm = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/ttlc/attach/confirm")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirm.status(), StatusCode::OK);
+        let body = to_bytes(confirm.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["spawned"], json!([uuid]));
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("publish must arrive")
+            .expect("recv");
+        assert_eq!(&*event.trigger_session, "ttlc");
+        assert_eq!(event.added.len(), 1);
+        assert_eq!(&*event.added[0], uuid);
+        assert_eq!(event.removed.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn attach_confirm_skips_publish_when_no_spawn_lands() {
+        // Empty layout → spawned=[] → no broadcast (would create wakeup
+        // noise for every WS subscriber to no purpose).
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        std::fs::write(
+            workspace_dir.join("empty.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state);
+        let cookie = "empty-cookie";
+        let attach = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/empty/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(attach.status(), StatusCode::OK);
+
+        let mut rx = hub.subscribe_terminal_list_change();
+
+        let confirm = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/empty/attach/confirm")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(confirm.status(), StatusCode::OK);
+
+        // Must time out — no event was emitted.
+        let race = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(race.is_err(), "expected no publish, got: {race:?}");
+    }
+
     // ── Stage 5-B: handle_pane_died publishes terminal-died via hub ──
 
     #[tokio::test]

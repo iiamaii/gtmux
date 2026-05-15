@@ -53,7 +53,9 @@ mod ring;
 mod varint;
 
 pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTED_CTRL_CMDS};
-pub use hub::{Hub, TerminalDiedEvent, HUB_BROADCAST_CAPACITY};
+pub use hub::{
+    CookieValidator, Hub, TerminalDiedEvent, TerminalListChangeEvent, HUB_BROADCAST_CAPACITY,
+};
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,6 +127,20 @@ pub enum FrameType {
     /// D1), so all attached webpages must see the death. Inner payload:
     /// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","reason":"exit"|"killed"}`.
     TerminalDied = 0x85,
+    /// `0x87 TERMINAL_LIST_UPDATE` (Stage 5-D path P1, ADR-0021 D3). Pool
+    /// delta hint emitted on *attach_confirm* spawn — every webpage
+    /// **outside** the triggering session sees `{ added: [...], removed: [] }`
+    /// so its Terminal-list sidebar refreshes ahead of the 5-s polling
+    /// loop. WS dispatcher filters per-connection via
+    /// [`Hub::session_for_cookie`]: the trigger session itself does not
+    /// receive this frame (its layout already reflects the spawn). Inner
+    /// payload: `varint 0 + UTF-8 JSON {"added":["<uuid>",…],"removed":[…]}`.
+    ///
+    /// 0x86 MOUNT_CASCADE (the trigger-session companion frame in
+    /// path P2 — `[New Terminal]` button) is *reserved by FE decoder*
+    /// (`decode.ts:517`) but not yet emitted by BE; see
+    /// `docs/reports/0035-be-fe-coordination-stage-5.md` §3.2.
+    TerminalListUpdate = 0x87,
 }
 
 impl FrameType {
@@ -143,6 +159,7 @@ impl FrameType {
             0x83 => Self::ViewportChanged,
             0x84 => Self::FocusMode,
             0x85 => Self::TerminalDied,
+            0x87 => Self::TerminalListUpdate,
             _ => return None,
         })
     }
@@ -357,21 +374,13 @@ async fn ws_handler(
     if !parsed.gtmux_v1 {
         return (StatusCode::UPGRADE_REQUIRED, "gtmux.v1 required").into_response();
     }
-    let Some(token) = parsed.bearer_token else {
-        return (StatusCode::UNAUTHORIZED, "bearer token required").into_response();
-    };
 
-    if !gtmux_auth::verify_token(&token, state.token.as_ref()) {
-        warn!("ws upgrade rejected: token mismatch");
-        return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
-    }
-
-    // ADR-0019 D6 / D6.2: capture the gtmux_auth cookie value (if present)
-    // so the per-connection lifecycle can announce its identity to the
-    // http-api layer on close, which then auto-releases any session lock
-    // the cookie still holds. WS authentication itself remains the
-    // subprotocol bearer flow above — the cookie is *only* for
-    // disconnect-notification routing, never for trust.
+    // Capture the `gtmux_auth` cookie value before the auth decision so
+    // both D10 α (cookie auth) and the existing disconnect-routing path
+    // can read the same source. Pre-D10 the cookie was *only* a
+    // disconnect-notification key; with D10 α it can also satisfy the
+    // upgrade authentication when the http-api layer registered a
+    // [`hub::CookieValidator`] on the hub.
     let cookie_value = headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())
@@ -383,6 +392,41 @@ async fn ws_handler(
                     .map(|v| v.to_string())
             })
         });
+
+    // D10 α additive auth: accept the upgrade when **either** the cookie
+    // validates **or** the subprotocol bearer matches the canonical
+    // token. The legacy bearer path remains the source of truth for
+    // automation / CLI scripts; the cookie path covers the browser
+    // session flow (ADR-0020 D10). When neither path produces an
+    // accept, reply with the most informative 401 message — bearer
+    // mismatch is the high-signal case for an attacker probe; missing
+    // bearer is the most common path for an unsigned client.
+    let cookie_ok = if let Some(c) = cookie_value.as_deref() {
+        if let Some(validator) = state.hub.cookie_validator() {
+            validator.validate(c).await
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    let bearer_token = parsed.bearer_token.as_deref();
+    let bearer_ok = bearer_token
+        .map(|t| gtmux_auth::verify_token(t, state.token.as_ref()))
+        .unwrap_or(false);
+
+    if !cookie_ok && !bearer_ok {
+        if bearer_token.is_some() {
+            warn!("ws upgrade rejected: bearer + cookie both invalid");
+            return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
+        }
+        if cookie_value.is_some() {
+            warn!("ws upgrade rejected: cookie invalid, no bearer");
+            return (StatusCode::UNAUTHORIZED, "invalid cookie").into_response();
+        }
+        return (StatusCode::UNAUTHORIZED, "bearer token or cookie required").into_response();
+    }
 
     let echo = state.echo_protocol.clone();
     let hub = state.hub.clone();
@@ -432,6 +476,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
     let mut layout_rx = hub.subscribe_layout();
     let mut output_rx = hub.subscribe_pane_output();
     let mut terminal_died_rx = hub.subscribe_terminal_died();
+    let mut terminal_list_change_rx = hub.subscribe_terminal_list_change();
 
     // Send the initial LAYOUT_CHANGED hello so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -646,6 +691,62 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
                         // stale UUID disappear from the next `GET /api/terminals`
                         // poll, so warn but do not tear down the connection.
                         warn!(skipped = n, "ws terminal-died subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — other arms will hit Closed too.
+                    }
+                }
+            }
+            list_change = terminal_list_change_rx.recv() => {
+                match list_change {
+                    Ok(event) => {
+                        // Stage 5-D P1 routing: skip when this connection has
+                        // no cookie at all, when the cookie has not yet
+                        // attached to any session, or when the cookie is
+                        // attached to the trigger session itself (its layout
+                        // already reflects the spawn — emitting here would
+                        // be redundant noise).
+                        let Some(cookie) = cookie_value.as_deref() else {
+                            continue;
+                        };
+                        let Some(my_session) = hub.session_for_cookie(cookie) else {
+                            continue;
+                        };
+                        if my_session.as_str() == event.trigger_session.as_ref() {
+                            continue;
+                        }
+                        // FE's `decodeTerminalListUpdate` validates `added`/
+                        // `removed` as string-of-string arrays; rebuild the
+                        // Vec<String> view of the Arc<[Arc<str>]> payload to
+                        // match `payload::encode_terminal_list_update`.
+                        let added_vec: Vec<String> = event
+                            .added
+                            .iter()
+                            .map(|s| s.as_ref().to_string())
+                            .collect();
+                        let removed_vec: Vec<String> = event
+                            .removed
+                            .iter()
+                            .map(|s| s.as_ref().to_string())
+                            .collect();
+                        let env = Envelope::new(
+                            FrameType::TerminalListUpdate,
+                            Bytes::from(payload::encode_terminal_list_update(
+                                &added_vec,
+                                &removed_vec,
+                            )),
+                        );
+                        if let Ok(buf) = env.encode() {
+                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Lagged here means a terminal-list-change delta was
+                        // dropped. FE will catch up via its 5-s polling loop;
+                        // warn but keep the connection alive.
+                        warn!(skipped = n, "ws terminal-list-change subscriber lagged");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Hub dropped — other arms will hit Closed too.
@@ -872,7 +973,10 @@ async fn handle_client_envelope(
             );
             false
         }
-        FrameType::PaneOutput | FrameType::NotifyMirror | FrameType::TerminalDied => {
+        FrameType::PaneOutput
+        | FrameType::NotifyMirror
+        | FrameType::TerminalDied
+        | FrameType::TerminalListUpdate => {
             let _ = sink
                 .send(close_frame(
                     close_codes::POLICY_VIOLATION,
@@ -1028,12 +1132,13 @@ mod tests {
         let mut buf = vec![0x08u8];
         buf.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x08)));
-        // 0x86 is the first unassigned slot above the Stage 5-B TerminalDied
-        // (0x85). Pre-Stage-5 this same assertion used 0x85; it migrates up
-        // every time a new frame type lands.
-        let mut buf = vec![0x86u8];
+        // 0x86 (MOUNT_CASCADE) is *reserved* by the FE decoder
+        // (`decode.ts`) for Stage 5-D path P2 but not yet emitted by BE,
+        // so the wire codec still rejects it here. The first *fully*
+        // unassigned slot is 0x88.
+        let mut buf = vec![0x88u8];
         buf.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x86)));
+        assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x88)));
     }
 
     #[test]
@@ -1070,12 +1175,15 @@ mod tests {
     #[test]
     fn frame_type_from_u8_covers_all() {
         for &b in &[
-            0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85,
+            0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x87,
         ] {
             let ft = FrameType::from_u8(b).expect("known frame");
             assert_eq!(ft.as_u8(), b);
         }
-        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x86, 0x8F, 0xFE, 0xFF] {
+        // 0x86 stays unknown to BE for now — reserved by FE for Stage 5-D
+        // path P2 (`MOUNT_CASCADE`) which is still gated on FE/BE
+        // coordination per `docs/reports/0035-be-fe-coordination-stage-5.md`.
+        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x86, 0x88, 0x8F, 0xFE, 0xFF] {
             assert!(FrameType::from_u8(b).is_none(), "byte 0x{b:02x} leaked");
         }
     }
@@ -1090,6 +1198,8 @@ mod tests {
         // splits "real-time pane I/O" from "schema metadata" will use the
         // marker.
         assert!(FrameType::TerminalDied.is_web_domain());
+        // 0x87 TerminalListUpdate is also web-domain; same marker rule.
+        assert!(FrameType::TerminalListUpdate.is_web_domain());
     }
 
     // ── BackendNotify → Envelope mapping ─────────────────────────────────
@@ -1243,6 +1353,108 @@ bind = "127.0.0.1"
         );
         let res = tokio_tungstenite::connect_async(req).await;
         assert!(res.is_err(), "handshake with wrong token must fail");
+    }
+
+    // ── Stage 5 D10 α: cookie additive auth path ────────────────────────────
+
+    #[async_trait::async_trait]
+    impl CookieValidator for std::collections::HashSet<String> {
+        async fn validate(&self, cookie_value: &str) -> bool {
+            self.contains(cookie_value)
+        }
+    }
+
+    fn validator_with(allowed: &[&str]) -> std::sync::Arc<dyn CookieValidator> {
+        let mut set = std::collections::HashSet::new();
+        for c in allowed {
+            set.insert((*c).to_string());
+        }
+        std::sync::Arc::new(set)
+    }
+
+    #[tokio::test]
+    async fn ws_upgrade_accepts_cookie_without_bearer_when_validator_set() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token).await;
+        hub.set_cookie_validator(validator_with(&["good-cookie"]));
+
+        let url = format!("ws://{addr}/ws");
+        let mut req = url.into_client_request().unwrap();
+        // Subprotocol carries only the marker, no bearer token.
+        req.headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, "gtmux.v1".parse().unwrap());
+        req.headers_mut()
+            .insert(http::header::COOKIE, "gtmux_auth=good-cookie".parse().unwrap());
+        let (ws, _resp) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("cookie-only upgrade should succeed");
+        drop(ws);
+    }
+
+    #[tokio::test]
+    async fn ws_upgrade_rejects_cookie_when_validator_returns_false() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token).await;
+        hub.set_cookie_validator(validator_with(&["good-cookie"]));
+
+        let url = format!("ws://{addr}/ws");
+        let mut req = url.into_client_request().unwrap();
+        req.headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, "gtmux.v1".parse().unwrap());
+        req.headers_mut()
+            .insert(http::header::COOKIE, "gtmux_auth=stale-cookie".parse().unwrap());
+        let res = tokio_tungstenite::connect_async(req).await;
+        assert!(res.is_err(), "invalid cookie + no bearer must fail");
+    }
+
+    #[tokio::test]
+    async fn ws_upgrade_accepts_bearer_when_no_validator_registered() {
+        // Pre-D10 / test-rig parity: a hub without a cookie validator must
+        // still accept the legacy bearer-only flow. Verifies additivity.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, _hub) = spawn_test_server(token.clone()).await;
+        let url = format!("ws://{addr}/ws");
+        let mut req = url.into_client_request().unwrap();
+        let proto = format!("gtmux.v1, bearer.{}", token.0);
+        req.headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, proto.parse().unwrap());
+        let (ws, _resp) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("legacy bearer upgrade must keep working");
+        drop(ws);
+    }
+
+    #[tokio::test]
+    async fn ws_upgrade_accepts_bearer_when_cookie_invalid_with_validator() {
+        // Truly additive: a bad cookie does **not** poison a valid bearer.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        hub.set_cookie_validator(validator_with(&["good-cookie"]));
+
+        let url = format!("ws://{addr}/ws");
+        let mut req = url.into_client_request().unwrap();
+        let proto = format!("gtmux.v1, bearer.{}", token.0);
+        req.headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, proto.parse().unwrap());
+        req.headers_mut()
+            .insert(http::header::COOKIE, "gtmux_auth=stale-cookie".parse().unwrap());
+        let (ws, _resp) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("invalid cookie + valid bearer must still succeed");
+        drop(ws);
+    }
+
+    #[tokio::test]
+    async fn ws_upgrade_rejects_when_neither_path_provided() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, _hub) = spawn_test_server(token).await;
+        let url = format!("ws://{addr}/ws");
+        let mut req = url.into_client_request().unwrap();
+        // Marker only — no bearer, no cookie.
+        req.headers_mut()
+            .insert(SEC_WEBSOCKET_PROTOCOL, "gtmux.v1".parse().unwrap());
+        let res = tokio_tungstenite::connect_async(req).await;
+        assert!(res.is_err(), "marker-only handshake must fail");
     }
 
     #[tokio::test]

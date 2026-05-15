@@ -59,6 +59,26 @@ pub fn encode_terminal_died(uuid: &str, reason: &str) -> Vec<u8> {
     out
 }
 
+/// `0x87 TERMINAL_LIST_UPDATE` (Stage 5-D path P1) inner =
+/// `varint 0 + UTF-8 JSON {"added":["<uuid>",…],"removed":["<uuid>",…]}`.
+///
+/// `added`/`removed` are always emitted (possibly empty) so the FE decoder
+/// (`decode.ts::decodeTerminalListUpdate`) can validate the shape with one
+/// `parseStringArray` pass per field. Empty `removed` is the normal P1
+/// case — attach_confirm emits spawn deltas only.
+pub fn encode_terminal_list_update(added: &[String], removed: &[String]) -> Vec<u8> {
+    let body = json!({
+        "added": added,
+        "removed": removed,
+    })
+    .to_string();
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(1 + bytes.len());
+    varint::encode_into(0, &mut out);
+    out.extend_from_slice(bytes);
+    out
+}
+
 // ─── Inbound (client → server) — inner payload parsers ────────────────────
 
 /// Parsed `0x03 PANE_IN` payload — varint paneId + raw input bytes.
@@ -218,6 +238,27 @@ mod tests {
         let inner = encode_terminal_died("uuid", "killed");
         let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
         assert_eq!(json["reason"], "killed");
+    }
+
+    #[test]
+    fn terminal_list_update_round_trip() {
+        let added = vec!["u1".to_string(), "u2".to_string()];
+        let removed: Vec<String> = vec![];
+        let inner = encode_terminal_list_update(&added, &removed);
+        assert_eq!(inner[0], 0x00);
+        let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
+        assert_eq!(json["added"], serde_json::json!(["u1", "u2"]));
+        assert_eq!(json["removed"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn terminal_list_update_emits_empty_arrays_explicitly() {
+        // FE decoder expects both fields present; serde_json::json! macro
+        // already emits the empty-array literal — guard the contract.
+        let inner = encode_terminal_list_update(&[], &[]);
+        let json: serde_json::Value = serde_json::from_slice(&inner[1..]).unwrap();
+        assert!(json["added"].is_array());
+        assert!(json["removed"].is_array());
     }
 
     #[test]

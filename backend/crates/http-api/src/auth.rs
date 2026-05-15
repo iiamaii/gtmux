@@ -38,6 +38,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
+use async_trait::async_trait;
 use gtmux_auth::{verify_token, TokenString};
 use gtmux_config::Mode;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -194,6 +195,22 @@ impl SessionTable {
     #[doc(hidden)]
     pub async fn len(&self) -> usize {
         self.inner.lock().await.len()
+    }
+}
+
+/// Stage 5 D10 α (ADR-0020 D10 additive): the WS handshake accepts a
+/// cookie as an alternative to the subprotocol bearer. `validate` here
+/// delegates to [`SessionTable::validate`] which already implements the
+/// expiry + rolling-renewal semantics — we only flatten the
+/// `Option<AuthMode>` return into the boolean the WS handler needs.
+///
+/// Side effect: a positive validation **does** bump the session's
+/// `expires_at` (rolling renewal — see D3). That's the intended behaviour
+/// for an active WS upgrade — the cookie's session counts as alive.
+#[async_trait]
+impl gtmux_ws_server::CookieValidator for SessionTable {
+    async fn validate(&self, cookie_value: &str) -> bool {
+        SessionTable::validate(self, cookie_value).await.is_some()
     }
 }
 
