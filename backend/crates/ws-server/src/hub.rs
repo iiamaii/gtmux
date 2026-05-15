@@ -76,6 +76,14 @@ const TERMINAL_LIST_CHANGE_BROADCAST_CAPACITY: usize = 32;
 /// `POST /api/sessions/:name/terminals`) — same low-frequency profile.
 const TERMINAL_SPAWNED_BROADCAST_CAPACITY: usize = 64;
 
+/// Fan-out channel depth for Stage 5-C manipulation events
+/// (0x81/0x82/0x83/0x84). These can be relatively bursty —
+/// `VIEWPORT_CHANGED` may stream during a canvas drag — so the cap matches
+/// the live pane-output broadcast (`HUB_BROADCAST_CAPACITY = 256`). A
+/// slow subscriber will surface `RecvError::Lagged`; the dispatcher logs
+/// and continues — the next event refreshes the state.
+const MANIPULATION_BROADCAST_CAPACITY: usize = 256;
+
 /// Payload of a `TerminalDied` broadcast. `uuid` is the schema-side
 /// terminal id; `reason` is `"exit"` (process self-exited) or `"killed"`
 /// (signal-driven exit). `Arc<str>` over `String` so the broadcast clone
@@ -116,6 +124,27 @@ pub struct TerminalListChangeEvent {
 pub struct TerminalSpawnedEvent {
     pub terminal_id: Arc<str>,
     pub pane_id: u64,
+}
+
+/// Payload of a `Manipulation` broadcast (Stage 5-C echo-minus-sender,
+/// ADR-0021 D5). Carries the *enriched* inner payload (original body +
+/// trailing varint-len + UTF-8 session_id) plus the routing identifiers
+/// the dispatcher needs to enforce echo-minus-sender + session-scoped
+/// delivery for `0x81..=0x84`.
+///
+/// `sender_conn_id` = the `connection_id` minted at the originating WS
+/// handshake. Each subscriber filters by:
+///   * `sender_conn_id == my_conn_id` → skip (own echo)
+///   * `session_id != my_session` → skip (cross-session leak guard)
+///
+/// `frame_type` is the raw `FrameType` byte so the subscriber can re-wrap
+/// without parsing the body.
+#[derive(Clone, Debug)]
+pub struct ManipulationEvent {
+    pub sender_conn_id: Arc<str>,
+    pub session_id: Arc<str>,
+    pub frame_type: u8,
+    pub payload: Bytes,
 }
 
 /// `Hub` is cheap to clone — internal state is `Arc<…>` + broadcast senders.
@@ -181,6 +210,14 @@ pub struct Hub {
     /// `0x88 TERMINAL_SPAWNED` envelope so the FE can update its local
     /// UUID→PaneId map ahead of the next `GET /api/terminals` poll.
     terminal_spawned_events: broadcast::Sender<TerminalSpawnedEvent>,
+    /// Manipulation broadcast (Stage 5-C, ADR-0021 D5). Published by the
+    /// inbound 0x81..=0x84 dispatch path once it knows the sender's
+    /// session. Each subscriber filters by `sender_conn_id` and
+    /// `session_id` — the trigger connection is skipped, and only
+    /// subscribers whose cookie maps to the same session receive the
+    /// frame. The payload carries the original inner bytes plus a
+    /// trailing varint-len + UTF-8 session_id (echo-minus-sender wire).
+    manipulation_events: broadcast::Sender<ManipulationEvent>,
     /// Cookie validator hook (Stage 5 D10 α / ADR-0020 D10 additive). When
     /// set, the WS handshake accepts a request whose `gtmux_auth` cookie
     /// validates here as an **alternative** to the subprotocol bearer
@@ -201,6 +238,8 @@ impl Hub {
             broadcast::channel(TERMINAL_LIST_CHANGE_BROADCAST_CAPACITY);
         let (terminal_spawned_events, _) =
             broadcast::channel(TERMINAL_SPAWNED_BROADCAST_CAPACITY);
+        let (manipulation_events, _) =
+            broadcast::channel(MANIPULATION_BROADCAST_CAPACITY);
 
         let mux_backend = backend.clone();
         let mux_tx = pane_output.clone();
@@ -219,6 +258,7 @@ impl Hub {
             terminal_died_events,
             terminal_list_change_events,
             terminal_spawned_events,
+            manipulation_events,
             cookie_validator: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -439,6 +479,20 @@ impl Hub {
         self.terminal_spawned_events.subscribe()
     }
 
+    /// Broadcast a manipulation event (Stage 5-C). Called by the WS
+    /// dispatcher after it receives an inbound `0x81..=0x84` frame and
+    /// resolves the sender's session via [`Hub::session_for_cookie`].
+    /// Subscribers (including the sender's own connection) all see the
+    /// event; per-subscriber filtering happens in the dispatcher loop.
+    pub fn publish_manipulation(&self, event: ManipulationEvent) {
+        let _ = self.manipulation_events.send(event);
+    }
+
+    /// Subscribe to manipulation events.
+    pub fn subscribe_manipulation(&self) -> broadcast::Receiver<ManipulationEvent> {
+        self.manipulation_events.subscribe()
+    }
+
     /// Register the cookie validator (Stage 5 D10 α). Called once at boot
     /// from the http-api wiring layer so the WS handshake can accept
     /// cookie-based auth as an alternative to the subprotocol bearer.
@@ -643,6 +697,37 @@ mod tests {
     async fn terminal_spawned_publish_silent_without_subscribers() {
         let hub = Hub::new(PtyBackend::new());
         hub.publish_terminal_spawned("uuid", 42);
+    }
+
+    #[tokio::test]
+    async fn manipulation_publish_silent_without_subscribers() {
+        let hub = Hub::new(PtyBackend::new());
+        hub.publish_manipulation(ManipulationEvent {
+            sender_conn_id: Arc::from("c1"),
+            session_id: Arc::from("alpha"),
+            frame_type: 0x81,
+            payload: Bytes::from_static(&[0x00]),
+        });
+    }
+
+    #[tokio::test]
+    async fn manipulation_subscriber_receives_event() {
+        let hub = Hub::new(PtyBackend::new());
+        let mut rx = hub.subscribe_manipulation();
+        hub.publish_manipulation(ManipulationEvent {
+            sender_conn_id: Arc::from("c1"),
+            session_id: Arc::from("alpha"),
+            frame_type: 0x83,
+            payload: Bytes::from_static(&[0x00, 0x01, 0x02]),
+        });
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        assert_eq!(&*got.sender_conn_id, "c1");
+        assert_eq!(&*got.session_id, "alpha");
+        assert_eq!(got.frame_type, 0x83);
+        assert_eq!(got.payload.as_ref(), &[0x00, 0x01, 0x02]);
     }
 
     #[tokio::test]

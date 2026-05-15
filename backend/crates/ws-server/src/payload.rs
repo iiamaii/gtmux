@@ -79,6 +79,19 @@ pub fn encode_terminal_list_update(added: &[String], removed: &[String]) -> Vec<
     out
 }
 
+/// Test-only helper — produces a minimal 0x83 VIEWPORT_CHANGED inner
+/// payload (varint 0 + 12 zero bytes = x=0, y=0, zoom=0.0). Stage 5-C
+/// tests use this as a recognizable "marker" body so they can assert the
+/// manipulation routing carries the original bytes through unchanged
+/// before the session_id trailer.
+#[cfg(test)]
+pub fn encode_viewport_marker_only() -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 12);
+    varint::encode_into(0, &mut out);
+    out.extend_from_slice(&[0u8; 12]);
+    out
+}
+
 /// `0x88 TERMINAL_SPAWNED` (FE Issue C unblock) inner =
 /// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","pane_id":<u64>}`.
 ///

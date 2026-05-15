@@ -54,8 +54,8 @@ mod varint;
 
 pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTED_CTRL_CMDS};
 pub use hub::{
-    CookieValidator, Hub, TerminalDiedEvent, TerminalListChangeEvent, TerminalSpawnedEvent,
-    HUB_BROADCAST_CAPACITY,
+    CookieValidator, Hub, ManipulationEvent, TerminalDiedEvent, TerminalListChangeEvent,
+    TerminalSpawnedEvent, HUB_BROADCAST_CAPACITY,
 };
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
 
@@ -92,6 +92,18 @@ const PONG_TIMEOUT: Duration = Duration::from_secs(30);
 /// the broadcast::Receiver" per ADR-0013 D10 amend (Panel Streaming
 /// State → Suspended at the WS layer, not the backend).
 const PAUSE_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Monotonic connection-id counter (Stage 5-C echo-minus-sender). Minted
+/// once per WS handshake so the manipulation broadcast can identify the
+/// sender connection and skip its own echo. Need not be unguessable —
+/// only unique within a single server boot.
+static CONNECTION_ID_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn mint_connection_id() -> Arc<str> {
+    let n = CONNECTION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Arc::from(format!("conn-{n}"))
+}
 
 /// WS close codes used by this crate.
 mod close_codes {
@@ -440,10 +452,15 @@ async fn ws_handler(
 
     let echo = state.echo_protocol.clone();
     let hub = state.hub.clone();
+    // Stage 5-C: mint a per-connection identifier so the manipulation
+    // broadcast can implement echo-minus-sender. Monotonic counter is
+    // sufficient — uniqueness is required only within a single server
+    // boot, and the value is never exposed back to the client.
+    let connection_id = mint_connection_id();
     let mut response = ws
         .protocols(["gtmux.v1"])
         .on_upgrade(move |socket| async move {
-            handle_socket(socket, hub.clone(), cookie_value.clone()).await;
+            handle_socket(socket, hub.clone(), cookie_value.clone(), connection_id.clone()).await;
             if let Some(cookie) = cookie_value {
                 if let Some(sink) = hub.disconnect_sink() {
                     // Errors here only mean "no consumer registered" —
@@ -470,7 +487,12 @@ async fn ws_handler(
 /// by the matching `pane-spawned` NOTIFY so the frontend knows the id
 /// is live), then enters the live fan-out: backend notifications +
 /// multiplexed pane outputs + layout broadcasts.
-async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>) {
+async fn handle_socket(
+    socket: WebSocket,
+    hub: Hub,
+    cookie_value: Option<String>,
+    connection_id: Arc<str>,
+) {
     let (mut sink, mut stream) = socket.split();
     let backend = hub.backend().clone();
 
@@ -488,6 +510,7 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
     let mut terminal_died_rx = hub.subscribe_terminal_died();
     let mut terminal_list_change_rx = hub.subscribe_terminal_list_change();
     let mut terminal_spawned_rx = hub.subscribe_terminal_spawned();
+    let mut manipulation_rx = hub.subscribe_manipulation();
 
     // Send the initial LAYOUT_CHANGED hello so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -578,6 +601,9 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
                             &mut suspended,
                             &mut last_pause_event,
                             &mut sink,
+                            &hub,
+                            cookie_value.as_deref(),
+                            &connection_id,
                         ).await;
                         if close_now {
                             return;
@@ -708,6 +734,53 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
                     }
                 }
             }
+            manip = manipulation_rx.recv() => {
+                match manip {
+                    Ok(event) => {
+                        // Stage 5-C: echo-minus-sender + session-scoped.
+                        //   * own echo → skip
+                        //   * no cookie or unattached cookie → skip
+                        //   * different session → skip
+                        if event.sender_conn_id.as_ref() == connection_id.as_ref() {
+                            continue;
+                        }
+                        let Some(cookie) = cookie_value.as_deref() else {
+                            continue;
+                        };
+                        let Some(my_session) = hub.session_for_cookie(cookie) else {
+                            continue;
+                        };
+                        if my_session.as_str() != event.session_id.as_ref() {
+                            continue;
+                        }
+                        let Some(kind) = FrameType::from_u8(event.frame_type) else {
+                            // Defensive — publisher would have to have set
+                            // an invalid byte for this to fire. Log and
+                            // skip rather than crash the loop.
+                            warn!(
+                                frame_type = event.frame_type,
+                                "ws manipulation event with unknown frame type"
+                            );
+                            continue;
+                        };
+                        let env = Envelope::new(kind, event.payload.clone());
+                        if let Ok(buf) = env.encode() {
+                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Manipulation events are *informational* (selection
+                        // / viewport / focus state). The next event refreshes
+                        // the snapshot — warn but keep the connection alive.
+                        warn!(skipped = n, "ws manipulation subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — other arms will hit Closed too.
+                    }
+                }
+            }
             spawned = terminal_spawned_rx.recv() => {
                 match spawned {
                     Ok(event) => {
@@ -815,12 +888,21 @@ async fn handle_socket(socket: WebSocket, hub: Hub, cookie_value: Option<String>
 /// Handle one client-origin binary frame. Returns `true` when the caller
 /// must close the connection (a policy violation already sent its close
 /// frame on `sink`).
+///
+/// The argument count grew with Stage 5-C (hub / cookie / connection_id
+/// needed for manipulation broadcast) — keeping them as parameters
+/// rather than a context struct preserves the per-frame call ergonomics
+/// in the `select!` loop. Clippy's 7-arg threshold is informational.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_envelope(
     buf: &[u8],
     backend: &gtmux_pty_backend::PtyBackend,
     suspended: &mut std::collections::HashSet<PaneId>,
     last_pause_event: &mut HashMap<PaneId, Instant>,
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
+    hub: &Hub,
+    cookie_value: Option<&str>,
+    connection_id: &Arc<str>,
 ) -> bool {
     let (env, _) = match Envelope::decode(buf) {
         Ok(t) => t,
@@ -1008,11 +1090,41 @@ async fn handle_client_envelope(
         | FrameType::InputTarget
         | FrameType::ViewportChanged
         | FrameType::FocusMode => {
-            debug!(
-                kind = ?env.kind,
-                bytes = env.payload.len(),
-                "ws web-domain envelope received (S4-C placeholder)"
-            );
+            // Stage 5-C: server-side echo-minus-sender. The originating
+            // connection's session_for_cookie binding determines the
+            // routing scope; we enrich the inbound payload with a trailing
+            // varint-len + UTF-8 `session_id` so subscribers can surface
+            // the value to the FE without an extra HTTP roundtrip. Drop
+            // silently when the connection has no cookie or the cookie
+            // has not yet attached — those clients are not addressable
+            // for session-scoped delivery.
+            let Some(cookie) = cookie_value else {
+                debug!(
+                    kind = ?env.kind,
+                    "ws manipulation dropped: no cookie on connection"
+                );
+                return false;
+            };
+            let Some(session_name) = hub.session_for_cookie(cookie) else {
+                debug!(
+                    kind = ?env.kind,
+                    "ws manipulation dropped: cookie has no session attach"
+                );
+                return false;
+            };
+            let mut enriched = env.payload.to_vec();
+            let session_bytes = session_name.as_bytes();
+            let mut len_buf: Vec<u8> = Vec::with_capacity(2);
+            varint::encode_into(session_bytes.len() as u64, &mut len_buf);
+            enriched.reserve(len_buf.len() + session_bytes.len());
+            enriched.extend_from_slice(&len_buf);
+            enriched.extend_from_slice(session_bytes);
+            hub.publish_manipulation(ManipulationEvent {
+                sender_conn_id: connection_id.clone(),
+                session_id: Arc::from(session_name.as_str()),
+                frame_type: env.kind.as_u8(),
+                payload: Bytes::from(enriched),
+            });
             false
         }
         FrameType::PaneOutput
@@ -1587,6 +1699,221 @@ bind = "127.0.0.1"
             got_policy_close,
             "client-origin 0x87 must be policy-violation closed"
         );
+    }
+
+    /// Read frames until a 0x81~0x84 envelope arrives or timeout. Returns
+    /// (kind, payload). Drains intervening frames (catch-up / heartbeats).
+    async fn expect_manipulation_frame(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        timeout: std::time::Duration,
+    ) -> Option<(FrameType, Bytes)> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let remaining = deadline - now;
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(TM::Binary(buf)))) => {
+                    let Ok((env, _)) = Envelope::decode(buf.as_ref()) else {
+                        continue;
+                    };
+                    if matches!(
+                        env.kind,
+                        FrameType::ManipulationSelection
+                            | FrameType::InputTarget
+                            | FrameType::ViewportChanged
+                            | FrameType::FocusMode
+                    ) {
+                        return Some((env.kind, env.payload));
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Parse the trailing varint-len + UTF-8 session_id at the end of a
+    /// Stage 5-C enriched payload. Returns `None` on malformed/missing
+    /// trailer — useful so tests can assert the absence path too.
+    fn read_trailing_session_id(payload: &[u8]) -> Option<String> {
+        if payload.is_empty() {
+            return None;
+        }
+        // The inner layout for 0x81~0x84 is shape-dependent (varint+...).
+        // For test purposes we know the leading varint is `0` (single
+        // byte). The session_id trailer is appended *after* the original
+        // payload, so we scan from the right: the last byte sequence is
+        // UTF-8 bytes preceded by the varint length. We try varint
+        // decoding from a few candidate offsets from the right and pick
+        // the one that exactly consumes the tail.
+        for start in (1..payload.len()).rev() {
+            let candidate = &payload[start..];
+            // Try decoding a varint at `candidate`
+            let mut len_bytes = 0usize;
+            let mut value: u64 = 0;
+            for (i, &b) in candidate.iter().enumerate() {
+                value |= (u64::from(b & 0x7F)) << (7 * i);
+                len_bytes = i + 1;
+                if b & 0x80 == 0 {
+                    break;
+                }
+                if i >= 9 {
+                    len_bytes = 0;
+                    break;
+                }
+            }
+            if len_bytes == 0 || candidate.len() < len_bytes {
+                continue;
+            }
+            let trailer_total = len_bytes + value as usize;
+            if trailer_total != candidate.len() {
+                continue;
+            }
+            let s_bytes = &candidate[len_bytes..];
+            if let Ok(s) = std::str::from_utf8(s_bytes) {
+                return Some(s.to_string());
+            }
+        }
+        None
+    }
+
+    // ── Stage 5-C: echo-minus-sender + session-scoped manipulation routing ──
+
+    #[tokio::test]
+    async fn manipulation_skipped_when_sender_has_no_session_attach() {
+        // Inbound 0x83 from a connection whose cookie has no session
+        // binding must be silently dropped — no broadcast publish.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+
+        let mut ws = connect_authed_with_cookie(addr, &token, "no-session-cookie").await;
+        drain_initial(&mut ws, std::time::Duration::from_millis(50)).await;
+
+        let mut probe = hub.subscribe_manipulation();
+        // Client sends a viewport-changed (0x83) but its cookie has no
+        // hub.session_for_cookie binding — dispatcher drops without publish.
+        let frame = Envelope::new(
+            FrameType::ViewportChanged,
+            Bytes::from(payload::encode_viewport_marker_only()),
+        )
+        .encode()
+        .unwrap();
+        ws.send(TM::Binary(frame.to_vec().into())).await.unwrap();
+
+        let racy = tokio::time::timeout(std::time::Duration::from_millis(100), probe.recv()).await;
+        assert!(
+            racy.is_err(),
+            "must not publish manipulation event for unattached cookie: {racy:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manipulation_fans_out_to_same_session_minus_sender() {
+        // A & B both attach to "alpha". A sends 0x83 — B receives it
+        // (with session_id trailer), A does NOT receive its own echo.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        hub.set_session_for_cookie("cookie-A", "alpha");
+        hub.set_session_for_cookie("cookie-B", "alpha");
+
+        let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
+        let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
+        drain_initial(&mut ws_a, std::time::Duration::from_millis(50)).await;
+        drain_initial(&mut ws_b, std::time::Duration::from_millis(50)).await;
+
+        // A → server: 0x83 with a recognizable body
+        let body = payload::encode_viewport_marker_only();
+        let frame = Envelope::new(FrameType::ViewportChanged, Bytes::from(body.clone()))
+            .encode()
+            .unwrap();
+        ws_a.send(TM::Binary(frame.to_vec().into())).await.unwrap();
+
+        // B must receive the enriched envelope.
+        let (kind, payload_b) =
+            expect_manipulation_frame(&mut ws_b, std::time::Duration::from_millis(500))
+                .await
+                .expect("peer-B must receive 0x83");
+        assert_eq!(kind, FrameType::ViewportChanged);
+        // First N bytes = original payload; trailing bytes = varint-len +
+        // UTF-8 "alpha".
+        assert!(payload_b.starts_with(&body));
+        let session = read_trailing_session_id(&payload_b)
+            .expect("trailing session_id must parse");
+        assert_eq!(session, "alpha");
+
+        // A must NOT receive its own echo.
+        let echo =
+            expect_manipulation_frame(&mut ws_a, std::time::Duration::from_millis(150)).await;
+        assert!(
+            echo.is_none(),
+            "sender must not receive its own manipulation echo: {echo:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manipulation_does_not_cross_sessions() {
+        // A→alpha, C→beta. A sends 0x83. C must NOT receive it.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        hub.set_session_for_cookie("cookie-A", "alpha");
+        hub.set_session_for_cookie("cookie-C", "beta");
+
+        let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
+        let mut ws_c = connect_authed_with_cookie(addr, &token, "cookie-C").await;
+        drain_initial(&mut ws_a, std::time::Duration::from_millis(50)).await;
+        drain_initial(&mut ws_c, std::time::Duration::from_millis(50)).await;
+
+        let body = payload::encode_viewport_marker_only();
+        let frame = Envelope::new(FrameType::ViewportChanged, Bytes::from(body))
+            .encode()
+            .unwrap();
+        ws_a.send(TM::Binary(frame.to_vec().into())).await.unwrap();
+
+        let leak = expect_manipulation_frame(&mut ws_c, std::time::Duration::from_millis(200))
+            .await;
+        assert!(
+            leak.is_none(),
+            "session-β connection must not receive session-α manipulation: {leak:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manipulation_session_id_trailer_format_matches_spec() {
+        // Wire spec: payload = <original inner> + varint(len) + UTF-8 bytes.
+        // This test pins the trailer format so a future codec refactor
+        // can't silently drift away from `read_trailing_session_id`.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        hub.set_session_for_cookie("cookie-A", "session-with-dashes");
+        hub.set_session_for_cookie("cookie-B", "session-with-dashes");
+
+        let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
+        let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
+        drain_initial(&mut ws_a, std::time::Duration::from_millis(50)).await;
+        drain_initial(&mut ws_b, std::time::Duration::from_millis(50)).await;
+
+        let body = payload::encode_viewport_marker_only();
+        let frame = Envelope::new(FrameType::ViewportChanged, Bytes::from(body.clone()))
+            .encode()
+            .unwrap();
+        ws_a.send(TM::Binary(frame.to_vec().into())).await.unwrap();
+
+        let (_, payload_b) =
+            expect_manipulation_frame(&mut ws_b, std::time::Duration::from_millis(500))
+                .await
+                .expect("recv");
+        // Original body is intact at the start.
+        assert_eq!(&payload_b[..body.len()], &body);
+        // Trailer = varint("session-with-dashes".len()) + UTF-8 bytes.
+        // For 19 bytes the varint is a single byte 0x13.
+        assert_eq!(payload_b[body.len()], 0x13);
+        assert_eq!(&payload_b[body.len() + 1..], b"session-with-dashes");
     }
 
     #[tokio::test]
