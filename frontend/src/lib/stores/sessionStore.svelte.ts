@@ -102,6 +102,37 @@ class SessionStore {
     targetPanelId: null,
   });
 
+  /**
+   * Minimize / maximize 직전 옛 geometry 의 *in-memory backup*. FE-only — page
+   * reload 시 손실 (사용자가 restore 누르면 default size 로 복원). Schema 의
+   * item.x/y/w/h 변경 패턴 (PanelNode onMinimize/onMaximize) 에서 옛 값 보존용.
+   *
+   * Key = item id. Value = { x, y, w, h } 직전 snapshot.
+   *
+   * - Minimize 진입 시 h 만 백업 (x/y/w 도 함께 저장 — restore 시 일괄 복원)
+   *   → h = 32 으로 PUT. restore 시 백업 의 h 복원, entry clear.
+   * - Maximize 진입 시 (x, y, w, h) 백업 → viewport visible extent 로 PUT.
+   *   restore 시 백업 복원, entry clear.
+   *
+   * 두 path 가 동시 활성화될 수 없도록 (minimize OR maximize 만), backup entry
+   * 는 한 가지 path 의 *원본* 만 가짐.
+   */
+  restoredItemGeoms = $state<SvelteMap<string, { x: number; y: number; w: number; h: number }>>(
+    new SvelteMap(),
+  );
+
+  backupItemGeom(id: string, geom: { x: number; y: number; w: number; h: number }): void {
+    this.restoredItemGeoms.set(id, { ...geom });
+  }
+
+  getRestoredGeom(id: string): { x: number; y: number; w: number; h: number } | null {
+    return this.restoredItemGeoms.get(id) ?? null;
+  }
+
+  clearRestoredGeom(id: string): void {
+    this.restoredItemGeoms.delete(id);
+  }
+
   /* ────────────────────────────────────────────────────────────────────── */
   /* Layout lifecycle (loaded ↔ cleared)                                    */
   /* ────────────────────────────────────────────────────────────────────── */

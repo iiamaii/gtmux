@@ -285,18 +285,43 @@
   // max: sessionStore.toggleMaximize (in-memory ephemeral).
   const isMaximized = $derived(sessionStore.maximizedItemId === data.id);
 
+  // Minimize / Maximize 모두 schema item geometry (x, y, w, h) 변경 패턴.
+  // 옛 값은 sessionStore.restoredItemGeoms 에 in-memory backup. restore 시 복원.
+  //
+  // - Minimize: h 만 32 으로 set, x/y/w 도 함께 백업 (단순화 — restore 시 일괄 복원)
+  // - Maximize: 전체 (x, y, w, h) 를 canvas viewport 의 visible extent 로 set.
+  //   flow coord = canvas DOM client size / zoom + viewport offset.
+  const MIN_HEADER_H = 32;
+  const RESTORE_DEFAULT_H = 220;
+
   async function onMinimizeClick(e: MouseEvent): Promise<void> {
     e.stopPropagation();
     e.preventDefault();
     const active = sessionStore.active;
     if (active === null) return;
+    const cur = sessionStore.items.get(data.id);
+    if (cur === undefined) return;
     if (!(await ensureMutationOk('Minimize aborted — session reconnect failed.'))) return;
-    const next = data.minimized !== true;
+    const wasMinimized = cur.minimized === true;
+    const next = !wasMinimized;
+    let nextH = cur.h;
+    if (next === true) {
+      // → minimize: 옛 geom 백업 + h = 32
+      sessionStore.backupItemGeom(data.id, { x: cur.x, y: cur.y, w: cur.w, h: cur.h });
+      nextH = MIN_HEADER_H;
+    } else {
+      // → restore: 백업 의 h 복원 (없으면 default)
+      const backup = sessionStore.getRestoredGeom(data.id);
+      nextH = backup !== null ? backup.h : RESTORE_DEFAULT_H;
+      sessionStore.clearRestoredGeom(data.id);
+    }
     try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
-        ...cur,
-        items: cur.items.map((it) =>
-          it.id === data.id ? ({ ...it, minimized: next } as typeof it) : it,
+      const { layout } = await mutateLayout(active.name, (cur2) => ({
+        ...cur2,
+        items: cur2.items.map((it) =>
+          it.id === data.id
+            ? ({ ...it, minimized: next, h: nextH } as typeof it)
+            : it,
         ),
       }));
       sessionStore.loadLayout(layout);
@@ -312,10 +337,58 @@
     }
   }
 
-  function onMaximizeClick(e: MouseEvent): void {
+  async function onMaximizeClick(e: MouseEvent): Promise<void> {
     e.stopPropagation();
     e.preventDefault();
+    const active = sessionStore.active;
+    if (active === null) return;
+    const cur = sessionStore.items.get(data.id);
+    if (cur === undefined) return;
+    if (!(await ensureMutationOk('Maximize aborted — session reconnect failed.'))) return;
+    const wasMaximized = sessionStore.maximizedItemId === data.id;
+    let nextGeom: { x: number; y: number; w: number; h: number } = {
+      x: cur.x, y: cur.y, w: cur.w, h: cur.h,
+    };
+    if (!wasMaximized) {
+      // → maximize: 옛 geom backup + viewport visible extent 로 set
+      sessionStore.backupItemGeom(data.id, { x: cur.x, y: cur.y, w: cur.w, h: cur.h });
+      const canvas = document.querySelector('.canvas-root') as HTMLElement | null;
+      const vw = canvas?.clientWidth ?? window.innerWidth;
+      const vh = canvas?.clientHeight ?? window.innerHeight;
+      const vp = sessionStore.viewport;
+      // flow-coord = (screen - viewport offset) / zoom. visible extent 의 top-left
+      // 는 (-vp.x / vp.zoom, -vp.y / vp.zoom), w/h 는 (vw/zoom, vh/zoom).
+      nextGeom = {
+        x: -vp.x / vp.zoom,
+        y: -vp.y / vp.zoom,
+        w: vw / vp.zoom,
+        h: vh / vp.zoom,
+      };
+    } else {
+      // → restore: 백업 복원 (없으면 현 geom 그대로 — fallback safety)
+      const backup = sessionStore.getRestoredGeom(data.id);
+      if (backup !== null) nextGeom = backup;
+      sessionStore.clearRestoredGeom(data.id);
+    }
     sessionStore.toggleMaximize(data.id);
+    try {
+      const { layout } = await mutateLayout(active.name, (cur2) => ({
+        ...cur2,
+        items: cur2.items.map((it) =>
+          it.id === data.id ? ({ ...it, ...nextGeom } as typeof it) : it,
+        ),
+      }));
+      sessionStore.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Maximize failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
   }
 </script>
 
