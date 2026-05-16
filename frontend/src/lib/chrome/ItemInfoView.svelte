@@ -1022,12 +1022,29 @@
     flex-wrap: wrap;
   }
 
+  /* Fixed-width label — 모든 row 의 value 시작 x 정렬 (color box / button
+   * group 의 가로 위치 일치). 가장 긴 label "v-align" (7자) 기준 + buffer. */
   .display-row .k {
-    flex: 0 0 auto;
+    flex: 0 0 56px;
+    width: 56px;
     color: var(--color-fg-muted);
     text-transform: uppercase;
     font-size: 10px;
     letter-spacing: 0.4px;
+  }
+
+  /* .picker row 의 control (ColorPicker / align-group) 이 row 너비 full
+   * 채우도록 — RightPanel resize 와 정합. */
+  .display-row.picker > .align-group,
+  .display-row.picker > :global(.color-picker) {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .display-row.picker > :global(.color-picker .hex-input) {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
   }
 
   /* Read-only value — editable InspectorField (color-fg) 와 색 차별. */
@@ -1081,12 +1098,25 @@
     font-weight: var(--weight-medium);
   }
 
-  /* ADR-0027 D9 — multi-select alignment row (Geometry section 안). */
+  /* ADR-0027 D9 — multi-select alignment row (Geometry section 안). row 가
+   * full width, 안의 align-group 들이 균등 분포, 각 button 도 균등 flex. */
   .prop-section > .align-row {
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-6);
     margin-top: var(--space-4);
+  }
+
+  .prop-section > .align-row > .align-group {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+  }
+
+  .prop-section > .align-row > .align-group > .align-btn {
+    flex: 1 1 0;
+    width: auto;
+    min-width: 0;
   }
 
   .align-group {
@@ -1097,6 +1127,17 @@
     background: var(--color-surface-2);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
+  }
+
+  /* picker row 의 align-group 은 row 너비 채움 + button 들 균등 분포. */
+  .display-row.picker > .align-group {
+    display: flex;
+  }
+
+  .display-row.picker > .align-group > .align-btn {
+    flex: 1 1 0;
+    width: auto;
+    min-width: 0;
   }
 
   .align-btn {
