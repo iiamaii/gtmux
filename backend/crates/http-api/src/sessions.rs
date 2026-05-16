@@ -846,6 +846,86 @@ pub struct CreateSessionBody {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ImportSessionBody {
+    pub name: String,
+    /// A schema v2 [`Layout`] (groups + items + viewport). Validated by
+    /// `crate::schema::validate` before any disk write — invalid bodies
+    /// return 400 `schema_invalid` with the precise field code from
+    /// `ValidationError::code()`.
+    pub layout: Layout,
+}
+
+/// `POST /api/sessions/import { name, layout }` — Slice D-4 (G28
+/// from `docs/sketch.md` §11.2.A). Atomic write of an externally
+/// supplied v2 layout under a fresh session record.
+///
+/// Outcomes:
+/// - 201 + `{ name, created_at }` — new record persisted, cache seeded.
+/// - 400 `invalid_name`            — name failed `validate_session_name`.
+/// - 400 `schema_invalid` + `field`/`details` — layout failed schema validation.
+/// - 409 `name_conflict`           — a session with this name already
+///                                   exists; client must rename + retry.
+/// - 503 `workspace_not_configured` — server started without a workspace.
+/// - 500 `save_failed`             — disk write error.
+///
+/// Terminal item UUIDs in the imported layout are **not** validated
+/// against the live pool — per ADR-0018 D6 the match-or-spawn
+/// algorithm handles them on first attach (spawn arm for unmatched).
+/// This keeps import side-effect-free: no Terminals are spawned at
+/// import time, only the file is written.
+pub async fn import_handler(
+    State(state): State<crate::AppState>,
+    Json(body): Json<ImportSessionBody>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    if let Err(e) = validate_session_name(&body.name) {
+        return SessionError::Workspace(e).into_response();
+    }
+    if let Err(e) = crate::schema::validate(&body.layout) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "schema_invalid",
+                "field": e.code(),
+                "details": e.to_string(),
+            })),
+        )
+            .into_response();
+    }
+    let path = match wm.session_path(&body.name) {
+        Ok(p) => p,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    if path.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "name_conflict", "name": body.name })),
+        )
+            .into_response();
+    }
+    let bytes = canonical_bytes(&body.layout);
+    if let Err(e) = atomic_write_session(&path, &bytes) {
+        return SessionError::Workspace(e).into_response();
+    }
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let cached = SessionLayout::new(body.layout);
+    {
+        let mut write = state.session_cache.entries.write().await;
+        write.insert(body.name.clone(), Arc::new(RwLock::new(cached)));
+    }
+    (
+        StatusCode::CREATED,
+        Json(json!({ "name": body.name, "created_at": created_at })),
+    )
+        .into_response()
+}
+
 /// `POST /api/sessions { name }` — create an empty v2 record.
 pub async fn create_handler(
     State(state): State<crate::AppState>,

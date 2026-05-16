@@ -678,6 +678,61 @@ PY
 pass "5-10 /api/settings/password 503 + /logout-all caller-preserved + 403 bearer (ADR-0020 D12)"
 
 # ─────────────────────────────────────────────────────────────────────
+#  Gate 5-11 — Slice D-4 session import (G28, sketch §11.2.A)
+# ─────────────────────────────────────────────────────────────────────
+echo
+echo "──── gate 5-11: POST /api/sessions/import ────"
+
+IMPORT_HAPPY=$(curl -fsS -X POST "http://$HOST/api/sessions/import" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"smoke-imported","layout":{"schema_version":2,"groups":[],"items":[],"viewport":{"x":0.0,"y":0.0,"zoom":1.0}}}')
+python3 - <<PY || fail "5-11: import happy path shape mismatch"
+import json
+d = json.loads("""$IMPORT_HAPPY""")
+assert d["name"] == "smoke-imported", d
+assert isinstance(d["created_at"], int) and d["created_at"] > 0, d
+PY
+
+# 409 on duplicate name.
+CONFLICT_STATUS=$(curl -sS -o /tmp/gtmux-smoke-stage5-import-dup.json -w '%{http_code}' \
+  -X POST "http://$HOST/api/sessions/import" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"smoke-imported","layout":{"schema_version":2,"groups":[],"items":[],"viewport":{"x":0.0,"y":0.0,"zoom":1.0}}}')
+[ "$CONFLICT_STATUS" = "409" ] || fail "5-11: duplicate import expected 409, got $CONFLICT_STATUS"
+python3 - <<PY || fail "5-11: 409 body shape mismatch"
+import json
+d = json.loads(open("/tmp/gtmux-smoke-stage5-import-dup.json").read())
+assert d["error"] == "name_conflict", d
+PY
+
+# 400 on schema_invalid (schema_version != 2).
+BAD_SCHEMA_STATUS=$(curl -sS -o /tmp/gtmux-smoke-stage5-import-bad.json -w '%{http_code}' \
+  -X POST "http://$HOST/api/sessions/import" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"bad-schema","layout":{"schema_version":1,"groups":[],"items":[],"viewport":{"x":0.0,"y":0.0,"zoom":1.0}}}')
+[ "$BAD_SCHEMA_STATUS" = "400" ] || fail "5-11: schema_invalid expected 400, got $BAD_SCHEMA_STATUS"
+python3 - <<PY || fail "5-11: 400 body shape mismatch"
+import json
+d = json.loads(open("/tmp/gtmux-smoke-stage5-import-bad.json").read())
+assert d["error"] == "schema_invalid", d
+assert "field" in d and "details" in d, d
+PY
+
+# Imported record appears in GET /api/sessions.
+LIST_BODY=$(curl -fsS "http://$HOST/api/sessions" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN")
+python3 - <<PY || fail "5-11: imported record missing from list"
+import json
+rows = json.loads("""$LIST_BODY""")
+assert any(r["name"] == "smoke-imported" for r in rows), rows
+PY
+
+pass "5-11 POST /api/sessions/import — 201 / 409 / 400 + list 정합 (G28)"
+
+# ─────────────────────────────────────────────────────────────────────
 print_summary
 echo
 echo "──── ALL STAGE 5 GATES PASSED ────"

@@ -637,6 +637,10 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             get(sessions::list_handler).post(sessions::create_handler),
         )
         .route(
+            "/api/sessions/import",
+            axum::routing::post(sessions::import_handler),
+        )
+        .route(
             "/api/sessions/{name}",
             axum::routing::delete(sessions::delete_handler),
         )
@@ -2316,6 +2320,189 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "name {bad:?}");
         }
+    }
+
+    // ── Slice D-4: POST /api/sessions/import (G28) ──
+
+    fn import_layout_body(name: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "name": name,
+            "layout": {
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sessions_import_201_with_name_and_created_at() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, wd) = make_app_with_workspace(&dir);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(import_layout_body("imported")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let bytes = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["name"], "imported");
+        assert!(v["created_at"].as_u64().unwrap() > 0);
+        // File persisted under the workspace dir.
+        assert!(wd.join("imported.json").exists());
+    }
+
+    #[tokio::test]
+    async fn sessions_import_409_on_name_conflict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _wd) = make_app_with_workspace(&dir);
+        // Seed by creating the same name first.
+        let create_body = serde_json::to_vec(&json!({ "name": "dup" })).unwrap();
+        let r1 = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::CREATED);
+        let r2 = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(import_layout_body("dup")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(r2.into_body(), 8 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "name_conflict");
+        assert_eq!(v["name"], "dup");
+    }
+
+    #[tokio::test]
+    async fn sessions_import_400_on_invalid_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _wd) = make_app_with_workspace(&dir);
+        let body = serde_json::to_vec(&json!({
+            "name": "../escape",
+            "layout": {
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }
+        }))
+        .unwrap();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sessions_import_400_on_schema_invalid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _wd) = make_app_with_workspace(&dir);
+        // schema_version = 1 → bad_schema_version per validate().
+        let body = serde_json::to_vec(&json!({
+            "name": "bad-schema",
+            "layout": {
+                "schema_version": 1,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }
+        }))
+        .unwrap();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "schema_invalid");
+        assert!(v["field"].is_string());
+        assert!(v["details"].is_string());
+    }
+
+    #[tokio::test]
+    async fn sessions_import_then_list_includes_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _wd) = make_app_with_workspace(&dir);
+        let r1 = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(import_layout_body("ledger")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::CREATED);
+        let list = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(list.into_body(), 8 * 1024).await.unwrap();
+        let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(rows.iter().any(|r| r["name"] == "ledger"));
     }
 
     #[tokio::test]
