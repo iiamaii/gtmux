@@ -994,6 +994,7 @@
     {onmove}
     {onpanecontextmenu}
     {onnodecontextmenu}
+    {onselectionchange}
     panOnDrag={panOnDragMask}
     selectionOnDrag={!isSpacePressed && !isHandTool && !isDragTool}
     minZoom={0.05}
