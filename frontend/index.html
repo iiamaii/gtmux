@@ -7,19 +7,25 @@
     <script>
       // FOUC guard — apply theme before Svelte hydrates so the first paint
       // never flashes the wrong theme. Mirrors `$lib/stores/theme.svelte.ts`
-      // resolveInitial() priority chain: localStorage → prefers-color-scheme
-      // → dark fallback. Runs synchronously at <head> parse time.
+      // resolveInitial() priority chain: localStorage('gtmux-theme') is
+      // one of 'system' | 'light' | 'dark'; 'system' (or missing) falls
+      // through to prefers-color-scheme. Runs synchronously at <head>
+      // parse time.
       (function () {
         try {
-          var stored = localStorage.getItem('gtmux-theme');
-          if (stored !== 'light' && stored !== 'dark') {
-            stored =
-              window.matchMedia &&
-              window.matchMedia('(prefers-color-scheme: light)').matches
-                ? 'light'
-                : 'dark';
+          var mode = localStorage.getItem('gtmux-theme');
+          if (mode !== 'light' && mode !== 'dark' && mode !== 'system') {
+            mode = 'system';
           }
-          if (stored === 'dark') {
+          var resolved = mode;
+          if (mode === 'system') {
+            resolved =
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches
+                ? 'dark'
+                : 'light';
+          }
+          if (resolved === 'dark') {
             document.documentElement.classList.add('dark');
           }
         } catch (e) {

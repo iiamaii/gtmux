@@ -9,8 +9,8 @@
   // - 선택 시각 (M):
   //     * single  (.m-single) → solid 1.5px accent outline (Figma 정합)
   //     * multi   (.m-multi)  → dashed 2px accent outline + 헤더 색조 변화
-  // - resize : NodeResizer (corner + edge handles). onResizeEnd 시 panelsStore
-  //   + PUT /api/layout 으로 영속화.
+  // - resize : NodeResizer (corner + edge handles). onResizeEnd 시 sessionStore
+  //   + PUT /api/sessions/<name>/layout 으로 영속화.
   // - visibility=false → 렌더 X.
 
   import { getContext } from 'svelte';
@@ -19,23 +19,12 @@
   import XtermHost from './XtermHost.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
-  import { panelsStore } from '$lib/stores/panels.svelte';
-  import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
-  import { muxStore } from '$lib/stores/mux.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
-  import { putLayoutCommitCurrent } from '$lib/http/layout';
   import { deleteItem, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
-  import { sendCtrl } from '$lib/ws/ctrl-registry';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
-  import type { WsClient } from '$lib/ws/client';
-
-  interface WsClientHolder {
-    current: WsClient | null;
-  }
-  const wsClientHolder = getContext<WsClientHolder>('wsClient');
 
   // ContextMenu summoner — header (…) button opens the same menu the
   // right-click would (ADR-0017 §D2 amend: panel header more menu).
@@ -98,123 +87,69 @@
   const isStreaming = $derived(isVisible && data.minimized !== true);
   const headerLabel = $derived(data.label ?? data.pane_id ?? data.id);
 
-  const isInM = $derived(selected || ephemeralStore.m.has(data.id));
+  const isInM = $derived(selected || sessionStore.M.has(data.id));
   const isMultiM = $derived(isInM && data.m_multi === true);
   const isSingleM = $derived(isInM && data.m_multi !== true);
 
   const isInI = $derived(
-    typeof data.pane_id === 'string' && ephemeralStore.i === data.pane_id
+    typeof data.pane_id === 'string' && sessionStore.I === data.pane_id
   );
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
   const isLocked = $derived(data.locked === true);
 
-  const TOKEN_STORAGE_KEY = 'gtmux_token';
-  function readToken(): string | null {
-    try {
-      return sessionStorage.getItem(TOKEN_STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  }
-
   // NodeResizer onResizeEnd — { event, params: { x, y, width, height } }.
   // Resize 도중에는 SvelteFlow 가 controlled width/height 를 자체 업데이트
   // 하므로 본 핸들러는 *최종 값만* store + disk 로 commit (drag 와 동일 패턴).
   function onResizeEnd(_event: unknown, params: ResizeParams) {
-    if (useSessionStore && sessionStore.active !== null) {
-      const sessionName = sessionStore.active.name;
-      const nextW = Math.max(240, params.width);
-      const nextH = Math.max(140, params.height);
-      void mutateLayout(sessionName, (cur) => ({
-        ...cur,
-        items: cur.items.map((it: CanvasItem) =>
-          it.id === data.id && it.type === 'terminal'
-            ? ({
-                ...it,
-                x: params.x,
-                y: params.y,
-                w: nextW,
-                h: nextH,
-              } as TerminalItem)
-            : it,
-        ),
-      }))
-        .then(({ layout }) => sessionStore.loadLayout(layout))
-        .catch((err: unknown) => {
-          if (err instanceof UnauthorizedError) {
-            window.location.href = '/auth';
-            return;
-          }
-          toastStore.show({
-            message: `Resize failed: ${err instanceof Error ? err.message : String(err)}`,
-            tone: 'error',
-          });
+    const active = sessionStore.active;
+    if (active === null) return;
+    const sessionName = active.name;
+    const nextW = Math.max(240, params.width);
+    const nextH = Math.max(140, params.height);
+    void mutateLayout(sessionName, (cur) => ({
+      ...cur,
+      items: cur.items.map((it: CanvasItem) =>
+        it.id === data.id && it.type === 'terminal'
+          ? ({
+              ...it,
+              x: params.x,
+              y: params.y,
+              w: nextW,
+              h: nextH,
+            } as TerminalItem)
+          : it,
+      ),
+    }))
+      .then(({ layout }) => sessionStore.loadLayout(layout))
+      .catch((err: unknown) => {
+        if (err instanceof UnauthorizedError) {
+          window.location.href = '/auth';
+          return;
+        }
+        toastStore.show({
+          message: `Resize failed: ${err instanceof Error ? err.message : String(err)}`,
+          tone: 'error',
         });
-      return;
-    }
-    panelsStore.resizePanel(data.id, params.x, params.y, params.width, params.height);
-    const token = readToken();
-    if (token === null) {
-      console.warn('[gtmux] resize commit skipped: no auth token');
-      return;
-    }
-    void putLayoutCommitCurrent(token).catch((e) => {
-      console.warn('[gtmux] resize commit failed:', e);
-    });
+      });
   }
 
-  /** Multi-session 흐름 활성 여부. */
-  const useSessionStore = $derived(sessionStore.active !== null);
-
   /**
-   * Multi-session terminal item 의 UUID→PaneId binding (0x88 TERMINAL_SPAWNED 가
-   * source). undefined → spawn 직후 또는 dangling 상태 → connecting placeholder.
+   * Terminal item 의 UUID→PaneId binding (0x88 TERMINAL_SPAWNED 가 source).
+   * undefined → spawn 직후 또는 dangling 상태 → connecting placeholder.
    * 정수 → XtermHost mount 가능.
    */
-  const terminalPaneId = $derived(
-    useSessionStore ? terminalPool.paneIdFor(data.id) : undefined,
-  );
+  const terminalPaneId = $derived(terminalPool.paneIdFor(data.id));
 
-  // ─ Close button enablement (0036 §3 P0-B) ─────────────────────────────
-  //
-  // legacy single-session: CONTEXT.md "Pane lifecycle invariant" — 마지막
-  // 살아 있는 child 일 때 close 비활성화 (Session shutdown 사용 유도).
-  //
-  // v2 multi-session: terminal item.id 는 UUID — legacy `%N` paneNumeric
-  // 조건은 무관. liveCount 도 무관 (terminal kill 은 mirror 보호를 위해
-  // PanelCloseConfirmModal 안에서 사용자 명시 선택). 항상 enabled.
-  const liveCount = $derived(
-    [...muxStore.panes.values()].filter((p) => p.dead !== true).length
-  );
-
-  const paneNumeric = $derived.by(() => {
-    if (typeof data.pane_id !== 'string' || data.pane_id[0] !== '%') return null;
-    const n = Number.parseInt(data.pane_id.slice(1), 10);
-    return Number.isNaN(n) ? null : n;
-  });
-
-  /** legacy 인지 — v2 path 와 confuse 하지 않기 위한 명시 분기. */
-  const isLegacyPane = $derived(!useSessionStore && paneNumeric !== null);
-
-  const closeDisabled = $derived.by(() => {
-    if (useSessionStore) return false;
-    // legacy 1-pane 보호 + pane spawn race 방지.
-    return liveCount <= 1 || paneNumeric === null;
-  });
-  const closeTooltip = $derived.by(() => {
-    if (!closeDisabled) return 'Close panel';
-    return liveCount <= 1
-      ? 'Last live pane — use Session shutdown'
-      : 'Close panel';
-  });
+  // Multi-session terminal kill 은 mirror 보호를 위해 PanelCloseConfirmModal
+  // 안에서 사용자 명시 선택. close 버튼 자체는 항상 enabled.
+  const closeTooltip = 'Close panel';
 
   let closing = $state(false);
   let confirmOpen = $state(false);
 
   /** 현 panel 의 terminal 이 다른 session 에서 reference 되는 list (현 session 제외). */
   const otherSessions = $derived.by((): string[] => {
-    if (!useSessionStore) return [];
     const active = sessionStore.active;
     if (active === null) return [];
     const t = terminalPool.byId(data.id);
@@ -223,67 +158,21 @@
   });
 
   const attachCount = $derived.by((): number => {
-    if (!useSessionStore) return 0;
     const t = terminalPool.byId(data.id);
     return t?.attach_count ?? 0;
   });
 
   function onClose(e: MouseEvent): void {
     e.stopPropagation();
-    if (closeDisabled || closing) return;
-    if (useSessionStore) {
-      // Multi-session — 3-option confirm dialog (G25).
-      confirmOpen = true;
-      return;
-    }
-    // Legacy single-session — sendCtrl('kill-pane') 흐름 유지.
-    void closeLegacy();
-  }
-
-  async function closeLegacy(): Promise<void> {
-    const client = wsClientHolder?.current;
-    if (!client || paneNumeric === null) {
-      toastStore.show({ message: 'WebSocket not ready', tone: 'error' });
-      return;
-    }
-    closing = true;
-    try {
-      panelsStore.removePanel(data.id);
-      const token = readToken();
-      if (token !== null) {
-        void putLayoutCommitCurrent(token).catch((e) => {
-          console.warn('[gtmux] close commit (layout) failed:', e);
-        });
-      }
-      const { response } = sendCtrl(client, 'kill-pane', [String(paneNumeric)], {
-        timeoutMs: 5_000,
-      });
-      const r = await response;
-      if (!r.ok) {
-        toastStore.show({
-          message: `kill-pane failed: ${r.code ?? '?'} ${r.error ?? ''}`,
-          tone: 'error',
-        });
-      }
-    } catch (e) {
-      toastStore.show({
-        message: `Close failed: ${(e as Error).message ?? e}`,
-        tone: 'error',
-      });
-    } finally {
-      closing = false;
-    }
+    if (closing) return;
+    confirmOpen = true;
   }
 
   // ─ Inline label rename (0033 §8.2 P1 — InlineEditField consumer wire) ─
   //
-  // multi-session 의 terminal panel header label 을 더블 클릭 → 인라인 편집 →
-  // commit 시 PATCH /api/terminals/:id { label }. terminalPool 즉시 refresh 로
-  // 다른 surface (TerminalsPanel, PaneInfoPanel) 와 정합.
-  //
-  // legacy single-session 시에는 backend 가 PATCH endpoint 의 *UUID* 기반 →
-  // legacy `%N` paneNumeric 은 endpoint 호출 불가. 따라서 useSessionStore 일
-  // 때만 인라인 편집 활성. legacy 는 텍스트 표시 only (P3 의 별 rename UX).
+  // terminal panel header label 을 더블 클릭 → 인라인 편집 → commit 시
+  // PATCH /api/terminals/:id { label }. terminalPool 즉시 refresh 로 다른
+  // surface (TerminalsPanel, PaneInfoPanel) 와 정합.
   let labelEditing = $state(false);
   let labelCommitting = $state(false);
 
@@ -297,7 +186,6 @@
 
   function onLabelStartEdit(e: MouseEvent): void {
     // 더블 클릭만 trigger — 일반 클릭은 drag handle 로 통과.
-    if (!useSessionStore) return;
     e.stopPropagation();
     labelEditing = true;
   }
@@ -386,7 +274,7 @@
       {onResizeEnd}
     />
     <header class="panel-header" aria-label={`Drag handle for ${headerLabel}`}>
-      {#if useSessionStore && labelEditing}
+      {#if labelEditing}
         <span class="panel-label-host" role="presentation">
           <InlineEditField
             value={data.label ?? ''}
@@ -402,15 +290,13 @@
             <span class="panel-label-saving" aria-hidden="true">…</span>
           {/if}
         </span>
-      {:else if useSessionStore}
+      {:else}
         <span
           class="panel-label panel-label-editable"
           title="Double-click to rename"
           ondblclick={onLabelStartEdit}
           role="presentation"
         >{headerLabel}</span>
-      {:else}
-        <span class="panel-label">{headerLabel}</span>
       {/if}
       <span class="panel-actions">
         <span class="panel-badges">
@@ -444,7 +330,7 @@
           class="panel-close"
           aria-label={closeTooltip}
           title={closeTooltip}
-          disabled={closeDisabled || closing}
+          disabled={closing}
           onclick={onClose}
           onmousedown={(e: MouseEvent) => e.stopPropagation()}
         >
@@ -457,15 +343,13 @@
     </header>
     <div class="panel-body">
       {#if isStreaming}
-        {#if isLegacyPane && typeof data.pane_id === 'string'}
-          <XtermHost paneId={data.pane_id.replace(/^%/, '')} />
-        {:else if useSessionStore && terminalPaneId !== undefined}
+        {#if terminalPaneId !== undefined}
           <!-- 0039 §3 Option C1 — terminalPool 의 UUID→PaneId binding (0x88
                TERMINAL_SPAWNED) 이 도착했으므로 numeric PaneId 로 XtermHost mount.
                같은 paneId 에 multiple panel 가 subscribe 하면 dispatcher 의
                multi-subscriber 패턴 (ADR-0021 D1 mirror) 으로 모두에게 fan-out. -->
           <XtermHost paneId={String(terminalPaneId)} />
-        {:else if useSessionStore}
+        {:else}
           <!-- binding 미도착 — `[New Terminal]` spawn race 의 짧은 구간 또는 page
                reload 후 첫 0x88 도착 전. terminal_died 상태는 PanelDanglingOverlay
                가 우선. -->
@@ -475,9 +359,7 @@
           </div>
         {/if}
       {/if}
-      {#if useSessionStore}
-        <PanelDanglingOverlay terminalId={data.id} />
-      {/if}
+      <PanelDanglingOverlay terminalId={data.id} />
     </div>
   </div>
 {/if}

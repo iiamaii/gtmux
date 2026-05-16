@@ -16,12 +16,12 @@
    */
 
   import { useSvelteFlow } from '@xyflow/svelte';
-  import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
   const flow = useSvelteFlow();
 
-  const zoomPct = $derived(Math.round((ephemeralStore.viewport.zoom ?? 1) * 100));
-  const mCount = $derived(ephemeralStore.m.size);
+  const zoomPct = $derived(Math.round(sessionStore.viewport.zoom * 100));
+  const mCount = $derived(sessionStore.M.size);
 
   function onZoomIn(): void {
     void flow.zoomIn({ duration: 150 });
@@ -31,7 +31,7 @@
   }
   function onReset100(): void {
     void flow.setViewport(
-      { x: ephemeralStore.viewport.x ?? 0, y: ephemeralStore.viewport.y ?? 0, zoom: 1 },
+      { x: sessionStore.viewport.x, y: sessionStore.viewport.y, zoom: 1 },
       { duration: 150 }
     );
   }

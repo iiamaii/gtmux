@@ -14,7 +14,6 @@
   // - 캔버스 dot grid 는 token-driven (--canvas-bg, --canvas-grid).
   // - panOnDrag = [1, 2] — middle/right 마우스 버튼만 pan (left는 selection/drag용).
 
-  import { untrack } from 'svelte';
   import { SvelteFlow, Background, BackgroundVariant, useSvelteFlow } from '@xyflow/svelte';
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
@@ -56,7 +55,7 @@
 
   // SvelteFlow viewport projection — onpaneclick 의 screen 좌표를 canvas 좌표로 변환.
   // useSvelteFlow 는 SvelteFlowProvider 컨텍스트가 있어야 동작 (+page.svelte 에서 마운트됨).
-  const { screenToFlowPosition, setViewport, getViewport, updateNode } = useSvelteFlow();
+  const { screenToFlowPosition, setViewport, getViewport } = useSvelteFlow();
 
   /** Drag-to-create state — Batch 2 의 rect/ellipse/line gesture. */
   type DragShape = 'rect' | 'ellipse' | 'line';
@@ -369,15 +368,11 @@
   function itemToNode(item: CanvasItem): Node {
     const visible = effectiveVisibility(item.visibility, item.parent_id, sessionGroupsById);
     const locked = effectiveLocked(item.locked, item.parent_id, sessionGroupsById);
-    // selected 는 의도적으로 채우지 않는다 — SvelteFlow internal 진실을
-    // useSvelteFlow().updateNode 로 single-source sync (아래 effect). nodes
-    // prop 에 selected 를 함께 보내면 (a) M 변경마다 전체 nodes derived 가
-    // 재계산되어 SvelteFlow 가 모든 node 를 merge 하고, (b) 그 merge 가
-    // internal store 의 부분 변화로 cascade → effect_update_depth 위험.
     const common = {
       id: item.id,
       position: { x: item.x, y: item.y },
       draggable: !locked,
+      selected: sessionStore.M.has(item.id),
       zIndex: item.z,
       width: item.w,
       height: item.h,
@@ -446,10 +441,27 @@
     };
   }
 
-  // SvelteFlow nodes — single source (sessionStore).
-  const nodes = $derived<Node[]>(
-    Array.from(sessionStore.items.values()).map(itemToNode),
-  );
+  /* ── SvelteFlow nodes — controlled binding via `bind:nodes` ─────────────
+   *
+   * Root cause of the `effect_update_depth_exceeded` loop:
+   *   `<SvelteFlow nodes = $bindable([])>` 가 controlled prop. `bind:nodes`
+   *   없이 derived 를 one-way 로 넘기면, xyflow 의 internal `set nodes(new)`
+   *   write-back 이 외부 (derived → 불가) 와 sync 실패 → 다음 internal effect
+   *   가 자기 store 와 다시 비교하며 자가 trigger → cascade.
+   *
+   * Fix: 외부에 *명시 mutable $state* (`internalNodes`) 를 두고 `bind:nodes`.
+   * sessionStore 변화 시 effect 가 internalNodes 를 *교체* (selected 포함).
+   * SvelteFlow internal mutation (drag/click 등) 은 bind 양방향으로
+   * internalNodes 에 반영. effect 의 deps 는 sessionStore 만 — SvelteFlow
+   * mutation 만 발생한 경우 fire 안 함 → loop 0.
+   *
+   * selected 의 single source 는 *sessionStore.M*. effect 가 매 rebuild 시
+   * `selected: M.has(id)` 를 채움. internal click 으로 selected 가 변하면
+   * onnodeclick 의 setM 으로 sessionStore 와 sync → effect → rebuild → ok. */
+  let internalNodes: Node[] = $state([]);
+  $effect(() => {
+    internalNodes = Array.from(sessionStore.items.values()).map(itemToNode);
+  });
 
   function onmove(_event: MouseEvent | TouchEvent | null, viewport: Viewport): void {
     sessionStore.updateViewport({ x: viewport.x, y: viewport.y, zoom: viewport.zoom });
@@ -474,34 +486,6 @@
     void setViewport({ x: v.x, y: v.y, zoom: v.zoom });
   });
 
-  /* ── M (sessionStore) → SvelteFlow internal selected — explicit sync ──
-   * Root cause: `nodes` derived 의 `selected` 필드는 SvelteFlow 의 internal
-   * store 에 *initial* 만 반영. user click 으로 internal selection 이 바뀐
-   * 후로는 external (LayerTreeView 등) 의 reactive sync 가 internal 과
-   * 충돌해 *그림에 안 보이는 상태* (store 는 진실, 시각은 stale) 가 된다.
-   * useSvelteFlow().updateNode 가 internal store 의 정식 진입점이라 본
-   * effect 가 매 M 변경마다 모든 item 에 대해 명시 sync.
-   *
-   * effect_update_depth_exceeded 회피:
-   * - 본 effect 가 sessionStore.items / M 에만 sub 되도록, SvelteFlow internal
-   *   proxy 의 reactive read 는 회피. `updateNode` 의 callback 패턴은
-   *   internal node 의 `n.selected` 를 read → 그 sub 가 internal store 와
-   *   엮여 updateNode 의 mutation 이 본 effect 의 deps 처럼 trigger 됨.
-   * - 따라서 (1) snapshot 을 `untrack` 으로 만들지 않고 본 effect 의 의도된
-   *   deps (items/M) 만 sub, (2) updateNode 는 callback 없이 partial 객체로,
-   *   (3) write 자체는 `untrack` 으로 감싸 SvelteFlow internal 변화가 본
-   *   effect 와 reactive 로 엮이지 않게 차단. */
-  $effect(() => {
-    const targets: Array<[string, boolean]> = [];
-    for (const id of sessionStore.items.keys()) {
-      targets.push([id, sessionStore.M.has(id)]);
-    }
-    untrack(() => {
-      for (const [id, want] of targets) {
-        updateNode(id, { selected: want });
-      }
-    });
-  });
 
   // 노드 클릭 → M 갱신. dual source.
   //   plain    : single (clear + add)
@@ -705,7 +689,7 @@
        legacy 진입은 `handleTerminalClick(legacy branch)` 가 `requestLegacyNewPane`
        호출. multi-session 은 BE Stage 5-D P2 endpoint 도착 시 wire. -->
   <SvelteFlow
-    {nodes}
+    bind:nodes={internalNodes}
     edges={[]}
     {nodeTypes}
     {onnodeclick}

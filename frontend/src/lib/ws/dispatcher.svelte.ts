@@ -4,11 +4,13 @@
 // - WsClient 가 디코드한 envelope 을 frame type 별로 fan-out:
 //     * 0x02 PANE_OUT  → registered per-pane handler (xterm.write)
 //     * 0x07 NOTIFY_MIRROR → connection / panel state hints (e.g. pane-died zombie)
-//     * 0x80 LAYOUT_CHANGED → layoutStore.etag 갱신 → HTTP GET /api/layout (호출 측)
-//     * 0x81 M_CHANGED       → ephemeralStore.m
-//     * 0x82 I_CHANGED       → ephemeralStore.i
-//     * 0x83 VIEWPORT_CHANGED → ephemeralStore.viewport
-//     * 0x84 FOCUS_MODE_CHANGED → ephemeralStore.focusMode
+//     * 0x80 LAYOUT_CHANGED → multi-session 에서는 mutateLayout 의 응답이 진실
+//       (legacy v1 refetch 는 0044 dual-source 제거 시 폐기). 본 핸들러는 외부
+//       hook 만 호출하고 자체 store mutation 은 안 함.
+//     * 0x81 M_CHANGED       → sessionStore.M (active session 매칭 시)
+//     * 0x82 I_CHANGED       → sessionStore.I (active session 매칭 시)
+//     * 0x83 VIEWPORT_CHANGED → sessionStore.viewport (active session 매칭 시)
+//     * 0x84 FOCUS_MODE_CHANGED → sessionStore.focusMode (active session 매칭 시)
 //     * 0x01/0x03/0x04/0x05/0x06: client→server 방향이므로 수신은 echo/loopback
 //       시나리오에서만 발생 — debug log + drop.
 // - WsClient lifecycle 콜백을 connectionStore 로 어댑팅.
@@ -21,14 +23,13 @@
 // - `docs/reports/0010-grill-amendments.md` D13 (MT-3 broadcast — 자기 발신도 echo
 //   수신), D16 (Streaming State), D21 c4 (zombie badge from `pane-died`)
 
-import { SvelteSet } from 'svelte/reactivity';
-
 import { connectionStore } from '$lib/stores/connection.svelte';
-import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
-// layoutStore 의 etag 갱신은 `lib/http/layout::fetchLayoutAndHydrate` 가 단일
-// 책임을 진다 — broadcast 도착 시점에 setEtag 하면 후속 GET 의 If-None-Match
-// 와 일치해 304 가 떨어지므로, 본 모듈은 etag 를 만지지 않는다.
+import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
 import { muxStore } from '$lib/stores/mux.svelte';
+import { sessionStore } from '$lib/stores/sessionStore.svelte';
+import { terminalPool } from '$lib/stores/terminalPool.svelte';
+import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
 import {
   FRAME_TYPE,
   decodeCtrl,
@@ -36,8 +37,12 @@ import {
   decodeIChanged,
   decodeLayoutChanged,
   decodeMChanged,
+  decodeMountCascade,
   decodeNotifyMirror,
   decodePaneOut,
+  decodeTerminalDied,
+  decodeTerminalListUpdate,
+  decodeTerminalSpawned,
   decodeViewport,
   type Envelope,
 } from './decode';
@@ -53,10 +58,15 @@ import { WsClient, computeWsUrl, type ConnectionState, type WsClientOptions } fr
 // **paneId 형식**: tmux pane id 의 정수 부분만 *문자열로* 저장 (예: `"%37"` → `"37"`).
 // 다른 store 들이 string id 를 쓰고 있어 일관성을 맞춤 — wire 의 number 와 변환은
 // dispatcher 에서 처리 (`String(number)`).
+//
+// **Multi-subscriber (ADR-0021 D1 — mirror)**: 같은 UUID terminal 이 multiple panel
+// 에 mount 될 수 있음 (mirror). 각 XtermHost 가 본 paneId 에 자신의 handler 를 등록 —
+// dispatcher 가 fan-out 으로 모두에게 같은 bytes 를 흘려보낸다. 등록 / 해제는 *handler
+// identity* 기반 (Set membership).
 
 type PaneOutHandler = (buf: Uint8Array, cb: () => void) => void;
 
-const paneOutHandlers = new Map<string, PaneOutHandler>();
+const paneOutHandlers = new Map<string, Set<PaneOutHandler>>();
 
 /**
  * Buffer of PANE_OUT bytes that arrived BEFORE a handler was registered.
@@ -90,61 +100,47 @@ function appendLateBuffer(paneKey: string, bytes: Uint8Array): void {
 }
 
 export function registerPaneOut(paneId: string, handler: PaneOutHandler): void {
-  paneOutHandlers.set(paneId, handler);
-  const queued = paneOutLateBuffers.get(paneId);
-  if (queued && queued.length > 0) {
-    console.debug('[ws] registerPaneOut pane=%s flushing %d buffered chunk(s)',
-      paneId, queued.length);
-    for (const bytes of queued) handler(bytes, noop);
-    paneOutLateBuffers.delete(paneId);
+  let set = paneOutHandlers.get(paneId);
+  if (!set) {
+    set = new Set();
+    paneOutHandlers.set(paneId, set);
+  }
+  const wasEmpty = set.size === 0;
+  set.add(handler);
+  // Only the FIRST subscriber on a pane drains the late buffer — subsequent
+  // mirror subscribers join the live stream from here on (no historical replay;
+  // that's ADR-0021 D6 catch-up territory, out of scope for the dispatcher).
+  if (wasEmpty) {
+    const queued = paneOutLateBuffers.get(paneId);
+    if (queued && queued.length > 0) {
+      console.debug('[ws] registerPaneOut pane=%s flushing %d buffered chunk(s)',
+        paneId, queued.length);
+      for (const bytes of queued) handler(bytes, noop);
+      paneOutLateBuffers.delete(paneId);
+    } else {
+      console.debug('[ws] registerPaneOut pane=%s (no buffered bytes)', paneId);
+    }
   } else {
-    console.debug('[ws] registerPaneOut pane=%s (no buffered bytes)', paneId);
+    console.debug('[ws] registerPaneOut pane=%s subscriber=%d (mirror)', paneId, set.size);
   }
 }
 
-export function unregisterPaneOut(paneId: string): void {
-  paneOutHandlers.delete(paneId);
-}
-
-// ── 외부에서 layoutStore 갱신을 트리거하는 hook ──────────────────────────
-//
-// `0x80 LAYOUT_CHANGED` 수신 시 dispatcher 는 store 의 etag 만 갱신하고, 실제
-// HTTP `GET /api/layout` re-fetch 는 *다른 모듈* (`$lib/http/layout`) 의 책임.
-// 그 모듈이 본 hook 을 등록해 fan-out 의 마지막 단계를 처리한다.
-//
-// 시그니처: `(etag: Uint8Array) => Promise<void> | void`. 인자 etag 는 broadcast
-// 페이로드의 raw 16B — handler 가 그 값을 If-Match 로 흘려 412 rebase 를 구현할
-// 수 있도록 전달한다 (현재 GET 경로는 응답 ETag 를 권위로 삼아 인자를 사용하지
-// 않으나, 시그니처는 미래 안정.)
-//
-// 미등록 시 (bootstrap 이전): warn + drop.
-
-export type LayoutRefetchHandler = (etag: Uint8Array) => Promise<void> | void;
-let layoutRefetchHandler: LayoutRefetchHandler | null = null;
-
-export function setLayoutRefetchHandler(handler: LayoutRefetchHandler | null): void {
-  layoutRefetchHandler = handler;
-}
-
-// ── pane-spawned auto-mount hook (ADR-0015, Stage I) ──────────────────────
-//
-// dispatcher 의 `pane-spawned` NOTIFY 안에서 호출되는 cascade PUT helper.
-// `$lib/http/layout` 의 `appendPanelIfMissing` 을 등록해야 토큰을 알 수 있는
-// `+page.svelte` 측이 wire 한다. 미등록 시 silent drop — 외부 spawn 시나리오
-// 가 아직 없으므로 NewPanelButton path 가 layout 을 만든다.
-
-export type AutoMountHandler = (paneId: number) => Promise<void> | void;
-let autoMountHandler: AutoMountHandler | null = null;
-
-export function setAutoMountHandler(handler: AutoMountHandler | null): void {
-  autoMountHandler = handler;
+export function unregisterPaneOut(paneId: string, handler: PaneOutHandler): void {
+  const set = paneOutHandlers.get(paneId);
+  if (!set) return;
+  set.delete(handler);
+  if (set.size === 0) paneOutHandlers.delete(paneId);
 }
 
 // ── Dispatcher factory ─────────────────────────────────────────────────────
 
 export interface DispatcherOptions {
-  /** base64url 토큰. */
-  readonly token: string;
+  /**
+   * base64url Bearer token. `null` 인 경우 cookie-only handshake (D10 α). WS
+   * subprotocol 은 `gtmux.v1` 만 송신 — BE 의 cookie_validator 가 cookie 로 upgrade
+   * 인증.
+   */
+  readonly token: string | null;
   /** 기본은 `computeWsUrl()` — 테스트 hook 용도. */
   readonly url?: string;
   /** Optional override for the on-frame handler (테스트 격리용). */
@@ -187,6 +183,14 @@ export function dispatch(env: Envelope): void {
       return handleViewportChanged(env.payload);
     case FRAME_TYPE.FOCUS_MODE_CHANGED:
       return handleFocusModeChanged(env.payload);
+    case FRAME_TYPE.TERMINAL_DIED:
+      return handleTerminalDied(env.payload);
+    case FRAME_TYPE.MOUNT_CASCADE:
+      return handleMountCascade(env.payload);
+    case FRAME_TYPE.TERMINAL_LIST_UPDATE:
+      return handleTerminalListUpdate(env.payload);
+    case FRAME_TYPE.TERMINAL_SPAWNED:
+      return handleTerminalSpawned(env.payload);
     case FRAME_TYPE.CTRL:
       return handleCtrlResponse(env.payload);
     case FRAME_TYPE.PANE_IN:
@@ -218,15 +222,23 @@ function handlePaneOut(payload: Uint8Array): void {
   // pending action 우회 경로 — backend success ack 정식 wire 전까지).
   muxStore.addPane(decoded.paneId);
   const key = String(decoded.paneId);
-  const handler = paneOutHandlers.get(key);
-  if (!handler) {
-    console.debug('[ws] PANE_OUT pane=%s len=%d → late-buffer (no handler yet)',
+  const handlers = paneOutHandlers.get(key);
+  if (!handlers || handlers.size === 0) {
+    console.debug('[ws] PANE_OUT pane=%s len=%d → late-buffer (no subscribers)',
       key, decoded.bytes.length);
     appendLateBuffer(key, decoded.bytes);
     return;
   }
-  console.debug('[ws] PANE_OUT pane=%s len=%d → handler', key, decoded.bytes.length);
-  handler(decoded.bytes, noop);
+  // Fan out to every subscriber (ADR-0021 D1 mirror). Each xterm gets the same
+  // bytes — they'll all converge on the same screen state (modulo their own
+  // local cursor / scrollback). Snapshot the set so a subscriber unregistering
+  // mid-iteration (e.g. via term.write triggering an unmount) doesn't skip
+  // siblings.
+  console.debug('[ws] PANE_OUT pane=%s len=%d → %d subscriber(s)',
+    key, decoded.bytes.length, handlers.size);
+  for (const handler of [...handlers]) {
+    handler(decoded.bytes, noop);
+  }
 }
 
 function handleNotifyMirror(payload: Uint8Array): void {
@@ -249,18 +261,8 @@ function handleNotifyMirror(payload: Uint8Array): void {
       // missing request_id is the (more common) broadcast case where
       // the NOTIFY simply tells every WS subscriber a new pane exists.
       muxStore.addPane(decoded.paneId);
-      // Stage I (ADR-0015) — auto-mount the pane into Canvas Layout if
-      // it isn't there yet. Idempotent guard inside the helper handles
-      // the two-path race (NewPanelButton + dispatcher both firing).
-      const mount = autoMountHandler;
-      if (mount) {
-        const result = mount(decoded.paneId);
-        if (result instanceof Promise) {
-          result.catch((e: unknown) => {
-            console.warn('[gtmux] pane-spawned auto-mount failed', e);
-          });
-        }
-      }
+      // Multi-session path: pane-spawned is informational. Canvas mount
+      // is owned by `0x86 MOUNT_CASCADE` / `0x88 TERMINAL_SPAWNED`.
       return;
     }
     case 'pane-died':
@@ -320,23 +322,34 @@ function handleLayoutChanged(payload: Uint8Array): void {
     console.warn('[ws] 0x80 LAYOUT_CHANGED decode failed');
     return;
   }
-  // DO NOT setEtag here. If we cache the broadcast etag *before* the
-  // re-fetch fires, fetchLayoutAndHydrate sends If-None-Match=<new_etag>
-  // and the server responds 304 — leaving panelsStore with the pre-PUT
-  // contents and the new panel invisible until a manual refresh. Let
-  // fetchLayoutAndHydrate own the etag transition: it calls setEtag on
-  // the 200 response after hydratePanels, and leaves the store alone on
-  // 304. The broadcast etag bytes are passed through for callers that
-  // want to short-circuit conditional fetches (none today).
-  const handler = layoutRefetchHandler;
-  if (handler) {
-    const result = handler(decoded.etag);
-    if (result instanceof Promise) {
-      result.catch((e: unknown) => {
-        console.warn('[gtmux] layout refetch failed', e);
-      });
-    }
-  }
+  // Multi-session: mutateLayout() 호출의 응답이 진실 — 본 broadcast 는 같은
+  // session 의 *다른 webpage* 가 변경했을 때 의미가 있는데 single-attach lock
+  // 으로 그 경로가 닫혀 있어 현재로서는 informational. Phase 2 (cross-tab
+  // multi-attach) 가 land 하면 `/api/sessions/<name>/layout` refetch 추가.
+  console.debug('[ws] 0x80 LAYOUT_CHANGED received (multi-session no-op)');
+}
+
+/**
+ * Stage 5-C 사전-scaffold (0034 §4 deferred).
+ *
+ * 5-C 가 ship 되면 0x81/0x82/0x83/0x84 frame body 에 *optional* `session_id` 가
+ * 포함된다 (0034 §8.2 option (a) — top-level field 권장). BE 가 cookie ↔
+ * session_id mapping (5-A) 으로 *해당 session 의 webpage 에만* fan-out 하므로
+ * 정상 흐름에서는 FE 측 추가 필터 불필요. 다만:
+ *   - BE 가 mid-attach race 로 잘못된 connection 에 보낼 가능성
+ *   - FE 의 sessionStore.active 가 BE 보다 먼저 변경됐을 race
+ * 위 두 경우 본 helper 가 drop 정책을 통일한다.
+ *
+ * 사용 시점: 5-C 가 BE 에 land 하면 각 handler 의 decoder 가 `sessionId` 를 추가
+ * 반환하도록 amend → handler 시작부에서 `if (!isFrameForActiveSession(decoded.sessionId)) return;`
+ * 한 줄 추가. wire 의 *frame-level shape* (binary varint vs JSON envelope) 는
+ * BE 가 확정 후 결정 — 현재 dispatcher 는 binary varint 형식 그대로 처리.
+ */
+export function isFrameForActiveSession(frameSessionId: string | null | undefined): boolean {
+  if (frameSessionId === null || frameSessionId === undefined) return true;
+  const active = sessionStore.active;
+  if (active === null) return false;
+  return active.name === frameSessionId;
 }
 
 function handleMChanged(payload: Uint8Array): void {
@@ -345,8 +358,9 @@ function handleMChanged(payload: Uint8Array): void {
     console.warn('[ws] 0x81 M_CHANGED decode failed');
     return;
   }
-  // EphemeralStore.m 은 `SvelteSet<string>` — paneId 정수를 문자열로 변환.
-  ephemeralStore.m = new SvelteSet(decoded.panelIds.map(String));
+  // Active session 이 없으면 drop — pre-attach race 안전 가드.
+  if (sessionStore.active === null) return;
+  sessionStore.setM(decoded.panelIds.map(String));
 }
 
 function handleIChanged(payload: Uint8Array): void {
@@ -355,7 +369,8 @@ function handleIChanged(payload: Uint8Array): void {
     console.warn('[ws] 0x82 I_CHANGED decode failed');
     return;
   }
-  ephemeralStore.i = decoded.paneId === null ? null : String(decoded.paneId);
+  if (sessionStore.active === null) return;
+  sessionStore.setI(decoded.paneId === null ? null : String(decoded.paneId));
 }
 
 function handleViewportChanged(payload: Uint8Array): void {
@@ -364,7 +379,118 @@ function handleViewportChanged(payload: Uint8Array): void {
     console.warn('[ws] 0x83 VIEWPORT_CHANGED decode failed');
     return;
   }
-  ephemeralStore.viewport = { x: decoded.x, y: decoded.y, zoom: decoded.zoom };
+  if (sessionStore.active === null) return;
+  // 직접 set — updateViewport 의 debounce PUT 은 외부 변경 (다른 tab 등) 에는
+  // 부적합. 본 broadcast 는 BE 가 이미 영속한 상태의 통보.
+  sessionStore.viewport = { x: decoded.x, y: decoded.y, zoom: decoded.zoom };
+}
+
+function handleTerminalDied(payload: Uint8Array): void {
+  const decoded = decodeTerminalDied(payload);
+  if (!decoded) {
+    console.warn('[ws] 0x85 TERMINAL_DIED decode failed');
+    return;
+  }
+  // server-wide broadcast (BE 0034 §3.5). Mirror panels in every session share the
+  // same UUID, so a single mark covers every PanelDanglingOverlay subscribed to it.
+  danglingTerminals.mark(decoded.terminalId, decoded.reason);
+  // Stale UUID→PaneId binding 폐기 — respawn 후 새 PaneId 가 0x88 로 도착하면
+  // 그때 다시 bind. 폐기를 미루면 dangling 상태에서 잠시 옛 PaneId 로 stream
+  // subscribe 시도가 일어날 수 있음.
+  terminalPool.unbindPaneId(decoded.terminalId);
+  // Pool snapshot follows (alive: false). Refresh to drop the latency from the
+  // 5-s poll window so TerminalsPanel / PaneInfoPanel show the change too.
+  void terminalPool.refresh();
+}
+
+/**
+ * 0x86 MOUNT_CASCADE — BE Stage 5-D (0034 §8.3).
+ *
+ * Trigger-session-only frame (BE routes via 5-A session_table). Append a fresh
+ * TerminalItem at the server-provided coordinates if not already on canvas.
+ * No-op when no active session (race: WS open before attach).
+ */
+function handleMountCascade(payload: Uint8Array): void {
+  const decoded = decodeMountCascade(payload);
+  if (!decoded) {
+    console.warn('[ws] 0x86 MOUNT_CASCADE decode failed');
+    return;
+  }
+  const active = sessionStore.active;
+  if (active === null) {
+    console.debug('[ws] MOUNT_CASCADE received without active session — drop');
+    return;
+  }
+  const name = active.name;
+  if (sessionStore.items.has(decoded.terminalId)) {
+    // Idempotent — BE may broadcast on a retry.
+    return;
+  }
+  void mutateLayout(name, (cur) => {
+    if (cur.items.some((it: CanvasItem) => it.id === decoded.terminalId)) {
+      return cur;
+    }
+    const maxZ = cur.items.reduce(
+      (m: number, it: CanvasItem) => (it.z > m ? it.z : m),
+      0,
+    );
+    const item: TerminalItem = {
+      id: decoded.terminalId,
+      type: 'terminal',
+      parent_id: null,
+      x: decoded.x,
+      y: decoded.y,
+      w: decoded.w,
+      h: decoded.h,
+      z: maxZ + 1,
+      visibility: 'visible',
+      locked: false,
+      minimized: false,
+    };
+    return { ...cur, items: [...cur.items, item] };
+  })
+    .then(({ layout }) => {
+      sessionStore.loadLayout(layout);
+      void terminalPool.refresh();
+    })
+    .catch((err: unknown) => {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      console.warn('[ws] MOUNT_CASCADE mutateLayout failed', err);
+    });
+}
+
+/**
+ * 0x87 TERMINAL_LIST_UPDATE — BE Stage 5-D (0034 §8.3).
+ *
+ * Non-trigger-session frame. `added`/`removed` is a hint delta; `GET /api/terminals`
+ * is authoritative. Just refresh the pool.
+ */
+function handleTerminalListUpdate(payload: Uint8Array): void {
+  const decoded = decodeTerminalListUpdate(payload);
+  if (!decoded) {
+    console.warn('[ws] 0x87 TERMINAL_LIST_UPDATE decode failed');
+    return;
+  }
+  void terminalPool.refresh();
+}
+
+/**
+ * 0x88 TERMINAL_SPAWNED — BE batch `d00db66` (0039 §1.2 + §2.3).
+ *
+ * server-wide broadcast. UUID → numeric PaneId binding 갱신 — XtermHost 의
+ * terminal 모드가 reactive 하게 PANE_OUT/IN/RESIZE 흐름을 시작한다 (Option C1
+ * unblocker).
+ */
+function handleTerminalSpawned(payload: Uint8Array): void {
+  const decoded = decodeTerminalSpawned(payload);
+  if (!decoded) {
+    console.warn('[ws] 0x88 TERMINAL_SPAWNED decode failed');
+    return;
+  }
+  terminalPool.bindPaneId(decoded.terminalId, decoded.paneId);
 }
 
 function handleFocusModeChanged(payload: Uint8Array): void {
@@ -373,7 +499,8 @@ function handleFocusModeChanged(payload: Uint8Array): void {
     console.warn('[ws] 0x84 FOCUS_MODE_CHANGED decode failed');
     return;
   }
-  ephemeralStore.focusMode = {
+  if (sessionStore.active === null) return;
+  sessionStore.focusMode = {
     enabled: decoded.enabled,
     targetPanelId: decoded.targetPanelId === null ? null : String(decoded.targetPanelId),
   };

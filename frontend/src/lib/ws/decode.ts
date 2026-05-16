@@ -30,9 +30,12 @@ const HEADER_LEN = 5;
 export const MAX_PAYLOAD = 4 * 1024 * 1024;
 
 /**
- * Frame type discriminants — SSoT §2 의 32 슬롯 중 정의된 12 개.
- * 예약 슬롯 (0x08–0x0F, 0x85–0x8F) 은 *디코드 단계에서 null* 로 떨어뜨려 forward-compat
+ * Frame type discriminants — SSoT §2 의 32 슬롯 중 정의된 15 개.
+ * 예약 슬롯 (0x08–0x0F, 0x88–0x8F) 은 *디코드 단계에서 null* 로 떨어뜨려 forward-compat
  * 을 유지한다 (SSoT §6 호환성 정책).
+ *
+ * 0x86/0x87 는 BE Stage 5-D 의 trigger-aware auto-mount 용 — FE 측 사전 wire 정의
+ * (FE-NEW-6 co-decision). 0034 §8.3 의 권장 ID + payload 그대로 채택.
  */
 export const FRAME_TYPE = {
   // tmux-domain (0x01–0x07)
@@ -43,12 +46,16 @@ export const FRAME_TYPE = {
   PANE_PAUSE: 0x05,
   PANE_RESUME: 0x06,
   NOTIFY_MIRROR: 0x07,
-  // web-domain (0x80–0x84)
+  // web-domain (0x80–0x87)
   LAYOUT_CHANGED: 0x80,
   M_CHANGED: 0x81,
   I_CHANGED: 0x82,
   VIEWPORT_CHANGED: 0x83,
   FOCUS_MODE_CHANGED: 0x84,
+  TERMINAL_DIED: 0x85,
+  MOUNT_CASCADE: 0x86,
+  TERMINAL_LIST_UPDATE: 0x87,
+  TERMINAL_SPAWNED: 0x88,
 } as const;
 
 /** 정의된 frame type 코드의 union. */
@@ -109,6 +116,52 @@ export interface NotifyMirrorPayload {
   readonly paneId: number;
   /** SSoT §2.3 의 `{ kind, ... }` JSON. 알지 못하는 `kind` 는 호출 측에서 무시. */
   readonly body: Readonly<Record<string, unknown>>;
+}
+
+/** 0x85 TERMINAL_DIED — BE Stage 5-B (0034 §3). UUID-carrying. */
+export type TerminalDiedReason = 'exit' | 'killed';
+export interface TerminalDiedPayload {
+  readonly terminalId: string;
+  readonly reason: TerminalDiedReason;
+}
+
+/**
+ * 0x86 MOUNT_CASCADE — BE Stage 5-D (0034 §8.3 recommended).
+ *
+ * BE 가 *trigger session 의 webpage* 에만 fan-out (5-A session_table 라우팅).
+ * payload: server-determined coordinates for a freshly-spawned terminal.
+ * FE 는 sessionStore.active 의 layout 에 TerminalItem append (idempotent).
+ */
+export interface MountCascadePayload {
+  readonly terminalId: string;
+  readonly x: number;
+  readonly y: number;
+  readonly w: number;
+  readonly h: number;
+}
+
+/**
+ * 0x87 TERMINAL_LIST_UPDATE — BE Stage 5-D (0034 §8.3 recommended).
+ *
+ * BE 가 *non-trigger session 의 webpage* 에 fan-out — pool 변동의 hint delta.
+ * Authoritative source 는 여전히 `GET /api/terminals`; 본 frame 은 5-s 폴링
+ * latency 단축용. FE 는 terminalPool.refresh() 만 호출.
+ */
+export interface TerminalListUpdatePayload {
+  readonly added: readonly string[];
+  readonly removed: readonly string[];
+}
+
+/**
+ * 0x88 TERMINAL_SPAWNED — BE Stage 5 batch `d00db66` (0039 §1.2).
+ *
+ * spawn_terminal_with_uuid 의 register 직후 server-wide broadcast.
+ * FE 의 terminalPool 가 UUID → numeric PaneId 매핑 갱신 → XtermHost 의 terminal
+ * 모드가 PANE_OUT subscriber 등록 + PANE_IN/RESIZE 송신 가능.
+ */
+export interface TerminalSpawnedPayload {
+  readonly terminalId: string;
+  readonly paneId: number;
 }
 
 // ── Varint (unsigned LEB128) ───────────────────────────────────────────────
@@ -451,6 +504,102 @@ export function encodeFocusMode(enabled: boolean, targetPanelId: number | null):
   out[head.length] = enabled ? 1 : 0;
   out.set(target, head.length + 1);
   return out;
+}
+
+/**
+ * `0x85 TERMINAL_DIED` payload = `varint 0 + UTF-8 JSON {terminal_id, reason}`.
+ * BE 정본: `crates/ws-server/src/payload.rs::encode_terminal_died` (0034 §3.2).
+ *
+ * server-wide broadcast — mirror 정합 (같은 UUID 가 여러 session 의 panel 일 수
+ * 있으므로 session_id 라우팅 X).
+ */
+export function decodeTerminalDied(payload: Uint8Array): TerminalDiedPayload | null {
+  const obj = decodeVarintZeroJsonObject(payload);
+  if (!obj) return null;
+  const terminalId = obj['terminal_id'];
+  const reason = obj['reason'];
+  if (typeof terminalId !== 'string' || terminalId.length === 0) return null;
+  if (reason !== 'exit' && reason !== 'killed') return null;
+  return { terminalId, reason };
+}
+
+/**
+ * `0x86 MOUNT_CASCADE` payload = `varint 0 + UTF-8 JSON {terminal_id, x, y, w, h}`.
+ * BE Stage 5-D wire (0034 §8.3 권장).
+ */
+export function decodeMountCascade(payload: Uint8Array): MountCascadePayload | null {
+  const obj = decodeVarintZeroJsonObject(payload);
+  if (!obj) return null;
+  const terminalId = obj['terminal_id'];
+  const x = obj['x'];
+  const y = obj['y'];
+  const w = obj['w'];
+  const h = obj['h'];
+  if (typeof terminalId !== 'string' || terminalId.length === 0) return null;
+  if (typeof x !== 'number' || typeof y !== 'number') return null;
+  if (typeof w !== 'number' || typeof h !== 'number') return null;
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) {
+    return null;
+  }
+  if (w <= 0 || h <= 0) return null;
+  return { terminalId, x, y, w, h };
+}
+
+/**
+ * `0x87 TERMINAL_LIST_UPDATE` payload = `varint 0 + UTF-8 JSON {added: [..], removed: [..]}`.
+ * BE Stage 5-D wire (0034 §8.3 권장).
+ */
+export function decodeTerminalListUpdate(payload: Uint8Array): TerminalListUpdatePayload | null {
+  const obj = decodeVarintZeroJsonObject(payload);
+  if (!obj) return null;
+  const added = parseStringArray(obj['added']);
+  const removed = parseStringArray(obj['removed']);
+  if (added === null || removed === null) return null;
+  return { added, removed };
+}
+
+/**
+ * `0x88 TERMINAL_SPAWNED` payload = `varint 0 + UTF-8 JSON {terminal_id, pane_id}`.
+ * BE 정본: 0039 §1.2. PaneId 는 JS Number — 2⁵³-1 미만 보장하지만 long-running
+ * server overflow 대비 isSafeInteger guard.
+ */
+export function decodeTerminalSpawned(payload: Uint8Array): TerminalSpawnedPayload | null {
+  const obj = decodeVarintZeroJsonObject(payload);
+  if (!obj) return null;
+  const terminalId = obj['terminal_id'];
+  const paneId = obj['pane_id'];
+  if (typeof terminalId !== 'string' || terminalId.length === 0) return null;
+  if (typeof paneId !== 'number' || !Number.isSafeInteger(paneId) || paneId <= 0) return null;
+  return { terminalId, paneId };
+}
+
+function parseStringArray(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: string[] = [];
+  for (const x of v) {
+    if (typeof x !== 'string' || x.length === 0) return null;
+    out.push(x);
+  }
+  return out;
+}
+
+/**
+ * Shared helper — `varint 0 + UTF-8 JSON object` 형식의 frame body 디코딩.
+ * 0x85/0x86/0x87 등 web-domain JSON-bodied frame 의 공통 prefix 처리.
+ */
+function decodeVarintZeroJsonObject(payload: Uint8Array): Record<string, unknown> | null {
+  const view = makeView(payload);
+  const head = readVarintU(view, 0);
+  if (!head || head.value !== 0) return null;
+  const jsonBytes = payload.subarray(head.next);
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(jsonBytes));
+  } catch {
+    return null;
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return null;
+  return body as Record<string, unknown>;
 }
 
 // ── 내부 helper ────────────────────────────────────────────────────────────

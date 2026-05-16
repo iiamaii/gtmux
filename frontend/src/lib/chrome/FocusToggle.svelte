@@ -2,22 +2,22 @@
   /**
    * Focus mode toggle (plan 0005 Stage C, ADR-0017 §D5).
    *
-   * Toggles `ephemeralStore.focusMode.enabled`. The actual visual effect
+   * Toggles `sessionStore.focusMode.enabled`. The actual visual effect
    * (canvas darken / single-panel highlight) is wired in a later phase —
    * this Stage C deliverable lands the *UI surface* only so the Titlebar
    * has a coherent action layout (theme + focus + menu) from day one.
    */
 
   import IconButton from '$lib/ui/IconButton.svelte';
-  import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
-  const enabled = $derived(ephemeralStore.focusMode.enabled === true);
+  const enabled = $derived(sessionStore.focusMode.enabled === true);
   const label = $derived(enabled ? 'Exit focus mode' : 'Enter focus mode');
 
   function toggle(): void {
-    ephemeralStore.focusMode = {
+    sessionStore.focusMode = {
       enabled: !enabled,
-      targetPanelId: ephemeralStore.focusMode.targetPanelId ?? null,
+      targetPanelId: sessionStore.focusMode.targetPanelId ?? null,
     };
   }
 </script>

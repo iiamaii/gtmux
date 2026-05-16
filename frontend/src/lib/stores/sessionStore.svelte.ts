@@ -90,6 +90,16 @@ class SessionStore {
    */
   maximizedItemId = $state<string | null>(null);
 
+  /**
+   * Focus mode (ADR-0017 §D5). FE-only ephemeral — session 단위.
+   * targetPanelId === null 이면 currently-selected M[0] 이 대상.
+   * Stage 7 G27 의 시각 효과는 후속.
+   */
+  focusMode = $state<{ enabled: boolean; targetPanelId: string | null }>({
+    enabled: false,
+    targetPanelId: null,
+  });
+
   /* ────────────────────────────────────────────────────────────────────── */
   /* Layout lifecycle (loaded ↔ cleared)                                    */
   /* ────────────────────────────────────────────────────────────────────── */
@@ -111,6 +121,7 @@ class SessionStore {
     this.M.clear();
     this.I = null;
     this.maximizedItemId = null;
+    this.focusMode = { enabled: false, targetPanelId: null };
   }
 
   /**
@@ -139,6 +150,7 @@ class SessionStore {
     this.M.clear();
     this.I = null;
     this.maximizedItemId = null;
+    this.focusMode = { enabled: false, targetPanelId: null };
     sessionStorageHint.clear();
   }
 

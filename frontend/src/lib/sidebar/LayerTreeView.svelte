@@ -278,21 +278,66 @@
   }
 
   /**
-   * 선택 동기화 — ADR-0024 의 layer list 1차 가치 "다중 선택 + bulk action"
-   * 정합. Canvas.svelte 의 `onnodeclick` 과 동일 modifier 정책:
-   *   - plain → 단일 선택 (M.clear + add)
-   *   - meta/ctrl/shift → toggle in/out
-   * Shift range select (start↔end 의 visible range 일괄) 는 후속 (P1+).
+   * Selection anchor — 단일 클릭이 직전에 set 한 row id. Shift+click 의 range
+   * 시작점. anchor 가 visible tree 에서 사라지면 (예: ancestor collapse) 첫
+   * shift-click 이 fallback 으로 target 만 add.
+   */
+  let selectionAnchor = $state<string | null>(null);
+
+  /**
+   * 선택 동기화 — ADR-0024 의 layer list 1차 가치 "다중 선택 + bulk action".
+   *   - plain                : M = [id]. anchor = id.
+   *   - meta/ctrl + click    : M.toggle(id). anchor = id.
+   *   - shift + click        : visible tree 의 anchor↔id range 일괄 add (set
+   *                            anchor 가 null 이면 toggle fallback). anchor 는
+   *                            그대로 유지 — 동일 anchor 에서 연속 shift-click
+   *                            가능 (Finder/VSCode 컨벤션).
    */
   function selectNode(id: string, e?: MouseEvent | KeyboardEvent): void {
-    const mod =
-      e instanceof MouseEvent &&
-      (e.metaKey || e.ctrlKey || e.shiftKey);
-    if (mod) {
-      sessionStore.toggleM(id);
-    } else {
-      sessionStore.setM([id]);
+    if (e instanceof MouseEvent) {
+      if (e.shiftKey) {
+        const anchor = selectionAnchor;
+        if (anchor === null || anchor === id) {
+          sessionStore.toggleM(id);
+          if (anchor === null) selectionAnchor = id;
+          return;
+        }
+        const ids = visibleRangeIds(anchor, id);
+        if (ids.length === 0) {
+          sessionStore.toggleM(id);
+          return;
+        }
+        // setM 으로 anchor↔target range 만 선택. (multi-select 의 일반 직관 —
+        // shift 는 range *select*, ctrl 와 결합 시에만 add-to.)
+        if (e.metaKey || e.ctrlKey) {
+          for (const rid of ids) sessionStore.addToM(rid);
+        } else {
+          sessionStore.setM(ids);
+        }
+        return;
+      }
+      if (e.metaKey || e.ctrlKey) {
+        sessionStore.toggleM(id);
+        selectionAnchor = id;
+        return;
+      }
     }
+    sessionStore.setM([id]);
+    selectionAnchor = id;
+  }
+
+  /**
+   * Visible tree 안에서 두 row id 사이의 inclusive range 를 순서대로 반환.
+   * 두 id 중 어느 쪽이 위인지 무관 — visible tree 의 순방향 (위→아래) 정렬.
+   * 둘 중 하나라도 invisible 면 빈 배열.
+   */
+  function visibleRangeIds(a: string, b: string): string[] {
+    const order = tree.map((n) => n.id);
+    const ia = order.indexOf(a);
+    const ib = order.indexOf(b);
+    if (ia < 0 || ib < 0) return [];
+    const [lo, hi] = ia <= ib ? [ia, ib] : [ib, ia];
+    return order.slice(lo, hi + 1);
   }
 
   // Panel 행이 dead pane 인지 — 회색/취소선 표시 트리거.
@@ -300,6 +345,228 @@
     const n = paneNumeric(p.pane_id);
     if (n === null) return false;
     return muxStore.panes.get(n)?.dead === true;
+  }
+
+  /* ── Drag reorder / reparent (ADR-0024 D1 organization-only) ──────────
+   * 흐름:
+   *   - 행 draggable=true. dragstart 에 sourceIds 캡처 (M 에 dragged id 포함되면
+   *     selected set 전체, 아니면 dragged id 한 개).
+   *   - 각 행 dragover 시 mouse Y 가 행 높이의 1/4 미만 → 'before', 3/4 초과 →
+   *     'after', 중간 + 행 kind === 'group' 이면 'inside'. effectiveLocked 행은
+   *     drop 거부.
+   *   - drop 시 mutation:
+   *       * 'before'/'after': dragged 들의 parent_id 를 target.parent_id 로
+   *         교체. 그 parent 안 group 들의 order 를 dragged 위치에 맞춰 재책정.
+   *         (item 은 sibling order field 없음 — 시각 위치 정확 일치 X, parent
+   *         이동만 보장. BE schema 의 item order 추가 시점에 보강.)
+   *       * 'inside': target 이 group 이어야 함. dragged 의 parent_id = target.id.
+   *         dragged group 의 order = (max order in target) + 1.
+   *   - Cycle 보호: dragged group 의 descendantGroups 에 target 의 ancestor 가
+   *     포함되면 drop 거부. dragged 가 target 자신이거나 target.parent 이면 noop.
+   *   - Layer mode === 'z' 일 때 drag 비활성 — z mode 는 rendering stack
+   *     관점이라 reorder 가 z 변경을 의미하지 않음 (ADR-0024 D2 의 4 액션과
+   *     혼동 방지). */
+
+  type DropPos = 'before' | 'inside' | 'after';
+  interface DragState {
+    sourceIds: string[];
+    invalidTargets: Set<string>;
+  }
+  let dragState = $state<DragState | null>(null);
+  let dropTargetId = $state<string | null>(null);
+  let dropTargetPos = $state<DropPos | null>(null);
+
+  function groupDescendantIds(groupId: string): Set<string> {
+    const out = new Set<string>([groupId]);
+    let added = true;
+    while (added) {
+      added = false;
+      for (const g of sessionStore.groups.values()) {
+        if (g.parent_id !== null && out.has(g.parent_id) && !out.has(g.id)) {
+          out.add(g.id);
+          added = true;
+        }
+      }
+    }
+    return out;
+  }
+
+  function isItemLocked(id: string): boolean {
+    const it = sessionStore.items.get(id);
+    if (it !== undefined) return it.locked === true;
+    const g = sessionStore.groups.get(id);
+    if (g !== undefined) return g.locked === true;
+    return false;
+  }
+
+  function onRowDragStart(id: string, e: DragEvent): void {
+    if (layerMode === 'z') {
+      e.preventDefault();
+      return;
+    }
+    if (isItemLocked(id)) {
+      e.preventDefault();
+      return;
+    }
+    const dragged = sessionStore.M.has(id) && sessionStore.M.size > 0
+      ? Array.from(sessionStore.M)
+      : [id];
+    // locked 가 섞여 있으면 unlocked 만 drag (silent).
+    const draggable = dragged.filter((d) => !isItemLocked(d));
+    if (draggable.length === 0) {
+      e.preventDefault();
+      return;
+    }
+    // Cycle 보호 대상 — dragged 중 group 인 것들의 descendant 합집합.
+    const invalid = new Set<string>(draggable);
+    for (const did of draggable) {
+      if (sessionStore.groups.has(did)) {
+        for (const desc of groupDescendantIds(did)) invalid.add(desc);
+      }
+    }
+    dragState = { sourceIds: draggable, invalidTargets: invalid };
+    if (e.dataTransfer !== null) {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', draggable.join(','));
+    }
+  }
+
+  function onRowDragOver(id: string, kind: 'group' | 'panel', e: DragEvent): void {
+    const state = dragState;
+    if (state === null) return;
+    if (state.invalidTargets.has(id)) return;
+    e.preventDefault();
+    if (e.dataTransfer !== null) e.dataTransfer.dropEffect = 'move';
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const ratio = (e.clientY - rect.top) / rect.height;
+    let pos: DropPos;
+    if (ratio < 0.25) pos = 'before';
+    else if (ratio > 0.75) pos = 'after';
+    else pos = kind === 'group' ? 'inside' : (ratio < 0.5 ? 'before' : 'after');
+    dropTargetId = id;
+    dropTargetPos = pos;
+  }
+
+  function onRowDragLeave(id: string, _e: DragEvent): void {
+    // 다른 행으로 진입하면 그쪽이 dragover 로 덮어쓰므로 noop 이지만, drop zone
+    // 밖으로 나가는 경우 대비 약간 지연 clear (다음 dragover 까지의 깜빡임 회피).
+    if (dropTargetId === id) {
+      queueMicrotask(() => {
+        if (dropTargetId === id) {
+          dropTargetId = null;
+          dropTargetPos = null;
+        }
+      });
+    }
+  }
+
+  function onRowDrop(id: string, kind: 'group' | 'panel', e: DragEvent): void {
+    const state = dragState;
+    dragState = null;
+    const pos = dropTargetPos;
+    dropTargetId = null;
+    dropTargetPos = null;
+    if (state === null || pos === null) return;
+    if (state.invalidTargets.has(id)) return;
+    e.preventDefault();
+    void commitReparent(state.sourceIds, id, kind, pos);
+  }
+
+  function onTreeDragEnd(_e: DragEvent): void {
+    dragState = null;
+    dropTargetId = null;
+    dropTargetPos = null;
+  }
+
+  /**
+   * Dragged ids 를 target 의 (parent_id, position) 으로 이동. Single
+   * mutateActiveLayout call 로 items/groups 두 배열 동시 갱신.
+   *
+   * - 'inside' (target = group): dragged.parent_id = target.id, dragged group 의
+   *   order = max(target 안 group order) + 1, item 은 order 무관.
+   * - 'before' / 'after': dragged.parent_id = target.parent_id. group 만 sibling
+   *   order 를 재배열 — dragged group 들을 target 의 order 직전/직후로 삽입 +
+   *   남은 group 들 sequential 재번호.
+   * - dragged 가 다중일 때 입력 순서 보존.
+   */
+  async function commitReparent(
+    sourceIds: string[],
+    targetId: string,
+    targetKind: 'group' | 'panel',
+    pos: DropPos,
+  ): Promise<void> {
+    // Resolve target's effective parent depending on pos.
+    let parentTargetId: string | null;
+    let beforeTargetId: string | null = null;
+    if (pos === 'inside') {
+      if (targetKind !== 'group') return;
+      parentTargetId = targetId;
+    } else {
+      const targetGroup = sessionStore.groups.get(targetId);
+      const targetItem = sessionStore.items.get(targetId);
+      parentTargetId =
+        (targetGroup?.parent_id ?? targetItem?.parent_id) ?? null;
+      beforeTargetId = pos === 'before' ? targetId : null;
+    }
+    // No-op fast paths.
+    if (sourceIds.length === 1 && sourceIds[0] === targetId) return;
+
+    await mutateActiveLayout((cur) => {
+      // 1) parent_id 갱신 (items + groups).
+      const movedItemSet = new Set(
+        sourceIds.filter((id) => cur.items.some((it) => it.id === id)),
+      );
+      const movedGroupSet = new Set(
+        sourceIds.filter((id) => cur.groups.some((g) => g.id === id)),
+      );
+      const itemsNext = cur.items.map((it) =>
+        movedItemSet.has(it.id) ? { ...it, parent_id: parentTargetId } : it,
+      );
+      const groupsParented = cur.groups.map((g) =>
+        movedGroupSet.has(g.id) ? { ...g, parent_id: parentTargetId } : g,
+      );
+
+      // 2) Group sibling order 재배열 — 같은 parentTargetId 의 groups 만.
+      const siblingsBefore = groupsParented
+        .filter((g) => g.parent_id === parentTargetId)
+        .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+      const movedInOrder = sourceIds
+        .map((id) => siblingsBefore.find((g) => g.id === id))
+        .filter((g): g is typeof siblingsBefore[number] => g !== undefined);
+      const others = siblingsBefore.filter((g) => !movedGroupSet.has(g.id));
+      const finalSequence: typeof siblingsBefore = [];
+      if (pos === 'inside') {
+        finalSequence.push(...others, ...movedInOrder);
+      } else {
+        // 'before' or 'after' a sibling row.
+        for (const g of others) {
+          if (g.id === beforeTargetId) {
+            finalSequence.push(...movedInOrder);
+          }
+          finalSequence.push(g);
+          if (pos === 'after' && g.id === targetId) {
+            finalSequence.push(...movedInOrder);
+          }
+        }
+        // beforeTargetId 가 others 안에 없거나 (target 이 group 이 아님), pos
+        // 'after' 의 target 이 others 안에 없으면 끝에 append (fall-through).
+        if (
+          movedInOrder.length > 0 &&
+          !finalSequence.some((g) => movedGroupSet.has(g.id))
+        ) {
+          finalSequence.push(...movedInOrder);
+        }
+      }
+      // 재번호 — sparse → 1, 2, 3 … (충돌 방지).
+      const reorderedIds = new Set(finalSequence.map((g) => g.id));
+      const groupsNext = groupsParented.map((g) => {
+        if (!reorderedIds.has(g.id)) return g;
+        const idx = finalSequence.findIndex((f) => f.id === g.id);
+        return { ...g, order: idx + 1 };
+      });
+
+      return { ...cur, items: itemsNext, groups: groupsNext };
+    });
   }
 
   async function mutateActiveLayout(
@@ -410,9 +677,19 @@
         <li
           class="row group-row"
           class:selected
+          class:drop-before={dropTargetId === node.id && dropTargetPos === 'before'}
+          class:drop-inside={dropTargetId === node.id && dropTargetPos === 'inside'}
+          class:drop-after={dropTargetId === node.id && dropTargetPos === 'after'}
+          class:dragging={dragState !== null && dragState.sourceIds.includes(node.id)}
           role="treeitem"
           aria-expanded={node.hasChildren ? isOpen : undefined}
           aria-selected={selected}
+          draggable={layerMode === 'tree' && !isItemLocked(node.id)}
+          ondragstart={(e: DragEvent) => onRowDragStart(node.id, e)}
+          ondragover={(e: DragEvent) => onRowDragOver(node.id, 'group', e)}
+          ondragleave={(e: DragEvent) => onRowDragLeave(node.id, e)}
+          ondrop={(e: DragEvent) => onRowDrop(node.id, 'group', e)}
+          ondragend={onTreeDragEnd}
           style:padding-left={`${node.depth * 16 + 4}px`}
         >
           <div class="row-inner">
@@ -534,8 +811,17 @@
           class="row panel-row"
           class:selected
           class:dead
+          class:drop-before={dropTargetId === node.id && dropTargetPos === 'before'}
+          class:drop-after={dropTargetId === node.id && dropTargetPos === 'after'}
+          class:dragging={dragState !== null && dragState.sourceIds.includes(node.id)}
           role="treeitem"
           aria-selected={selected}
+          draggable={layerMode === 'tree' && !isItemLocked(node.id)}
+          ondragstart={(e: DragEvent) => onRowDragStart(node.id, e)}
+          ondragover={(e: DragEvent) => onRowDragOver(node.id, 'panel', e)}
+          ondragleave={(e: DragEvent) => onRowDragLeave(node.id, e)}
+          ondrop={(e: DragEvent) => onRowDrop(node.id, 'panel', e)}
+          ondragend={onTreeDragEnd}
           style:padding-left={`${node.depth * 16 + 24}px`}
         >
           <div class="row-inner">
@@ -648,6 +934,36 @@
 
   .row {
     display: block;
+    position: relative;
+  }
+
+  /* Drag-reorder/reparent — drop indicator (ADR-0024 D1 layer list V2).
+   * before/after = 2px accent line at top/bottom edge.
+   * inside (group only) = accent tint background + dashed outline. */
+  .row.dragging {
+    opacity: 0.4;
+  }
+  .row.drop-before::before,
+  .row.drop-after::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--color-accent);
+    pointer-events: none;
+    z-index: 1;
+  }
+  .row.drop-before::before {
+    top: 0;
+  }
+  .row.drop-after::after {
+    bottom: 0;
+  }
+  .row.drop-inside {
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+    outline: 1px dashed var(--color-accent);
+    outline-offset: -1px;
   }
 
   .row-inner {

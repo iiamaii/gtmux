@@ -20,8 +20,14 @@ export type ConnectionState = 'connecting' | 'open' | 'closing' | 'closed' | 're
 export interface WsClientOptions {
   /** WS URL — 일반적으로 `computeWsUrl()` 산출. */
   readonly url: string;
-  /** base64url 토큰 (XDG_STATE_HOME 의 `.token` 파일). */
-  readonly token: string;
+  /**
+   * base64url Bearer token (XDG_STATE_HOME 의 `.token` 파일). `null` 인 경우
+   * subprotocol 에 `bearer.<token>` 미포함 — handshake 는 `gtmux.v1` 만 송신.
+   * BE 의 D10 α (cookie-additive auth) 가 cookie 만으로 upgrade 를 허용하므로
+   * cookie-only 사용자도 정상 WS 연결 가능. token 없으면 PANE_IN / RESIZE 송신
+   * 도 dispatch 안 됨 (XtermHost 의 wsClient null check) — output 만 받는 read-only.
+   */
+  readonly token: string | null;
   /** 디코드 성공한 envelope 단위 콜백. dispatcher 가 store fan-out 수행. */
   readonly onMessage: (frame: Envelope) => void;
   /** 상태 전이 콜백. ConnectionStore 와 ReconnectBanner 의 single source. */
@@ -158,7 +164,14 @@ export class WsClient {
       // RFC 6455: subprotocol 은 comma-separated value 가 아니라 *배열* 로
       // 전달해야 한다 (브라우저 WS API). 백엔드 lib.rs 의 `parse_subprotocol` 은
       // comma-separated 를 받아 두 sub-token 을 추출한다.
-      ws = new WebSocket(this.#opts.url, ['gtmux.v1', `bearer.${this.#opts.token}`]);
+      //
+      // D10 α (cookie-additive auth): token 이 없으면 `bearer.<t>` 를 송신하지
+      // 않고 cookie 만으로 upgrade. BE 의 cookie_validator 가 cookie 를 검증.
+      const protocols =
+        this.#opts.token !== null
+          ? ['gtmux.v1', `bearer.${this.#opts.token}`]
+          : ['gtmux.v1'];
+      ws = new WebSocket(this.#opts.url, protocols);
     } catch (e) {
       this.#opts.onError?.(e);
       this.#scheduleReconnect();
