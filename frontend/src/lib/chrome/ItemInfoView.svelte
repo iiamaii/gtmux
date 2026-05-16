@@ -29,12 +29,65 @@
     TextVerticalAlign,
   } from '$lib/types/canvas';
 
-  // First-selected Panel — Set iteration order is insertion order, which
-  // matches the user's click sequence well enough for v0.
-  const selectedPanelId = $derived.by(() => {
-    const it = sessionStore.M.values().next();
-    return it.done ? null : (it.value as string);
+  // ADR-0027 D2 — multi-select aware. selectedIds = M 의 array snapshot.
+  // selectedPanelId = first id (display 의 single-item fallback path 용).
+  const selectedIds = $derived.by((): string[] => Array.from(sessionStore.M));
+  const selectedPanelId = $derived.by((): string | null =>
+    selectedIds.length === 0 ? null : (selectedIds[0] as string),
+  );
+  const selectionCount = $derived(selectedIds.length);
+
+  // 다중 선택의 type 동질성 — 모두 동일 type 이면 그 type, 아니면 null (mixed).
+  const selectedItems = $derived.by((): CanvasItem[] => {
+    const out: CanvasItem[] = [];
+    for (const id of selectedIds) {
+      const it = sessionStore.items.get(id);
+      if (it !== undefined) out.push(it);
+    }
+    return out;
   });
+  const commonType = $derived.by((): string | null => {
+    const first = selectedItems[0];
+    if (first === undefined) return null;
+    const t = first.type;
+    for (const it of selectedItems) {
+      if (it.type !== t) return null;
+    }
+    return t;
+  });
+  const isMultiMixed = $derived(selectionCount > 1 && commonType === null);
+  const isMultiHomogeneous = $derived(selectionCount > 1 && commonType !== null);
+
+  /**
+   * ADR-0027 D3 — Common numeric / string field 의 mixed-aware reader.
+   * 모든 selected item 의 `key` 값이 동일 하면 그 값, 아니면 sentinel 'Mixed'.
+   * Empty selection 은 null.
+   */
+  function commonField<K extends keyof CanvasItem>(key: K): CanvasItem[K] | 'Mixed' | null {
+    const head = selectedItems[0];
+    if (head === undefined) return null;
+    const first = head[key];
+    for (const it of selectedItems) {
+      if (it[key] !== first) return 'Mixed';
+    }
+    return first;
+  }
+
+  /** Common field 를 display string 으로 — numeric / boolean / Mixed 처리. */
+  function commonNumStr(key: keyof CanvasItem, fallback = '—'): string {
+    const v = commonField(key);
+    if (v === null) return fallback;
+    if (v === 'Mixed') return 'Mixed';
+    if (typeof v === 'number') return String(Math.round(v));
+    return fallback;
+  }
+  function commonStrOr(key: keyof CanvasItem, fallback = '—'): string {
+    const v = commonField(key);
+    if (v === null) return fallback;
+    if (v === 'Mixed') return 'Mixed';
+    if (typeof v === 'string' && v.length > 0) return v;
+    return fallback;
+  }
 
   const selectedPanel = $derived.by((): Record<string, unknown> | null => {
     if (selectedPanelId === null) return null;
@@ -176,13 +229,34 @@
         <p class="hint">Click a panel on the canvas to inspect.</p>
       </div>
     {:else}
+      {#if selectionCount > 1}
+        <!-- ADR-0027 D2 — multi-select header (count + type homogeneity). -->
+        <div class="multi-header">
+          <span class="multi-count mono">{selectionCount}</span>
+          <span class="multi-label">
+            {#if isMultiMixed}
+              items selected · <span class="muted">multiple types</span>
+            {:else}
+              {commonType}s selected
+            {/if}
+          </span>
+        </div>
+      {/if}
       <section class="section">
         <h4 class="section-head">Identity</h4>
         <div class="kv">
           <span class="k">type</span>
-          <span class="v mono">{strOr(selectedPanel['type'], 'panel')}</span>
+          <span class="v mono" class:mixed={isMultiMixed}>
+            {#if selectionCount === 1}
+              {strOr(selectedPanel['type'], 'panel')}
+            {:else if isMultiMixed}
+              Mixed
+            {:else}
+              {commonType}
+            {/if}
+          </span>
         </div>
-        {#if isSelectedTerminal}
+        {#if selectionCount === 1 && isSelectedTerminal}
           <div class="kv">
             <span class="k">terminal</span>
             <span class="v mono">{strOr(selectedPanel['pane_id'], '—')}</span>
@@ -190,12 +264,16 @@
         {/if}
         <div class="kv">
           <span class="k">label</span>
-          <span class="v">{strOr(selectedPanel['label'], '—')}</span>
+          <span class="v" class:mixed={commonField('label') === 'Mixed'}>
+            {commonStrOr('label')}
+          </span>
         </div>
-        <div class="kv">
-          <span class="k">id</span>
-          <span class="v mono">{selectedPanel.id}</span>
-        </div>
+        {#if selectionCount === 1}
+          <div class="kv">
+            <span class="k">id</span>
+            <span class="v mono">{selectedPanel.id}</span>
+          </div>
+        {/if}
       </section>
 
       <section class="section">
@@ -203,30 +281,40 @@
         <div class="kv-pair">
           <div class="kv">
             <span class="k">x</span>
-            <span class="v mono">{numOr(selectedPanel['x'], '0')}</span>
+            <span class="v mono" class:mixed={commonField('x') === 'Mixed'}>
+              {commonNumStr('x', '0')}
+            </span>
           </div>
           <div class="kv">
             <span class="k">y</span>
-            <span class="v mono">{numOr(selectedPanel['y'], '0')}</span>
+            <span class="v mono" class:mixed={commonField('y') === 'Mixed'}>
+              {commonNumStr('y', '0')}
+            </span>
           </div>
         </div>
         <div class="kv-pair">
           <div class="kv">
             <span class="k">w</span>
-            <span class="v mono">{numOr(selectedPanel['w'], '—')}</span>
+            <span class="v mono" class:mixed={commonField('w') === 'Mixed'}>
+              {commonNumStr('w')}
+            </span>
           </div>
           <div class="kv">
             <span class="k">h</span>
-            <span class="v mono">{numOr(selectedPanel['h'], '—')}</span>
+            <span class="v mono" class:mixed={commonField('h') === 'Mixed'}>
+              {commonNumStr('h')}
+            </span>
           </div>
         </div>
         <div class="kv">
           <span class="k">z</span>
-          <span class="v mono">{numOr(selectedPanel['z'], '0')}</span>
+          <span class="v mono" class:mixed={commonField('z') === 'Mixed'}>
+            {commonNumStr('z', '0')}
+          </span>
         </div>
       </section>
 
-      {#if isSelectedTerminal && (terminalPoolEntry !== null || sessionItem !== null)}
+      {#if selectionCount === 1 && isSelectedTerminal && (terminalPoolEntry !== null || sessionItem !== null)}
         <section class="section">
           <h4 class="section-head">Terminal · Pool</h4>
           {#if terminalPoolEntry !== null}
@@ -264,7 +352,7 @@
         </section>
       {/if}
 
-      {#if sessionItem !== null && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path')}
+      {#if selectionCount === 1 && sessionItem !== null && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path')}
         <section class="section">
           <h4 class="section-head">Item Payload</h4>
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
@@ -470,6 +558,36 @@
   .empty .hint {
     font-size: var(--text-base);
     color: var(--color-fg-subtle);
+  }
+
+  /* ADR-0027 D2 — multi-select header. */
+  .multi-header {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-6);
+    padding: var(--space-8) var(--space-12);
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+    font-size: var(--text-md);
+  }
+
+  .multi-count {
+    font-weight: 540;
+    color: var(--color-fg);
+  }
+
+  .multi-label {
+    color: var(--color-fg-muted);
+  }
+
+  .multi-label .muted {
+    color: var(--color-fg-subtle);
+  }
+
+  /* ADR-0027 D3 — mixed value (placeholder 같은 muted italic). */
+  .kv .v.mixed {
+    color: var(--color-fg-subtle);
+    font-style: italic;
   }
 
   .section {
