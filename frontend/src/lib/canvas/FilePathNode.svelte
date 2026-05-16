@@ -92,6 +92,7 @@
   async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
     const active = sessionStore.active;
     if (active === null) return;
+    if (!(await ensureMutationOk('Resize aborted — session reconnect failed.'))) return;
     try {
       const { layout } = await mutateLayout(active.name, (cur) => ({
         ...cur,
