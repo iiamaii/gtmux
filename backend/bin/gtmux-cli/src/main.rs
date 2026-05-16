@@ -462,6 +462,14 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     // `XtermHost` would otherwise stay on the "connecting" placeholder.
     hub.set_terminal_uuid_provider(app_state.terminal_map.clone());
 
+    // Slice next-2 (ADR-0025 D6): session pane-set provider so the WS
+    // handler's `pane_output` filter can resolve a session_name to its
+    // current PaneId set. Cookie-attached WS connections only forward
+    // bytes for terminals in their session's layout — cross-session
+    // mirror (ADR-0021 D2) still works because a mirrored UUID appears
+    // in both sessions' layouts.
+    hub.set_session_pane_set_provider(std::sync::Arc::new(app_state.clone()));
+
     let state_for_disconnect = app_state.clone();
     let _disconnect_task = tokio::spawn(async move {
         while let Some(cookie) = disconnect_rx.recv().await {

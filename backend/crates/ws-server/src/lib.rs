@@ -55,8 +55,8 @@ mod varint;
 pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTED_CTRL_CMDS};
 pub use hub::{
     CookieValidator, Hub, ManipulationEvent, MountCascadeEvent, ServerShutdownEvent,
-    TerminalDiedEvent, TerminalListChangeEvent, TerminalSpawnedEvent, TerminalUuidProvider,
-    HUB_BROADCAST_CAPACITY,
+    SessionChangeEvent, SessionPaneSetProvider, TerminalDiedEvent, TerminalListChangeEvent,
+    TerminalSpawnedEvent, TerminalUuidProvider, HUB_BROADCAST_CAPACITY,
 };
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
 
@@ -533,6 +533,22 @@ async fn handle_socket(
     let mut manipulation_rx = hub.subscribe_manipulation();
     let mut mount_cascade_rx = hub.subscribe_mount_cascade();
     let mut server_shutdown_rx = hub.subscribe_server_shutdown();
+    // Slice next-2 (ADR-0025 D4): observe cookie session changes so
+    // the filter set rebuilds without a full reconnect.
+    let mut session_change_rx = hub.subscribe_session_change();
+
+    // Slice next-2 (ADR-0025 D1/D2/D3): per-WS owned `PaneId` filter
+    // set. `None` = legacy demo path (server-wide pass per D5).
+    // `Some(set)` = forward only when `pane_id ∈ set`. The set is
+    // *owned* by this task (no `Arc<RwLock>`) so the hot `contains`
+    // check in the `pane_output` arm is lock-free.
+    //
+    // `filter_armed` = false during catch-up replay so the cold-load
+    // race (handshake racing a layout PUT) doesn't drop the user's
+    // own session history. Live frames are filtered (true) once the
+    // catch-up replay completes.
+    let mut session_pane_set: Option<std::collections::HashSet<u64>> = None;
+    let mut filter_armed = false;
 
     // Send the initial LAYOUT_CHANGED hello so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -640,6 +656,24 @@ async fn handle_socket(
     let mut suspended: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
     let mut last_pause_event: HashMap<PaneId, Instant> = HashMap::new();
 
+    // Slice next-2 (ADR-0025 D2): cold-load the session pane-set at
+    // the live-phase boundary — catch-up replay above ran without the
+    // filter (D1.catch-up-replay-policy), and we transition into the
+    // filtered live phase here.
+    //
+    // No provider → legacy demo path (`session_pane_set = None`).
+    // Has provider but cookie not attached → legacy demo path too —
+    // bearer-only automation clients keep working unchanged.
+    if let (Some(provider), Some(cookie)) =
+        (hub.session_pane_set_provider(), cookie_value.as_deref())
+    {
+        if let Some(session_name) = hub.session_for_cookie(cookie) {
+            let set = provider.pane_ids_for_session(&session_name).await;
+            session_pane_set = Some(set);
+        }
+    }
+    filter_armed = true;
+
     loop {
         tokio::select! {
             biased;
@@ -719,6 +753,18 @@ async fn handle_socket(
                         if suspended.contains(&id) {
                             continue;
                         }
+                        // Slice next-2 (ADR-0025 D1): session-scoped
+                        // filter. `filter_armed = false` during the
+                        // catch-up replay above — no filter. After
+                        // catch-up, `Some(set)` enforces ownership;
+                        // `None` (legacy demo path, D5) passes through.
+                        if filter_armed {
+                            if let Some(set) = session_pane_set.as_ref() {
+                                if !set.contains(&id.0) {
+                                    continue;
+                                }
+                            }
+                        }
                         let env = Envelope::new(
                             FrameType::PaneOutput,
                             Bytes::from(payload::encode_pane_out(
@@ -743,6 +789,25 @@ async fn handle_socket(
             layout = layout_rx.recv() => {
                 match layout {
                     Ok(etag) => {
+                        // Slice next-2 (ADR-0025 D3): a layout PUT may
+                        // have added/removed terminal items in *some*
+                        // session. We can't tell which from the ETag
+                        // alone, so re-query when this connection has
+                        // an attached session. False positives are
+                        // cheap (rare PUT × in-memory join).
+                        if let (Some(provider), Some(cookie)) = (
+                            hub.session_pane_set_provider(),
+                            cookie_value.as_deref(),
+                        ) {
+                            if let Some(my_session) = hub.session_for_cookie(cookie) {
+                                let fresh = provider
+                                    .pane_ids_for_session(&my_session)
+                                    .await;
+                                if let Some(set) = session_pane_set.as_mut() {
+                                    *set = fresh;
+                                }
+                            }
+                        }
                         let env = Envelope::new(
                             FrameType::LayoutChanged,
                             Bytes::from(payload::encode_layout_changed(&etag)),
@@ -764,6 +829,14 @@ async fn handle_socket(
             died = terminal_died_rx.recv() => {
                 match died {
                     Ok(event) => {
+                        // Slice next-2 (ADR-0025 D3): drop the dead
+                        // PaneId from the filter set so the next
+                        // (impossible — dead) broadcast for it would
+                        // already have been filtered out anyway. The
+                        // remove is a memory-hygiene op, not security.
+                        if let Some(set) = session_pane_set.as_mut() {
+                            set.remove(&event.pane_id);
+                        }
                         let env = Envelope::new(
                             FrameType::TerminalDied,
                             Bytes::from(payload::encode_terminal_died(&event.uuid, event.reason)),
@@ -880,6 +953,26 @@ async fn handle_socket(
             spawned = terminal_spawned_rx.recv() => {
                 match spawned {
                     Ok(event) => {
+                        // Slice next-2 (ADR-0025 D3): add the new
+                        // PaneId to the filter set if the terminal's
+                        // UUID belongs to *our* session. Re-query the
+                        // provider — the cheaper alternative would
+                        // require a UUID→session reverse index in the
+                        // hub, but the work-package payload (~1 spawn
+                        // per user click) doesn't justify it.
+                        if let (Some(provider), Some(cookie)) = (
+                            hub.session_pane_set_provider(),
+                            cookie_value.as_deref(),
+                        ) {
+                            if let Some(my_session) = hub.session_for_cookie(cookie) {
+                                let fresh = provider
+                                    .pane_ids_for_session(&my_session)
+                                    .await;
+                                if let Some(set) = session_pane_set.as_mut() {
+                                    *set = fresh;
+                                }
+                            }
+                        }
                         // Server-wide broadcast — every attached webpage
                         // potentially mirrors the new terminal. No cookie
                         // filter; the FE decides per-instance whether to
@@ -902,6 +995,58 @@ async fn handle_socket(
                         // FE will catch up via the next /api/terminals poll,
                         // same fallback as the terminal-list-change arm.
                         warn!(skipped = n, "ws terminal-spawned subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — other arms will hit Closed too.
+                    }
+                }
+            }
+            change = session_change_rx.recv() => {
+                match change {
+                    Ok(event) => {
+                        // Slice next-2 (ADR-0025 D4): cookie session
+                        // change. Only matter when this connection's
+                        // cookie matches.
+                        let my_cookie = match cookie_value.as_deref() {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        if event.cookie.as_ref() != my_cookie {
+                            continue;
+                        }
+                        match (event.new_session.as_deref(), hub.session_pane_set_provider()) {
+                            (Some(name), Some(provider)) => {
+                                let fresh = provider.pane_ids_for_session(name).await;
+                                session_pane_set = Some(fresh);
+                            }
+                            (None, _) => {
+                                // D5: cookie detached → legacy path.
+                                session_pane_set = None;
+                            }
+                            (Some(_), None) => {
+                                // Provider got unregistered? Treat as
+                                // legacy path so PANE_OUT keeps
+                                // flowing rather than going dark.
+                                session_pane_set = None;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Lagged on a low-freq channel implies many
+                        // workspace switches; recompute defensively.
+                        if let (Some(provider), Some(cookie)) = (
+                            hub.session_pane_set_provider(),
+                            cookie_value.as_deref(),
+                        ) {
+                            if let Some(my_session) = hub.session_for_cookie(cookie) {
+                                let fresh = provider
+                                    .pane_ids_for_session(&my_session)
+                                    .await;
+                                session_pane_set = Some(fresh);
+                            } else {
+                                session_pane_set = None;
+                            }
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // Hub dropped — other arms will hit Closed too.

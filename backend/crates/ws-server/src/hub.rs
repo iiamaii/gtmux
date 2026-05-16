@@ -70,6 +70,26 @@ pub trait TerminalUuidProvider: Send + Sync {
     async fn alive_bindings(&self) -> Vec<(u64, Arc<str>)>;
 }
 
+/// Slice next-2 (ADR-0025 D6): join `SessionLayout.items` ∩ `TerminalMap`
+/// to surface the *current `PaneId` set* of the terminals attached to
+/// `session_name`. Used by the WS handler's `pane_output` filter so a
+/// connection only forwards frames whose `PaneId` is in its session's
+/// set — D2 of ADR-0025 defines the set as
+/// `{ TerminalMap.by_uuid[item.id] : item ∈ layout, item.type == "terminal" }`.
+///
+/// Implementations should treat unmatched UUIDs (terminal item present
+/// in layout but no live `PaneId`) as *omitted* — the filter's
+/// false-negative-is-safe invariant (D3) covers them via the next
+/// `0x88 TERMINAL_SPAWNED` event.
+#[async_trait]
+pub trait SessionPaneSetProvider: Send + Sync {
+    /// Resolve `session_name` to the current PaneId set. Missing
+    /// session or empty layout → empty set. Called once per WS
+    /// handshake (cold load); hot updates come through the hub's event
+    /// channels.
+    async fn pane_ids_for_session(&self, session_name: &str) -> std::collections::HashSet<u64>;
+}
+
 /// Fan-out channel depth for the multiplexed pane output stream. Sized
 /// for 50-pane × occasional-burst (mirrors the legacy `HUB_BROADCAST_CAPACITY`
 /// value before §2.4 of `docs/reports/0026-stage-b-carry-forward.md` —
@@ -114,6 +134,12 @@ const MOUNT_CASCADE_BROADCAST_CAPACITY: usize = 64;
 /// loop to drain even under heavy contention.
 const SERVER_SHUTDOWN_BROADCAST_CAPACITY: usize = 16;
 
+/// Capacity for the `SessionChange` channel (Slice next-2, ADR-0025
+/// D4). Cookie session changes are rare events (workspace switch, ~1
+/// per minute peak), so a small cap suffices. 64 leaves headroom for
+/// bursts of test churn without straining the broadcast layer.
+const SESSION_CHANGE_BROADCAST_CAPACITY: usize = 64;
+
 /// Payload of a `TerminalDied` broadcast. `uuid` is the schema-side
 /// terminal id; `reason` is `"exit"` (process self-exited) or `"killed"`
 /// (signal-driven exit). `Arc<str>` over `String` so the broadcast clone
@@ -122,6 +148,12 @@ const SERVER_SHUTDOWN_BROADCAST_CAPACITY: usize = 16;
 pub struct TerminalDiedEvent {
     pub uuid: Arc<str>,
     pub reason: &'static str,
+    /// PaneId of the dead terminal, carried so the WS handler's
+    /// session pane-set filter (ADR-0025 D3) can `set.remove(pane_id)`
+    /// without a `TerminalMap` round-trip. The PaneId monotonically
+    /// increments per spawn, so removing a dead one will never collide
+    /// with a future live PaneId.
+    pub pane_id: u64,
 }
 
 /// Payload of a `TerminalListChange` broadcast (Stage 5-D path P1).
@@ -154,6 +186,20 @@ pub struct TerminalListChangeEvent {
 pub struct TerminalSpawnedEvent {
     pub terminal_id: Arc<str>,
     pub pane_id: u64,
+}
+
+/// Payload of a `SessionChange` broadcast (Slice next-2, ADR-0025 D4).
+/// Published by [`Hub::set_session_for_cookie`] /
+/// [`Hub::clear_session_for_cookie`] whenever a cookie's attached
+/// session changes. WS handlers filter by their own cookie and
+/// recompute the `pane_output` filter set.
+///
+/// `new_session` is `None` when the cookie was detached (the cookie
+/// is now in the *legacy demo path* — no filter, server-wide pass).
+#[derive(Clone, Debug)]
+pub struct SessionChangeEvent {
+    pub cookie: Arc<str>,
+    pub new_session: Option<Arc<str>>,
 }
 
 /// Payload of a `ServerShutdown` broadcast (Slice D-5, ADR-0014 D12).
@@ -309,6 +355,19 @@ pub struct Hub {
     /// turns one event into a `0x89 SERVER_SHUTDOWN` envelope before
     /// the close frame (1000 normal) arrives.
     server_shutdown_events: broadcast::Sender<ServerShutdownEvent>,
+    /// Session-change broadcast (Slice next-2, ADR-0025 D4). Emitted
+    /// by `set_session_for_cookie` / `clear_session_for_cookie` so WS
+    /// handlers can refresh their per-connection PaneId filter set
+    /// when the cookie's attached session changes (workspace switch,
+    /// implicit detach-on-reattach).
+    session_change_events: broadcast::Sender<SessionChangeEvent>,
+    /// Session pane-set provider (Slice next-2, ADR-0025 D6). Set
+    /// once at boot — the WS handshake snapshots this on every new
+    /// connection to seed its filter set, and the runtime layout
+    /// events recompute it whenever a session's terminal-item set
+    /// changes. `None` (test paths + boot bootstrap) keeps the WS
+    /// handler in the *legacy demo path* (server-wide PaneId pass).
+    session_pane_set_provider: Arc<std::sync::Mutex<Option<Arc<dyn SessionPaneSetProvider>>>>,
 }
 
 impl Hub {
@@ -329,6 +388,8 @@ impl Hub {
             broadcast::channel(MOUNT_CASCADE_BROADCAST_CAPACITY);
         let (server_shutdown_events, _) =
             broadcast::channel(SERVER_SHUTDOWN_BROADCAST_CAPACITY);
+        let (session_change_events, _) =
+            broadcast::channel(SESSION_CHANGE_BROADCAST_CAPACITY);
 
         let mux_backend = backend.clone();
         let mux_tx = pane_output.clone();
@@ -352,6 +413,8 @@ impl Hub {
             cookie_validator: Arc::new(std::sync::Mutex::new(None)),
             terminal_uuid_provider: Arc::new(std::sync::Mutex::new(None)),
             server_shutdown_events,
+            session_change_events,
+            session_pane_set_provider: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -401,16 +464,26 @@ impl Hub {
     /// frame routing, so a missed update degrades to "session-scoped frame
     /// behaves like server-wide" until the next attach refreshes it.
     pub fn set_session_for_cookie(&self, cookie: &str, session_name: &str) {
-        match self.session_table.write() {
+        let changed = match self.session_table.write() {
             Ok(mut t) => {
-                t.insert(cookie.to_string(), session_name.to_string());
+                let prev = t.insert(cookie.to_string(), session_name.to_string());
+                prev.as_deref() != Some(session_name)
             }
             Err(_) => {
                 tracing::warn!(
                     cookie_len = cookie.len(),
                     "hub session_table: write poisoned; skipping set_session_for_cookie"
                 );
+                false
             }
+        };
+        if changed {
+            // Slice next-2 (ADR-0025 D4): notify the WS handler that
+            // owns this cookie so it can recompute its filter set.
+            let _ = self.session_change_events.send(SessionChangeEvent {
+                cookie: Arc::from(cookie),
+                new_session: Some(Arc::from(session_name)),
+            });
         }
     }
 
@@ -418,16 +491,24 @@ impl Hub {
     /// http-api `detach_handler` and by the WS-disconnect-driven
     /// `release_lock_for_cookie`. Idempotent: a missing entry is a no-op.
     pub fn clear_session_for_cookie(&self, cookie: &str) {
-        match self.session_table.write() {
-            Ok(mut t) => {
-                t.remove(cookie);
-            }
+        let removed = match self.session_table.write() {
+            Ok(mut t) => t.remove(cookie).is_some(),
             Err(_) => {
                 tracing::warn!(
                     cookie_len = cookie.len(),
                     "hub session_table: write poisoned; skipping clear_session_for_cookie"
                 );
+                false
             }
+        };
+        if removed {
+            // ADR-0025 D5: cookie reverts to the legacy demo path
+            // (no filter, server-wide pass). WS handler will rebuild
+            // its filter set to `None`.
+            let _ = self.session_change_events.send(SessionChangeEvent {
+                cookie: Arc::from(cookie),
+                new_session: None,
+            });
         }
     }
 
@@ -449,16 +530,31 @@ impl Hub {
     /// surface stale "still attached" routing for cookies that just
     /// detached.
     pub fn clear_sessions_by_name(&self, session_name: &str) {
-        match self.session_table.write() {
+        let removed_cookies: Vec<String> = match self.session_table.write() {
             Ok(mut t) => {
-                t.retain(|_, v| v != session_name);
+                let to_remove: Vec<String> = t
+                    .iter()
+                    .filter(|(_, v)| v.as_str() == session_name)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in &to_remove {
+                    t.remove(k);
+                }
+                to_remove
             }
             Err(_) => {
                 tracing::warn!(
                     session = %session_name,
                     "hub session_table: write poisoned; skipping clear_sessions_by_name"
                 );
+                Vec::new()
             }
+        };
+        for cookie in &removed_cookies {
+            let _ = self.session_change_events.send(SessionChangeEvent {
+                cookie: Arc::from(cookie.as_str()),
+                new_session: None,
+            });
         }
     }
 
@@ -503,10 +599,11 @@ impl Hub {
     /// has been resolved to a schema UUID. The send is silent on
     /// "no subscribers" — that's the normal idle state, identical to
     /// [`publish_layout_changed`].
-    pub fn publish_terminal_died(&self, uuid: &str, reason: &'static str) {
+    pub fn publish_terminal_died(&self, uuid: &str, reason: &'static str, pane_id: u64) {
         let _ = self.terminal_died_events.send(TerminalDiedEvent {
             uuid: Arc::from(uuid),
             reason,
+            pane_id,
         });
     }
 
@@ -588,6 +685,34 @@ impl Hub {
     /// then exits the connection loop so the close-handshake path runs.
     pub fn subscribe_server_shutdown(&self) -> broadcast::Receiver<ServerShutdownEvent> {
         self.server_shutdown_events.subscribe()
+    }
+
+    /// Subscribe to cookie session-change events (Slice next-2, ADR-0025
+    /// D4). Each WS handler filters by its own cookie and recomputes
+    /// its `pane_output` filter set.
+    pub fn subscribe_session_change(&self) -> broadcast::Receiver<SessionChangeEvent> {
+        self.session_change_events.subscribe()
+    }
+
+    /// Register the session pane-set provider (Slice next-2, ADR-0025
+    /// D6). Called once at boot from `gtmux-cli` after the http-api
+    /// `AppState` is built — supplies the http-api side of the trait.
+    pub fn set_session_pane_set_provider(&self, provider: Arc<dyn SessionPaneSetProvider>) {
+        match self.session_pane_set_provider.lock() {
+            Ok(mut slot) => *slot = Some(provider),
+            Err(e) => tracing::error!(
+                error = ?e,
+                "hub session_pane_set_provider lock poisoned"
+            ),
+        }
+    }
+
+    /// Borrow the registered session pane-set provider, if any.
+    pub fn session_pane_set_provider(&self) -> Option<Arc<dyn SessionPaneSetProvider>> {
+        self.session_pane_set_provider
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned())
     }
 
     /// Broadcast a manipulation event (Stage 5-C). Called by the WS
@@ -770,14 +895,14 @@ mod tests {
     async fn terminal_died_publish_silent_without_subscribers() {
         let hub = Hub::new(PtyBackend::new());
         // Must not panic / error.
-        hub.publish_terminal_died("uuid", "exit");
+        hub.publish_terminal_died("uuid", "exit", 1);
     }
 
     #[tokio::test]
     async fn terminal_died_subscriber_receives_event() {
         let hub = Hub::new(PtyBackend::new());
         let mut rx = hub.subscribe_terminal_died();
-        hub.publish_terminal_died("11111111-2222-4333-8444-555555555555", "killed");
+        hub.publish_terminal_died("11111111-2222-4333-8444-555555555555", "killed", 1);
         let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
             .await
             .expect("timeout")
@@ -791,7 +916,7 @@ mod tests {
         let hub = Hub::new(PtyBackend::new());
         let mut r1 = hub.subscribe_terminal_died();
         let mut r2 = hub.subscribe_terminal_died();
-        hub.publish_terminal_died("uuid", "exit");
+        hub.publish_terminal_died("uuid", "exit", 1);
         let a = tokio::time::timeout(std::time::Duration::from_millis(100), r1.recv())
             .await
             .expect("t1")

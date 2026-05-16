@@ -47,6 +47,7 @@ mod auth;
 mod file_open;
 mod schema;
 mod session_lock;
+mod session_pane_set;
 mod sessions;
 mod settings;
 mod shutdown;
@@ -321,7 +322,7 @@ impl AppState {
         if let Some(uuid) = self.terminal_map.unregister_pane(pane).await {
             let reason = if signal.is_some() { "killed" } else { "exit" };
             if let Some(hub) = self.hub.as_ref() {
-                hub.publish_terminal_died(&uuid, reason);
+                hub.publish_terminal_died(&uuid, reason, pane.0);
             }
             tracing::debug!(
                 pane = ?pane,
