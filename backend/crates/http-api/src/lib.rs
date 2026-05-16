@@ -49,6 +49,7 @@ mod schema;
 mod session_lock;
 mod sessions;
 mod settings;
+mod shutdown;
 mod storage;
 mod terminal_map;
 mod terminals;
@@ -703,6 +704,10 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         .route(
             "/api/file-path/open",
             axum::routing::post(file_open::open_handler),
+        )
+        .route(
+            "/api/shutdown",
+            axum::routing::post(shutdown::shutdown_handler),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

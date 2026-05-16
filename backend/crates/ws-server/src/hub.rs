@@ -108,6 +108,12 @@ const MANIPULATION_BROADCAST_CAPACITY: usize = 256;
 /// low-frequency profile as terminal-spawned.
 const MOUNT_CASCADE_BROADCAST_CAPACITY: usize = 64;
 
+/// Capacity for the `0x89 SERVER_SHUTDOWN` channel (Slice D-5).
+/// Server shutdown is a once-per-lifetime event so any reasonable
+/// capacity is fine — 16 leaves plenty of headroom for the WS handler
+/// loop to drain even under heavy contention.
+const SERVER_SHUTDOWN_BROADCAST_CAPACITY: usize = 16;
+
 /// Payload of a `TerminalDied` broadcast. `uuid` is the schema-side
 /// terminal id; `reason` is `"exit"` (process self-exited) or `"killed"`
 /// (signal-driven exit). `Arc<str>` over `String` so the broadcast clone
@@ -148,6 +154,23 @@ pub struct TerminalListChangeEvent {
 pub struct TerminalSpawnedEvent {
     pub terminal_id: Arc<str>,
     pub pane_id: u64,
+}
+
+/// Payload of a `ServerShutdown` broadcast (Slice D-5, ADR-0014 D12).
+/// Emitted by `POST /api/shutdown`'s detached background task ~50 ms
+/// after the 202 response. Server-wide — every connected webpage
+/// receives this and is expected to flip its reconnect banner to the
+/// *intentional shutdown* branch before the WS close arrives.
+#[derive(Clone, Debug)]
+pub struct ServerShutdownEvent {
+    /// Free-form `enum` string. Known values: `"user_initiated"` (MVP),
+    /// `"oom"` / `"upgrade"` (P1+). FE forward-compat: unknown values
+    /// fall back to `"user_initiated"` semantics.
+    pub reason: Arc<str>,
+    /// Mirror of the `expected_exit_code` in the `POST /api/shutdown`
+    /// 202 body, so the FE can correlate the HTTP response with the
+    /// WS frame and surface a single toast.
+    pub expected_exit_code: i32,
 }
 
 /// Payload of a `MountCascade` broadcast (Stage 5-D path P2).
@@ -280,6 +303,12 @@ pub struct Hub {
     /// + pre-wired boot phase) leaves the catch-up unchanged — fresh-spawn
     /// `0x88` frames still arrive via [`publish_terminal_spawned`].
     terminal_uuid_provider: Arc<std::sync::Mutex<Option<Arc<dyn TerminalUuidProvider>>>>,
+    /// Server-shutdown broadcast (Slice D-5, ADR-0014 D12). Published
+    /// by `POST /api/shutdown`'s detached task once the 202 response
+    /// has been flushed. Server-wide — every webpage's WS handler
+    /// turns one event into a `0x89 SERVER_SHUTDOWN` envelope before
+    /// the close frame (1000 normal) arrives.
+    server_shutdown_events: broadcast::Sender<ServerShutdownEvent>,
 }
 
 impl Hub {
@@ -298,6 +327,8 @@ impl Hub {
             broadcast::channel(MANIPULATION_BROADCAST_CAPACITY);
         let (mount_cascade_events, _) =
             broadcast::channel(MOUNT_CASCADE_BROADCAST_CAPACITY);
+        let (server_shutdown_events, _) =
+            broadcast::channel(SERVER_SHUTDOWN_BROADCAST_CAPACITY);
 
         let mux_backend = backend.clone();
         let mux_tx = pane_output.clone();
@@ -320,6 +351,7 @@ impl Hub {
             mount_cascade_events,
             cookie_validator: Arc::new(std::sync::Mutex::new(None)),
             terminal_uuid_provider: Arc::new(std::sync::Mutex::new(None)),
+            server_shutdown_events,
         }
     }
 
@@ -537,6 +569,25 @@ impl Hub {
     /// Subscribe to UUID↔PaneId binding events.
     pub fn subscribe_terminal_spawned(&self) -> broadcast::Receiver<TerminalSpawnedEvent> {
         self.terminal_spawned_events.subscribe()
+    }
+
+    /// Broadcast a server-shutdown notify (Slice D-5, ADR-0014 D12).
+    /// Called by `POST /api/shutdown`'s detached task ~50 ms after the
+    /// 202 response. Server-wide — every WS subscriber sees a single
+    /// `0x89 SERVER_SHUTDOWN` envelope right before the connection is
+    /// closed with code 1000.
+    pub fn publish_server_shutdown(&self, reason: &str, expected_exit_code: i32) {
+        let _ = self.server_shutdown_events.send(ServerShutdownEvent {
+            reason: Arc::from(reason),
+            expected_exit_code,
+        });
+    }
+
+    /// Subscribe to server-shutdown notifications. Each WS handler
+    /// pulls from this channel and emits one `0x89` envelope per event,
+    /// then exits the connection loop so the close-handshake path runs.
+    pub fn subscribe_server_shutdown(&self) -> broadcast::Receiver<ServerShutdownEvent> {
+        self.server_shutdown_events.subscribe()
     }
 
     /// Broadcast a manipulation event (Stage 5-C). Called by the WS

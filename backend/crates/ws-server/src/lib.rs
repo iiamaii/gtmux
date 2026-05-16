@@ -54,8 +54,8 @@ mod varint;
 
 pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTED_CTRL_CMDS};
 pub use hub::{
-    CookieValidator, Hub, ManipulationEvent, MountCascadeEvent, TerminalDiedEvent,
-    TerminalListChangeEvent, TerminalSpawnedEvent, TerminalUuidProvider,
+    CookieValidator, Hub, ManipulationEvent, MountCascadeEvent, ServerShutdownEvent,
+    TerminalDiedEvent, TerminalListChangeEvent, TerminalSpawnedEvent, TerminalUuidProvider,
     HUB_BROADCAST_CAPACITY,
 };
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
@@ -165,6 +165,15 @@ pub enum FrameType {
     /// terminal in its sidebar / layout (ADR-0021 D1). Inner payload:
     /// `varint 0 + UTF-8 JSON {"terminal_id":"<uuid>","pane_id":<u64>}`.
     TerminalSpawned = 0x88,
+    /// `0x89 SERVER_SHUTDOWN` (Slice D-5, ADR-0014 D12). Server-wide
+    /// notify that the gtmux Server is about to exit. Sent ~50 ms after
+    /// `POST /api/shutdown` returns 202; the FE switches its
+    /// `ReconnectBanner` to the *intentional shutdown* branch (no
+    /// reconnect retry loop) before the WS close (1000 normal) arrives.
+    /// Inner payload: `varint 0 + UTF-8 JSON {"reason":"user_initiated"
+    /// |"oom"|"upgrade","expected_exit_code":<int>}`. Unknown `reason`
+    /// values are treated as `"user_initiated"` for forward-compat.
+    ServerShutdown = 0x89,
 }
 
 impl FrameType {
@@ -186,6 +195,7 @@ impl FrameType {
             0x86 => Self::MountCascade,
             0x87 => Self::TerminalListUpdate,
             0x88 => Self::TerminalSpawned,
+            0x89 => Self::ServerShutdown,
             _ => return None,
         })
     }
@@ -522,6 +532,7 @@ async fn handle_socket(
     let mut terminal_spawned_rx = hub.subscribe_terminal_spawned();
     let mut manipulation_rx = hub.subscribe_manipulation();
     let mut mount_cascade_rx = hub.subscribe_mount_cascade();
+    let mut server_shutdown_rx = hub.subscribe_server_shutdown();
 
     // Send the initial LAYOUT_CHANGED hello so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -897,6 +908,46 @@ async fn handle_socket(
                     }
                 }
             }
+            shutdown = server_shutdown_rx.recv() => {
+                match shutdown {
+                    Ok(event) => {
+                        // Server-wide broadcast (Slice D-5, ADR-0014
+                        // D12). Emit one envelope, then break the
+                        // select loop so the close handshake runs.
+                        let env = Envelope::new(
+                            FrameType::ServerShutdown,
+                            Bytes::from(payload::encode_server_shutdown(
+                                &event.reason,
+                                event.expected_exit_code,
+                            )),
+                        );
+                        if let Ok(buf) = env.encode() {
+                            let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                        }
+                        // Send the close frame ourselves so the FE sees
+                        // a deterministic ordering: 0x89 envelope then
+                        // 1000 normal close. The process will exit a
+                        // few hundred ms later via the http-api task.
+                        let _ = sink
+                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: 1000,
+                                reason: "server_shutdown".into(),
+                            })))
+                            .await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Channel capacity is 16 vs ~1 send per lifetime
+                        // — lagging would mean we missed our only
+                        // notification. Treat as still-shutdown and
+                        // drop the connection.
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — other arms will hit Closed too.
+                    }
+                }
+            }
             list_change = terminal_list_change_rx.recv() => {
                 match list_change {
                     Ok(event) => {
@@ -1217,7 +1268,8 @@ async fn handle_client_envelope(
         | FrameType::TerminalDied
         | FrameType::TerminalListUpdate
         | FrameType::TerminalSpawned
-        | FrameType::MountCascade => {
+        | FrameType::MountCascade
+        | FrameType::ServerShutdown => {
             let _ = sink
                 .send(close_frame(
                     close_codes::POLICY_VIOLATION,
@@ -1373,13 +1425,11 @@ mod tests {
         let mut buf = vec![0x08u8];
         buf.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x08)));
-        // 0x86 (MOUNT_CASCADE) is *reserved* by the FE decoder
-        // (`decode.ts`) for Stage 5-D path P2 but not yet emitted by BE,
-        // so the wire codec still rejects it here. The first *fully*
-        // unassigned slot is 0x89.
-        let mut buf = vec![0x89u8];
+        // First fully unassigned slot is now `0x8A` (Slice D-5
+        // allocated `0x89 SERVER_SHUTDOWN`).
+        let mut buf = vec![0x8au8];
         buf.extend_from_slice(&0u32.to_le_bytes());
-        assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x89)));
+        assert_eq!(Envelope::decode(&buf), Err(CodecError::UnknownType(0x8a)));
     }
 
     #[test]
@@ -1417,13 +1467,13 @@ mod tests {
     fn frame_type_from_u8_covers_all() {
         for &b in &[
             0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86,
-            0x87, 0x88,
+            0x87, 0x88, 0x89,
         ] {
             let ft = FrameType::from_u8(b).expect("known frame");
             assert_eq!(ft.as_u8(), b);
         }
-        // 0x89 is the first unassigned slot above 0x88 TerminalSpawned.
-        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x89, 0x8F, 0xFE, 0xFF] {
+        // 0x8A is the first unassigned slot above 0x89 ServerShutdown.
+        for &b in &[0x00u8, 0x08, 0x0F, 0x10, 0x7F, 0x8a, 0x8F, 0xFE, 0xFF] {
             assert!(FrameType::from_u8(b).is_none(), "byte 0x{b:02x} leaked");
         }
     }

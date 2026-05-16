@@ -733,6 +733,135 @@ PY
 pass "5-11 POST /api/sessions/import — 201 / 409 / 400 + list 정합 (G28)"
 
 # ─────────────────────────────────────────────────────────────────────
+#  Gate 5-12 — Slice D-5 graceful shutdown (ADR-0014 D12)
+# ─────────────────────────────────────────────────────────────────────
+# Validates: 202 response shape + WS 0x89 SERVER_SHUTDOWN frame +
+# close (1000) ordering + process exits with code 6.
+# Runs LAST because the server is gone after this gate.
+echo
+echo "──── gate 5-12: POST /api/shutdown — 202 + 0x89 + exit 6 ────"
+
+python3 - "$PORT" "$COOKIE" "$HOST" "$TOKEN" >/tmp/gtmux-smoke-stage5-shutdown.log 2>&1 <<'PY' || { cat /tmp/gtmux-smoke-stage5-shutdown.log; fail "5-12: 0x89 SERVER_SHUTDOWN not received"; }
+import base64, http.client, json, os, socket, struct, sys, threading, time
+
+port = int(sys.argv[1]); cookie = sys.argv[2]; host = sys.argv[3]; token = sys.argv[4]
+
+# 1. Open WS with cookie.
+key = base64.b64encode(os.urandom(16)).decode()
+req = (
+  "GET /ws HTTP/1.1\r\n"
+  f"Host: {host}\r\n"
+  f"Origin: http://{host}\r\n"
+  "Upgrade: websocket\r\n"
+  "Connection: Upgrade\r\n"
+  f"Sec-WebSocket-Key: {key}\r\n"
+  "Sec-WebSocket-Version: 13\r\n"
+  "Sec-WebSocket-Protocol: gtmux.v1\r\n"
+  f"Cookie: {cookie}\r\n"
+  "\r\n"
+)
+s = socket.create_connection(("127.0.0.1", port))
+s.settimeout(5)
+s.sendall(req.encode())
+buf = b""
+while b"\r\n\r\n" not in buf:
+    chunk = s.recv(4096)
+    if not chunk: sys.exit(2)
+    buf += chunk
+rest = buf.split(b"\r\n\r\n", 1)[1]
+
+def read_frame(sock, carry):
+    def need(n):
+        nonlocal carry
+        while len(carry) < n:
+            chunk = sock.recv(65536)
+            if not chunk: raise EOFError()
+            carry += chunk
+    need(2)
+    b0, b1 = carry[0], carry[1]
+    opcode = b0 & 0x0F
+    masked = (b1 & 0x80) != 0
+    plen = b1 & 0x7F
+    pos = 2
+    if plen == 126:
+        need(pos+2); plen = struct.unpack(">H", carry[pos:pos+2])[0]; pos += 2
+    elif plen == 127:
+        need(pos+8); plen = struct.unpack(">Q", carry[pos:pos+8])[0]; pos += 8
+    if masked:
+        need(pos+4); mk = carry[pos:pos+4]; pos += 4
+    need(pos+plen)
+    payload = carry[pos:pos+plen]
+    if masked:
+        payload = bytes(b ^ mk[i % 4] for i, b in enumerate(payload))
+    return opcode, payload, carry[pos+plen:]
+
+# 2. Issue POST /api/shutdown via a parallel thread (so we can read WS
+#    in this thread without race).
+shutdown_response = {}
+def fire_shutdown():
+    time.sleep(0.3)  # drain catch-up
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("POST", "/api/shutdown",
+                 headers={"Host": host, "Authorization": f"Bearer {token}"})
+    r = conn.getresponse()
+    shutdown_response["status"] = r.status
+    shutdown_response["body"] = json.loads(r.read())
+    conn.close()
+
+threading.Thread(target=fire_shutdown, daemon=True).start()
+
+# 3. Read frames until 0x89 + close arrive.
+deadline = time.monotonic() + 4.0
+carry = rest
+saw_0x89 = None
+saw_close = False
+while time.monotonic() < deadline:
+    try:
+        opcode, payload, carry = read_frame(s, carry)
+    except (socket.timeout, EOFError):
+        break
+    if opcode == 0x8:  # close
+        saw_close = True
+        break
+    if opcode != 0x2 or len(payload) < 5:
+        continue
+    ftype = payload[0]
+    if ftype != 0x89:
+        continue
+    inner_len = struct.unpack("<I", payload[1:5])[0]
+    inner = payload[5:5+inner_len]
+    body = json.loads(inner[1:].decode("utf-8"))
+    saw_0x89 = body
+
+sys.stderr.write(f"shutdown_response={shutdown_response} saw_0x89={saw_0x89} saw_close={saw_close}\n")
+assert shutdown_response.get("status") == 202, shutdown_response
+assert shutdown_response["body"].get("shutdown") == "scheduled", shutdown_response
+assert shutdown_response["body"].get("expected_exit_code") == 6, shutdown_response
+assert saw_0x89 is not None, "0x89 SERVER_SHUTDOWN missing"
+assert saw_0x89.get("reason") == "user_initiated", saw_0x89
+assert saw_0x89.get("expected_exit_code") == 6, saw_0x89
+assert saw_close, "WS close frame not seen"
+print("OK")
+PY
+
+# 4. Process must have exited with code 6.
+EXIT_DEADLINE=$(($(date +%s) + 5))
+while kill -0 "$SERVER_PID" 2>/dev/null; do
+  if [ "$(date +%s)" -ge "$EXIT_DEADLINE" ]; then
+    fail "5-12: server did not exit within 5s"
+  fi
+  sleep 0.1
+done
+# `wait` returns the child's exit code (6), which would trip `set -e`.
+# Capture it via `|| EXIT_CODE=$?` so the non-zero exit is consumed.
+EXIT_CODE=0
+wait "$SERVER_PID" 2>/dev/null || EXIT_CODE=$?
+[ "$EXIT_CODE" = "6" ] || fail "5-12: expected exit code 6, got $EXIT_CODE"
+# Prevent the EXIT trap from killing again.
+SERVER_PID=""
+pass "5-12 POST /api/shutdown — 202 + 0x89 SERVER_SHUTDOWN + close 1000 + exit 6 (ADR-0014 D12)"
+
+# ─────────────────────────────────────────────────────────────────────
 print_summary
 echo
 echo "──── ALL STAGE 5 GATES PASSED ────"

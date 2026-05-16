@@ -144,6 +144,26 @@ pub fn encode_terminal_spawned(terminal_id: &str, pane_id: u64) -> Vec<u8> {
     out
 }
 
+/// `0x89 SERVER_SHUTDOWN` (Slice D-5, ADR-0014 D12) inner =
+/// `varint 0 + UTF-8 JSON {"reason":"<kind>","expected_exit_code":<int>}`.
+///
+/// Emitted ~50 ms after `POST /api/shutdown` returns 202, just before
+/// the WS connections are closed (CloseFrame 1000). FE consumers
+/// switch their reconnect banner to the *intentional shutdown* branch
+/// — no retry loop, a toast surfaces the reason.
+pub fn encode_server_shutdown(reason: &str, expected_exit_code: i32) -> Vec<u8> {
+    let body = json!({
+        "reason": reason,
+        "expected_exit_code": expected_exit_code,
+    })
+    .to_string();
+    let bytes = body.as_bytes();
+    let mut out = Vec::with_capacity(1 + bytes.len());
+    varint::encode_into(0, &mut out);
+    out.extend_from_slice(bytes);
+    out
+}
+
 // ─── Inbound (client → server) — inner payload parsers ────────────────────
 
 /// Parsed `0x03 PANE_IN` payload — varint paneId + raw input bytes.
