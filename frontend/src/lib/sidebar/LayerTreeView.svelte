@@ -629,25 +629,8 @@
     }));
   }
 
-  // plan-0010 Task 1 — minimize / maximize / focus row actions.
-  function togglePanelMinimize(id: string, e: MouseEvent): void {
-    stopRowAction(e);
-    const item = sessionStore.items.get(id);
-    if (item === undefined) return;
-    const nextMinimized = item.minimized !== true;
-    void mutateActiveLayout((cur) => ({
-      ...cur,
-      items: cur.items.map((it) =>
-        it.id === id ? ({ ...it, minimized: nextMinimized } as CanvasItem) : it,
-      ),
-    }));
-  }
-
-  function togglePanelMaximizeAction(id: string, e: MouseEvent): void {
-    stopRowAction(e);
-    sessionStore.toggleMaximize(id);
-  }
-
+  // plan-0010 Task 1 — focus row action.
+  // min/max 는 PanelNode header 가 단일 entry — LayerTreeView 에서 제거.
   function focusPanel(id: string, e: MouseEvent): void {
     stopRowAction(e);
     sessionStore.zoomToItem(id);
@@ -922,33 +905,8 @@
                   </svg>
                 {/if}
               </button>
-              {#if p.type === 'terminal' || p.type === 'panel' || p.type == null}
-                <!-- min/max 는 terminal panel 에만 의미 — 그래픽 element 는 제외. -->
-                <button
-                  type="button"
-                  class="icon"
-                  class:on={p.minimized === true}
-                  title={p.minimized === true ? 'Restore item' : 'Minimize item'}
-                  aria-label={p.minimized === true ? 'Restore item' : 'Minimize item'}
-                  onclick={(e: MouseEvent) => togglePanelMinimize(node.id, e)}
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <line x1="5" y1="12" x2="19" y2="12" />
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  class="icon"
-                  class:on={sessionStore.maximizedItemId === node.id}
-                  title={sessionStore.maximizedItemId === node.id ? 'Restore item' : 'Maximize item'}
-                  aria-label={sessionStore.maximizedItemId === node.id ? 'Restore item' : 'Maximize item'}
-                  onclick={(e: MouseEvent) => togglePanelMaximizeAction(node.id, e)}
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <rect x="4" y="4" width="16" height="16" rx="1.5" />
-                  </svg>
-                </button>
-              {/if}
+              <!-- min/max 는 LayerTreeView 에서 제거 — PanelNode header 가 단일 entry.
+                   focus 만 유지 (모든 type 에서 viewport zoom-to-item). -->
               <button
                 type="button"
                 class="icon"
@@ -1038,11 +996,28 @@
     outline-offset: -1px;
   }
 
+  /* Row hover / selected 는 row-inner 단위 — label / icons 가 *별도* hover 영역으로
+   * 분절되지 않도록 두 child 를 담는 container 가 hover target. icon 자체의 추가
+   * hover (background-tint 강화) 는 layered 으로 유지. */
   .row-inner {
     display: flex;
     align-items: center;
     gap: 0;
     width: 100%;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing),
+      box-shadow var(--motion-fast) var(--motion-easing);
+  }
+
+  .row:hover .row-inner {
+    background: var(--color-glass-1);
+  }
+
+  .row.selected .row-inner {
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+    color: var(--color-accent);
+    box-shadow: inset 2px 0 0 var(--color-accent);
   }
 
   .row-button {
@@ -1059,17 +1034,6 @@
     font: inherit;
   }
 
-  .row-button {
-    transition:
-      background var(--motion-fast) var(--motion-easing),
-      color var(--motion-fast) var(--motion-easing),
-      box-shadow var(--motion-fast) var(--motion-easing);
-  }
-
-  .row-button:hover {
-    background: var(--color-glass-1);
-  }
-
   /* Inline-edit host occupies the same slot as the button — let the
    * embedded field fill it without breaking row layout. */
   .row-button-edit {
@@ -1083,14 +1047,6 @@
   .row-button-edit :global(.group-label-edit) {
     flex: 1 1 auto;
     min-width: 0;
-  }
-
-  /* Figma-style selected — accent text + accent-tint background + 2px
-   * border-left indicator on the row inner. */
-  .row.selected .row-button {
-    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
-    color: var(--color-accent);
-    box-shadow: inset 2px 0 0 var(--color-accent);
   }
 
   .row.dead .row-button .label {
