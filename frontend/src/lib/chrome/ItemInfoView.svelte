@@ -1172,9 +1172,9 @@
     box-shadow: var(--shadow-sm);
   }
 
-  /* Figma-style state icon row (visibility / lock / minimize). */
+  /* Figma-style state icon row (visibility / lock / minimize) — panel full width. */
   .state-row {
-    display: inline-flex;
+    display: flex;
     align-items: center;
     gap: 2px;
     padding: 2px;
@@ -1182,11 +1182,13 @@
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
     margin-bottom: var(--space-6);
+    width: 100%;
   }
 
   .state-btn {
     position: relative;
-    width: 28px;
+    flex: 1 1 0;
+    min-width: 0;
     height: 24px;
     display: inline-flex;
     align-items: center;

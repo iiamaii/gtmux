@@ -23,6 +23,7 @@
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, CanvasItemType } from '$lib/types/canvas';
   import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
+  import { zStore } from '$lib/stores/zStore.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
 
   /** Currently inline-editing group id, or `null`. Component-local. */
@@ -636,6 +637,17 @@
     sessionStore.zoomToItem(id);
   }
 
+  // Z-mode 의 reorder — bringForward / sendBackward 와 동일. List 가 z desc 정렬이므로
+  // 위 = z+ (bringForward), 아래 = z- (sendBackward).
+  function zMoveUp(id: string, e: MouseEvent): void {
+    stopRowAction(e);
+    zStore.bringForward(id);
+  }
+  function zMoveDown(id: string, e: MouseEvent): void {
+    stopRowAction(e);
+    zStore.sendBackward(id);
+  }
+
   function toggleGroupVisibility(id: string, e: MouseEvent): void {
     stopRowAction(e);
     const group = sessionStore.groups.get(id);
@@ -685,7 +697,7 @@
     </div>
   </div>
   <ul class="tree" role="tree">
-    {#each tree as node (node.kind + ':' + node.id)}
+    {#each tree as node, nodeIdx (node.kind + ':' + node.id)}
       {#if node.kind === 'group'}
         {@const g = node.group}
         {@const selected = sessionStore.M.has(node.id)}
@@ -838,7 +850,40 @@
           ondrop={(e: DragEvent) => onRowDrop(node.id, 'panel', e)}
           ondragend={onTreeDragEnd}
         >
-          <div class="row-inner" style:padding-left={`${node.depth * 16 + 24}px`}>
+          <div
+            class="row-inner"
+            style:padding-left={layerMode === 'z' ? '0px' : `${node.depth * 16 + 24}px`}
+          >
+            {#if layerMode === 'z'}
+              {@const canMoveUp = nodeIdx > 0}
+              {@const canMoveDown = nodeIdx < tree.length - 1}
+              <div class="z-actions" aria-label="Reorder z-index">
+                <button
+                  type="button"
+                  class="z-btn"
+                  disabled={!canMoveUp}
+                  title="Bring forward — z+1"
+                  aria-label="Bring forward"
+                  onclick={(e: MouseEvent) => zMoveUp(node.id, e)}
+                >
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 6l3-3 3 3"/>
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="z-btn"
+                  disabled={!canMoveDown}
+                  title="Send backward — z−1"
+                  aria-label="Send backward"
+                  onclick={(e: MouseEvent) => zMoveDown(node.id, e)}
+                >
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 4l3 3 3-3"/>
+                  </svg>
+                </button>
+              </div>
+            {/if}
             <button
               type="button"
               class="row-button"
@@ -946,7 +991,7 @@
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    font-size: var(--text-lg);
+    font-size: var(--text-md);
     line-height: var(--leading-normal);
     user-select: none;
   }
@@ -1049,7 +1094,7 @@
     align-items: center;
     gap: var(--space-4);
     flex: 1 1 auto;
-    padding: var(--space-2) var(--space-8) var(--space-2) 0;
+    padding: var(--space-4) var(--space-8) var(--space-4) 0;
     background: transparent;
     border: 0;
     color: inherit;
@@ -1064,7 +1109,7 @@
     flex: 1 1 auto;
     display: flex;
     align-items: center;
-    padding: var(--space-2) var(--space-8) var(--space-2) 0;
+    padding: var(--space-4) var(--space-8) var(--space-4) 0;
     min-width: 0;
   }
 
@@ -1076,6 +1121,42 @@
   .row.dead .row-button .label {
     color: var(--color-fg-subtle);
     text-decoration: line-through;
+  }
+
+  /* Z-mode reorder buttons — left 24px slot 안에 up/down 두 button 수직 분할.
+     tree mode 의 padding-left: 24 와 동일 width 유지. */
+  .z-actions {
+    flex: 0 0 24px;
+    width: 24px;
+    align-self: stretch;
+    display: flex;
+    flex-direction: column;
+  }
+  .z-btn {
+    flex: 1 1 0;
+    display: grid;
+    place-items: center;
+    background: transparent;
+    border: 0;
+    padding: 0;
+    color: var(--color-fg-subtle);
+    cursor: pointer;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing),
+      opacity var(--motion-fast) var(--motion-easing);
+  }
+  .z-btn:hover:not(:disabled) {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
+  }
+  .z-btn:focus-visible {
+    outline: 1px dashed var(--color-accent);
+    outline-offset: -1px;
+  }
+  .z-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
   }
 
   /* Panel rows don't have a caret block — use the same padding-left as group rows so the

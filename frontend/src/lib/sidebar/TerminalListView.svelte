@@ -421,9 +421,10 @@
     display: grid;
     grid-template-columns: 8px 1fr auto auto auto;
     align-items: center;
-    gap: var(--space-6);
+    gap: var(--space-4);
     padding: var(--space-4) var(--space-8) var(--space-4) var(--space-12);
     font-size: var(--text-md);
+    line-height: var(--leading-normal);
     cursor: default;
     transition: background var(--motion-fast) var(--motion-easing);
   }
@@ -435,8 +436,8 @@
   }
 
   .kill-btn {
-    width: 22px;
-    height: 22px;
+    width: 18px;
+    height: 18px;
     border-radius: var(--radius-sm);
     color: var(--color-fg-muted);
     background: transparent;
@@ -452,7 +453,7 @@
   }
 
   .term-row:hover .kill-btn {
-    opacity: 0.7;
+    opacity: 1;
   }
 
   .kill-btn:hover:not(:disabled) {
@@ -475,8 +476,8 @@
   }
 
   .attach-btn {
-    width: 22px;
-    height: 22px;
+    width: 18px;
+    height: 18px;
     border-radius: var(--radius-sm);
     color: var(--color-fg-muted);
     background: transparent;
@@ -524,7 +525,7 @@
     white-space: nowrap;
     color: var(--color-fg);
     font-family: var(--font-mono);
-    font-size: var(--text-base);
+    font-size: var(--text-md);
   }
 
   .badge {

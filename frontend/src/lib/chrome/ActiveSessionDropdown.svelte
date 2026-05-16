@@ -58,7 +58,7 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-8);
-    height: 28px;
+    height: 36px;
     padding: 0 var(--space-10);
     border-radius: var(--radius-md);
     background: var(--color-surface-2);
