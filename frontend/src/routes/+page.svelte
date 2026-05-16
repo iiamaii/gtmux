@@ -1,19 +1,13 @@
 <script lang="ts">
   // 단일 라우트 — Canvas + Sidebar + Toolbar + ReconnectBanner 마운트 + WS bootstrap.
   //
-  // Bootstrap 흐름 (D17 + D21 c3):
-  // 1. token 획득 — sessionStorage('gtmux_token') 우선. 미존재 시 dev fallback 로
-  //    prompt() 1회 (명백히 dev-only — 정식 구현은 server-side rendered HTML 이
-  //    sessionStorage 에 토큰 주입). HttpOnly cookie 는 JS 에서 읽을 수 없어 WS
-  //    서브프로토콜 경로(Sec-WebSocket-Protocol)에 토큰을 실을 수 없음 → 따라서
-  //    sessionStorage 경로 채택.
-  // 2. WsClient 단일 인스턴스 생성 (createDispatcher) + setContext('wsClient', …)
-  //    로 sub-tree (XtermHost 등) 가 getContext 로 꺼내 사용.
-  // 3. setLayoutRefetchHandler 등록 — 0x80 LAYOUT_CHANGED 수신 시 dispatcher 가
-  //    HTTP GET /api/layout 을 트리거. (Pull-through-notify.)
-  // 4. wsClient.start() → connecting → open. 동시에 GET /api/layout 으로 초기
-  //    hydrate (etag/panels/groups).
-  // 5. onDestroy: wsClient.stop() + setLayoutRefetchHandler(null) 로 cleanup.
+  // Bootstrap 흐름 (post-0044 dual-source 제거):
+  // 1. `?t=<token>` 가 있으면 cookie 발급. sessionStorage 에도 Bearer 보관
+  //    (legacy WS subprotocol 호환 — BE Stage 5-A cookie-only handshake land 후 폐기).
+  // 2. Auth gate — GET /api/sessions 로 cookie 검증, 401 시 /auth.
+  // 3. Session attach — hint 있으면 reconnectGate.start, 없으면 workspaceSwitcher.
+  // 4. WsClient 단일 인스턴스 생성 + setContext('wsClient'). cookie 만으로 upgrade.
+  // 5. onDestroy: wsClient.stop().
 
   import { setContext, onDestroy, onMount } from 'svelte';
   import { SvelteFlowProvider } from '@xyflow/svelte';
@@ -21,7 +15,6 @@
   import Titlebar from '$lib/chrome/Titlebar.svelte';
   import LeftPanel from '$lib/sidebar/LeftPanel.svelte';
   import RightPanel from '$lib/chrome/RightPanel.svelte';
-  import HelpBar from '$lib/chrome/HelpBar.svelte';
   import ViewportCtrl from '$lib/chrome/ViewportCtrl.svelte';
   import ContextMenu from '$lib/chrome/ContextMenu.svelte';
   import ChangeTerminalModal from '$lib/chrome/ChangeTerminalModal.svelte';
@@ -30,16 +23,14 @@
   import WorkspaceSwitcher from '$lib/chrome/WorkspaceSwitcher.svelte';
   import ReconnectModal from '$lib/chrome/ReconnectModal.svelte';
   import Toolbar2 from '$lib/toolbar/Toolbar2.svelte';
+  import ToolbarSubbar from '$lib/toolbar/ToolbarSubbar.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
   import Toast from '$lib/ui/Toast.svelte';
-  import { createDispatcher, setLayoutRefetchHandler, setAutoMountHandler } from '$lib/ws/dispatcher.svelte';
-  import { appendPanelIfMissing, createLayoutRefetchHandler, fetchLayoutAndHydrate } from '$lib/http/layout';
+  import { createDispatcher } from '$lib/ws/dispatcher.svelte';
   import { login } from '$lib/http/auth';
   import { bindZShortcuts } from '$lib/keyboard/zShortcuts.svelte';
   import { bindChromeShortcuts } from '$lib/keyboard/chromeShortcuts.svelte';
-  import { layoutStore } from '$lib/stores/layout.svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
-  import { chromeStore } from '$lib/stores/chrome.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
@@ -53,11 +44,7 @@
    * - Stage 2 cookie 인증 (ADR-0020) 이후로 *Bearer token 은 선택* — HTTP `/api/*`
    *   는 `credentials: 'include'` 의 `gtmux_auth` cookie 로 인증. Bearer token 은
    *   *legacy WS 핸드셰이크* (ws-server 가 아직 옛 subprotocol 사용) 시에만 필요.
-   *   BE-NEW-4 (Stage 3 WS routing) 가 cookie 검증 통합하면 본 토큰 경로도 폐기.
-   * - 본 함수는 *sessionStorage 에 있으면 반환, 없으면 null*. native prompt 폐기 —
-   *   `/auth/bootstrap?token=…` 흐름으로 들어오면 cookie 가 이미 발행되어 있고,
-   *   prompt 가 그 위에 또 뜨면 사용자 혼란. null 반환 시 onMount 가 WS bootstrap
-   *   skip 하고 HTTP 경로 (cookie + 모달 stack) 만 활성.
+   *   BE Stage 5-A cookie-only handshake 가 land 하면 본 토큰 경로도 폐기.
    */
   function acquireToken(): string | null {
     try {
@@ -66,14 +53,8 @@
         return fromStorage;
       }
     } catch (e) {
-      // sessionStorage 접근 실패 (private browsing 등) — silent fall-through.
       console.debug('[gtmux] sessionStorage unavailable', e);
     }
-    console.info(
-      '[gtmux] No Bearer token in sessionStorage. Cookie auth handles ' +
-        '/api/*. Legacy WS streaming (Bearer subprotocol) will not start ' +
-        'until Stage 3 BE migrates the WS handshake to cookie.',
-    );
     return null;
   }
 
@@ -226,43 +207,11 @@
 
       // Step 3 — WS bootstrap. Cookie-additive auth (0035 §3.3 α, BE 의 D10 α)
       // 가 land 되어 있으므로 Bearer token 부재 시에도 WS 가 cookie 만으로 upgrade.
-      // 본 WS 가 열려야:
-      //   - 0x88 TERMINAL_SPAWNED catch-up 으로 UUID↔PaneId binding 복원
-      //     (0040 §5 옵션 A). XtermHost 가 "connecting" placeholder 에서 벗어남.
-      //   - 페이지 닫힘 시 disconnect_sink 가 cookie release_lock_for_cookie 트리거
-      //     → session 의 active 가 자동 false.
-      //   - PANE_OUT / PANE_IN streaming.
-      // legacy v1 layout PUT/GET 의 refetch handler 와 auto-mount 은 Bearer token
-      // 이 있을 때만 wire — multi-session 사용자는 token 없어도 정상 동작.
+      // WS 가 열려야 0x88 TERMINAL_SPAWNED catch-up 으로 UUID↔PaneId binding 복원,
+      // 페이지 닫힘 시 disconnect_sink, PANE_OUT / PANE_IN streaming 동작.
       const token = acquireToken();
       const client = createDispatcher({ token });
       wsClientHolder.current = client;
-
-      if (token !== null) {
-        const refetch = createLayoutRefetchHandler(token);
-        setLayoutRefetchHandler(refetch);
-
-        // 0036 §5 (P1-D) — legacy auto-mount 은 sessionStore.active 가 *없을 때만*.
-        // multi-session active 동안 backend 의 server-wide `pane-spawned` notify
-        // 가 v1 panelsStore 를 오염시키지 않도록 격리. Stage 5-D 의 MOUNT_CASCADE
-        // 가 정식 경로.
-        setAutoMountHandler(async (paneId) => {
-          if (sessionStore.active !== null) {
-            console.debug(
-              '[gtmux] legacy pane-spawned auto-mount skipped — multi-session active',
-            );
-            return;
-          }
-          await appendPanelIfMissing(paneId, { token });
-        });
-
-        void fetchLayoutAndHydrate(token, layoutStore.etag);
-      } else {
-        console.debug(
-          '[gtmux] cookie-only WS bootstrap — legacy v1 layout PUT/GET disabled',
-        );
-      }
-
       client.start();
     })();
   });
@@ -273,8 +222,6 @@
       client.stop();
       wsClientHolder.current = null;
     }
-    setLayoutRefetchHandler(null);
-    setAutoMountHandler(null);
     if (unbindZShortcuts !== null) {
       unbindZShortcuts();
       unbindZShortcuts = null;
@@ -301,6 +248,7 @@
          mount 차단. canMountApp = state ∈ {idle, success}. -->
     <Titlebar />
     <Toolbar2 />
+    <ToolbarSubbar />
     <SvelteFlowProvider>
       <div class="workspace">
         <main class="canvas-pane">
@@ -308,7 +256,6 @@
         </main>
         <LeftPanel />
         <RightPanel />
-        <HelpBar />
         <ViewportCtrl />
         <ContextMenu bind:this={contextMenuRef} />
       </div>

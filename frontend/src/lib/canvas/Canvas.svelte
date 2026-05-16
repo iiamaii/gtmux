@@ -2,11 +2,11 @@
   // Svelte Flow 캔버스 host — R3 보고서 채택, ADR-0012 D2/D5/D6.
   //
   // 책임:
-  // - `panelsStore.panels` (SvelteMap<string, Panel>) → Svelte Flow `nodes` 매핑.
+  // - `sessionStore.items` (SvelteMap<string, CanvasItem>) → Svelte Flow `nodes` 매핑.
   //   `$derived`로 entry-level fine-grain reactivity (R8 §F3).
-  // - viewport (`ephemeralStore.viewport`) bind — pan/zoom (D14 0x83 VIEWPORT_CHANGED
-  //   broadcast는 dispatcher가 store 갱신 → 본 컴포넌트는 store 구독만).
-  // - 노드 드래그 → 위치 갱신 (panelsStore.movePanel + PUT /api/layout).
+  // - viewport (`sessionStore.viewport`) bind — pan/zoom 양방향 sync. PUT 은
+  //   updateViewport 의 500ms debounce.
+  // - 노드 드래그 → sessionStore.items 갱신 + mutateLayout PUT.
   // - 노드 클릭 → M selection 갱신.
   //     * plain click       : M = [id] (single — Figma 컨벤션)
   //     * Cmd / Ctrl + click : M.toggle(id) (multi-select 추가/제거)
@@ -14,17 +14,13 @@
   // - 캔버스 dot grid 는 token-driven (--canvas-bg, --canvas-grid).
   // - panOnDrag = [1, 2] — middle/right 마우스 버튼만 pan (left는 selection/drag용).
 
-  import { getContext } from 'svelte';
   import { SvelteFlow, Background, BackgroundVariant, useSvelteFlow } from '@xyflow/svelte';
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
-  import { panelsStore } from '$lib/stores/panels.svelte';
-  import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toolStore } from '$lib/stores/toolStore.svelte';
-  import { putLayoutCommitCurrent } from '$lib/http/layout';
   import { attachConfirm, deleteItem, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
-  import { isTerminal, type CanvasItem } from '$lib/types/canvas';
+  import type { CanvasItem } from '$lib/types/canvas';
   import { effectiveLocked, effectiveVisibility } from '$lib/types/group';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import PanelNode from './PanelNode.svelte';
@@ -41,13 +37,7 @@
     createTerminalItem,
     lineBoxFromEndpoints,
   } from './itemFactory';
-  import { requestLegacyNewPane } from './legacyNewPane';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
-  import type { WsClient } from '$lib/ws/client';
-
-  /** +page.svelte 의 setContext('wsClient', ...) 가 등록한 holder. */
-  interface WsClientHolder { current: WsClient | null }
-  const wsClientHolder = getContext<WsClientHolder | undefined>('wsClient') ?? null;
 
   interface CanvasProps {
     /** ContextMenu trigger — `+page.svelte` 가 호스팅하는 ContextMenu
@@ -65,7 +55,7 @@
 
   // SvelteFlow viewport projection — onpaneclick 의 screen 좌표를 canvas 좌표로 변환.
   // useSvelteFlow 는 SvelteFlowProvider 컨텍스트가 있어야 동작 (+page.svelte 에서 마운트됨).
-  const { screenToFlowPosition, setViewport, getViewport } = useSvelteFlow();
+  const { screenToFlowPosition, setViewport, getViewport, updateNode } = useSvelteFlow();
 
   /** Drag-to-create state — Batch 2 의 rect/ellipse/line gesture. */
   type DragShape = 'rect' | 'ellipse' | 'line';
@@ -123,7 +113,6 @@
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isEditableFocused()) return;
-      if (!useSessionStore) return;
       if (sessionStore.M.size === 0) return;
       e.preventDefault();
       void deleteSelected();
@@ -258,7 +247,7 @@
   function onCanvasPointerDown(e: PointerEvent) {
     if (!isDragTool) return;
     if (e.button !== 0) return; // left button only
-    if (!useSessionStore) return;
+    if (sessionStore.active === null) return;
     // Space-hold takes priority — let SvelteFlow handle the left-button pan.
     if (isSpacePressed) return;
 
@@ -349,32 +338,6 @@
     dragState = null;
   }
 
-  const TOKEN_STORAGE_KEY = 'gtmux_token';
-  function readToken(): string | null {
-    try {
-      return sessionStorage.getItem(TOKEN_STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  }
-
-  // Panel JSON shape — `docs/ssot/canvas-layout-schema.md` §1 `$defs/Panel`의 부분 view.
-  // 코드젠된 `$lib/types/canvas-layout.d.ts`가 정본이 되기 전까지의 잠정 정의 — 정본
-  // 산출 후 본 타입은 `import type { Panel } from '$lib/types/canvas-layout'`로 교체.
-  interface PanelData {
-    id: string;
-    pane_id?: string;
-    x?: number;
-    y?: number;
-    w?: number;
-    h?: number;
-    z?: number;
-    visibility?: boolean;
-    minimized?: boolean;
-    locked?: boolean;
-    label?: string | null;
-  }
-
   // Custom node type lookup table for Svelte Flow.
   // - 'panel'     = gtmux terminal panel (PanelNode). schema v2 의 `type:"terminal"` ↔ 'panel'.
   // - 'text'      = 자유 텍스트 (TextNode)
@@ -391,17 +354,8 @@
     line: LineNode,
   };
 
-  /**
-   * Dual-source flag — multi-session attach 후엔 sessionStore 가 source,
-   * 그 외엔 legacy panelsStore (single-session Sprint 7 데모 호환).
-   * Stage 5+ 에서 legacy 폐기.
-   */
-  const useSessionStore = $derived(sessionStore.active !== null);
-
   // M cardinality — PanelNode 가 single/multi 분기를 위해 참조.
-  const isMultiSelection = $derived(
-    useSessionStore ? sessionStore.M.size > 1 : ephemeralStore.m.size > 1,
-  );
+  const isMultiSelection = $derived(sessionStore.M.size > 1);
   const sessionGroupsById = $derived(new Map(sessionStore.groups));
 
   /**
@@ -487,33 +441,13 @@
     };
   }
 
-  // SvelteFlow nodes — dual source.
+  // SvelteFlow nodes — single source (sessionStore).
   const nodes = $derived<Node[]>(
-    useSessionStore
-      ? Array.from(sessionStore.items.values()).map(itemToNode)
-      : Array.from(panelsStore.panels.values() as Iterable<PanelData>).map((p) => ({
-          id: p.id,
-          type: 'panel',
-          position: { x: p.x ?? 0, y: p.y ?? 0 },
-          data: {
-            ...(p as unknown as Record<string, unknown>),
-            m_multi: isMultiSelection,
-          },
-          draggable: p.locked !== true,
-          selected: ephemeralStore.m.has(p.id),
-          zIndex: p.z ?? 0,
-          width: p.w,
-          height: p.h,
-        })),
+    Array.from(sessionStore.items.values()).map(itemToNode),
   );
 
   function onmove(_event: MouseEvent | TouchEvent | null, viewport: Viewport): void {
-    // Legacy single-session — ephemeralStore.
-    ephemeralStore.viewport = { x: viewport.x, y: viewport.y, zoom: viewport.zoom };
-    // Multi-session (FE-9 Stage 7) — sessionStore + debounced PUT.
-    if (useSessionStore) {
-      sessionStore.updateViewport({ x: viewport.x, y: viewport.y, zoom: viewport.zoom });
-    }
+    sessionStore.updateViewport({ x: viewport.x, y: viewport.y, zoom: viewport.zoom });
   }
 
   /* ── FE-9: sessionStore.viewport → SvelteFlow setViewport ──────────────
@@ -526,7 +460,6 @@
    * onmove 가 처리. 본 effect 에서 sessionStore.viewport 자체는 변경하지 않음
    * — 단방향 (sessionStore → SvelteFlow) reactive sync 만. */
   $effect(() => {
-    if (!useSessionStore) return;
     const v = sessionStore.viewport;
     const cur = getViewport();
     const dx = Math.abs(cur.x - v.x);
@@ -534,6 +467,22 @@
     const dz = Math.abs(cur.zoom - v.zoom);
     if (dx < 0.5 && dy < 0.5 && dz < 0.001) return;
     void setViewport({ x: v.x, y: v.y, zoom: v.zoom });
+  });
+
+  /* ── M (sessionStore) → SvelteFlow internal selected — explicit sync ──
+   * Root cause: `nodes` derived 의 `selected` 필드는 SvelteFlow 의 internal
+   * store 에 *initial* 만 반영. user click 으로 internal selection 이 바뀐
+   * 후로는 external (LayerTreeView 등) 의 reactive sync 가 internal 과
+   * 충돌해 *그림에 안 보이는 상태* (store 는 진실, 시각은 stale) 가 된다.
+   * useSvelteFlow().updateNode 가 internal store 의 정식 진입점이라 본
+   * effect 가 매 M 변경마다 모든 item 에 대해 명시 sync. */
+  $effect(() => {
+    // sessionStore.M / items 가 reactive dep — has() 와 keys() 가 sub 형성.
+    for (const id of sessionStore.items.keys()) {
+      const want = sessionStore.M.has(id);
+      const cur = updateNode; // avoid TS narrowing — local alias
+      cur(id, (n) => (n.selected === want ? {} : { selected: want }));
+    }
   });
 
   // 노드 클릭 → M 갱신. dual source.
@@ -546,23 +495,10 @@
     const isModifierClick =
       event instanceof MouseEvent &&
       (event.metaKey || event.ctrlKey || event.shiftKey);
-    if (useSessionStore) {
-      if (isModifierClick) {
-        sessionStore.toggleM(id);
-      } else {
-        sessionStore.setM([id]);
-      }
-      return;
-    }
     if (isModifierClick) {
-      if (ephemeralStore.m.has(id)) {
-        ephemeralStore.m.delete(id);
-      } else {
-        ephemeralStore.m.add(id);
-      }
+      sessionStore.toggleM(id);
     } else {
-      ephemeralStore.m.clear();
-      ephemeralStore.m.add(id);
+      sessionStore.setM([id]);
     }
   }
 
@@ -571,29 +507,19 @@
     if (isHandTool) return;
     // ── Tool-driven creation ───────────────────────────────────────────
     //
-    // 점-spawn 도구 (text/note/file_path) 가 active 인 동안 빈 캔버스 클릭은
-    // 새 item 을 그 위치에 생성. terminal 도구는 NewPanelButton 의 legacy
-    // path 와 multi-session path 분기. drag-spawn 도구 (rect/ellipse/line) 는
+    // 점-spawn 도구 (text/note/file_path/terminal) 가 active 인 동안 빈 캔버스
+    // 클릭은 새 item 을 그 위치에 생성. drag-spawn 도구 (rect/ellipse/line) 는
     // 별 pointer handler 가 처리 — onpaneclick 은 *down/up 이 같은 점* 인
     // 경우만 fire. 'select' 는 빈 영역 click 시 M clear (default).
-    if (!(event instanceof MouseEvent)) {
-      // Touch 는 P3 의 별 UX — fall through 후 selection clear.
-    } else {
+    if (event instanceof MouseEvent) {
       const tool = toolStore.current;
       const flow = screenToFlowPosition({ x: event.clientX, y: event.clientY });
 
-      // Terminal — legacy WS CTRL 'new-pane' or multi-session P2 endpoint.
       if (tool === 'terminal') {
-        void handleTerminalClick(flow);
+        void spawnMultiSessionTerminal(flow);
         return;
       }
-
-      // text / note / file_path — multi-session only (legacy v1 layout 은
-      // panelsStore 기반이라 비-terminal item 구조 없음).
-      if (
-        useSessionStore &&
-        (tool === 'text' || tool === 'note' || tool === 'file_path')
-      ) {
+      if (tool === 'text' || tool === 'note' || tool === 'file_path') {
         const item = createCanvasItem(tool, { x: flow.x, y: flow.y });
         void commitNewItem(item)
           .then(() => {
@@ -612,56 +538,7 @@
         return;
       }
     }
-    // Default — selection clear.
-    if (useSessionStore) {
-      sessionStore.clearM();
-      return;
-    }
-    if (ephemeralStore.m.size > 0) {
-      ephemeralStore.m.clear();
-    }
-  }
-
-  /**
-   * Terminal 도구 click 핸들러 — legacy/multi-session 분기.
-   *
-   * - legacy (sessionStore.active === null) → `requestLegacyNewPane` (WS CTRL
-   *   'new-pane' + race + appendPanelIfMissing). NewPanelButton 의 기존 흐름.
-   * - multi-session → fresh UUID + mutateLayout append + attachConfirm
-   *   emulation. BE 가 unmatched UUID 를 spawn → 0x88 TERMINAL_SPAWNED →
-   *   terminalPool.bindPaneId → XtermHost mount. BE 의 P2 endpoint 가 ship 되면
-   *   본 emulation 은 1-call endpoint 로 대체 가능 (wire 결과 동일).
-   */
-  async function handleTerminalClick(coords: { x: number; y: number }): Promise<void> {
-    if (useSessionStore) {
-      await spawnMultiSessionTerminal(coords);
-      return;
-    }
-    const client = wsClientHolder?.current ?? null;
-    const token = readToken();
-    if (client === null) {
-      toastStore.show({
-        message: 'WebSocket not ready — legacy new-pane requires Bearer token.',
-        tone: 'error',
-      });
-      return;
-    }
-    if (token === null) {
-      toastStore.show({
-        message: 'No auth token in sessionStorage.',
-        tone: 'error',
-      });
-      return;
-    }
-    try {
-      await requestLegacyNewPane(client, token, coords);
-      toolStore.consume();
-    } catch (err) {
-      toastStore.show({
-        message: `New panel failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+    sessionStore.clearM();
   }
 
   /**
@@ -724,55 +601,43 @@
   function onnodedragstop({ targetNode }: { targetNode: Node | null }) {
     if (!targetNode) return;
     const { id, position } = targetNode;
-    if (useSessionStore && sessionStore.active !== null) {
-      // Multi-session 의 drag commit — sessionStore items 갱신 + PUT layout.
-      const sessionName = sessionStore.active.name;
-      const item = sessionStore.items.get(id);
-      if (item === undefined) return;
-      let moved: CanvasItem;
-      if (item.type === 'line') {
-        // Line 은 (x,y), (x2,y2) 가 절대 좌표 → SvelteFlow Node.position 의
-        // 새 값 - 옛 bounding-box-TL = delta 만큼 두 endpoint 모두 이동.
-        const oldBox = lineBoxFromEndpoints(
-          { x: item.x, y: item.y },
-          { x: item.x2, y: item.y2 },
-        );
-        const dx = position.x - oldBox.x;
-        const dy = position.y - oldBox.y;
-        const nextP1 = { x: item.x + dx, y: item.y + dy };
-        const nextP2 = { x: item.x2 + dx, y: item.y2 + dy };
-        const nextBox = lineBoxFromEndpoints(nextP1, nextP2);
-        moved = {
-          ...item,
-          x: nextP1.x,
-          y: nextP1.y,
-          x2: nextP2.x,
-          y2: nextP2.y,
-          w: nextBox.w,
-          h: nextBox.h,
-        };
-      } else {
-        moved = { ...item, x: position.x, y: position.y };
-      }
-      sessionStore.items.set(id, moved);
-      void mutateLayout(sessionName, (cur) => ({
-        ...cur,
-        items: cur.items.map((it) => (it.id === id ? moved : it)),
-      }))
-        .then(({ layout }) => sessionStore.loadLayout(layout))
-        .catch((e) => console.warn('[gtmux] drag commit (multi-session) failed:', e));
-      return;
+    const active = sessionStore.active;
+    if (active === null) return;
+    const sessionName = active.name;
+    const item = sessionStore.items.get(id);
+    if (item === undefined) return;
+    let moved: CanvasItem;
+    if (item.type === 'line') {
+      // Line 은 (x,y), (x2,y2) 가 절대 좌표 → SvelteFlow Node.position 의
+      // 새 값 - 옛 bounding-box-TL = delta 만큼 두 endpoint 모두 이동.
+      const oldBox = lineBoxFromEndpoints(
+        { x: item.x, y: item.y },
+        { x: item.x2, y: item.y2 },
+      );
+      const dx = position.x - oldBox.x;
+      const dy = position.y - oldBox.y;
+      const nextP1 = { x: item.x + dx, y: item.y + dy };
+      const nextP2 = { x: item.x2 + dx, y: item.y2 + dy };
+      const nextBox = lineBoxFromEndpoints(nextP1, nextP2);
+      moved = {
+        ...item,
+        x: nextP1.x,
+        y: nextP1.y,
+        x2: nextP2.x,
+        y2: nextP2.y,
+        w: nextBox.w,
+        h: nextBox.h,
+      };
+    } else {
+      moved = { ...item, x: position.x, y: position.y };
     }
-    // Legacy
-    panelsStore.movePanel(id, position.x, position.y);
-    const token = readToken();
-    if (token === null) {
-      console.warn('[gtmux] drag commit skipped: no auth token');
-      return;
-    }
-    void putLayoutCommitCurrent(token).catch((e) => {
-      console.warn('[gtmux] drag commit failed:', e);
-    });
+    sessionStore.items.set(id, moved);
+    void mutateLayout(sessionName, (cur) => ({
+      ...cur,
+      items: cur.items.map((it) => (it.id === id ? moved : it)),
+    }))
+      .then(({ layout }) => sessionStore.loadLayout(layout))
+      .catch((e) => console.warn('[gtmux] drag commit failed:', e));
   }
 
   // Right-click handlers — pane area + node. Both prevent the native
