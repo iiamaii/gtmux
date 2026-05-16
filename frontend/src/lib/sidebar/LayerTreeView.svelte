@@ -629,6 +629,30 @@
     }));
   }
 
+  // plan-0010 Task 1 — minimize / maximize / focus row actions.
+  function togglePanelMinimize(id: string, e: MouseEvent): void {
+    stopRowAction(e);
+    const item = sessionStore.items.get(id);
+    if (item === undefined) return;
+    const nextMinimized = item.minimized !== true;
+    void mutateActiveLayout((cur) => ({
+      ...cur,
+      items: cur.items.map((it) =>
+        it.id === id ? ({ ...it, minimized: nextMinimized } as CanvasItem) : it,
+      ),
+    }));
+  }
+
+  function togglePanelMaximizeAction(id: string, e: MouseEvent): void {
+    stopRowAction(e);
+    sessionStore.toggleMaximize(id);
+  }
+
+  function focusPanel(id: string, e: MouseEvent): void {
+    stopRowAction(e);
+    sessionStore.zoomToItem(id);
+  }
+
   function toggleGroupVisibility(id: string, e: MouseEvent): void {
     stopRowAction(e);
     const group = sessionStore.groups.get(id);
@@ -897,6 +921,42 @@
                     <path d="M7 11V7a5 5 0 0 1 9.9-1"/>
                   </svg>
                 {/if}
+              </button>
+              <button
+                type="button"
+                class="icon"
+                class:on={p.minimized === true}
+                title={p.minimized === true ? 'Restore item' : 'Minimize item'}
+                aria-label={p.minimized === true ? 'Restore item' : 'Minimize item'}
+                onclick={(e: MouseEvent) => togglePanelMinimize(node.id, e)}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="icon"
+                class:on={sessionStore.maximizedItemId === node.id}
+                title={sessionStore.maximizedItemId === node.id ? 'Restore item' : 'Maximize item'}
+                aria-label={sessionStore.maximizedItemId === node.id ? 'Restore item' : 'Maximize item'}
+                onclick={(e: MouseEvent) => togglePanelMaximizeAction(node.id, e)}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="4" y="4" width="16" height="16" rx="1.5" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                class="icon"
+                title="Focus item — zoom viewport to item"
+                aria-label="Focus item"
+                onclick={(e: MouseEvent) => focusPanel(node.id, e)}
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" />
+                  <circle cx="12" cy="12" r="3" fill="currentColor" />
+                </svg>
               </button>
             </span>
             {/snippet}
