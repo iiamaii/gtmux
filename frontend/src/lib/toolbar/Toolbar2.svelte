@@ -164,7 +164,7 @@
     <!-- ADR-0019 D9 + UX 결정: active session 버튼은 *SessionListModal 직접
          진입*. session *생성* 진입점은 SessionMenu 의 "Switch workspace session…"
          (workspaceSwitcher.open() → AuthDialog 의 [New session]) 만. -->
-    <ActiveSessionDropdown onSwitch={() => workspaceSwitcher.goList()} />
+    <ActiveSessionDropdown onSwitch={() => workspaceSwitcher.goList('closed')} />
   </div>
 
   <div class="center">

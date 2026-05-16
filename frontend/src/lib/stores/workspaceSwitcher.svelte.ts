@@ -18,29 +18,44 @@ export type SwitcherStage =
   | 'list'
   | 'attach_confirm';
 
+export type ListCloseTarget = 'choice' | 'closed';
+
 class WorkspaceSwitcherStore {
   stage = $state<SwitcherStage>('closed');
   /** Attach 시도 중인 session 이름 (attach_confirm stage 의 입력). */
   pendingSession = $state<string | null>(null);
   /** Attach confirm summary — BE 가 confirm_required 응답 시 채워짐. */
   pendingSummary = $state<AttachConfirmSummary | null>(null);
+  /** SessionListModal cancel target depends on entry point. */
+  listCloseTarget = $state<ListCloseTarget>('choice');
 
   open(): void {
     this.stage = 'choice';
+    this.listCloseTarget = 'choice';
   }
 
   close(): void {
     this.stage = 'closed';
     this.pendingSession = null;
     this.pendingSummary = null;
+    this.listCloseTarget = 'choice';
   }
 
   goCreate(): void {
     this.stage = 'create';
   }
 
-  goList(): void {
+  goList(closeTarget: ListCloseTarget = this.listCloseTarget): void {
+    this.listCloseTarget = closeTarget;
     this.stage = 'list';
+  }
+
+  closeList(): void {
+    if (this.listCloseTarget === 'closed') {
+      this.close();
+      return;
+    }
+    this.open();
   }
 
   goAttachConfirm(sessionName: string, summary: AttachConfirmSummary): void {
