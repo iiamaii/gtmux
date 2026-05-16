@@ -136,7 +136,7 @@
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'file_path'
-            ? ({ ...it, x: params.x, y: params.y, w: Math.max(160, params.width), h: Math.max(32, params.height) } as FilePathItem)
+            ? ({ ...it, x: params.x, y: params.y, w: Math.max(200, params.width), h: Math.max(80, params.height) } as FilePathItem)
             : it,
         ),
       }));
@@ -168,7 +168,7 @@
       nodeId={data.id}
       isVisible={isInM && !isLocked}
       minWidth={200}
-      minHeight={64}
+      minHeight={80}
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"

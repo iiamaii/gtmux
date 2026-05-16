@@ -34,7 +34,11 @@ const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
 // 거의 안 보여 fit-perception 가짐.
 const DEFAULT_TEXT_SIZE = { w: 160, h: 56 } as const;
 const DEFAULT_NOTE_SIZE = { w: 300, h: 96 } as const;
-const DEFAULT_FILE_PATH_SIZE = { w: 320, h: 48 } as const;
+// 시안 §03 — fp-main(icon 24 + padding 11+10 = 45) + fp-foot(content 14 +
+// padding 6+7 = 27) + border 2 = ~74. NodeResizer minHeight 와 정합 — 셋
+// (factory default / NodeResizer minHeight / onResizeEnd clamp) 가 동일해야
+// resize 시 layout shift 없음.
+const DEFAULT_FILE_PATH_SIZE = { w: 320, h: 80 } as const;
 const DEFAULT_SHAPE_SIZE = { w: 200, h: 140 } as const;
 const DEFAULT_LINE_SIZE = { w: 240, h: 80 } as const;
 export const LINE_MIN_LENGTH = 5;
