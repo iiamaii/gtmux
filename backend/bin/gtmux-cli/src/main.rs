@@ -42,7 +42,7 @@ use gtmux_config::{derive_mode, load_with_overrides as load_config, Config, Mode
 use gtmux_pty_backend::PtyBackend;
 use gtmux_ws_server::Hub;
 use state_files::{
-    check_pidfile_liveness, layout_path_for, pidfile_path_for, stop_server, write_pidfile,
+    check_pidfile_liveness, pidfile_path_for, stop_server, write_pidfile,
     PidLiveness, StateFileError, StopOutcome, TeardownOpts, TeardownReport,
 };
 use tokio::net::TcpListener;
@@ -369,13 +369,6 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         },
     };
 
-    // 6a) layout file path — S7-PERSISTENCE-MINIMAL / ADR-0006 (legacy
-    //     `/api/layout`). The multi-session storage (ADR-0019) lives in a
-    //     *different* directory; the legacy file remains for backwards
-    //     compatibility with the singular `/api/layout` route.
-    let layout_path = layout_path_for(&config.server.session)
-        .context("resolving layout file path under XDG_STATE_HOME")?;
-
     // 6b) workspace — ADR-0019 D2 / D11 boot-immutable bind. Precedence:
     //     CLI `--workspace` > TOML `workspace_path` > XDG_DATA_HOME default.
     //     The boot-time v1→v2 migration scans the resolved dir for legacy
@@ -445,7 +438,6 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         &config,
         &token,
         hub.clone(),
-        layout_path,
         workspace,
         password_hash,
     );
@@ -593,26 +585,22 @@ fn build_app_state(
     config: &Config,
     token: &TokenString,
     hub: Hub,
-    layout_path: PathBuf,
     workspace: gtmux_http_api::WorkspaceManager,
     password_hash: Option<String>,
 ) -> gtmux_http_api::AppState {
-    // AppState wires four side-channels into the HTTP router:
-    //  * `hub` so `layout_put_handler` broadcasts LAYOUT_CHANGED to WS
-    //    subscribers right after a successful PUT.
-    //  * `layout_path` so the legacy `/api/layout` endpoint persists per
-    //    ADR-0006 (boot-time load + atomic-write swap).
+    // AppState wires three side-channels into the HTTP router:
+    //  * `hub` so session-scoped `PUT /api/sessions/:name/layout` and the
+    //    other handlers broadcast LAYOUT_CHANGED / TERMINAL_* events to
+    //    WS subscribers.
     //  * `workspace` so the multi-session `/api/sessions[/<name>[/layout]]`
     //    routes (ADR-0018 / ADR-0019) start serving — 503 otherwise.
     //  * `password_hash` so password-mode logins (ADR-0020 D5) can verify
     //    against the on-disk Argon2id hash.
-    let mut app_state = gtmux_http_api::AppState::with_hub_and_path(
-        config.clone(),
-        token.clone(),
-        hub,
-        layout_path,
-    )
-    .with_workspace(workspace);
+    //
+    // Legacy `/api/layout` v1 + `LayoutStore` were removed in the Stage 6
+    // cleanup (handover §5.3.3); v2 is the only `/layout` surface.
+    let mut app_state =
+        gtmux_http_api::AppState::with_hub_and_workspace(config.clone(), token.clone(), hub, workspace);
     if let Some(h) = password_hash {
         app_state = app_state.with_password_hash(h);
     }

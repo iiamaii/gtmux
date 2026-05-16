@@ -51,7 +51,6 @@ mod session_pane_set;
 mod sessions;
 mod settings;
 mod shutdown;
-mod storage;
 mod terminal_map;
 mod terminals;
 mod workspace;
@@ -72,14 +71,13 @@ pub use file_open::{
 };
 pub use sessions::{SessionCache, SessionError, SessionLayout};
 pub use settings::{default_behavior_settings, BehaviorSettings};
-pub use storage::{LayoutStore, StorageError};
 pub use terminal_map::{fresh_terminal_uuid, MapError as TerminalMapError, TerminalMap};
 pub use terminals::{TerminalInfo, TerminalMetadata, TerminalMetadataStore};
 pub use workspace::{
     validate_session_name, BootMigrationReport, SessionInfo, WorkspaceError, WorkspaceManager,
 };
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -93,7 +91,6 @@ use axum::Json;
 use axum::Router;
 use gtmux_auth::TokenString;
 use gtmux_config::{Config, Mode};
-use ring::digest::{digest, SHA256};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -107,42 +104,6 @@ use tracing::warn;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Server-side canvas layout snapshot. The 16-byte raw ETag is the canonical
-/// form; the hex string is a rendering helper kept in sync with the bytes.
-#[derive(Debug, Clone)]
-pub struct LayoutSnapshot {
-    /// 16-byte raw ETag (SHA-256-128 of the canonical body bytes).
-    pub etag: [u8; 16],
-    /// 32-character lowercase hex of `etag` — for `ETag` header rendering.
-    pub etag_hex: String,
-    /// The current layout body as an opaque JSON value. A future
-    /// `gtmux-canvas-layout` crate will replace this with a strongly-typed
-    /// struct; the API contract holds because canonical JSON serialisation is
-    /// stable for both shapes.
-    pub body: Value,
-}
-
-impl LayoutSnapshot {
-    /// Build the initial empty snapshot per `canvas-layout-schema.md` §4.1.
-    pub fn empty() -> Self {
-        let body = json!({
-            "schema_version": 1,
-            "groups": [],
-            "panels": [],
-        });
-        Self::from_body(body)
-    }
-
-    pub(crate) fn from_body(body: Value) -> Self {
-        let bytes = canonical_serialize(&body);
-        let (etag, etag_hex) = compute_etag(&bytes);
-        Self {
-            etag,
-            etag_hex,
-            body,
-        }
-    }
-}
-
 /// Shared application state wired into the router. Cloning is cheap (Arc).
 #[derive(Clone)]
 pub struct AppState {
@@ -150,21 +111,14 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// The session token for this Server run.
     pub token: Arc<TokenString>,
-    /// Layout snapshot guarded by an `RwLock` for atomic GET / PUT swap.
-    pub layout: Arc<RwLock<LayoutSnapshot>>,
     /// Auth-failure counter exposed for downstream rate-limit middleware
     /// (P1 enforcement; ADR-0003 D12 cloud-only). The counter is monotonic.
     pub auth_failure_counter: Arc<AtomicU64>,
-    /// Optional WS broadcast hub. When set, `layout_put_handler` publishes
-    /// the new ETag so live WS subscribers re-hydrate via the dispatcher's
-    /// `LAYOUT_CHANGED` path. `None` in unit-tests that exercise the HTTP
-    /// surface in isolation.
+    /// Optional WS broadcast hub. When set, session-scoped layout PUT
+    /// handlers publish the new ETag so live WS subscribers re-hydrate via
+    /// the dispatcher's `LAYOUT_CHANGED` path. `None` in unit-tests that
+    /// exercise the HTTP surface in isolation.
     pub hub: Option<gtmux_ws_server::Hub>,
-    /// Optional on-disk layout store. When set, `layout_put_handler` writes
-    /// the new snapshot atomically before swapping the in-memory state and
-    /// broadcasting `LAYOUT_CHANGED` (ADR-0006 D13 5-step). `None` in tests
-    /// that exercise the HTTP surface without touching disk.
-    pub store: Option<Arc<LayoutStore>>,
     /// Per-Server workspace handle — the multi-session storage root (ADR-0019
     /// D1/D2). When `Some`, the `/api/sessions[/<name>[/layout]]` routes are
     /// wired and accept requests; when `None` those routes return 503.
@@ -246,10 +200,8 @@ impl AppState {
             terminal_meta: Arc::new(TerminalMetadataStore::new()),
             config: Arc::new(config),
             token: Arc::new(token),
-            layout: Arc::new(RwLock::new(LayoutSnapshot::empty())),
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
             hub: None,
-            store: None,
             workspace: None,
             session_cache: Arc::new(SessionCache::new()),
             behavior_settings: default_behavior_settings(),
@@ -454,46 +406,6 @@ impl AppState {
         me
     }
 
-    /// Production constructor: hub + on-disk layout file. The file is loaded
-    /// at boot time via [`LayoutStore::load`] (ADR-0006 D10 7-state table
-    /// — absent / valid / corrupt all converge on a valid `LayoutSnapshot`).
-    /// Subsequent successful `PUT /api/layout` calls atomically rewrite the
-    /// file before the in-memory swap.
-    pub fn with_hub_and_path(
-        config: Config,
-        token: TokenString,
-        hub: gtmux_ws_server::Hub,
-        layout_path: PathBuf,
-    ) -> Self {
-        let store = LayoutStore::new(layout_path);
-        let snapshot = store.load();
-        let session_table = default_session_table(config.auth.cookie_max_age_days);
-        Self {
-            session_table,
-            rate_limiter: default_rate_limiter(),
-            password_hash: Arc::new(RwLock::new(None)),
-            password_hash_path: None,
-            server_id: Arc::from(fresh_server_id()),
-            session_locks: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            terminal_map: Arc::new(TerminalMap::new()),
-            terminal_meta: Arc::new(TerminalMetadataStore::new()),
-            config: Arc::new(config),
-            token: Arc::new(token),
-            layout: Arc::new(RwLock::new(snapshot)),
-            auth_failure_counter: Arc::new(AtomicU64::new(0)),
-            hub: Some(hub),
-            store: Some(Arc::new(store)),
-            workspace: None,
-            session_cache: Arc::new(SessionCache::new()),
-            behavior_settings: default_behavior_settings(),
-            file_open: FileOpenContext::production(),
-        }
-    }
 }
 
 /// Errors from [`AppState::spawn_terminal_with_uuid`]. Distinct from
@@ -630,10 +542,6 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
     // bypass it. Origin/Host checks still run on every request via the outer
     // chain.
     let api = Router::new()
-        .route(
-            "/api/layout",
-            get(layout_get_handler).put(layout_put_handler),
-        )
         .route(
             "/api/sessions",
             get(sessions::list_handler).post(sessions::create_handler),
@@ -913,155 +821,11 @@ fn urlencode_query(s: &str) -> String {
     out
 }
 
-async fn layout_get_handler(State(state): State<AppState>, req: Request) -> Response {
-    let snap = state.layout.read().await;
-    let etag_quoted = format!("\"{}\"", snap.etag_hex);
-
-    // RFC 7232: If-None-Match → 304 when current ETag matches.
-    if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
-        if let Ok(v) = if_none_match.to_str() {
-            if parse_etag_header(v).is_some_and(|h| h == snap.etag_hex) {
-                let mut resp = Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, &etag_quoted)
-                    .body(Body::empty())
-                    .expect("static headers");
-                apply_security_headers(resp.headers_mut(), state.config.mode());
-                return resp;
-            }
-        }
-    }
-
-    let body = serde_json::to_vec(&snap.body).expect("snapshot is always valid JSON");
-    let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ETAG, &etag_quoted)
-        .body(Body::from(body))
-        .expect("static headers");
-    apply_security_headers(resp.headers_mut(), state.config.mode());
-    resp
-}
-
-/// Soft cap from `canvas-layout-schema.md` §3 R9 (256 KB).
-const PUT_MAX_BYTES: usize = 256 * 1024;
-
-async fn layout_put_handler(State(state): State<AppState>, req: Request) -> Response {
-    // 1. If-Match — required.
-    let if_match = match req.headers().get(header::IF_MATCH) {
-        Some(v) => match v.to_str() {
-            Ok(s) => match parse_etag_header(s) {
-                Some(parsed) => parsed,
-                None => return HttpApiError::PreconditionRequired.into_response(),
-            },
-            Err(_) => return HttpApiError::PreconditionRequired.into_response(),
-        },
-        None => return HttpApiError::PreconditionRequired.into_response(),
-    };
-
-    // 2. Read the body up to the 256 KB cap. axum 0.8 returns `Body`, which
-    //    we drain via `http-body-util` for a portable size-bounded read.
-    let body_bytes = match read_bounded_body(req, PUT_MAX_BYTES).await {
-        Ok(b) => b,
-        Err(BodyReadError::TooLarge) => return HttpApiError::PayloadTooLarge.into_response(),
-        Err(BodyReadError::Io(msg)) => return HttpApiError::BadRequest(msg).into_response(),
-    };
-
-    // 3. Parse JSON.
-    let body: Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(e) => return HttpApiError::BadRequest(format!("json: {e}")).into_response(),
-    };
-
-    // 4. Minimal schema check — full validation is gated behind the
-    //    `gtmux-canvas-layout` crate (Sprint 3+).
-    if let Err(msg) = minimal_layout_check(&body) {
-        return HttpApiError::BadRequest(msg).into_response();
-    }
-
-    // 5. Atomic compare-and-swap on the ETag. The whole transition runs under
-    //    the write lock so two concurrent PUTs cannot observe the same ETag.
-    //    ADR-0006 D13 5-step: validate (done) → new ETag → atomic disk write →
-    //    in-memory swap → LAYOUT_CHANGED broadcast.
-    let mut snap = state.layout.write().await;
-    if if_match != snap.etag_hex {
-        let current_etag_quoted = format!("\"{}\"", snap.etag_hex);
-        let mut resp = HttpApiError::PreconditionFailed.into_response();
-        // Hand back the current ETag so the client can refetch and retry.
-        resp.headers_mut().insert(
-            header::ETAG,
-            HeaderValue::from_str(&current_etag_quoted).expect("hex is always valid header value"),
-        );
-        return resp;
-    }
-
-    let new_snap = LayoutSnapshot::from_body(body);
-    let new_etag = new_snap.etag;
-    let new_etag_quoted = format!("\"{}\"", new_snap.etag_hex);
-
-    // Disk-first: a failed atomic write must leave both the on-disk file and
-    // the in-memory snapshot untouched so the client can safely retry. The
-    // 500 response carries the *current* ETag so the SPA can resync without
-    // re-fetching the layout (the rejected payload never made it to memory).
-    if let Some(store) = &state.store {
-        let body_bytes = canonical_serialize(&new_snap.body);
-        if let Err(e) = store.save(&body_bytes) {
-            tracing::error!(
-                error = %e,
-                "layout_put_handler: atomic disk write failed; in-memory snapshot preserved"
-            );
-            let current_etag_quoted = format!("\"{}\"", snap.etag_hex);
-            let mut resp = (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": "layout_persist_failed",
-                    "message": e.to_string(),
-                })),
-            )
-                .into_response();
-            if let Ok(val) = HeaderValue::from_str(&current_etag_quoted) {
-                resp.headers_mut().insert(header::ETAG, val);
-            }
-            return resp;
-        }
-    }
-
-    *snap = new_snap;
-    drop(snap);
-
-    // Fan out LAYOUT_CHANGED to every live WS subscriber so the SPA
-    // dispatcher revalidates via `If-None-Match` and rehydrates panels.
-    match &state.hub {
-        Some(hub) => {
-            tracing::debug!(
-                etag = %new_etag_quoted,
-                "layout_put_handler: publishing LAYOUT_CHANGED to WS subscribers"
-            );
-            hub.publish_layout_changed(new_etag);
-        }
-        None => {
-            tracing::debug!("layout_put_handler: no hub attached, skipping broadcast");
-        }
-    }
-
-    // canvas-layout-schema §4.2: 204 No Content + ETag header. The empty
-    // body distinguishes a confirmed commit from a 200-style response so
-    // the SPA's PUT helper does not misclassify it as an error.
-    let mut resp = Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .header(header::ETAG, &new_etag_quoted)
-        .body(Body::empty())
-        .expect("static headers");
-    apply_security_headers(resp.headers_mut(), state.config.mode());
-    resp
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Apply the SSoT §1.5 security headers to every response. STS is only
-/// emitted in Cloud mode (SSoT line for STS).
+/// Stamp the standard security headers (ADR-0003 §1) on `headers`.
+/// Used by the auth + bootstrap responses; the routes that go through
+/// `tower-http`'s `set-header` layer already include these. `Mode::Cloud`
+/// additionally adds `Strict-Transport-Security` — local mode omits it
+/// because plain HTTP would silently drop the directive.
 pub(crate) fn apply_security_headers(headers: &mut HeaderMap, mode: Mode) {
     static NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
     static REFERRER: HeaderValue = HeaderValue::from_static("no-referrer");
@@ -1079,80 +843,6 @@ pub(crate) fn apply_security_headers(headers: &mut HeaderMap, mode: Mode) {
     if matches!(mode, Mode::Cloud) {
         headers.insert(header::STRICT_TRANSPORT_SECURITY, HSTS.clone());
     }
-}
-
-/// Canonical-form serialisation for ETag stability. We use `serde_json`'s
-/// default (compact, no trailing whitespace, deterministic struct ordering)
-/// — sufficient for the MVP. Future tightening (sorted keys, normalised
-/// numbers) lives in the `gtmux-canvas-layout` crate so behaviour can change
-/// without affecting the HTTP surface.
-fn canonical_serialize(v: &Value) -> Vec<u8> {
-    serde_json::to_vec(v).expect("Value is always serialisable")
-}
-
-/// Compute SHA256-128 → (raw bytes, lowercase hex). 32 chars.
-fn compute_etag(bytes: &[u8]) -> ([u8; 16], String) {
-    let d = digest(&SHA256, bytes);
-    let full = d.as_ref();
-    let mut raw = [0u8; 16];
-    raw.copy_from_slice(&full[..16]);
-    let mut hex = String::with_capacity(32);
-    for b in raw.iter() {
-        hex.push_str(&format!("{:02x}", b));
-    }
-    (raw, hex)
-}
-
-/// Parse the value of an `ETag` / `If-Match` / `If-None-Match` header into
-/// its 32-character lowercase-hex inner content. Returns `None` if the
-/// header is not a single, strong, 32-hex ETag.
-fn parse_etag_header(v: &str) -> Option<String> {
-    let trimmed = v.trim();
-    // RFC 7232: weak ETags begin with `W/`. We accept neither weak nor
-    // wildcard (`*`) — PUT must use the strong opaque-tag form.
-    if trimmed.starts_with("W/") || trimmed == "*" {
-        return None;
-    }
-    let inner = trimmed
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))?;
-    if inner.len() != 32 {
-        return None;
-    }
-    if !inner
-        .bytes()
-        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    {
-        return None;
-    }
-    Some(inner.to_string())
-}
-
-/// Minimal schema check pending the full `gtmux-canvas-layout` crate. We
-/// reject anything that obviously cannot satisfy the schema so the hook into
-/// the future validator is a drop-in.
-pub(crate) fn minimal_layout_check(body: &Value) -> Result<(), String> {
-    let obj = body.as_object().ok_or("body must be a JSON object")?;
-    if let Some(g) = obj.get("groups") {
-        if !g.is_array() {
-            return Err("groups must be an array".to_string());
-        }
-    } else {
-        return Err("missing required field: groups".to_string());
-    }
-    if let Some(p) = obj.get("panels") {
-        if !p.is_array() {
-            return Err("panels must be an array".to_string());
-        }
-    } else {
-        return Err("missing required field: panels".to_string());
-    }
-    if let Some(sv) = obj.get("schema_version") {
-        if sv.as_u64() != Some(1) {
-            return Err("schema_version must be 1".to_string());
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -1258,262 +948,6 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body, json!({"ok": true}));
-    }
-
-    #[tokio::test]
-    async fn layout_get_initial() {
-        let (app, token) = make_app();
-        let req = HttpRequest::builder()
-            .uri("/api/layout")
-            .header(header::HOST, TEST_HOST)
-            .header(header::AUTHORIZATION, bearer(&token))
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let etag = resp.headers().get(header::ETAG).cloned();
-        assert!(etag.is_some(), "ETag header must be present");
-        let etag_str = etag.unwrap();
-        let inner = parse_etag_header(etag_str.to_str().unwrap());
-        assert!(inner.is_some(), "ETag must be quoted 32-hex");
-        assert_eq!(inner.unwrap().len(), 32);
-        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["groups"].as_array().unwrap().len(), 0);
-        assert_eq!(body["panels"].as_array().unwrap().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn layout_get_304_on_if_none_match() {
-        let (app, token) = make_app();
-        let first = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let etag = first
-            .headers()
-            .get(header::ETAG)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let second = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::IF_NONE_MATCH, &etag)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
-    }
-
-    #[tokio::test]
-    async fn layout_put_requires_if_match() {
-        let (app, token) = make_app();
-        let body = serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "groups": [],
-            "panels": [],
-        }))
-        .unwrap();
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::PUT)
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED);
-    }
-
-    #[tokio::test]
-    async fn layout_put_etag_mismatch() {
-        let (app, token) = make_app();
-        let body = serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "groups": [],
-            "panels": [],
-        }))
-        .unwrap();
-        let stale = "\"00000000000000000000000000000000\"";
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::PUT)
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::IF_MATCH, stale)
-                    .body(Body::from(body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
-        // The current ETag must be attached so clients can rebase.
-        assert!(resp.headers().get(header::ETAG).is_some());
-    }
-
-    #[tokio::test]
-    async fn layout_put_success_updates_etag() {
-        let (app, token) = make_app();
-        // 1. Fetch current ETag.
-        let get1 = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let etag1 = get1
-            .headers()
-            .get(header::ETAG)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        // 2. PUT a new body.
-        let new_body = serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "groups": [{
-                "id": "ga1",
-                "parent_id": null,
-                "label": "main",
-                "color": "#abcdef",
-                "visibility": true,
-                "locked": false,
-                "order": 0,
-            }],
-            "panels": [],
-        }))
-        .unwrap();
-        let put = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::PUT)
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::IF_MATCH, &etag1)
-                    .body(Body::from(new_body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(put.status(), StatusCode::NO_CONTENT);
-        let etag2 = put
-            .headers()
-            .get(header::ETAG)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert_ne!(etag1, etag2);
-
-        // 3. GET reflects the new content.
-        let get2 = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let bytes = to_bytes(get2.into_body(), 64 * 1024).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["groups"].as_array().unwrap().len(), 1);
-        assert_eq!(body["groups"][0]["id"], "ga1");
-    }
-
-    #[tokio::test]
-    async fn layout_put_schema_violation() {
-        let (app, token) = make_app();
-        // Get the current ETag first so If-Match matches.
-        let get1 = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let etag = get1
-            .headers()
-            .get(header::ETAG)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let bogus_body = serde_json::to_vec(&json!({
-            "groups": "not an array",
-        }))
-        .unwrap();
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::PUT)
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::IF_MATCH, &etag)
-                    .body(Body::from(bogus_body))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn auth_required_for_layout() {
-        let (app, _token) = make_app();
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -1737,10 +1171,13 @@ mod tests {
             .trim()
             .to_string();
 
+        // After the layout v1 cleanup (handover §5.3.3), use the v2
+        // `/api/sessions` endpoint to verify the cookie satisfies the
+        // `/api/*` auth middleware.
         let resp = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/api/layout")
+                    .uri("/api/sessions")
                     .header(header::HOST, TEST_HOST)
                     .header(header::COOKIE, &name_value)
                     .body(Body::empty())
@@ -1748,9 +1185,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE,
+            "session cookie must reach the middleware (got {:?}); 503 is OK when this AppState has no workspace",
+            resp.status()
+        );
+        assert_ne!(
             resp.status(),
-            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
             "session cookie must satisfy the auth middleware"
         );
     }
@@ -1805,10 +1247,12 @@ mod tests {
         assert!(clear.contains("Max-Age=0"), "clear cookie expected: {clear}");
 
         // Subsequent request with the now-revoked cookie must 401.
+        // Targets `/api/sessions` after the layout v1 cleanup
+        // (handover §5.3.3) — any authed `/api/*` path works.
         let after = app
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/api/layout")
+                    .uri("/api/sessions")
                     .header(header::HOST, TEST_HOST)
                     .header(header::COOKIE, &name_value)
                     .body(Body::empty())
@@ -1859,25 +1303,6 @@ mod tests {
         assert!(resp.headers().get(header::SET_COOKIE).is_none());
     }
 
-    // ── pure-function unit tests for the helpers ──
-
-    #[test]
-    fn etag_helper_is_deterministic() {
-        let snap1 = LayoutSnapshot::empty();
-        let snap2 = LayoutSnapshot::empty();
-        assert_eq!(snap1.etag, snap2.etag);
-        assert_eq!(snap1.etag_hex.len(), 32);
-        assert!(snap1.etag_hex.bytes().all(|b| b.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn parse_etag_header_rejects_weak_and_uppercase() {
-        assert!(parse_etag_header("W/\"deadbeefdeadbeefdeadbeefdeadbeef\"").is_none());
-        assert!(parse_etag_header("\"DEADBEEFDEADBEEFDEADBEEFDEADBEEF\"").is_none());
-        assert!(parse_etag_header("*").is_none());
-        assert!(parse_etag_header("\"deadbeefdeadbeefdeadbeefdeadbeef\"").is_some());
-    }
-
     #[test]
     fn normalise_redirect_blocks_open_redirect() {
         // The helper lives in `auth.rs` now (ADR-0020 D8 relocation). The
@@ -1893,293 +1318,6 @@ mod tests {
             crate::auth::normalise_redirect_target(Some("/x\r\nSet-Cookie: ev")),
             "/"
         );
-    }
-
-    // ── S7-PERSISTENCE-MINIMAL (ADR-0006) — disk-backed PUT flow ──
-
-    fn make_app_with_store(dir: &tempfile::TempDir) -> (Router, TokenString, std::path::PathBuf) {
-        let token = issue_token().expect("token");
-        let cfg = test_config();
-        let layout_path = dir.path().join("test.layout.json");
-        let store = LayoutStore::new(layout_path.clone());
-        let state = AppState {
-            config: Arc::new(cfg),
-            token: Arc::new(token.clone()),
-            layout: Arc::new(RwLock::new(store.load())),
-            auth_failure_counter: Arc::new(AtomicU64::new(0)),
-            hub: None,
-            store: Some(Arc::new(store)),
-            workspace: None,
-            session_cache: Arc::new(crate::sessions::SessionCache::new()),
-            session_table: crate::auth::default_session_table(7),
-            rate_limiter: crate::auth::default_rate_limiter(),
-            password_hash: Arc::new(RwLock::new(None)),
-            password_hash_path: None,
-            server_id: Arc::from(crate::session_lock::fresh_server_id()),
-            session_locks: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            terminal_map: Arc::new(TerminalMap::new()),
-            terminal_meta: Arc::new(TerminalMetadataStore::new()),
-            behavior_settings: default_behavior_settings(),
-            file_open: FileOpenContext::production(),
-        };
-        let app = router_with_state(state);
-        (app, token, layout_path)
-    }
-
-    async fn current_etag(app: &Router, token: &TokenString) -> String {
-        let resp = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        resp.headers()
-            .get(header::ETAG)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string()
-    }
-
-    fn sample_body() -> Value {
-        json!({
-            "schema_version": 1,
-            "groups": [{
-                "id": "ga1",
-                "parent_id": null,
-                "label": "main",
-                "color": "#abcdef",
-                "visibility": true,
-                "locked": false,
-                "order": 0,
-            }],
-            "panels": [],
-        })
-    }
-
-    #[tokio::test]
-    async fn layout_put_persists_to_disk() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (app, token, path) = make_app_with_store(&dir);
-        // Before PUT the file does not exist (empty layout loaded from absent).
-        assert!(!path.exists());
-
-        let etag = current_etag(&app, &token).await;
-        let new_body = sample_body();
-        let put = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::PUT)
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::IF_MATCH, &etag)
-                    .body(Body::from(serde_json::to_vec(&new_body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(put.status(), StatusCode::NO_CONTENT);
-
-        // The atomic write must have produced exactly one file with mode 0600.
-        assert!(path.exists(), "PUT must materialise the layout file");
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(on_disk, new_body);
-    }
-
-    #[tokio::test]
-    async fn layout_put_412_leaves_disk_unchanged() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (app, token, path) = make_app_with_store(&dir);
-
-        // Seed disk with a known-good layout via a successful PUT.
-        let etag1 = current_etag(&app, &token).await;
-        let _ = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::PUT)
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::IF_MATCH, &etag1)
-                    .body(Body::from(serde_json::to_vec(&sample_body()).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let baseline = std::fs::read(&path).unwrap();
-
-        // PUT with a stale ETag must be rejected with 412 — and the file
-        // bytes on disk must be untouched.
-        let stale = "\"00000000000000000000000000000000\"";
-        let alt_body = json!({
-            "schema_version": 1,
-            "groups": [],
-            "panels": [],
-        });
-        let resp = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::PUT)
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::IF_MATCH, stale)
-                    .body(Body::from(serde_json::to_vec(&alt_body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
-
-        let after = std::fs::read(&path).unwrap();
-        assert_eq!(baseline, after, "412 must not write to disk");
-    }
-
-    #[tokio::test]
-    async fn boot_after_put_reloads_same_etag() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (app1, token, path) = make_app_with_store(&dir);
-        let etag1 = current_etag(&app1, &token).await;
-        let body = sample_body();
-        let put = app1
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::PUT)
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::IF_MATCH, &etag1)
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(put.status(), StatusCode::NO_CONTENT);
-        let etag_after_put = put
-            .headers()
-            .get(header::ETAG)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-
-        // Simulate a server restart: build a fresh AppState pointing at the
-        // same file. The loader recomputes the ETag from disk bytes and the
-        // GET handler must surface the same value the previous PUT returned.
-        let cfg = test_config();
-        let store = LayoutStore::new(path);
-        let state = AppState {
-            config: Arc::new(cfg),
-            token: Arc::new(token.clone()),
-            layout: Arc::new(RwLock::new(store.load())),
-            auth_failure_counter: Arc::new(AtomicU64::new(0)),
-            hub: None,
-            store: Some(Arc::new(store)),
-            workspace: None,
-            session_cache: Arc::new(crate::sessions::SessionCache::new()),
-            session_table: crate::auth::default_session_table(7),
-            rate_limiter: crate::auth::default_rate_limiter(),
-            password_hash: Arc::new(RwLock::new(None)),
-            password_hash_path: None,
-            server_id: Arc::from(crate::session_lock::fresh_server_id()),
-            session_locks: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            terminal_map: Arc::new(TerminalMap::new()),
-            terminal_meta: Arc::new(TerminalMetadataStore::new()),
-            behavior_settings: default_behavior_settings(),
-            file_open: FileOpenContext::production(),
-        };
-        let app2 = router_with_state(state);
-        let etag2 = current_etag(&app2, &token).await;
-        assert_eq!(etag_after_put, etag2, "ETag must survive a cold boot");
-    }
-
-    #[tokio::test]
-    async fn boot_with_corrupt_file_quarantines_and_serves_empty() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.layout.json");
-        // Seed a parse-failure file before the server starts.
-        std::fs::write(&path, b"{ not json }").unwrap();
-        let store = LayoutStore::new(path.clone());
-        let cfg = test_config();
-        let token = issue_token().expect("token");
-        let state = AppState {
-            config: Arc::new(cfg),
-            token: Arc::new(token.clone()),
-            layout: Arc::new(RwLock::new(store.load())),
-            auth_failure_counter: Arc::new(AtomicU64::new(0)),
-            hub: None,
-            store: Some(Arc::new(store)),
-            workspace: None,
-            session_cache: Arc::new(crate::sessions::SessionCache::new()),
-            session_table: crate::auth::default_session_table(7),
-            rate_limiter: crate::auth::default_rate_limiter(),
-            password_hash: Arc::new(RwLock::new(None)),
-            password_hash_path: None,
-            server_id: Arc::from(crate::session_lock::fresh_server_id()),
-            session_locks: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            terminal_map: Arc::new(TerminalMap::new()),
-            terminal_meta: Arc::new(TerminalMetadataStore::new()),
-            behavior_settings: default_behavior_settings(),
-            file_open: FileOpenContext::production(),
-        };
-        let app = router_with_state(state);
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/layout")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["groups"].as_array().unwrap().len(), 0);
-        assert_eq!(body["panels"].as_array().unwrap().len(), 0);
-        // Original file is gone; a sidecar is in its place.
-        assert!(!path.exists());
-        let has_sidecar = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().contains(".corrupt-"));
-        assert!(has_sidecar, "corrupt file must be quarantined");
     }
 
     // ── Multi-session HTTP surface (Stage 1, ADR-0019 + ADR-0018) ──
