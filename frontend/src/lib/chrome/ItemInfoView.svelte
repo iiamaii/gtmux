@@ -28,6 +28,7 @@
     type AlignMode,
     type DistributeMode,
   } from '$lib/canvas/alignment';
+  import ColorPicker from '$lib/ui/ColorPicker.svelte';
   import type {
     CanvasItem,
     TextAlign,
@@ -210,6 +211,43 @@
   async function onDistribute(mode: DistributeMode): Promise<void> {
     const moves = distributeItems(selectedItems, mode);
     await applyAlignMutation(moves, 'Distribute aborted — session reconnect failed.');
+  }
+
+  /* ── Shape fill / stroke editor (ADR-0027 D3, plan-0010 Task 3) ──
+   * rect / ellipse / line 의 fill / stroke 를 ColorPicker 로 편집. multi
+   * 동일 type 일 때 broadcast (D6 batch). value 가 mixed 면 placeholder.
+   */
+  async function applyShapeColor(
+    field: 'fill' | 'stroke',
+    hex: string,
+  ): Promise<void> {
+    const active = sessionStore.active;
+    if (active === null) return;
+    if (selectedItems.length === 0) return;
+    if (!(await ensureMutationOk('Color change aborted — session reconnect failed.'))) return;
+    const ids = new Set(selectedIds);
+    try {
+      const { layout } = await mutateLayout(active.name, (cur) => ({
+        ...cur,
+        items: cur.items.map((it) => {
+          if (!ids.has(it.id)) return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line') return it;
+          // line 에는 fill 이 없음 — 무시.
+          if (field === 'fill' && it.type === 'line') return it;
+          return { ...it, [field]: hex } as CanvasItem;
+        }),
+      }));
+      sessionStore.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Color change failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
   }
 
   /* ── Text alignment — Figma-style segmented control ──────────────
@@ -449,11 +487,21 @@
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
             <div class="kv">
               <span class="k">stroke</span>
-              <span class="v mono">{sessionItem.stroke}</span>
+              <div class="v">
+                <ColorPicker
+                  value={sessionItem.stroke}
+                  oncommit={(hex) => void applyShapeColor('stroke', hex)}
+                />
+              </div>
             </div>
             <div class="kv">
               <span class="k">fill</span>
-              <span class="v mono">{sessionItem.fill}</span>
+              <div class="v">
+                <ColorPicker
+                  value={sessionItem.fill}
+                  oncommit={(hex) => void applyShapeColor('fill', hex)}
+                />
+              </div>
             </div>
           {:else if sessionItem.type === 'line'}
             <div class="kv-pair">
@@ -468,7 +516,12 @@
             </div>
             <div class="kv">
               <span class="k">stroke</span>
-              <span class="v mono">{sessionItem.stroke}</span>
+              <div class="v">
+                <ColorPicker
+                  value={sessionItem.stroke}
+                  oncommit={(hex) => void applyShapeColor('stroke', hex)}
+                />
+              </div>
             </div>
           {:else if sessionItem.type === 'text'}
             {@const txt = sessionItem}
