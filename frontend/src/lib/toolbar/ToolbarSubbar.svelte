@@ -49,8 +49,13 @@
     return { kind: 'text-align', target: item };
   });
 
-  /** Toolbar2 의 text tool button center — anchor for horizontal alignment. */
+  /**
+   * Anchor — toolbar 의 *source tool button* 의 center-x + 그 button 의
+   * bottom-y. Excalidraw 식 floating panel 패턴: panel 이 toolbar row 의 자리를
+   * 점유하지 않고, 해당 tool 버튼 *바로 아래* 에 띄워진다.
+   */
   let anchorX = $state<number | null>(null);
+  let anchorTop = $state<number | null>(null);
   let resizeObs: ResizeObserver | null = null;
 
   function anchorKey(): string {
@@ -63,6 +68,7 @@
     const key = anchorKey();
     if (key.length === 0) {
       anchorX = null;
+      anchorTop = null;
       return;
     }
     const btn = document.querySelector<HTMLElement>(
@@ -70,10 +76,13 @@
     );
     if (btn === null) {
       anchorX = null;
+      anchorTop = null;
       return;
     }
     const rect = btn.getBoundingClientRect();
     anchorX = rect.left + rect.width / 2;
+    // 8px gap below the toolbar button. viewport-relative (position: fixed).
+    anchorTop = rect.bottom + 8;
   }
 
   // anchor 는 toolbar layout 변화에 영향 — toolbar element 자체에 resize obs.
@@ -161,12 +170,15 @@
   }
 </script>
 
-{#if ctx !== null}
-  <div class="subbar" role="toolbar" aria-label="Tool detail options">
-    <div
-      class="group"
-      style:left={anchorX !== null ? `${anchorX}px` : '50%'}
-    >
+{#if ctx !== null && anchorX !== null && anchorTop !== null}
+  <div
+    class="subbar"
+    role="toolbar"
+    aria-label="Tool detail options"
+    style:left={`${anchorX}px`}
+    style:top={`${anchorTop}px`}
+  >
+    <div class="group">
       {#if ctx.kind === 'text-align'}
         {@const target = ctx.target}
         {@const h = target.text_align ?? 'center'}
@@ -268,20 +280,34 @@
 {/if}
 
 <style>
+  /* Excalidraw-style floating panel — toolbar row 자리 점유 0.
+     anchor (source tool button) 의 center-bottom 에 떠 있다.
+     `position: fixed` 이라 scroll/resize 시 anchor 재측정 (measureAnchor) 으로 따라옴. */
   .subbar {
-    position: relative;
-    height: 44px;
-    background: var(--color-surface);
-    border-bottom: 1px solid var(--color-border);
-    z-index: calc(var(--z-toolbar) - 1);
+    position: fixed;
+    transform: translateX(-50%);
+    z-index: var(--z-toolbar);
     user-select: none;
-    flex: 0 0 auto;
+    padding: var(--space-4);
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md);
+    animation: subbar-in 120ms var(--motion-easing);
+  }
+
+  @keyframes subbar-in {
+    from {
+      opacity: 0;
+      transform: translateX(-50%) translateY(-4px) scale(0.96);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0) scale(1);
+    }
   }
 
   .group {
-    position: absolute;
-    top: 4px;
-    transform: translateX(-50%);
     display: inline-flex;
     align-items: center;
     gap: 2px;
