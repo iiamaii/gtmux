@@ -5,7 +5,7 @@
   // 시각 차이는 border-radius 만 — `data.type` 으로 분기.
 
   import { NodeResizer } from '@xyflow/svelte';
-  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, EllipseItem, RectItem } from '$lib/types/canvas';
@@ -53,6 +53,7 @@
   async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
     const active = sessionStore.active;
     if (active === null) return;
+    if (!(await ensureMutationOk('Resize aborted — session reconnect failed.'))) return;
     const nextW = Math.max(20, params.width);
     const nextH = Math.max(20, params.height);
     try {

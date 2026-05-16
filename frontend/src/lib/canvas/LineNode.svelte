@@ -12,7 +12,7 @@
   // SVG 좌표 결정.
 
   import { useSvelteFlow } from '@xyflow/svelte';
-  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, LineItem } from '$lib/types/canvas';
@@ -146,6 +146,10 @@
     }
     const active = sessionStore.active;
     if (active === null) {
+      pendingCommit = null;
+      return;
+    }
+    if (!(await ensureMutationOk('Line edit aborted — session reconnect failed.'))) {
       pendingCommit = null;
       return;
     }

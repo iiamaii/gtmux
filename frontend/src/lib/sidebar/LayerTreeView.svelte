@@ -17,7 +17,7 @@
 
   import { SvelteSet } from 'svelte/reactivity';
   import { muxStore } from '$lib/stores/mux.svelte';
-  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, CanvasItemType } from '$lib/types/canvas';
@@ -574,6 +574,7 @@
   ): Promise<void> {
     const active = sessionStore.active;
     if (active === null) return;
+    if (!(await ensureMutationOk('Layer mutation aborted — session reconnect failed.'))) return;
     try {
       const { layout } = await mutateLayout(active.name, mutator);
       sessionStore.loadLayout(layout);

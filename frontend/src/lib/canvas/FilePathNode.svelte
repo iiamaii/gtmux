@@ -9,7 +9,7 @@
 
   import { NodeResizer } from '@xyflow/svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
-  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { FilePathItem, CanvasItem } from '$lib/types/canvas';
@@ -65,6 +65,7 @@
     }
     const active = sessionStore.active;
     if (active === null) return;
+    if (!(await ensureMutationOk('File path edit aborted — session reconnect failed.'))) return;
     try {
       const { layout } = await mutateLayout(active.name, (cur) => ({
         ...cur,

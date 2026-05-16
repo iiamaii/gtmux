@@ -19,7 +19,7 @@
   import XtermHost from './XtermHost.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
-  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { deleteItem, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
@@ -107,6 +107,13 @@
     const sessionName = active.name;
     const nextW = Math.max(240, params.width);
     const nextH = Math.max(140, params.height);
+    void (async () => {
+      if (!(await ensureMutationOk('Resize aborted — session reconnect failed.'))) return;
+      _commitResize(sessionName, params, nextW, nextH);
+    })();
+  }
+
+  function _commitResize(sessionName: string, params: ResizeParams, nextW: number, nextH: number): void {
     void mutateLayout(sessionName, (cur) => ({
       ...cur,
       items: cur.items.map((it: CanvasItem) =>
@@ -196,6 +203,7 @@
       labelEditing = false;
       return;
     }
+    if (!(await ensureMutationOk('Label rename aborted — session reconnect failed.'))) return;
     labelCommitting = true;
     try {
       await patchTerminalLabel(data.id, trimmed);

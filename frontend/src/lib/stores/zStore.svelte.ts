@@ -16,7 +16,7 @@
 //
 // Mutate 후 caller 가 mutateLayout PUT 호출 책임. 본 store 는 *순수 계산* 만.
 
-import { sessionStore } from './sessionStore.svelte';
+import { ensureMutationOk, sessionStore } from './sessionStore.svelte';
 import { mutateLayout } from '$lib/http/sessions';
 import type { CanvasItem, CanvasLayout } from '$lib/types/canvas';
 
@@ -112,11 +112,15 @@ class ZStore {
   #commit(mutator: (cur: CanvasLayout) => CanvasLayout): void {
     const active = sessionStore.active;
     if (active === null) return;
-    void mutateLayout(active.name, mutator)
-      .then(({ layout }) => sessionStore.loadLayout(layout))
-      .catch((e) =>
-        console.warn('[gtmux] z mutation commit failed:', e),
-      );
+    void (async () => {
+      if (!(await ensureMutationOk('Z order change aborted — session reconnect failed.'))) return;
+      try {
+        const { layout } = await mutateLayout(active.name, mutator);
+        sessionStore.loadLayout(layout);
+      } catch (e) {
+        console.warn('[gtmux] z mutation commit failed:', e);
+      }
+    })();
   }
 }
 

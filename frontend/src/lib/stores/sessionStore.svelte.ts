@@ -25,6 +25,7 @@ import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { debugCount } from '$lib/common/debugCounts';
 import { mutateLayout } from '$lib/http/sessions';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
+import { toastStore } from '$lib/ui/toast-store.svelte';
 import type { CanvasItem, CanvasLayout, Viewport } from '$lib/types/canvas';
 import type { Group } from '$lib/types/group';
 
@@ -475,3 +476,29 @@ class SessionStore {
 
 /** Single session-scoped store instance. */
 export const sessionStore = new SessionStore();
+
+/**
+ * `ensureMutationOk` — Phase 2 mutation guard 의 사용자-facing wrapper.
+ *
+ * 모든 outgoing write 의 *진입점* 에서 await 한 후 false 면 early return
+ * 패턴. 기본 toast 가 portable 하므로 site 별 reword 필요 없음 — site-specific
+ * 메시지가 필요한 경우 `abortMessage` 로 override.
+ *
+ * 사용:
+ *   if (!(await ensureMutationOk('Drag commit aborted.'))) return;
+ *   await mutateLayout(...);
+ */
+export async function ensureMutationOk(abortMessage?: string): Promise<boolean> {
+  const guard = await sessionStore.guardOutgoingMutation();
+  if (!guard.ok) {
+    toastStore.show({
+      message:
+        abortMessage ??
+        'Session reconnect failed — action aborted. Use Switch session… in the menu.',
+      tone: 'error',
+      durationMs: 6_000,
+    });
+    return false;
+  }
+  return true;
+}

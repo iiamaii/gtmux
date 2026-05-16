@@ -24,7 +24,7 @@ import type {
   TerminalItem,
 } from '$lib/types/canvas';
 import { mutateLayout } from '$lib/http/sessions';
-import { sessionStore } from '$lib/stores/sessionStore.svelte';
+import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
 
 /** 신규 item 의 기본 좌표 + 크기 default. ADR-0018 D7 의 z 정책은 commit 시점에 결정. */
 const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
@@ -239,6 +239,7 @@ export function createLineItem(
 export async function commitNewItem(item: CanvasItem): Promise<CanvasItem | null> {
   const active = sessionStore.active;
   if (active === null) return null;
+  if (!(await ensureMutationOk('Item creation aborted — session reconnect failed.'))) return null;
   let committed: CanvasItem = item;
   const { layout } = await mutateLayout(active.name, (cur) => {
     const maxZ = cur.items.reduce((m, it) => (it.z > m ? it.z : m), 0);

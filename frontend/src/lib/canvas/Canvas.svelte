@@ -19,7 +19,7 @@
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import { debugCount } from '$lib/common/debugCounts';
-  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toolStore } from '$lib/stores/toolStore.svelte';
   import { attachConfirm, deleteItem, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import type { CanvasItem } from '$lib/types/canvas';
@@ -773,12 +773,18 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
-    void mutateLayout(sessionName, (cur) => ({
-      ...cur,
-      items: cur.items.map((it) => movedById.get(it.id) ?? it),
-    }))
-      .then(({ layout }) => sessionStore.loadLayout(layout))
-      .catch((e) => console.warn('[gtmux] drag commit failed:', e));
+    void (async () => {
+      if (!(await ensureMutationOk('Drag commit aborted — session reconnect failed.'))) return;
+      try {
+        const { layout } = await mutateLayout(sessionName, (cur) => ({
+          ...cur,
+          items: cur.items.map((it) => movedById.get(it.id) ?? it),
+        }));
+        sessionStore.loadLayout(layout);
+      } catch (e) {
+        console.warn('[gtmux] drag commit failed:', e);
+      }
+    })();
   }
 
   // Right-click handlers — pane area + node. Both prevent the native
