@@ -18,10 +18,16 @@
 
   import { onMount } from 'svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
-  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import {
+    alignItems,
+    distributeItems,
+    type AlignMode,
+    type DistributeMode,
+  } from '$lib/canvas/alignment';
   import type {
     CanvasItem,
     TextAlign,
@@ -157,6 +163,54 @@
   }
 
   const isSelectedTerminal = $derived(sessionItem?.type === 'terminal');
+
+  /* ── Multi-select node alignment (ADR-0027 D4~D8, plan-0010 Task 5) ──
+   * Selection BBox 기준의 6 align + 2 distribute. M.size ≥ 2 일 때 button
+   * row 표시, distribute 는 ≥ 3 일 때만. 한 mutateLayout PUT 으로 broadcast
+   * (D6 batch contract). locked item 은 새 position 갱신 skip (D7).
+   */
+  async function applyAlignMutation(
+    moves: Map<string, { x: number; y: number; x2?: number; y2?: number }>,
+    abortMessage: string,
+  ): Promise<void> {
+    if (moves.size === 0) return;
+    const active = sessionStore.active;
+    if (active === null) return;
+    if (!(await ensureMutationOk(abortMessage))) return;
+    try {
+      const { layout } = await mutateLayout(active.name, (cur) => ({
+        ...cur,
+        items: cur.items.map((it) => {
+          const m = moves.get(it.id);
+          if (m === undefined) return it;
+          if (it.type === 'line' && m.x2 !== undefined && m.y2 !== undefined) {
+            return { ...it, x: m.x, y: m.y, x2: m.x2, y2: m.y2 } as CanvasItem;
+          }
+          return { ...it, x: m.x, y: m.y } as CanvasItem;
+        }),
+      }));
+      sessionStore.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Align failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
+  }
+
+  async function onAlign(mode: AlignMode): Promise<void> {
+    const moves = alignItems(selectedItems, mode);
+    await applyAlignMutation(moves, 'Align aborted — session reconnect failed.');
+  }
+
+  async function onDistribute(mode: DistributeMode): Promise<void> {
+    const moves = distributeItems(selectedItems, mode);
+    await applyAlignMutation(moves, 'Distribute aborted — session reconnect failed.');
+  }
 
   /* ── Text alignment — Figma-style segmented control ──────────────
    * Inspector 가 text item 의 alignment 를 직접 mutate. 옛
@@ -312,6 +366,43 @@
             {commonNumStr('z', '0')}
           </span>
         </div>
+        {#if selectionCount >= 2}
+          <!-- ADR-0027 D4/D9 — alignment row. Distribute 는 N≥3. -->
+          <div class="align-row" role="group" aria-label="Alignment">
+            <div class="align-group" aria-label="Align horizontal">
+              <button type="button" class="align-btn" title="Align left" aria-label="Align left" onclick={() => onAlign('left')}>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="2" x2="2" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="3.5" y="9" width="5" height="3"/></svg>
+              </button>
+              <button type="button" class="align-btn" title="Align center horizontally" aria-label="Align center horizontally" onclick={() => onAlign('center-x')}>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="8" y1="2" x2="8" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="5.5" y="9" width="5" height="3"/></svg>
+              </button>
+              <button type="button" class="align-btn" title="Align right" aria-label="Align right" onclick={() => onAlign('right')}>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="14" y1="2" x2="14" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="7.5" y="9" width="5" height="3"/></svg>
+              </button>
+            </div>
+            <div class="align-group" aria-label="Align vertical">
+              <button type="button" class="align-btn" title="Align top" aria-label="Align top" onclick={() => onAlign('top')}>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="2" x2="14" y2="2"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="3.5" width="3" height="5"/></svg>
+              </button>
+              <button type="button" class="align-btn" title="Align center vertically" aria-label="Align center vertically" onclick={() => onAlign('center-y')}>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="8" x2="14" y2="8"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="5.5" width="3" height="5"/></svg>
+              </button>
+              <button type="button" class="align-btn" title="Align bottom" aria-label="Align bottom" onclick={() => onAlign('bottom')}>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="14" x2="14" y2="14"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="7.5" width="3" height="5"/></svg>
+              </button>
+            </div>
+            {#if selectionCount >= 3}
+              <div class="align-group" aria-label="Distribute">
+                <button type="button" class="align-btn" title="Distribute horizontally" aria-label="Distribute horizontally" onclick={() => onDistribute('horizontal')}>
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="1" y="4" width="3" height="8"/><rect x="6.5" y="4" width="3" height="8"/><rect x="12" y="4" width="3" height="8"/></svg>
+                </button>
+                <button type="button" class="align-btn" title="Distribute vertically" aria-label="Distribute vertically" onclick={() => onDistribute('vertical')}>
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="4" y="1" width="8" height="3"/><rect x="4" y="6.5" width="8" height="3"/><rect x="4" y="12" width="8" height="3"/></svg>
+                </button>
+              </div>
+            {/if}
+          </div>
+        {/if}
       </section>
 
       {#if selectionCount === 1 && isSelectedTerminal && (terminalPoolEntry !== null || sessionItem !== null)}
@@ -677,6 +768,14 @@
   .align-row .v {
     display: inline-flex;
     justify-content: flex-start;
+  }
+
+  /* ADR-0027 D9 — multi-select alignment row (Common section 안). */
+  .section > .align-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-6);
+    margin-top: var(--space-10);
   }
 
   .align-group {
