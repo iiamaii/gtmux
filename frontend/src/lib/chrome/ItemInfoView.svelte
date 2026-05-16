@@ -676,7 +676,7 @@
                 <span class="k">stroke</span>
                 <ColorPicker
                   value={sessionItem.stroke}
-                  allowTransparent={true}
+                  allowAlpha={true}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
                 />
               </div>
@@ -686,6 +686,7 @@
                 <span class="k">fill</span>
                 <ColorPicker
                   value={sessionItem.fill}
+                  allowAlpha={true}
                   allowTransparent={true}
                   oncommit={(hex) => void applyShapeColor('fill', hex)}
                 />
@@ -716,7 +717,7 @@
                 <span class="k">stroke</span>
                 <ColorPicker
                   value={line.stroke}
-                  allowTransparent={true}
+                  allowAlpha={true}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
                 />
               </div>
