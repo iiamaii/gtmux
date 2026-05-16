@@ -3,8 +3,8 @@
    * Titlebar — 44px chrome (plan 0005 Stage C, ADR-0017 §D1/D2).
    *
    * Layout (3-col grid):
-   *   - left   : SessionMenu (kebab) + "Workspace" tab
-   *   - center : session info — "gtmux · <session> · <bind>:<port> · <mode>"
+   *   - left   : SessionMenu (kebab) + brand-mark + "gtmux"
+   *   - center : host info — "<bind>:<port> · <mode>"
    *   - right  : ThemeToggle + FocusToggle
    *
    * Stage C scope: chrome shell + actions only. ViewportCtrl / HelpBar /
@@ -50,14 +50,13 @@
 <header class="titlebar" aria-label="gtmux titlebar">
   <div class="titlebar-left">
     <SessionMenu {sessionName} />
-    <span class="title-tab active">Workspace</span>
+    <div class="brand" aria-label="gtmux">
+      <div class="brand-mark" aria-hidden="true"></div>
+      <span class="brand-name">gtmux</span>
+    </div>
   </div>
 
   <div class="titlebar-center">
-    <span class="brand">gtmux</span>
-    <span class="sep">·</span>
-    <strong class="session">{sessionName}</strong>
-    <span class="sep">·</span>
     <span class="muted">{hostInfo}</span>
     <span class="sep">·</span>
     <span class="muted">{mode}</span>
@@ -108,16 +107,30 @@
     white-space: nowrap;
   }
 
+  /* Brand — auth page (routes/auth/+page.svelte) 의 .brand / .brand-mark 정합.
+     22px conic-gradient logo + sans 15px 'gtmux'. */
   .brand {
-    font-family: var(--font-mono);
-    font-size: var(--text-md);
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-8);
+    font-weight: var(--weight-semibold);
+    font-size: 15px;
+    letter-spacing: -0.2px;
     color: var(--color-fg);
-    letter-spacing: 0.2px;
+    user-select: none;
   }
 
-  .session {
-    color: var(--color-fg);
-    font-weight: var(--weight-medium);
+  .brand-mark {
+    width: 20px;
+    height: 20px;
+    border-radius: var(--radius-md);
+    background: conic-gradient(from 220deg, #0acf83, #a259ff, #f24e1e, #ff7262, #1abcfe, #0acf83);
+    box-shadow: var(--shadow-sm);
+    flex-shrink: 0;
+  }
+
+  .brand-name {
+    line-height: 1;
   }
 
   .sep {
@@ -126,24 +139,6 @@
 
   .muted {
     color: var(--color-fg-muted);
-  }
-
-  .title-tab {
-    padding: var(--space-4) var(--space-10);
-    border-radius: var(--radius-sm);
-    font-size: var(--text-md);
-    color: var(--color-fg-muted);
-    cursor: pointer;
-    transition: background var(--motion-fast) var(--motion-easing);
-  }
-
-  .title-tab:hover {
-    background: var(--color-glass-1);
-  }
-
-  .title-tab.active {
-    background: var(--color-glass-1);
-    color: var(--color-fg);
   }
 
   /* Responsive — narrow viewport hides center session info to keep

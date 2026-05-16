@@ -706,9 +706,8 @@
           ondragleave={(e: DragEvent) => onRowDragLeave(node.id, e)}
           ondrop={(e: DragEvent) => onRowDrop(node.id, 'group', e)}
           ondragend={onTreeDragEnd}
-          style:padding-left={`${node.depth * 16 + 4}px`}
         >
-          <div class="row-inner">
+          <div class="row-inner" style:padding-left={`${node.depth * 16 + 4}px`}>
             <!-- caret 은 span (button 중첩 금지) — keyboard 접근은 row-button 의 Enter/Space 가
                  select 만 트리거하며 expand toggle 은 별도 키 (P1+에서 Right/Left arrow 처리). -->
             <span
@@ -838,9 +837,8 @@
           ondragleave={(e: DragEvent) => onRowDragLeave(node.id, e)}
           ondrop={(e: DragEvent) => onRowDrop(node.id, 'panel', e)}
           ondragend={onTreeDragEnd}
-          style:padding-left={`${node.depth * 16 + 24}px`}
         >
-          <div class="row-inner">
+          <div class="row-inner" style:padding-left={`${node.depth * 16 + 24}px`}>
             <button
               type="button"
               class="row-button"
@@ -974,6 +972,15 @@
   .row {
     display: block;
     position: relative;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  /* 행 간 세로 간격 — gap-like spacing. drop indicator (::before/::after, 2px) 는
+     row 의 top/bottom edge 에 위치하므로 margin 영역과 겹치지 않음. */
+  .row + .row {
+    margin-top: 2px;
   }
 
   /* Drag-reorder/reparent — drop indicator (ADR-0024 D1 layer list V2).
@@ -1005,28 +1012,36 @@
     outline-offset: -1px;
   }
 
-  /* Row hover / selected 는 row-inner 단위 — label / icons 가 *별도* hover 영역으로
-   * 분절되지 않도록 두 child 를 담는 container 가 hover target. icon 자체의 추가
-   * hover (background-tint 강화) 는 layered 으로 유지. */
+  /* Row hover / selected 는 row 단위 — panel width 가 resize 되어도 가로 전체
+   * 적용 (.row 가 panel 의 full width 차지). row-inner 는 padding-left (indent)
+   * 안쪽의 content container — accent rail 만 row-inner 의 left edge 에 유지. */
   .row-inner {
     display: flex;
     align-items: center;
     gap: 0;
     width: 100%;
     transition:
-      background var(--motion-fast) var(--motion-easing),
-      color var(--motion-fast) var(--motion-easing),
       box-shadow var(--motion-fast) var(--motion-easing);
   }
 
-  .row:hover .row-inner {
+  .row:hover {
     background: var(--color-glass-1);
   }
 
-  .row.selected .row-inner {
+  .row.selected {
     background: color-mix(in srgb, var(--color-accent) 12%, transparent);
     color: var(--color-accent);
+  }
+
+  .row.selected .row-inner {
     box-shadow: inset 2px 0 0 var(--color-accent);
+  }
+
+  /* drop-inside (drag target) 는 hover/selected 보다 우선 — drag 중 시각 단서가
+     명확해야 함. CSS source order 로 specificity 같은 selector 의 우선순위
+     역전. */
+  .row.drop-inside {
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
   }
 
   .row-button {
