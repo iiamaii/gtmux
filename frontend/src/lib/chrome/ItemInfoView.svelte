@@ -427,114 +427,100 @@
           </span>
         </div>
       {/if}
-      <section class="section">
-        <h4 class="section-head">Identity</h4>
-        <div class="kv">
-          <span class="k">type</span>
-          <span class="v mono" class:mixed={isMultiMixed}>
-            {#if selectionCount === 1}
-              {strOr(selectedPanel['type'], 'panel')}
-            {:else if isMultiMixed}
-              Mixed
-            {:else}
-              {commonType}
-            {/if}
-          </span>
+      <section class="prop-section">
+        <div class="prop-head"><h4>Identity</h4></div>
+        <div class="prop-row full">
+          <div class="display-row" class:mixed={isMultiMixed}>
+            <span class="k">type</span>
+            <span class="display-val mono">
+              {#if selectionCount === 1}
+                {strOr(selectedPanel['type'], 'panel')}
+              {:else if isMultiMixed}
+                Mixed
+              {:else}
+                {commonType}
+              {/if}
+            </span>
+          </div>
         </div>
         {#if selectionCount === 1 && isSelectedTerminal}
-          <div class="kv">
-            <span class="k">terminal</span>
-            <span class="v mono">{strOr(selectedPanel['pane_id'], '—')}</span>
+          <div class="prop-row full">
+            <div class="display-row">
+              <span class="k">term</span>
+              <span class="display-val mono">{strOr(selectedPanel['pane_id'], '—')}</span>
+            </div>
           </div>
         {/if}
-        <div class="kv">
-          <span class="k">label</span>
-          <div class="v">
-            <InspectorField
-              value={(() => {
-                const v = commonField('label');
-                return typeof v === 'string' ? v : '';
-              })()}
-              mixed={commonField('label') === 'Mixed'}
-              placeholder="—"
-              ariaLabel="Label"
-              oncommit={(next) => void applyCommonLabel(next)}
-            />
-          </div>
+        <div class="prop-row full">
+          <InspectorField
+            k="label"
+            value={(() => {
+              const v = commonField('label');
+              return typeof v === 'string' ? v : '';
+            })()}
+            mixed={commonField('label') === 'Mixed'}
+            placeholder="—"
+            ariaLabel="Label"
+            oncommit={(next) => void applyCommonLabel(next)}
+          />
         </div>
         {#if selectionCount === 1}
-          <div class="kv">
-            <span class="k">id</span>
-            <span class="v mono">{selectedPanel.id}</span>
+          <div class="prop-row full">
+            <div class="display-row">
+              <span class="k">id</span>
+              <span class="display-val mono" title={selectedPanel.id as string}>{selectedPanel.id}</span>
+            </div>
           </div>
         {/if}
       </section>
 
-      <section class="section">
-        <h4 class="section-head">Geometry</h4>
-        <div class="kv-pair">
-          <div class="kv">
-            <span class="k">x</span>
-            <div class="v">
-              <InspectorField
-                type="number"
-                value={(() => { const v = commonField('x'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
-                mixed={commonField('x') === 'Mixed'}
-                ariaLabel="x"
-                oncommit={(s) => void applyCommonNum('x', Number(s))}
-              />
-            </div>
-          </div>
-          <div class="kv">
-            <span class="k">y</span>
-            <div class="v">
-              <InspectorField
-                type="number"
-                value={(() => { const v = commonField('y'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
-                mixed={commonField('y') === 'Mixed'}
-                ariaLabel="y"
-                oncommit={(s) => void applyCommonNum('y', Number(s))}
-              />
-            </div>
-          </div>
+      <section class="prop-section">
+        <div class="prop-head"><h4>Geometry</h4></div>
+        <div class="prop-row">
+          <InspectorField
+            type="number"
+            k="X"
+            value={(() => { const v = commonField('x'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
+            mixed={commonField('x') === 'Mixed'}
+            ariaLabel="x"
+            oncommit={(s) => void applyCommonNum('x', Number(s))}
+          />
+          <InspectorField
+            type="number"
+            k="Y"
+            value={(() => { const v = commonField('y'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
+            mixed={commonField('y') === 'Mixed'}
+            ariaLabel="y"
+            oncommit={(s) => void applyCommonNum('y', Number(s))}
+          />
         </div>
-        <div class="kv-pair">
-          <div class="kv">
-            <span class="k">w</span>
-            <div class="v">
-              <InspectorField
-                type="number"
-                value={(() => { const v = commonField('w'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
-                mixed={commonField('w') === 'Mixed'}
-                ariaLabel="w"
-                oncommit={(s) => void applyCommonNum('w', Number(s))}
-              />
-            </div>
-          </div>
-          <div class="kv">
-            <span class="k">h</span>
-            <div class="v">
-              <InspectorField
-                type="number"
-                value={(() => { const v = commonField('h'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
-                mixed={commonField('h') === 'Mixed'}
-                ariaLabel="h"
-                oncommit={(s) => void applyCommonNum('h', Number(s))}
-              />
-            </div>
-          </div>
+        <div class="prop-row">
+          <InspectorField
+            type="number"
+            k="W"
+            value={(() => { const v = commonField('w'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
+            mixed={commonField('w') === 'Mixed'}
+            ariaLabel="w"
+            oncommit={(s) => void applyCommonNum('w', Number(s))}
+          />
+          <InspectorField
+            type="number"
+            k="H"
+            value={(() => { const v = commonField('h'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
+            mixed={commonField('h') === 'Mixed'}
+            ariaLabel="h"
+            oncommit={(s) => void applyCommonNum('h', Number(s))}
+          />
         </div>
-        <div class="kv">
-          <span class="k">z</span>
-          <div class="v">
-            <InspectorField
-              type="number"
-              value={(() => { const v = commonField('z'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
-              mixed={commonField('z') === 'Mixed'}
-              ariaLabel="z-index"
-              oncommit={(s) => void applyCommonNum('z', Number(s))}
-            />
-          </div>
+        <div class="prop-row full">
+          <InspectorField
+            type="number"
+            k="Z"
+            value={(() => { const v = commonField('z'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
+            mixed={commonField('z') === 'Mixed'}
+            ariaLabel="z-index"
+            oncommit={(s) => void applyCommonNum('z', Number(s))}
+          />
         </div>
         {#if selectionCount >= 2}
           <!-- ADR-0027 D4/D9 — alignment row. Distribute 는 N≥3. -->
@@ -576,59 +562,65 @@
       </section>
 
       {#if selectionCount === 1 && isSelectedTerminal && (terminalPoolEntry !== null || sessionItem !== null)}
-        <section class="section">
-          <h4 class="section-head">Terminal · Pool</h4>
+        <section class="prop-section">
+          <div class="prop-head"><h4>Terminal · Pool</h4></div>
           {#if terminalPoolEntry !== null}
-            <div class="kv">
-              <span class="k">attach</span>
-              <span class="v mono">×{terminalPoolEntry.attach_count}</span>
+            <div class="prop-row full">
+              <div class="display-row">
+                <span class="k">attach</span>
+                <span class="display-val mono">×{terminalPoolEntry.attach_count}</span>
+              </div>
             </div>
             {#if terminalPoolEntry.attached_sessions.length > 0}
-              <div class="kv">
-                <span class="k">sessions</span>
-                <span class="v">
-                  {#each terminalPoolEntry.attached_sessions as s, i (s)}
-                    {#if i > 0}, {/if}<span
-                      class="session-chip"
-                      class:current={sessionStore.active?.name === s}
-                    >{s}</span>
-                  {/each}
-                </span>
+              <div class="prop-row full">
+                <div class="display-row wrap">
+                  <span class="k">sess</span>
+                  <span class="display-val">
+                    {#each terminalPoolEntry.attached_sessions as s, i (s)}
+                      {#if i > 0}, {/if}<span
+                        class="session-chip"
+                        class:current={sessionStore.active?.name === s}
+                      >{s}</span>
+                    {/each}
+                  </span>
+                </div>
               </div>
             {/if}
-            <div class="kv">
-              <span class="k">alive</span>
-              <span class="v mono" class:dead={!terminalPoolEntry.alive}>
-                {terminalPoolEntry.alive ? 'live' : 'dangling'}
-              </span>
+            <div class="prop-row full">
+              <div class="display-row">
+                <span class="k">alive</span>
+                <span class="display-val mono" class:dead={!terminalPoolEntry.alive}>
+                  {terminalPoolEntry.alive ? 'live' : 'dangling'}
+                </span>
+              </div>
             </div>
           {:else if sessionItem !== null && sessionItem.type === 'terminal'}
-            <div class="kv">
-              <span class="k">pool</span>
-              <span class="v">
-                <span class="warn">missing</span> — terminal not in server pool
-              </span>
+            <div class="prop-row full">
+              <div class="display-row">
+                <span class="k">pool</span>
+                <span class="display-val"><span class="warn">missing</span></span>
+              </div>
             </div>
           {/if}
         </section>
       {/if}
 
       {#if selectionCount === 1 && sessionItem !== null && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path')}
-        <section class="section">
-          <h4 class="section-head">Item Payload</h4>
+        <section class="prop-section">
+          <div class="prop-head"><h4>Item Payload</h4></div>
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
-            <div class="kv">
-              <span class="k">stroke</span>
-              <div class="v">
+            <div class="prop-row full">
+              <div class="display-row picker">
+                <span class="k">stroke</span>
                 <ColorPicker
                   value={sessionItem.stroke}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
                 />
               </div>
             </div>
-            <div class="kv">
-              <span class="k">fill</span>
-              <div class="v">
+            <div class="prop-row full">
+              <div class="display-row picker">
+                <span class="k">fill</span>
                 <ColorPicker
                   value={sessionItem.fill}
                   oncommit={(hex) => void applyShapeColor('fill', hex)}
@@ -637,35 +629,27 @@
             </div>
           {:else if sessionItem.type === 'line'}
             {@const line = sessionItem}
-            <div class="kv-pair">
-              <div class="kv">
-                <span class="k">x2</span>
-                <div class="v">
-                  <InspectorField
-                    type="number"
-                    value={String(Math.round(line.x2))}
-                    mixed={false}
-                    ariaLabel="x2"
-                    oncommit={(s) => void applyLineEndpoint('x2', Number(s))}
-                  />
-                </div>
-              </div>
-              <div class="kv">
-                <span class="k">y2</span>
-                <div class="v">
-                  <InspectorField
-                    type="number"
-                    value={String(Math.round(line.y2))}
-                    mixed={false}
-                    ariaLabel="y2"
-                    oncommit={(s) => void applyLineEndpoint('y2', Number(s))}
-                  />
-                </div>
-              </div>
+            <div class="prop-row">
+              <InspectorField
+                type="number"
+                k="X2"
+                value={String(Math.round(line.x2))}
+                mixed={false}
+                ariaLabel="x2"
+                oncommit={(s) => void applyLineEndpoint('x2', Number(s))}
+              />
+              <InspectorField
+                type="number"
+                k="Y2"
+                value={String(Math.round(line.y2))}
+                mixed={false}
+                ariaLabel="y2"
+                oncommit={(s) => void applyLineEndpoint('y2', Number(s))}
+              />
             </div>
-            <div class="kv">
-              <span class="k">stroke</span>
-              <div class="v">
+            <div class="prop-row full">
+              <div class="display-row picker">
+                <span class="k">stroke</span>
                 <ColorPicker
                   value={line.stroke}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
@@ -676,13 +660,15 @@
             {@const txt = sessionItem}
             {@const h = txt.text_align ?? 'center'}
             {@const v = txt.text_vertical_align ?? 'middle'}
-            <div class="kv">
-              <span class="k">chars</span>
-              <span class="v mono">{txt.text.length}</span>
+            <div class="prop-row full">
+              <div class="display-row">
+                <span class="k">chars</span>
+                <span class="display-val mono">{txt.text.length}</span>
+              </div>
             </div>
-            <div class="kv align-row">
-              <span class="k">align</span>
-              <div class="v">
+            <div class="prop-row full">
+              <div class="display-row picker">
+                <span class="k">align</span>
                 <div class="align-group" role="group" aria-label="Horizontal alignment">
                   <button
                     type="button"
@@ -732,9 +718,9 @@
                 </div>
               </div>
             </div>
-            <div class="kv align-row">
-              <span class="k">v-align</span>
-              <div class="v">
+            <div class="prop-row full">
+              <div class="display-row picker">
+                <span class="k">v-align</span>
                 <div class="align-group" role="group" aria-label="Vertical alignment">
                   <button
                     type="button"
@@ -785,13 +771,15 @@
               </div>
             </div>
           {:else if sessionItem.type === 'note'}
-            <div class="kv">
-              <span class="k">title</span>
-              <span class="v">{strOr(sessionItem.title, 'Untitled')}</span>
+            <div class="prop-row full">
+              <div class="display-row">
+                <span class="k">title</span>
+                <span class="display-val">{strOr(sessionItem.title, 'Untitled')}</span>
+              </div>
             </div>
-            <div class="kv">
-              <span class="k">color</span>
-              <div class="v">
+            <div class="prop-row full">
+              <div class="display-row picker">
+                <span class="k">color</span>
                 <ColorPicker
                   value={sessionItem.color}
                   oncommit={(hex) => void applyNoteColor(hex)}
@@ -799,16 +787,18 @@
               </div>
             </div>
           {:else if sessionItem.type === 'file_path'}
-            <div class="kv">
-              <span class="k">path</span>
-              <span class="v mono">{strOr(sessionItem.path, '—')}</span>
+            <div class="prop-row full">
+              <div class="display-row">
+                <span class="k">path</span>
+                <span class="display-val mono" title={sessionItem.path}>{strOr(sessionItem.path, '—')}</span>
+              </div>
             </div>
           {/if}
         </section>
       {/if}
 
-      <section class="section">
-        <h4 class="section-head">State</h4>
+      <section class="prop-section">
+        <div class="prop-head"><h4>State</h4></div>
         <div class="state-row" role="group" aria-label="Item state">
           <button
             type="button"
@@ -889,11 +879,13 @@
           </button>
         </div>
         {#if selectionCount === 1 && isSelectedTerminal}
-          <div class="kv">
-            <span class="k">alive</span>
-            <span class="v mono" class:dead={isDead}>
-              {isDead ? 'dead' : 'live'}
-            </span>
+          <div class="prop-row full">
+            <div class="display-row">
+              <span class="k">alive</span>
+              <span class="display-val mono" class:dead={isDead}>
+                {isDead ? 'dead' : 'live'}
+              </span>
+            </div>
           </div>
         {/if}
       </section>
@@ -955,59 +947,113 @@
     color: var(--color-fg-subtle);
   }
 
-  /* ADR-0027 D3 — mixed value (placeholder 같은 muted italic). */
-  .kv .v.mixed {
-    color: var(--color-fg-subtle);
-    font-style: italic;
-  }
+  /* ref/frontend-design/index-v2.html — `.prop-section / .prop-row / .input`
+   * 정합. Inspector input 의 시각 (height/bg/font/hover) 은 InspectorField
+   * 컴포넌트 안에서 캡슐화. 본 파일은 row layout (1fr 1fr / full) 만 관리. */
 
-  .section {
+  .prop-section {
     padding: var(--space-8) var(--space-12) var(--space-12);
     border-bottom: 1px solid var(--color-border);
   }
 
-  .section:last-child {
+  .prop-section:last-child {
     border-bottom: 0;
   }
 
-  .section-head {
-    margin: 0 0 var(--space-8);
+  .prop-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--space-8);
+  }
+
+  .prop-head h4 {
+    margin: 0;
     font-family: var(--font-mono);
-    font-size: var(--text-base);
+    font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.6px;
     font-weight: var(--weight-regular);
     color: var(--color-fg-muted);
   }
 
-  .kv {
+  .prop-row {
     display: grid;
-    grid-template-columns: 64px 1fr;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-bottom: 6px;
+    min-width: 0;
+  }
+
+  .prop-row.full {
+    grid-template-columns: 1fr;
+  }
+
+  /* Read-only display row — InspectorField 의 시각 (.inspector-input) 과 정합. */
+  .display-row {
+    display: flex;
     align-items: center;
-    gap: var(--space-6);
-    padding: var(--space-4) 0;
-    font-size: var(--text-md);
-  }
-
-  .kv .k {
-    color: var(--color-fg-muted);
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    height: 28px;
+    padding: 0 8px;
+    box-sizing: border-box;
+    background: var(--color-surface-2);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
     font-family: var(--font-mono);
-    font-size: var(--text-base);
+    font-size: 11px;
+    letter-spacing: 0.2px;
+    color: var(--color-fg);
+    transition: background var(--motion-fast) var(--motion-easing);
   }
 
-  .kv .v {
+  .display-row:hover {
+    background: var(--color-glass-1);
+  }
+
+  .display-row.picker {
+    /* ColorPicker / align-group 등 inline control 을 안에 두는 row — 컨트롤이
+     * 자체 surface 를 가져 height 가 늘어날 수 있음. */
+    height: auto;
+    min-height: 28px;
+    padding: 4px 8px;
+    flex-wrap: wrap;
+  }
+
+  .display-row .k {
+    flex: 0 0 auto;
+    color: var(--color-fg-muted);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.4px;
+  }
+
+  .display-row .display-val {
+    flex: 1 1 auto;
+    min-width: 0;
     color: var(--color-fg);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .kv .v.mono {
+  .display-row .display-val.mono {
     font-family: var(--font-mono);
-    font-size: var(--text-base);
   }
 
-  .kv .v.dead {
+  .display-row.wrap {
+    height: auto;
+    min-height: 28px;
+    padding: 4px 8px;
+  }
+
+  .display-row.wrap .display-val {
+    white-space: normal;
+  }
+
+  .display-row .display-val.dead {
     color: var(--color-warning);
   }
 
@@ -1034,28 +1080,12 @@
     font-weight: var(--weight-medium);
   }
 
-  .kv-pair {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: var(--space-6);
-  }
-
-  .kv-pair .kv {
-    grid-template-columns: 24px 1fr;
-  }
-
-  /* Figma-style segmented control for text alignment. */
-  .align-row .v {
-    display: inline-flex;
-    justify-content: flex-start;
-  }
-
-  /* ADR-0027 D9 — multi-select alignment row (Common section 안). */
-  .section > .align-row {
+  /* ADR-0027 D9 — multi-select alignment row (Geometry section 안). */
+  .prop-section > .align-row {
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-6);
-    margin-top: var(--space-10);
+    margin-top: var(--space-4);
   }
 
   .align-group {
