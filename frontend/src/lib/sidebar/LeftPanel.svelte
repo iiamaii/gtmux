@@ -126,7 +126,7 @@
     box-sizing: border-box;
     background: var(--color-surface);
     color: var(--color-fg);
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius-sm);
     box-shadow: var(--shadow-md);
     z-index: var(--z-side-panel);
     display: flex;
@@ -207,7 +207,7 @@
     width: 28px;
     box-sizing: border-box;
     background: var(--color-surface);
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius-sm);
     box-shadow: var(--shadow-sm);
     z-index: var(--z-side-panel);
     display: flex;

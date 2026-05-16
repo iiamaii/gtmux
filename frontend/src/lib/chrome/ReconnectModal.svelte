@@ -22,7 +22,7 @@
 
   import Modal from '$lib/ui/Modal.svelte';
   import Button from '$lib/ui/Button.svelte';
-  import type { ReconnectState } from '$lib/stores/reconnectGate.svelte';
+  import type { ReconnectModalState } from '$lib/stores/reconnectGate.svelte';
 
   interface Props {
     /**
@@ -31,7 +31,7 @@
      * Prop 이름은 `mode` — svelte-check 의 legacy `$state` store-prefix
      * heuristic 회피.
      */
-    mode: Exclude<ReconnectState, 'idle' | 'success'>;
+    mode: ReconnectModalState;
     name: string;
     attempt: number;
     error: string | null;

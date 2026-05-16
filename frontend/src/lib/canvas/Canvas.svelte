@@ -14,6 +14,7 @@
   // - 캔버스 dot grid 는 token-driven (--canvas-bg, --canvas-grid).
   // - panOnDrag = [1, 2] — middle/right 마우스 버튼만 pan (left는 selection/drag용).
 
+  import { untrack } from 'svelte';
   import { SvelteFlow, Background, BackgroundVariant, useSvelteFlow } from '@xyflow/svelte';
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
@@ -56,6 +57,7 @@
   // SvelteFlow viewport projection — onpaneclick 의 screen 좌표를 canvas 좌표로 변환.
   // useSvelteFlow 는 SvelteFlowProvider 컨텍스트가 있어야 동작 (+page.svelte 에서 마운트됨).
   const { screenToFlowPosition, setViewport, getViewport } = useSvelteFlow();
+  let applyingStoreViewport = false;
 
   /** Drag-to-create state — Batch 2 의 rect/ellipse/line gesture. */
   type DragShape = 'rect' | 'ellipse' | 'line';
@@ -68,6 +70,25 @@
     currentLocal: { x: number; y: number };
   }
   let dragState = $state<DragState | null>(null);
+
+  /**
+   * Cursor hover preview — terminal 도구가 active 일 때 cursor 위치에 새
+   * panel 의 *default 크기 (480×320 flow units)* 윤곽선을 미리보기. zoom 에
+   * 따라 screen px 크기가 비례 (`size_screen = size_flow * zoom`).
+   * cursor 가 .canvas-root 밖이거나 노드 위면 null 로 hide.
+   */
+  let hoverScreen = $state<{ x: number; y: number } | null>(null);
+
+  const isPanelTool = $derived(toolStore.current === 'terminal');
+  const terminalGhost = $derived.by(() => {
+    if (!isPanelTool || hoverScreen === null) return null;
+    return {
+      x: hoverScreen.x,
+      y: hoverScreen.y,
+      w: 480 * sessionStore.viewport.zoom,
+      h: 320 * sessionStore.viewport.zoom,
+    };
+  });
 
   const isDragTool = $derived(
     toolStore.current === 'rect' ||
@@ -282,6 +303,13 @@
   }
 
   function onCanvasPointerMove(e: PointerEvent) {
+    // Always track hover screen position — terminal ghost preview 의 입력.
+    const rootEl = e.currentTarget as HTMLElement;
+    const rootRect = rootEl.getBoundingClientRect();
+    hoverScreen = {
+      x: e.clientX - rootRect.left,
+      y: e.clientY - rootRect.top,
+    };
     if (dragState === null) return;
     const root = e.currentTarget as HTMLElement;
     const rect = root.getBoundingClientRect();
@@ -449,29 +477,20 @@
     };
   }
 
-  /* ── SvelteFlow nodes — controlled binding via `bind:nodes` ─────────────
+  /* ── SvelteFlow nodes — one-way from sessionStore ──────────────────────
    *
-   * Root cause of the `effect_update_depth_exceeded` loop:
-   *   `<SvelteFlow nodes = $bindable([])>` 가 controlled prop. `bind:nodes`
-   *   없이 derived 를 one-way 로 넘기면, xyflow 의 internal `set nodes(new)`
-   *   write-back 이 외부 (derived → 불가) 와 sync 실패 → 다음 internal effect
-   *   가 자기 store 와 다시 비교하며 자가 trigger → cascade.
-   *
-   * Fix: 외부에 *명시 mutable $state* (`internalNodes`) 를 두고 `bind:nodes`.
-   * sessionStore 변화 시 effect 가 internalNodes 를 *교체* (selected 포함).
-   * SvelteFlow internal mutation (drag/click 등) 은 bind 양방향으로
-   * internalNodes 에 반영. effect 의 deps 는 sessionStore 만 — SvelteFlow
-   * mutation 만 발생한 경우 fire 안 함 → loop 0.
-   *
-   * selected 의 single source 는 *sessionStore.M*. effect 가 매 rebuild 시
-   * `selected: M.has(id)` 를 채움. internal click 으로 selected 가 변하면
-   * onnodeclick 의 setM 으로 sessionStore 와 sync → effect → rebuild → ok. */
-  let internalNodes: Node[] = $state([]);
-  $effect(() => {
-    internalNodes = Array.from(sessionStore.items.values()).map(itemToNode);
-  });
+   * SvelteFlow writes measured dimensions back into its local `nodes`
+   * prop during `updateNodeInternals()`. Binding that prop to parent state
+   * (`bind:nodes`) feeds those internal measurement writes back into this
+   * component, where rebuilding nodes from `sessionStore.items` can create
+   * a Svelte effect-depth loop on initial hydrate. Keep the source of truth
+   * one-way: sessionStore -> flowNodes. Drag/resize commits still write to
+   * sessionStore explicitly through event handlers.
+   */
+  const flowNodes = $derived(Array.from(sessionStore.items.values()).map(itemToNode));
 
   function onmove(_event: MouseEvent | TouchEvent | null, viewport: Viewport): void {
+    if (applyingStoreViewport) return;
     sessionStore.updateViewport({ x: viewport.x, y: viewport.y, zoom: viewport.zoom });
   }
 
@@ -486,12 +505,17 @@
    * — 단방향 (sessionStore → SvelteFlow) reactive sync 만. */
   $effect(() => {
     const v = sessionStore.viewport;
-    const cur = getViewport();
+    const cur = untrack(() => getViewport());
     const dx = Math.abs(cur.x - v.x);
     const dy = Math.abs(cur.y - v.y);
     const dz = Math.abs(cur.zoom - v.zoom);
     if (dx < 0.5 && dy < 0.5 && dz < 0.001) return;
-    void setViewport({ x: v.x, y: v.y, zoom: v.zoom });
+    applyingStoreViewport = true;
+    void setViewport({ x: v.x, y: v.y, zoom: v.zoom }).finally(() => {
+      queueMicrotask(() => {
+        applyingStoreViewport = false;
+      });
+    });
   });
 
 
@@ -694,18 +718,20 @@
      이벤트는 SvelteFlow 가 정상 처리. -->
 <div
   class="canvas-root"
+  role="presentation"
   class:drag-cursor={isDragTool && !isSpacePressed && !isHandTool}
   class:pan-cursor={isSpacePressed || isHandTool}
   onpointerdowncapture={onCanvasPointerDown}
   onpointermovecapture={onCanvasPointerMove}
   onpointerupcapture={onCanvasPointerUp}
   onpointercancelcapture={onCanvasPointerCancel}
+  onpointerleave={() => (hoverScreen = null)}
 >
   <!-- NewPanelButton overlay 제거 — 기능은 Toolbar2 의 terminal 도구로 마이그레이션.
        legacy 진입은 `handleTerminalClick(legacy branch)` 가 `requestLegacyNewPane`
        호출. multi-session 은 BE Stage 5-D P2 endpoint 도착 시 wire. -->
   <SvelteFlow
-    bind:nodes={internalNodes}
+    nodes={flowNodes}
     edges={[]}
     {nodeTypes}
     {onnodeclick}
@@ -759,6 +785,14 @@
       {/if}
     </div>
   {/if}
+
+  {#if terminalGhost !== null && dragState === null}
+    <div
+      class="terminal-ghost"
+      style="left: {terminalGhost.x}px; top: {terminalGhost.y}px; width: {terminalGhost.w}px; height: {terminalGhost.h}px;"
+      aria-hidden="true"
+    ></div>
+  {/if}
 </div>
 
 <style>
@@ -810,6 +844,18 @@
   .canvas-root.pan-cursor :global(.svelte-flow.dragging),
   .canvas-root.pan-cursor :global(.svelte-flow.dragging .svelte-flow__pane) {
     cursor: grabbing;
+  }
+
+  /* Terminal tool — cursor hover preview of the panel-to-be-spawned.
+     Dashed accent outline, no fill — purely guide, no interactivity. */
+  .terminal-ghost {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1.5px dashed var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 6%, transparent);
+    pointer-events: none;
+    z-index: 99;
+    border-radius: var(--radius-sm);
   }
 
   /* Live preview during drag — container-local screen coords. */

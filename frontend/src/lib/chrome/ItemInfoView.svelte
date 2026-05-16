@@ -20,6 +20,14 @@
   import { muxStore } from '$lib/stores/mux.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
+  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
+  import type {
+    CanvasItem,
+    TextAlign,
+    TextItem,
+    TextVerticalAlign,
+  } from '$lib/types/canvas';
 
   // First-selected Panel — Set iteration order is insertion order, which
   // matches the user's click sequence well enough for v0.
@@ -96,6 +104,68 @@
   }
 
   const isSelectedTerminal = $derived(sessionItem?.type === 'terminal');
+
+  /* ── Text alignment — Figma-style segmented control ──────────────
+   * Inspector 가 text item 의 alignment 를 직접 mutate. 옛
+   * ToolbarSubbar/TextNode 에 분산되어 있던 로직을 본 곳으로 단일화. */
+
+  async function applyTextAlign(
+    target: TextItem,
+    next: TextAlign,
+  ): Promise<void> {
+    if (next === (target.text_align ?? 'center')) return;
+    const active = sessionStore.active;
+    if (active === null) return;
+    try {
+      const { layout } = await mutateLayout(active.name, (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          it.id === target.id && it.type === 'text'
+            ? ({ ...it, text_align: next } as TextItem)
+            : it,
+        ),
+      }));
+      sessionStore.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Text align failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
+  }
+
+  async function applyTextVerticalAlign(
+    target: TextItem,
+    next: TextVerticalAlign,
+  ): Promise<void> {
+    if (next === (target.text_vertical_align ?? 'middle')) return;
+    const active = sessionStore.active;
+    if (active === null) return;
+    try {
+      const { layout } = await mutateLayout(active.name, (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          it.id === target.id && it.type === 'text'
+            ? ({ ...it, text_vertical_align: next } as TextItem)
+            : it,
+        ),
+      }));
+      sessionStore.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Text vertical align failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
+  }
 </script>
 
 <div class="item-info-view" aria-label="Item info">
@@ -222,17 +292,116 @@
               <span class="v mono">{sessionItem.stroke}</span>
             </div>
           {:else if sessionItem.type === 'text'}
+            {@const txt = sessionItem}
+            {@const h = txt.text_align ?? 'center'}
+            {@const v = txt.text_vertical_align ?? 'middle'}
             <div class="kv">
               <span class="k">chars</span>
-              <span class="v mono">{sessionItem.text.length}</span>
+              <span class="v mono">{txt.text.length}</span>
             </div>
-            <div class="kv">
+            <div class="kv align-row">
               <span class="k">align</span>
-              <span class="v mono">{sessionItem.text_align ?? 'center'}</span>
+              <div class="v">
+                <div class="align-group" role="group" aria-label="Horizontal alignment">
+                  <button
+                    type="button"
+                    class="align-btn"
+                    class:active={h === 'left'}
+                    aria-pressed={h === 'left'}
+                    title="Align left"
+                    aria-label="Align left"
+                    onclick={() => void applyTextAlign(txt, 'left')}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <line x1="4" y1="6" x2="20" y2="6"/>
+                      <line x1="4" y1="12" x2="14" y2="12"/>
+                      <line x1="4" y1="18" x2="18" y2="18"/>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="align-btn"
+                    class:active={h === 'center'}
+                    aria-pressed={h === 'center'}
+                    title="Align center"
+                    aria-label="Align center"
+                    onclick={() => void applyTextAlign(txt, 'center')}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <line x1="4" y1="6" x2="20" y2="6"/>
+                      <line x1="7" y1="12" x2="17" y2="12"/>
+                      <line x1="5" y1="18" x2="19" y2="18"/>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="align-btn"
+                    class:active={h === 'right'}
+                    aria-pressed={h === 'right'}
+                    title="Align right"
+                    aria-label="Align right"
+                    onclick={() => void applyTextAlign(txt, 'right')}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <line x1="4" y1="6" x2="20" y2="6"/>
+                      <line x1="10" y1="12" x2="20" y2="12"/>
+                      <line x1="6" y1="18" x2="20" y2="18"/>
+                    </svg>
+                  </button>
+                </div>
+              </div>
             </div>
-            <div class="kv">
+            <div class="kv align-row">
               <span class="k">v-align</span>
-              <span class="v mono">{sessionItem.text_vertical_align ?? 'middle'}</span>
+              <div class="v">
+                <div class="align-group" role="group" aria-label="Vertical alignment">
+                  <button
+                    type="button"
+                    class="align-btn"
+                    class:active={v === 'top'}
+                    aria-pressed={v === 'top'}
+                    title="Align top"
+                    aria-label="Align top"
+                    onclick={() => void applyTextVerticalAlign(txt, 'top')}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <line x1="5" y1="5" x2="19" y2="5"/>
+                      <line x1="8" y1="10" x2="16" y2="10"/>
+                      <line x1="10" y1="15" x2="14" y2="15"/>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="align-btn"
+                    class:active={v === 'middle'}
+                    aria-pressed={v === 'middle'}
+                    title="Align middle"
+                    aria-label="Align middle"
+                    onclick={() => void applyTextVerticalAlign(txt, 'middle')}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <line x1="6" y1="7" x2="18" y2="7"/>
+                      <line x1="4" y1="12" x2="20" y2="12"/>
+                      <line x1="6" y1="17" x2="18" y2="17"/>
+                    </svg>
+                  </button>
+                  <button
+                    type="button"
+                    class="align-btn"
+                    class:active={v === 'bottom'}
+                    aria-pressed={v === 'bottom'}
+                    title="Align bottom"
+                    aria-label="Align bottom"
+                    onclick={() => void applyTextVerticalAlign(txt, 'bottom')}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <line x1="10" y1="9" x2="14" y2="9"/>
+                      <line x1="8" y1="14" x2="16" y2="14"/>
+                      <line x1="5" y1="19" x2="19" y2="19"/>
+                    </svg>
+                  </button>
+                </div>
+              </div>
             </div>
           {:else if sessionItem.type === 'note'}
             <div class="kv">
@@ -384,5 +553,53 @@
 
   .kv-pair .kv {
     grid-template-columns: 24px 1fr;
+  }
+
+  /* Figma-style segmented control for text alignment. */
+  .align-row .v {
+    display: inline-flex;
+    justify-content: flex-start;
+  }
+
+  .align-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    padding: 2px;
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+  }
+
+  .align-btn {
+    width: 26px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 0;
+    border-radius: 3px;
+    color: var(--color-fg-muted);
+    cursor: pointer;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  .align-btn:hover {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
+  }
+
+  .align-btn:focus-visible {
+    outline: 2px dashed var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  .align-btn.active {
+    background: var(--color-surface);
+    color: var(--color-fg);
+    box-shadow: var(--shadow-sm);
   }
 </style>

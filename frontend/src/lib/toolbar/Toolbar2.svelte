@@ -211,7 +211,10 @@
     {#if locked}
       <span class="lock-indicator" title="Tool locked (Q to release)">Q</span>
     {/if}
-    <ActiveSessionDropdown onSwitch={() => workspaceSwitcher.open()} />
+    <!-- ADR-0019 D9 + UX 결정: 우측 active session 버튼은 *SessionListModal 직접
+         진입*. session *생성* 진입점은 SessionMenu 의 "Switch workspace session…"
+         (workspaceSwitcher.open() → AuthDialog 의 [New session]) 만. -->
+    <ActiveSessionDropdown onSwitch={() => workspaceSwitcher.goList()} />
   </div>
 </nav>
 

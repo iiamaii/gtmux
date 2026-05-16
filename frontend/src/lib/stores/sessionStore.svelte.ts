@@ -234,6 +234,14 @@ class SessionStore {
    * panning on the next reload.
    */
   updateViewport(v: Viewport): void {
+    const cur = this.viewport;
+    if (
+      Math.abs(cur.x - v.x) < 0.5 &&
+      Math.abs(cur.y - v.y) < 0.5 &&
+      Math.abs(cur.zoom - v.zoom) < 0.001
+    ) {
+      return;
+    }
     this.viewport = { ...v };
     if (this.active === null) return;
     if (this.#viewportTimer !== null) clearTimeout(this.#viewportTimer);

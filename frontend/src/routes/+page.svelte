@@ -23,7 +23,6 @@
   import WorkspaceSwitcher from '$lib/chrome/WorkspaceSwitcher.svelte';
   import ReconnectModal from '$lib/chrome/ReconnectModal.svelte';
   import Toolbar2 from '$lib/toolbar/Toolbar2.svelte';
-  import ToolbarSubbar from '$lib/toolbar/ToolbarSubbar.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
   import Toast from '$lib/ui/Toast.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -257,11 +256,13 @@
           if (hint !== null) {
             void reconnectGate.start(hint);
           } else {
+            reconnectGate.markIdle();
             workspaceSwitcher.open();
           }
         }
       } catch (e) {
         console.warn('[gtmux] auth ping failed', e);
+        reconnectGate.markIdle();
       }
 
       // Step 3 — WS bootstrap. Cookie-additive auth (0035 §3.3 α, BE 의 D10 α)
@@ -312,7 +313,6 @@
          mount 차단. canMountApp = state ∈ {idle, success}. -->
     <Titlebar />
     <Toolbar2 />
-    <ToolbarSubbar />
     <SvelteFlowProvider>
       <div class="workspace">
         <main class="canvas-pane">
@@ -324,15 +324,20 @@
         <ContextMenu bind:this={contextMenuRef} />
       </div>
     </SvelteFlowProvider>
+  {:else if reconnectGate.state === 'booting'}
+    <div class="boot-screen" role="status" aria-live="polite">
+      <span class="boot-spinner" aria-hidden="true"></span>
+      <span>Preparing workspace…</span>
+    </div>
   {/if}
 </div>
 <WorkspaceSwitcher />
 <ChangeTerminalModal />
 <GroupCloseConfirmModal />
 <SettingsOverlay />
-{#if reconnectGate.state !== 'idle' && reconnectGate.state !== 'success'}
+{#if reconnectGate.modalState !== null}
   <ReconnectModal
-    mode={reconnectGate.state}
+    mode={reconnectGate.modalState}
     name={reconnectGate.attemptName ?? ''}
     attempt={reconnectGate.attempt}
     error={reconnectGate.error}
@@ -358,6 +363,32 @@
     width: 100vw;
     height: 100vh;
     overflow: hidden;
+  }
+
+  .boot-screen {
+    flex: 1 1 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-12);
+    color: var(--color-fg-muted);
+    background: var(--canvas-bg);
+    font-size: var(--text-sm);
+  }
+
+  .boot-spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--color-border);
+    border-top-color: var(--color-accent);
+    border-radius: 50%;
+    animation: boot-spin 0.7s linear infinite;
+  }
+
+  @keyframes boot-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 
   /* Stage E — workspace is an `absolute` overlay host. Canvas fills the

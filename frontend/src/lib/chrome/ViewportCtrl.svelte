@@ -81,7 +81,7 @@
     gap: var(--space-2);
     padding: var(--space-4);
     background: var(--color-surface);
-    border-radius: var(--radius-pill);
+    border-radius: var(--radius-md);
     box-shadow: var(--shadow-md);
     color: var(--color-fg);
     z-index: var(--z-canvas-overlay);

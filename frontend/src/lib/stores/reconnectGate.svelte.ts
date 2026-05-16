@@ -4,6 +4,9 @@
 // - `sessionStorage` 의 hint 가 있을 때 AppPage onMount 가 `start(name)` 호출.
 // - 본 화면 (Canvas / Toolbar / ...) 은 `canMountApp` 이 true 일 때만 mount.
 //   = state === 'success' (정상 진입) OR state === 'idle' (hint 없음 / cancel 후).
+// - 최초 page load 는 'booting' 으로 시작한다. auth gate / session hint 확인 전
+//   Canvas 를 먼저 mount 하면 빈 workspace → reconnect → hydrated workspace 로
+//   불필요한 mount churn 이 생기므로, bootstrap 이 결론을 내릴 때까지 차단한다.
 // - `state === 'loading' | 'in_use' | 'not_found' | 'unreachable'` 동안에는
 //   ReconnectModal 만 보이고 본 화면은 mount 차단.
 //
@@ -20,15 +23,18 @@ import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 
 export type ReconnectState =
-  | 'idle'         // 아직 start 안 됨 / cancel 후
+  | 'booting'      // auth gate / session hint 검사 중 — 본 화면 mount 금지
+  | 'idle'         // hint 없음 / cancel 후
   | 'loading'
   | 'in_use'
   | 'not_found'
   | 'unreachable'
   | 'success';     // attemptReattach 200 — 본 화면 mount 가능
 
+export type ReconnectModalState = Exclude<ReconnectState, 'booting' | 'idle' | 'success'>;
+
 class ReconnectGate {
-  state = $state<ReconnectState>('idle');
+  state = $state<ReconnectState>('booting');
   attemptName = $state<string | null>(null);
   /** unreachable state 의 last error message. */
   error = $state<string | null>(null);
@@ -40,11 +46,35 @@ class ReconnectGate {
   /**
    * 본 화면 mount 게이트. ADR-0019 D5.4 + plan-0008 §4.4.
    *
+   * - 'booting' = bootstrap 판단 전 — 빈 Canvas mount 금지.
    * - 'idle' = hint 없거나 사용자 cancel 후 — workspaceSwitcher 가 mount 결정.
    * - 'success' = 정상 reattach 후 본 화면 mount 허용.
    * - 그 외 = ReconnectModal 만 mount, 본 화면 차단.
    */
   canMountApp = $derived(this.state === 'success' || this.state === 'idle');
+
+  /** ReconnectModal 이 실제로 다룰 수 있는 user-actionable 상태. */
+  modalState = $derived.by((): ReconnectModalState | null => {
+    switch (this.state) {
+      case 'loading':
+      case 'in_use':
+      case 'not_found':
+      case 'unreachable':
+        return this.state;
+      case 'booting':
+      case 'idle':
+      case 'success':
+        return null;
+    }
+  });
+
+  /** Auth gate 통과 + session hint 없음. WorkspaceSwitcher 흐름으로 진입 가능. */
+  markIdle(): void {
+    this.state = 'idle';
+    this.attemptName = null;
+    this.error = null;
+    this.attempt = 0;
+  }
 
   async start(name: string): Promise<void> {
     this.attemptName = name;
@@ -74,10 +104,7 @@ class ReconnectGate {
   cancel(): void {
     this.#controller?.abort();
     this.#controller = null;
-    this.state = 'idle';
-    this.attemptName = null;
-    this.error = null;
-    this.attempt = 0;
+    this.markIdle();
     sessionStorageHint.clear();
   }
 

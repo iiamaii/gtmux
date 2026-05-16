@@ -6,7 +6,6 @@
   //
   // 현재 단계: 더블 클릭 → InlineEditTextarea (body) → commit 시 mutateLayout.
 
-  import { onMount, tick } from 'svelte';
   import { NodeResizer } from '@xyflow/svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
@@ -60,45 +59,8 @@
   const textVerticalAlign = $derived(data.text_vertical_align ?? 'middle');
 
   let editing = $state(false);
-  let textContentEl: HTMLDivElement | undefined = $state();
-  let textCellEl: HTMLDivElement | undefined = $state();
-  let resizeObserver: ResizeObserver | null = null;
-  let minTextHeight = $state(16);
+  const minTextHeight = $derived(Math.max(16, Math.ceil(data.font_size)));
   type ResizeParams = { x: number; y: number; width: number; height: number };
-
-  function measureTextHeight(): void {
-    if (textCellEl === undefined) {
-      minTextHeight = Math.max(16, data.font_size);
-      return;
-    }
-    minTextHeight = Math.max(
-      8,
-      Math.ceil(textCellEl.scrollHeight),
-      Math.ceil(textCellEl.getBoundingClientRect().height),
-    );
-  }
-
-  onMount(() => {
-    resizeObserver = new ResizeObserver(() => {
-      measureTextHeight();
-    });
-    if (textContentEl !== undefined) resizeObserver.observe(textContentEl);
-    if (textCellEl !== undefined) resizeObserver.observe(textCellEl);
-    void tick().then(measureTextHeight);
-    return () => {
-      resizeObserver?.disconnect();
-      resizeObserver = null;
-    };
-  });
-
-  $effect(() => {
-    void data.text;
-    void data.font_size;
-    void editing;
-    void textAlign;
-    void textVerticalAlign;
-    void tick().then(measureTextHeight);
-  });
 
   function onDblClick(e: MouseEvent): void {
     if (isLocked) return;
@@ -147,7 +109,7 @@
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'text'
-            ? ({ ...it, x: params.x, y: params.y, w: Math.max(120, params.width), h: Math.max(32, params.height) } as TextItem)
+            ? ({ ...it, x: params.x, y: params.y, w: Math.max(120, params.width), h: Math.max(minTextHeight, params.height) } as TextItem)
             : it,
         ),
       }));
@@ -187,14 +149,13 @@
       {onResizeEnd}
     />
     <div
-      bind:this={textContentEl}
       class="text-content"
       class:editing
       class:v-top={textVerticalAlign === 'top'}
       class:v-middle={textVerticalAlign === 'middle'}
       class:v-bottom={textVerticalAlign === 'bottom'}
     >
-      <div class="text-cell" bind:this={textCellEl}>
+      <div class="text-cell">
         {#if editing}
           <InlineEditTextarea
             value={data.text}
