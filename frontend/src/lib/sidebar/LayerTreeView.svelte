@@ -922,30 +922,33 @@
                   </svg>
                 {/if}
               </button>
-              <button
-                type="button"
-                class="icon"
-                class:on={p.minimized === true}
-                title={p.minimized === true ? 'Restore item' : 'Minimize item'}
-                aria-label={p.minimized === true ? 'Restore item' : 'Minimize item'}
-                onclick={(e: MouseEvent) => togglePanelMinimize(node.id, e)}
-              >
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <line x1="5" y1="12" x2="19" y2="12" />
-                </svg>
-              </button>
-              <button
-                type="button"
-                class="icon"
-                class:on={sessionStore.maximizedItemId === node.id}
-                title={sessionStore.maximizedItemId === node.id ? 'Restore item' : 'Maximize item'}
-                aria-label={sessionStore.maximizedItemId === node.id ? 'Restore item' : 'Maximize item'}
-                onclick={(e: MouseEvent) => togglePanelMaximizeAction(node.id, e)}
-              >
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <rect x="4" y="4" width="16" height="16" rx="1.5" />
-                </svg>
-              </button>
+              {#if p.type === 'terminal' || p.type === 'panel' || p.type == null}
+                <!-- min/max 는 terminal panel 에만 의미 — 그래픽 element 는 제외. -->
+                <button
+                  type="button"
+                  class="icon"
+                  class:on={p.minimized === true}
+                  title={p.minimized === true ? 'Restore item' : 'Minimize item'}
+                  aria-label={p.minimized === true ? 'Restore item' : 'Minimize item'}
+                  onclick={(e: MouseEvent) => togglePanelMinimize(node.id, e)}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <line x1="5" y1="12" x2="19" y2="12" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="icon"
+                  class:on={sessionStore.maximizedItemId === node.id}
+                  title={sessionStore.maximizedItemId === node.id ? 'Restore item' : 'Maximize item'}
+                  aria-label={sessionStore.maximizedItemId === node.id ? 'Restore item' : 'Maximize item'}
+                  onclick={(e: MouseEvent) => togglePanelMaximizeAction(node.id, e)}
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="4" y="4" width="16" height="16" rx="1.5" />
+                  </svg>
+                </button>
+              {/if}
               <button
                 type="button"
                 class="icon"
