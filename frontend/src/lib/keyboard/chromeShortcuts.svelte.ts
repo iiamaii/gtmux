@@ -1,0 +1,164 @@
+// chromeShortcuts — chrome-level keyboard shortcuts (G26 P1 partial).
+//
+// 정본:
+// - frontend-handover-v2 §3.3 G26 P1 매트릭스
+// - ADR-0017 §D6 (Stage C chrome shortcuts) — partial wire here.
+//
+// Wired in this module:
+//   Cmd+Shift+L  → toggle LeftPanel  (Layers/Terminals)
+//   Cmd+Shift+I  → toggle RightPanel (Inspect)
+//
+// Deferred (need their own anchor components to land first):
+//   Cmd+N        → new terminal      (Toolbar2 terminal-tool wire)
+//   Cmd+Shift+Q  → ShutdownModal     (SessionMenu)
+//   Cmd+,        → Settings overlay  (Slice C)
+
+import { chromeStore } from '$lib/stores/chrome.svelte';
+import { settingsDialog } from '$lib/stores/settingsDialog.svelte';
+import { shutdownDialog } from '$lib/stores/shutdownDialog.svelte';
+import { toolStore } from '$lib/stores/toolStore.svelte';
+import { shortcutRegistry } from './shortcutRegistry.svelte';
+
+export function bindChromeShortcuts(): () => void {
+  const unsubs: Array<() => void> = [];
+
+  // Cmd+N / Ctrl+N → arm the Terminal tool. Subsequent canvas click
+  // spawns the terminal at the click position (matches the Toolbar2
+  // [Terminal] tool behaviour). Doesn't spawn outright because the
+  // user hasn't picked a location yet — picking is part of the gesture.
+  unsubs.push(
+    shortcutRegistry.register({
+      key: 'n',
+      meta: true,
+      description: 'New terminal (click canvas to place)',
+      category: 'Canvas',
+      handler: () => {
+        toolStore.set('terminal');
+        return true;
+      },
+    }),
+  );
+  unsubs.push(
+    shortcutRegistry.register({
+      key: 'n',
+      ctrl: true,
+      description: 'New terminal (Win/Linux)',
+      category: 'Canvas',
+      handler: () => {
+        toolStore.set('terminal');
+        return true;
+      },
+    }),
+  );
+
+  // Cmd+Shift+Q → Session shutdown confirm modal (ADR-0017 §D6).
+  unsubs.push(
+    shortcutRegistry.register({
+      key: 'q',
+      meta: true,
+      shift: true,
+      description: 'Session shutdown…',
+      category: 'Chrome',
+      handler: () => {
+        shutdownDialog.show();
+        return true;
+      },
+    }),
+  );
+  unsubs.push(
+    shortcutRegistry.register({
+      key: 'q',
+      ctrl: true,
+      shift: true,
+      description: 'Session shutdown (Win/Linux)',
+      category: 'Chrome',
+      handler: () => {
+        shutdownDialog.show();
+        return true;
+      },
+    }),
+  );
+
+  // Cmd+, / Ctrl+, → Settings overlay (macOS / Win-Linux convention).
+  unsubs.push(
+    shortcutRegistry.register({
+      key: ',',
+      meta: true,
+      description: 'Open Settings',
+      category: 'Chrome',
+      handler: () => {
+        settingsDialog.toggle();
+        return true;
+      },
+    }),
+  );
+  unsubs.push(
+    shortcutRegistry.register({
+      key: ',',
+      ctrl: true,
+      description: 'Open Settings (Win/Linux)',
+      category: 'Chrome',
+      handler: () => {
+        settingsDialog.toggle();
+        return true;
+      },
+    }),
+  );
+
+  unsubs.push(
+    shortcutRegistry.register({
+      key: 'l',
+      meta: true,
+      shift: true,
+      description: 'Toggle Layers/Terminals panel',
+      category: 'Chrome',
+      handler: () => {
+        chromeStore.toggleSidebar();
+        return true;
+      },
+    }),
+  );
+  unsubs.push(
+    shortcutRegistry.register({
+      key: 'l',
+      ctrl: true,
+      shift: true,
+      description: 'Toggle Layers/Terminals panel (Win/Linux)',
+      category: 'Chrome',
+      handler: () => {
+        chromeStore.toggleSidebar();
+        return true;
+      },
+    }),
+  );
+  unsubs.push(
+    shortcutRegistry.register({
+      key: 'i',
+      meta: true,
+      shift: true,
+      description: 'Toggle Inspect panel',
+      category: 'Chrome',
+      handler: () => {
+        chromeStore.togglePaneInfo();
+        return true;
+      },
+    }),
+  );
+  unsubs.push(
+    shortcutRegistry.register({
+      key: 'i',
+      ctrl: true,
+      shift: true,
+      description: 'Toggle Inspect panel (Win/Linux)',
+      category: 'Chrome',
+      handler: () => {
+        chromeStore.togglePaneInfo();
+        return true;
+      },
+    }),
+  );
+
+  return () => {
+    for (const fn of unsubs) fn();
+  };
+}
