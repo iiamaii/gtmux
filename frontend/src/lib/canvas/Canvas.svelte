@@ -14,10 +14,11 @@
   // - 캔버스 dot grid 는 token-driven (--canvas-bg, --canvas-grid).
   // - panOnDrag = [1, 2] — middle/right 마우스 버튼만 pan (left는 selection/drag용).
 
-  import { untrack } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { SvelteFlow, Background, BackgroundVariant, useSvelteFlow } from '@xyflow/svelte';
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
+  import { debugCount } from '$lib/common/debugCounts';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toolStore } from '$lib/stores/toolStore.svelte';
   import { attachConfirm, deleteItem, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
@@ -525,6 +526,7 @@
    * 판단 → 내부 측정 effect 가 무한 트리거되지 않음.
    */
   const flowNodes = $derived.by<Node[]>(() => {
+    debugCount('flowNodes.rebuild');
     const items = sessionStore.items;
     const groupsById = sessionGroupsById;
     const mMulti = isMultiSelection;
@@ -537,9 +539,11 @@
       const sig = makeSignature(item, visible, locked, selected, mMulti);
       const cached = nodeCache.get(item.id);
       if (cached !== undefined && cached.sig === sig) {
+        debugCount('flowNodes.cache.hit');
         out.push(cached.node);
         next.set(item.id, cached);
       } else {
+        debugCount('flowNodes.cache.miss');
         const node = itemToNode(item);
         out.push(node);
         next.set(item.id, { sig, node });
@@ -550,7 +554,11 @@
   });
 
   function onmove(_event: MouseEvent | TouchEvent | null, viewport: Viewport): void {
-    if (applyingStoreViewport) return;
+    debugCount('canvas.onmove');
+    if (applyingStoreViewport) {
+      debugCount('canvas.onmove.skip-applying');
+      return;
+    }
     sessionStore.updateViewport({ x: viewport.x, y: viewport.y, zoom: viewport.zoom });
   }
 
@@ -570,12 +578,19 @@
     const dy = Math.abs(cur.y - v.y);
     const dz = Math.abs(cur.zoom - v.zoom);
     if (dx < 0.5 && dy < 0.5 && dz < 0.001) return;
+    debugCount('canvas.setViewport');
     applyingStoreViewport = true;
     void setViewport({ x: v.x, y: v.y, zoom: v.zoom }).finally(() => {
       queueMicrotask(() => {
         applyingStoreViewport = false;
       });
     });
+  });
+
+  // Canvas mount/unmount count — 0045 검증 §8.3 의 "Canvas mount count == refresh당 1회".
+  onMount(() => {
+    debugCount('canvas.mount');
+    return () => debugCount('canvas.unmount');
   });
 
 

@@ -36,6 +36,7 @@
   import { xtermTheme } from '$lib/xterm/xtermTheme';
   import { registerPaneOut, unregisterPaneOut } from '$lib/ws/dispatcher.svelte';
   import { encodePaneIn, encodePaneResize, FRAME_TYPE } from '$lib/ws/decode';
+  import { debugCount } from '$lib/common/debugCounts';
   import { themeStore } from '$lib/stores/theme.svelte';
   import type { WsClient } from '$lib/ws/client';
 
@@ -135,6 +136,11 @@
     let sendTimer: ReturnType<typeof setTimeout> | null = null;
     let pendingCols: number | null = null;
     let pendingRows: number | null = null;
+    // 0045 P1-D — 직전 ResizeObserver entry 의 contentRect px. SvelteFlow
+    // measurement loop 와의 증폭 방지: 같은 px 면 fit() 자체 skip (DOM 측정 비용
+    // 0). cols/rows dedup 은 fit() *이후* 단계 — entry-level dedup 가 더 빠름.
+    let lastObservedW = -1;
+    let lastObservedH = -1;
 
     function flushResize(): void {
       if (pendingCols === null || pendingRows === null) return;
@@ -158,10 +164,22 @@
       client.sendFrame(FRAME_TYPE.PANE_RESIZE, encodePaneResize(paneIdNumLocal, cols, rows));
     }
 
-    const ro = new ResizeObserver(() => {
+    const ro = new ResizeObserver((entries) => {
+      // P1-D entry-level dedup — 직전 px 와 동일하면 fit() 진입 자체 skip.
+      // SvelteFlow 의 nodeInternals update 가 동일 width/height 재측정을 트리거할
+      // 때 fit() 호출 + 결과 비교 비용을 0 으로.
+      const last = entries[entries.length - 1];
+      if (last !== undefined) {
+        const w = Math.round(last.contentRect.width);
+        const h = Math.round(last.contentRect.height);
+        if (w === lastObservedW && h === lastObservedH) return;
+        lastObservedW = w;
+        lastObservedH = h;
+      }
       if (fitTimer) clearTimeout(fitTimer);
       fitTimer = setTimeout(() => {
         fitTimer = null;
+        debugCount('xterm.fit');
         try {
           fitAddon.fit();
         } catch (e) {

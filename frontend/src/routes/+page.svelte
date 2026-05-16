@@ -359,10 +359,18 @@
         <ContextMenu bind:this={contextMenuRef} />
       </div>
     </SvelteFlowProvider>
-  {:else if reconnectGate.state === 'booting'}
+  {:else if reconnectGate.state === 'booting' || reconnectGate.state === 'attaching' || reconnectGate.state === 'hydrating'}
     <div class="boot-screen" role="status" aria-live="polite">
       <span class="boot-spinner" aria-hidden="true"></span>
-      <span>Preparing workspace…</span>
+      <span>
+        {#if reconnectGate.state === 'attaching'}
+          Reconnecting…
+        {:else if reconnectGate.state === 'hydrating'}
+          Loading layout…
+        {:else}
+          Preparing workspace…
+        {/if}
+      </span>
     </div>
   {/if}
 </div>

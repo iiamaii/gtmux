@@ -22,6 +22,7 @@
 
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
+import { debugCount } from '$lib/common/debugCounts';
 import { mutateLayout } from '$lib/http/sessions';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 import type { CanvasItem, CanvasLayout, Viewport } from '$lib/types/canvas';
@@ -119,6 +120,7 @@ class SessionStore {
    * 단 *layout 에서 사라진 id* 는 stale 이지만 next user gesture 가 cleanup.
    */
   loadLayout(layout: CanvasLayout): void {
+    debugCount('sessionStore.loadLayout');
     this.items.clear();
     for (const it of layout.items) {
       this.items.set(it.id, it);
