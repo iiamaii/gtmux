@@ -375,6 +375,14 @@
     dragState = null;
   }
 
+  /* ── 0045 P0-A root-cause 후속 fix — literal props 의 매-flush new reference
+   * 폭증 차단. `edges={[]}` / `proOptions={{...}}` 같은 inline literal 은 매
+   * reactive flush 마다 새 reference 생성 → SvelteFlow 가 prop 변경으로 판단
+   * → internal effect → re-derive → effect-depth loop. component-local const 로
+   * 추출해 reference 안정화. */
+  const EMPTY_EDGES: never[] = [];
+  const SVELTE_FLOW_PRO_OPTIONS = { hideAttribution: true };
+
   // Custom node type lookup table for Svelte Flow.
   // - 'panel'     = gtmux terminal panel (PanelNode). schema v2 의 `type:"terminal"` ↔ 'panel'.
   // - 'text'      = 자유 텍스트 (TextNode)
@@ -416,8 +424,27 @@
    * 주의: signature 누락 시 stale render — 본 cache 가 의도와 다른
    * 동작을 발견하면 가장 먼저 makeSignature 의 누락 field 의심.
    */
-  let nodeCache = new Map<string, { sig: string; node: Node }>();
+  /**
+   * Node cache — module-local Map, derived 안에서 mutation 안 함 (reactive
+   * noise 차단). 매 derived pass 후 별 effect 에서 GC (사라진 id 제거).
+   *
+   * 본 Map 은 reactive 가 아닌 *plain JS Map*. derived 가 cache.get/set 만
+   * 호출 — set 은 reactive trigger 없음. derived 의 read 는 sessionStore.
+   * items + sessionStore.M + sessionGroupsById + isMultiSelection 만.
+   */
+  const nodeCache = new Map<string, { sig: string; node: Node }>();
 
+  /**
+   * P0-A signature — 모든 mutation-relevant field 의 *명시 concat*.
+   *
+   * ⚠️ JSON.stringify(item) 회피 이유 (0045 P0-A 후속 fix):
+   * SvelteMap 의 entry 는 reactive proxy 일 수 있음. proxy 의 enumerable
+   * property 를 모두 read 하면 derived 가 *모든 field* 의 reactive
+   * subscription 등록 → 어떤 field 변경 시 전체 re-derive → 폭발적 loop.
+   *
+   * 명시 field 만 read = subscription 면적 제한 + 의도 명확.
+   * 신규 field 추가 시 본 함수도 명시 update 필요 (누락 = stale render bug).
+   */
   function makeSignature(
     item: CanvasItem,
     effVisible: boolean,
@@ -425,7 +452,41 @@
     selected: boolean,
     mMulti: boolean,
   ): string {
-    return `${effVisible ? 1 : 0}|${effLocked ? 1 : 0}|${selected ? 1 : 0}|${mMulti ? 1 : 0}|${JSON.stringify(item)}`;
+    // Common fields (all CanvasItem)
+    const common = `${item.id}|${item.type}|${item.parent_id ?? ''}|${item.x}|${item.y}|${item.w}|${item.h}|${item.z}|${item.visibility}|${item.locked ? 1 : 0}|${item.minimized ? 1 : 0}|${item.label ?? ''}`;
+    // Type-specific payload — 명시 field only
+    let payload = '';
+    switch (item.type) {
+      case 'terminal':
+        // No type-specific payload
+        break;
+      case 'text':
+        payload = `|${item.text}|${item.font_size}|${item.color}|${item.text_align ?? ''}|${item.text_vertical_align ?? ''}`;
+        break;
+      case 'note':
+        payload = `|${item.title ?? ''}|${item.body ?? ''}|${item.color ?? ''}`;
+        break;
+      case 'file_path':
+        payload = `|${item.path}|${item.kind ?? ''}`;
+        break;
+      case 'rect':
+      case 'ellipse':
+        payload = `|${item.stroke}|${item.fill}|${item.stroke_width}`;
+        break;
+      case 'line':
+        payload = `|${item.x2}|${item.y2}|${item.stroke}|${item.stroke_width}`;
+        break;
+      case 'free_draw':
+        // P2 — placeholder until ship
+        payload = '|free_draw';
+        break;
+      case 'image':
+      case 'document':
+        // P2 — placeholder until ship
+        payload = `|${item.type}`;
+        break;
+    }
+    return `${effVisible ? 1 : 0}|${effLocked ? 1 : 0}|${selected ? 1 : 0}|${mMulti ? 1 : 0}|${common}${payload}`;
   }
 
   /**
@@ -530,26 +591,33 @@
     const items = sessionStore.items;
     const groupsById = sessionGroupsById;
     const mMulti = isMultiSelection;
-    const next = new Map<string, { sig: string; node: Node }>();
     const out: Node[] = [];
+    const seen = new Set<string>();
     for (const item of items.values()) {
       const visible = effectiveVisibility(item.visibility, item.parent_id, groupsById);
       const locked = effectiveLocked(item.locked, item.parent_id, groupsById);
       const selected = sessionStore.M.has(item.id);
       const sig = makeSignature(item, visible, locked, selected, mMulti);
       const cached = nodeCache.get(item.id);
+      seen.add(item.id);
       if (cached !== undefined && cached.sig === sig) {
         debugCount('flowNodes.cache.hit');
         out.push(cached.node);
-        next.set(item.id, cached);
       } else {
         debugCount('flowNodes.cache.miss');
         const node = itemToNode(item);
+        // cache 갱신은 derived 안에서 OK — nodeCache 는 plain Map (reactive X).
+        // 외부 변수 reassignment 가 아닌 .set() 호출이므로 reactive noise 0.
+        nodeCache.set(item.id, { sig, node });
         out.push(node);
-        next.set(item.id, { sig, node });
       }
     }
-    nodeCache = next;
+    // GC — items 에서 사라진 id 의 cache entry 제거.
+    if (nodeCache.size > seen.size) {
+      for (const id of nodeCache.keys()) {
+        if (!seen.has(id)) nodeCache.delete(id);
+      }
+    }
     return out;
   });
 
@@ -573,16 +641,20 @@
    * — 단방향 (sessionStore → SvelteFlow) reactive sync 만. */
   $effect(() => {
     const v = sessionStore.viewport;
-    const cur = untrack(() => getViewport());
-    const dx = Math.abs(cur.x - v.x);
-    const dy = Math.abs(cur.y - v.y);
-    const dz = Math.abs(cur.zoom - v.zoom);
-    if (dx < 0.5 && dy < 0.5 && dz < 0.001) return;
-    debugCount('canvas.setViewport');
-    applyingStoreViewport = true;
-    void setViewport({ x: v.x, y: v.y, zoom: v.zoom }).finally(() => {
-      queueMicrotask(() => {
-        applyingStoreViewport = false;
+    untrack(() => {
+      const cur = getViewport();
+      const dx = Math.abs(cur.x - v.x);
+      const dy = Math.abs(cur.y - v.y);
+      const dz = Math.abs(cur.zoom - v.zoom);
+      if (dx < 0.5 && dy < 0.5 && dz < 0.001) return;
+      debugCount('canvas.setViewport');
+      applyingStoreViewport = true;
+      void setViewport({ x: v.x, y: v.y, zoom: v.zoom }).finally(() => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            applyingStoreViewport = false;
+          });
+        });
       });
     });
   });
@@ -914,7 +986,7 @@
        호출. multi-session 은 BE Stage 5-D P2 endpoint 도착 시 wire. -->
   <SvelteFlow
     nodes={flowNodes}
-    edges={[]}
+    edges={EMPTY_EDGES}
     {nodeTypes}
     {onnodeclick}
     {onpaneclick}
@@ -922,7 +994,6 @@
     {onmove}
     {onpanecontextmenu}
     {onnodecontextmenu}
-    {onselectionchange}
     panOnDrag={panOnDragMask}
     selectionOnDrag={!isSpacePressed && !isHandTool && !isDragTool}
     minZoom={0.05}
@@ -931,7 +1002,7 @@
     elevateNodesOnSelect={true}
     onlyRenderVisibleElements={true}
     deleteKey={null}
-    proOptions={{ hideAttribution: true }}
+    proOptions={SVELTE_FLOW_PRO_OPTIONS}
   >
     <!-- patternColor/bgColor 를 prop 으로 넘기면 SVG attribute 로 들어가
          CSS var() 가 풀리지 않음. .svelte-flow 의 --xy-background-*

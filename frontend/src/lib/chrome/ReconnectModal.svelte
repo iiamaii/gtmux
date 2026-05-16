@@ -20,6 +20,7 @@
    * - unreachable: [Retry] = primary (default), [Switch session…] = secondary
    */
 
+  import { untrack } from 'svelte';
   import Modal from '$lib/ui/Modal.svelte';
   import Button from '$lib/ui/Button.svelte';
   import type { ReconnectModalState } from '$lib/stores/reconnectGate.svelte';
@@ -44,11 +45,19 @@
 
   // 100ms grace — mount 시점부터 timer 시작, expire 시 visible=true.
   // state 가 loading 외로 전이되면 grace skip (즉시 visible).
+  //
+  // ⚠️ 0045 fix — graceTimer 는 *plain let* (NOT $state)!
+  //   $state 로 두면 effect 의 `if (graceTimer !== null)` read + `graceTimer = ...`
+  //   write 가 self-trigger → effect_update_depth_exceeded. effect deps 에서
+  //   graceTimer 를 제외해야 안정.
   let visible = $state(false);
-  let graceTimer: ReturnType<typeof setTimeout> | null = $state(null);
+  let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
   $effect(() => {
-    if (mode === 'loading' && !visible) {
+    // 의존성: mode 만. visible 은 untrack 으로 read.
+    const currentMode = mode;
+    const isVisible = untrack(() => visible);
+    if (currentMode === 'loading' && !isVisible) {
       // first mount in loading — start grace
       if (graceTimer !== null) clearTimeout(graceTimer);
       graceTimer = setTimeout(() => {
@@ -63,7 +72,7 @@
       };
     }
     // non-loading state — show immediately
-    if (mode !== 'loading') {
+    if (currentMode !== 'loading') {
       if (graceTimer !== null) {
         clearTimeout(graceTimer);
         graceTimer = null;

@@ -186,8 +186,6 @@
     // OS preference listener — keeps `system` mode in sync when the OS
     // flips between light/dark while the app is open.
     unbindSystemTheme = themeStore.bindSystemListener();
-    // WS heartbeat watchdog (ADR-0021 D6) — activity / frame timestamp 추적.
-    // Phase 2 silent reattach 와 stale detection 의 입력.
     heartbeatStore.start();
 
     // Phase 2 (plan-0008 §6) — visibility transition listener.
@@ -300,10 +298,6 @@
         });
       }
 
-      // Step 3 — WS bootstrap. Cookie-additive auth (0035 §3.3 α, BE 의 D10 α)
-      // 가 land 되어 있으므로 Bearer token 부재 시에도 WS 가 cookie 만으로 upgrade.
-      // WS 가 열려야 0x88 TERMINAL_SPAWNED catch-up 으로 UUID↔PaneId binding 복원,
-      // 페이지 닫힘 시 disconnect_sink, PANE_OUT / PANE_IN streaming 동작.
       const token = acquireToken();
       const client = createDispatcher({ token });
       wsClientHolder.current = client;
