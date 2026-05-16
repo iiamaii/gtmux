@@ -14,6 +14,7 @@
   // - 캔버스 dot grid 는 token-driven (--canvas-bg, --canvas-grid).
   // - panOnDrag = [1, 2] — middle/right 마우스 버튼만 pan (left는 selection/drag용).
 
+  import { untrack } from 'svelte';
   import { SvelteFlow, Background, BackgroundVariant, useSvelteFlow } from '@xyflow/svelte';
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
@@ -368,11 +369,15 @@
   function itemToNode(item: CanvasItem): Node {
     const visible = effectiveVisibility(item.visibility, item.parent_id, sessionGroupsById);
     const locked = effectiveLocked(item.locked, item.parent_id, sessionGroupsById);
+    // selected 는 의도적으로 채우지 않는다 — SvelteFlow internal 진실을
+    // useSvelteFlow().updateNode 로 single-source sync (아래 effect). nodes
+    // prop 에 selected 를 함께 보내면 (a) M 변경마다 전체 nodes derived 가
+    // 재계산되어 SvelteFlow 가 모든 node 를 merge 하고, (b) 그 merge 가
+    // internal store 의 부분 변화로 cascade → effect_update_depth 위험.
     const common = {
       id: item.id,
       position: { x: item.x, y: item.y },
       draggable: !locked,
-      selected: sessionStore.M.has(item.id),
       zIndex: item.z,
       width: item.w,
       height: item.h,
@@ -475,14 +480,27 @@
    * 후로는 external (LayerTreeView 등) 의 reactive sync 가 internal 과
    * 충돌해 *그림에 안 보이는 상태* (store 는 진실, 시각은 stale) 가 된다.
    * useSvelteFlow().updateNode 가 internal store 의 정식 진입점이라 본
-   * effect 가 매 M 변경마다 모든 item 에 대해 명시 sync. */
+   * effect 가 매 M 변경마다 모든 item 에 대해 명시 sync.
+   *
+   * effect_update_depth_exceeded 회피:
+   * - 본 effect 가 sessionStore.items / M 에만 sub 되도록, SvelteFlow internal
+   *   proxy 의 reactive read 는 회피. `updateNode` 의 callback 패턴은
+   *   internal node 의 `n.selected` 를 read → 그 sub 가 internal store 와
+   *   엮여 updateNode 의 mutation 이 본 effect 의 deps 처럼 trigger 됨.
+   * - 따라서 (1) snapshot 을 `untrack` 으로 만들지 않고 본 effect 의 의도된
+   *   deps (items/M) 만 sub, (2) updateNode 는 callback 없이 partial 객체로,
+   *   (3) write 자체는 `untrack` 으로 감싸 SvelteFlow internal 변화가 본
+   *   effect 와 reactive 로 엮이지 않게 차단. */
   $effect(() => {
-    // sessionStore.M / items 가 reactive dep — has() 와 keys() 가 sub 형성.
+    const targets: Array<[string, boolean]> = [];
     for (const id of sessionStore.items.keys()) {
-      const want = sessionStore.M.has(id);
-      const cur = updateNode; // avoid TS narrowing — local alias
-      cur(id, (n) => (n.selected === want ? {} : { selected: want }));
+      targets.push([id, sessionStore.M.has(id)]);
     }
+    untrack(() => {
+      for (const [id, want] of targets) {
+        updateNode(id, { selected: want });
+      }
+    });
   });
 
   // 노드 클릭 → M 갱신. dual source.
