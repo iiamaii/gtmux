@@ -108,6 +108,37 @@ impl Default for Visibility {
     }
 }
 
+/// Horizontal alignment for text Canvas Items. Defaults to center so newly
+/// created empty text boxes edit from their visual center.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+impl Default for TextAlign {
+    fn default() -> Self {
+        Self::Center
+    }
+}
+
+/// Vertical alignment for text Canvas Items.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TextVerticalAlign {
+    Top,
+    Middle,
+    Bottom,
+}
+
+impl Default for TextVerticalAlign {
+    fn default() -> Self {
+        Self::Middle
+    }
+}
+
 /// Canvas viewport state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -177,6 +208,10 @@ pub enum Item {
         common: ItemCommon,
         text: String,
         font_size: u32,
+        #[serde(default)]
+        text_align: TextAlign,
+        #[serde(default)]
+        text_vertical_align: TextVerticalAlign,
         color: String,
     },
     Note {
@@ -528,6 +563,8 @@ mod tests {
                     common: item_common(UUID_A),
                     text: "hi".into(),
                     font_size: 14,
+                    text_align: TextAlign::Center,
+                    text_vertical_align: TextVerticalAlign::Middle,
                     color: "#333".into(),
                 },
                 Item::FreeDraw {
@@ -628,6 +665,8 @@ mod tests {
             common: item_common(UUID_A),
             text: "x".repeat(TEXT_PAYLOAD_MAX_BYTES + 1),
             font_size: 14,
+            text_align: TextAlign::Center,
+            text_vertical_align: TextVerticalAlign::Middle,
             color: "#000".into(),
         });
         assert_eq!(validate(&l), Err(ValidationError::TextTooLong));

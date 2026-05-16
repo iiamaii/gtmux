@@ -448,7 +448,13 @@ async fn ws_handler(
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
         if cookie_value.is_some() {
-            warn!("ws upgrade rejected: cookie invalid, no bearer");
+            // Cookie-only browser sessions are stored in-memory by the
+            // http-api layer. After a server restart, an existing browser tab
+            // can still hold the old HttpOnly cookie and auto-reconnect once
+            // before the SPA redirects through /auth. This is expected churn,
+            // not a high-signal intrusion attempt. Keep invalid bearer cases
+            // at warn above; stale cookie-only handshakes stay debug-level.
+            debug!("ws upgrade rejected: stale/invalid cookie, no bearer");
             return (StatusCode::UNAUTHORIZED, "invalid cookie").into_response();
         }
         return (StatusCode::UNAUTHORIZED, "bearer token or cookie required").into_response();
