@@ -1095,6 +1095,18 @@
     box-shadow: 0 0 0 1.5px var(--color-accent);
   }
 
+  /* line 같은 *대각선 line-art* 의 bounding-box 는 ring 으로 표시하면 회귀
+   * (사각형 outline 으로 보임). SvelteFlow 가 type 별 class (`svelte-flow__
+   * node-line`) 자동 부여 → 본 selector 로 ring 일괄 비활성. 자체 selection
+   * 시각은 LineNode 의 endpoint button 이 담당. */
+  .canvas-root :global(.svelte-flow__node-line),
+  .canvas-root :global(.svelte-flow__node-line:hover),
+  .canvas-root :global(.svelte-flow__node-line.selected),
+  .canvas-root :global(.svelte-flow__node-line:focus),
+  .canvas-root :global(.svelte-flow__node-line:focus-visible) {
+    box-shadow: none;
+  }
+
   /* Drag-to-create tool cursor — Batch 2 (rect/ellipse/line). */
   .canvas-root.drag-cursor,
   .canvas-root.drag-cursor :global(.svelte-flow__pane) {
