@@ -506,6 +506,78 @@ pub async fn auth_login_handler(
     }
 }
 
+/// `POST /auth/rotate` — ADR-0020 D14. Token-rotation action surfaced by the
+/// FE SettingsOverlay's [Rotate token] button. Authenticated by the caller's
+/// `gtmux_auth` cookie:
+///   * 200 + new Set-Cookie + `{ ok: true, revoked_count }` — caller's old
+///     cookie and every *other* session are dropped; the caller gets a fresh
+///     opaque session-id (same mode as before).
+///   * 401 — no cookie or invalid/expired cookie. No state change.
+///
+/// Notes:
+///   * The *server* token (`state.token`, used by `?t=` / bearer paths)
+///     is **not** rotated here — that's a CLI-side operation (`gtmux
+///     rotate-token`). This endpoint rotates the in-memory cookie session
+///     only. ADR-0020 D14 §"거절된 대안" R1.
+///   * Sits outside `/api/*` so the SPA can fire it during the auth surface
+///     transition (e.g. immediately after sign-in), but every request still
+///     passes through the Host + Origin checks so CSRF surface is bounded.
+pub async fn auth_rotate_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let Some(old_cookie) = extract_session_cookie(req.headers()) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "session_cookie_required" })),
+        )
+            .into_response();
+    };
+    // Constant-time-equivalent validate against the session table — also
+    // returns the active `AuthMode` so the rotated cookie inherits it.
+    let Some(mode) = state.session_table.validate(&old_cookie).await else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid_session" })),
+        )
+            .into_response();
+    };
+
+    // 1. Revoke every *other* session first, capture the count so the FE
+    //    can surface "logged out of N other devices".
+    let revoked_others = state.session_table.revoke_others(&old_cookie).await;
+    // 2. Revoke the caller's previous cookie so even an attacker who
+    //    captured it before rotation loses access.
+    state.session_table.revoke(&old_cookie).await;
+    // 3. Mint a fresh opaque cookie token (same mode).
+    let new_token = match state.session_table.issue(mode).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "auth_rotate: failed to mint replacement cookie");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "issue_failed" })),
+            )
+                .into_response();
+        }
+    };
+    let secure = matches!(state.config.mode(), Mode::Cloud);
+    let cookie_header =
+        build_session_cookie(&new_token, state.session_table.max_age(), secure);
+
+    let revoked_count = revoked_others + 1;
+    let mut resp = (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "revoked_count": revoked_count,
+        })),
+    )
+        .into_response();
+    if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie_header) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
+    apply_security_headers(resp.headers_mut(), state.config.mode());
+    resp
+}
+
 /// `POST /auth/logout` — revoke the cookie in the session table and emit a
 /// Max-Age=0 Set-Cookie to clear the browser jar. Idempotent — calling
 /// without a cookie is a 200 (no-op).

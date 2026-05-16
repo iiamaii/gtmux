@@ -632,6 +632,7 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         // so URLs printed by `gtmux start` keep working.
         .route("/auth/login", axum::routing::post(auth::auth_login_handler))
         .route("/auth/logout", axum::routing::post(auth::auth_logout_handler))
+        .route("/auth/rotate", axum::routing::post(auth::auth_rotate_handler))
         .route("/auth/bootstrap", get(bootstrap_handler))
         .route("/healthz", get(healthz_handler));
 
@@ -1210,6 +1211,196 @@ mod tests {
                     .header(header::HOST, TEST_HOST)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    // ── ADR-0020 D14: POST /auth/rotate ──
+
+    /// Helper — login token-mode, return the minted `gtmux_auth=<value>`
+    /// cookie value (just the opaque part, no flags).
+    async fn login_and_get_cookie_value(app: &Router, token: &TokenString) -> String {
+        let body = serde_json::to_vec(&json!({ "token": token.0 })).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/login")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("Set-Cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Strip flags — keep `gtmux_auth=<value>` only.
+        set_cookie.split(';').next().unwrap().trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn auth_rotate_issues_fresh_cookie_and_revokes_old() {
+        let (app, token) = make_app();
+        let old_cookie = login_and_get_cookie_value(&app, &token).await;
+
+        // Rotate.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/rotate")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &old_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let new_set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("rotate emits a new Set-Cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(new_set_cookie.starts_with(&format!("{COOKIE_NAME_STR}=")));
+        assert!(new_set_cookie.contains("HttpOnly"));
+        let new_cookie = new_set_cookie.split(';').next().unwrap().trim().to_string();
+        assert_ne!(new_cookie, old_cookie, "rotate must mint a fresh opaque value");
+
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        // Only the caller was alive → revoked_count == 1 (caller's old session).
+        assert_eq!(v["revoked_count"], json!(1));
+
+        // The new cookie must satisfy the auth middleware.
+        let ok = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &new_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            ok.status(),
+            StatusCode::UNAUTHORIZED,
+            "fresh rotated cookie must authenticate (got {:?})",
+            ok.status()
+        );
+
+        // The old cookie must now 401.
+        let stale = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &old_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stale.status(),
+            StatusCode::UNAUTHORIZED,
+            "old cookie must be revoked after rotate"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_rotate_revokes_other_sessions_too() {
+        let (app, token) = make_app();
+        // Two independent logins → two cookies. Rotating one must revoke
+        // both the rotator's old cookie *and* the other live session.
+        let cookie_a = login_and_get_cookie_value(&app, &token).await;
+        let cookie_b = login_and_get_cookie_value(&app, &token).await;
+        assert_ne!(cookie_a, cookie_b, "two logins should mint distinct cookies");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/rotate")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &cookie_a)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // Caller (a) was revoked + the other session (b) — count of 2.
+        assert_eq!(v["revoked_count"], json!(2));
+
+        // cookie_b must now 401 even though it never touched /rotate.
+        let stale = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &cookie_b)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_rotate_401_without_cookie() {
+        let (app, _token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/rotate")
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_rotate_401_with_invalid_cookie() {
+        let (app, _token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/rotate")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, "gtmux_auth=not-a-real-session")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
