@@ -276,6 +276,44 @@
       closing = false;
     }
   }
+
+  // ref/frontend-design/components.html §04 — min/max button 핸들러.
+  // min: items[].minimized toggle + mutateLayout PUT (Layer list 와 동일 path).
+  // max: sessionStore.toggleMaximize (in-memory ephemeral).
+  const isMaximized = $derived(sessionStore.maximizedItemId === data.id);
+
+  async function onMinimizeClick(e: MouseEvent): Promise<void> {
+    e.stopPropagation();
+    e.preventDefault();
+    const active = sessionStore.active;
+    if (active === null) return;
+    if (!(await ensureMutationOk('Minimize aborted — session reconnect failed.'))) return;
+    const next = data.minimized !== true;
+    try {
+      const { layout } = await mutateLayout(active.name, (cur) => ({
+        ...cur,
+        items: cur.items.map((it) =>
+          it.id === data.id ? ({ ...it, minimized: next } as typeof it) : it,
+        ),
+      }));
+      sessionStore.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Minimize failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
+  }
+
+  function onMaximizeClick(e: MouseEvent): void {
+    e.stopPropagation();
+    e.preventDefault();
+    sessionStore.toggleMaximize(data.id);
+  }
 </script>
 
 {#if isVisible}
@@ -285,6 +323,7 @@
     class:m-multi={isMultiM}
     class:i-active={isInI}
     class:locked={isLocked}
+    class:minimized={data.minimized === true}
     style="width: 100%; height: 100%;"
     role="group"
     aria-label={`Panel ${headerLabel}`}
@@ -300,6 +339,12 @@
       {onResizeEnd}
     />
     <header class="panel-header" aria-label={`Drag handle for ${headerLabel}`}>
+      <!-- ref/frontend-design/components.html §04 — panel glyph (terminal icon). -->
+      <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/>
+        <path d="M3 5l1.8 1.4L3 7.8"/>
+        <path d="M6 8.4h4"/>
+      </svg>
       {#if labelEditing}
         <span class="panel-label-host" role="presentation">
           <InlineEditField
@@ -318,54 +363,93 @@
         </span>
       {:else}
         <span
-          class="panel-label panel-label-editable"
+          class="panel-title panel-label-editable"
           title="Double-click to rename"
           ondblclick={onLabelStartEdit}
           role="presentation"
         >{headerLabel}</span>
       {/if}
-      <span class="panel-actions">
-        <span class="panel-badges">
-          {#if isLocked}
-            <span class="badge badge-lock" aria-label="Locked">L</span>
-          {/if}
-          {#if data.minimized === true}
-            <span class="badge badge-min" aria-label="Minimized">M</span>
-          {/if}
-          {#if isInI}
-            <span class="badge badge-input" aria-label="Input target">I</span>
-          {/if}
-        </span>
+      <!-- Status LED — running 고정 (실 source = terminalPool.alive / muxStore 의
+           dead 결합 은 후속 wire). -->
+      <span class="panel-status" aria-label="Panel status">
+        <span class="led" aria-hidden="true"></span>
+        <span class="status-label">running</span>
+      </span>
+      <div class="panel-actions">
+        {#if isInI}
+          <span class="badge badge-input" aria-label="Input target" title="Input target">I</span>
+        {/if}
+        {#if isLocked}
+          <span class="badge badge-lock" aria-label="Locked" title="Locked">L</span>
+        {/if}
         <button
           type="button"
-          class="panel-more"
+          class="panel-btn"
+          class:is-active={data.minimized === true}
+          aria-label={data.minimized === true ? 'Restore' : 'Minimize'}
+          title={data.minimized === true ? 'Restore' : 'Minimize'}
+          onclick={(e) => void onMinimizeClick(e)}
+          onmousedown={(e: MouseEvent) => e.stopPropagation()}
+        >
+          {#if data.minimized === true}
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+              <path d="M3 5.5h6"/><path d="M3 8.5h6"/>
+            </svg>
+          {:else}
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+              <path d="M3 8.5h6"/>
+            </svg>
+          {/if}
+        </button>
+        <button
+          type="button"
+          class="panel-btn"
+          class:is-active={isMaximized}
+          aria-label={isMaximized ? 'Restore' : 'Maximize'}
+          title={isMaximized ? 'Restore' : 'Maximize'}
+          onclick={onMaximizeClick}
+          onmousedown={(e: MouseEvent) => e.stopPropagation()}
+        >
+          {#if isMaximized}
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="3.6" width="6.5" height="6.4" rx="0.5"/>
+              <path d="M4 3.6V2.4h6.5v6.4H9"/>
+            </svg>
+          {:else}
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/>
+            </svg>
+          {/if}
+        </button>
+        <button
+          type="button"
+          class="panel-btn"
           aria-label="Panel actions"
           aria-haspopup="menu"
           title="Panel actions (arrange · change terminal · remove)"
           onclick={onMoreClick}
           onmousedown={(e: MouseEvent) => e.stopPropagation()}
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-            <circle cx="5" cy="12" r="1.6"/>
-            <circle cx="12" cy="12" r="1.6"/>
-            <circle cx="19" cy="12" r="1.6"/>
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
+            <circle cx="2.4" cy="6" r="1"/>
+            <circle cx="6" cy="6" r="1"/>
+            <circle cx="9.6" cy="6" r="1"/>
           </svg>
         </button>
         <button
           type="button"
-          class="panel-close"
+          class="panel-btn close"
           aria-label={closeTooltip}
           title={closeTooltip}
           disabled={closing}
           onclick={onClose}
           onmousedown={(e: MouseEvent) => e.stopPropagation()}
         >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <line x1="18" y1="6" x2="6" y2="18"/>
-            <line x1="6" y1="6" x2="18" y2="18"/>
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
+            <path d="M3 3l6 6M9 3l-6 6"/>
           </svg>
         </button>
-      </span>
+      </div>
     </header>
     <div class="panel-body">
       {#if isStreaming}
@@ -441,12 +525,13 @@
     cursor: default;
   }
 
+  /* ref/frontend-design/components.html §04 — panel head 정합 */
   .panel-header {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    padding: var(--space-4) var(--space-8);
-    height: 24px;
+    gap: var(--space-6);
+    padding: 0 6px 0 12px;
+    height: 32px;
     background: var(--color-surface-2);
     border-bottom: 1px solid var(--color-border);
     cursor: grab;
@@ -457,12 +542,24 @@
       border-color var(--motion-fast) var(--motion-easing);
   }
 
-  .panel-label {
+  .panel-glyph {
+    width: 13px;
+    height: 13px;
+    color: var(--color-fg-muted);
+    flex: 0 0 auto;
+  }
+
+  .panel-title {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: var(--text-md);
-    font-weight: var(--weight-medium);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 540;
+    letter-spacing: 0.2px;
+    color: var(--color-fg);
+    flex: 0 1 auto;
+    min-width: 0;
   }
 
   .panel-label-editable {
@@ -478,9 +575,11 @@
   }
 
   .panel-label-host :global(.panel-label-edit) {
-    /* InlineEditField input — panel-label 의 height/typography 따라가도록. */
-    font-size: var(--text-md);
-    font-weight: var(--weight-medium);
+    /* InlineEditField input — panel-title typography 동기. */
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 540;
+    letter-spacing: 0.2px;
     height: 22px;
     min-width: 0;
   }
@@ -491,50 +590,44 @@
     flex: 0 0 auto;
   }
 
+  /* Status — LED + uppercase label. margin-left: auto 로 좌측 title 과 우측 actions
+   * 사이의 공간 점유. running 색 고정 (#2dc26b, 시안 정합). */
+  .panel-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: auto;
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--color-fg-muted);
+  }
+
+  .panel-status .led {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #2dc26b;
+    flex: 0 0 auto;
+  }
+
   .panel-actions {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-4);
+    gap: 1px;
+    flex: 0 0 auto;
   }
 
-  .panel-badges {
-    display: inline-flex;
-    gap: var(--space-4);
-  }
-
-  /* More-actions button — 16×16 ghost. Same surface as panel-close but
-   * neutral hover (not destructive). Summons the shared ContextMenu so
-   * the action set stays single-sourced. */
-  .panel-more {
+  /* 22×22 ghost button — panel-btn (시안 §04). close 변형: red on hover. */
+  .panel-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 16px;
-    height: 16px;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    border: 0;
-    color: var(--color-fg-muted);
-    cursor: pointer;
-    padding: 0;
-    transition:
-      background var(--motion-fast) var(--motion-easing),
-      color var(--motion-fast) var(--motion-easing);
-  }
-
-  .panel-more:hover {
-    background: var(--color-glass-2);
-    color: var(--color-fg);
-  }
-
-  /* Close button — 16×16 ghost. disabled 시 opacity 낮춤 + cursor 변경. */
-  .panel-close {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    border-radius: var(--radius-sm);
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
     background: transparent;
     border: 0;
     color: var(--color-fg-muted);
@@ -546,12 +639,22 @@
       opacity var(--motion-fast) var(--motion-easing);
   }
 
-  .panel-close:hover:not(:disabled) {
-    background: var(--color-danger);
-    color: white;
+  .panel-btn:hover:not(:disabled) {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
   }
 
-  .panel-close:disabled {
+  .panel-btn.is-active {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
+  }
+
+  .panel-btn.close:hover:not(:disabled) {
+    background: #e5484d;
+    color: #ffffff;
+  }
+
+  .panel-btn:disabled {
     opacity: 0.35;
     cursor: not-allowed;
   }
@@ -573,10 +676,7 @@
     color: var(--color-bg);
   }
 
-  .badge-min {
-    background: var(--color-warning);
-    color: var(--color-bg);
-  }
+  /* .badge-min 제거 — minimize 상태는 panel-btn 의 is-active 로 표시. */
 
   .badge-input {
     background: var(--color-success);
@@ -591,6 +691,15 @@
      * height 와 컨테이너 사이 잔여 영역이 같은 색이라 resize 중에도
      * 검은색 갭이 노출되지 않음. */
     background: var(--xterm-bg);
+  }
+
+  /* Minimized — header only, body hide, header bottom border 제거 (시안 §04). */
+  .panel.minimized .panel-body {
+    display: none;
+  }
+
+  .panel.minimized .panel-header {
+    border-bottom: 0;
   }
 
   .panel-pending {
