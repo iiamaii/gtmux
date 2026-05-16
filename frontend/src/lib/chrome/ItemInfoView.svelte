@@ -1030,10 +1030,11 @@
     letter-spacing: 0.4px;
   }
 
+  /* Read-only value — editable InspectorField (color-fg) 와 색 차별. */
   .display-row .display-val {
     flex: 1 1 auto;
     min-width: 0;
-    color: var(--color-fg);
+    color: var(--color-fg-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
