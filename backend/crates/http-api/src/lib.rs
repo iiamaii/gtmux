@@ -625,10 +625,11 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
 
     let mut router = Router::new()
         .merge(api)
-        // Auth subtree — ADR-0020. The legacy `/auth/bootstrap` is kept as a
-        // 302-style redirect to `/auth?token=…` for backwards compat with
-        // bookmarks; the inline-script HTML it used to serve is gone.
-        .route("/auth", get(auth::auth_page_handler))
+        // Auth subtree — ADR-0020 + D13. `/auth` is intentionally *not*
+        // routed here: the FE bundle (SPA fallback) is the single source for
+        // the sign-in page. The legacy `/auth/bootstrap` survives as a 303
+        // redirect to `/auth?t=…` (the FE AuthPage's magic-link contract)
+        // so URLs printed by `gtmux start` keep working.
         .route("/auth/login", axum::routing::post(auth::auth_login_handler))
         .route("/auth/logout", axum::routing::post(auth::auth_logout_handler))
         .route("/auth/bootstrap", get(bootstrap_handler))
@@ -776,10 +777,12 @@ struct BootstrapQuery {
     redirect: Option<String>,
 }
 
-/// Legacy bootstrap route — ADR-0020 D8 obsoleted the inline-script flow.
-/// We keep the URL alive so existing bookmarks still work, but the body is
-/// now a 303 to the canonical `/auth?token=…` endpoint. The token query
-/// itself is verified (and cookie issued) by `auth_page_handler`.
+/// Legacy bootstrap route — ADR-0020 D8 obsoleted the inline-script flow,
+/// and D13 hands the sign-in page off to the FE bundle. We keep the URL
+/// alive so existing bookmarks (and the URL printed by `gtmux start`) still
+/// work, but the body is now a 303 to `/auth?t=…` — the FE AuthPage's
+/// magic-link contract. The token is then POSTed to `/auth/login` by the FE
+/// to mint the cookie.
 async fn bootstrap_handler(
     State(_state): State<AppState>,
     Query(q): Query<BootstrapQuery>,
@@ -791,11 +794,11 @@ async fn bootstrap_handler(
     // stale bookmark isn't laundered into a header-splitting payload.
     let target = match q.redirect.as_deref() {
         Some(r) => format!(
-            "/auth?token={}&redirect={}",
+            "/auth?t={}&redirect={}",
             urlencode_query(&token),
             urlencode_query(r)
         ),
-        None => format!("/auth?token={}", urlencode_query(&token)),
+        None => format!("/auth?t={}", urlencode_query(&token)),
     };
     Response::builder()
         .status(StatusCode::SEE_OTHER)
@@ -985,99 +988,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    // ── ADR-0020: token-mode entry → opaque session cookie + 303 ──
+    // ── ADR-0020 + D13 — auth-page wiring ──
     //
-    // The legacy `/auth/bootstrap` route now redirects to the canonical
-    // `/auth?token=…` endpoint (ADR-0020 D8). Tests below cover both routes
-    // since existing bookmarks must keep working until the FE migrates.
+    // The server-rendered `GET /auth` handler is gone (D13): the FE SPA
+    // bundle is now the single source for the sign-in page. The legacy
+    // `/auth/bootstrap` URL survives as a 303 redirect to the FE-handled
+    // `/auth?t=…` so URLs printed by `gtmux start` keep working. Tests
+    // below cover the bootstrap redirect contract; the SPA fallback is
+    // exercised by the FE/E2E layer. Cookie minting is now reached via
+    // `POST /auth/login`.
 
     #[tokio::test]
-    async fn auth_page_token_query_issues_cookie_and_redirects() {
-        let (app, token) = make_app();
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri(format!("/auth?token={}", token.0))
-                    .header(header::HOST, TEST_HOST)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        let set_cookie = resp
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("Set-Cookie present")
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(set_cookie.starts_with(&format!("{COOKIE_NAME_STR}=")));
-        assert!(set_cookie.contains("HttpOnly"));
-        assert!(set_cookie.contains("SameSite=Strict"));
-        // Cookie value must NOT be the raw bearer token — it's an opaque
-        // session-id from `SessionTable::issue`.
-        let cookie_value = set_cookie
-            .split(';')
-            .next()
-            .unwrap()
-            .strip_prefix(&format!("{COOKIE_NAME_STR}="))
-            .unwrap()
-            .to_string();
-        assert_ne!(cookie_value, token.0, "cookie must be opaque session-id, not bearer token");
-        // Location → "/" (default redirect target).
-        let location = resp
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(location, "/");
-    }
-
-    #[tokio::test]
-    async fn auth_page_invalid_token_returns_html_error() {
-        let (app, _token) = make_app();
-        let wrong = "A".repeat(43);
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri(format!("/auth?token={wrong}"))
-                    .header(header::HOST, TEST_HOST)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert!(resp.headers().get(header::SET_COOKIE).is_none());
-    }
-
-    #[tokio::test]
-    async fn auth_page_without_token_renders_landing() {
-        let (app, _token) = make_app();
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/auth")
-                    .header(header::HOST, TEST_HOST)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(ct.starts_with("text/html"));
-    }
-
-    #[tokio::test]
-    async fn bootstrap_legacy_route_redirects_to_auth() {
+    async fn bootstrap_legacy_route_redirects_to_fe_auth_page() {
+        // D13: `gtmux start` prints `/auth/bootstrap?token=…`. The handler
+        // must 303 to `/auth?t=…` (the FE AuthPage magic-link contract)
+        // — not the legacy `?token=` form the old server-rendered handler
+        // accepted.
         let (app, token) = make_app();
         let resp = app
             .oneshot(
@@ -1097,7 +1023,14 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        assert!(location.starts_with("/auth?token="));
+        assert!(
+            location.starts_with("/auth?t="),
+            "bootstrap must redirect to FE magic-link path /auth?t=…, got {location}"
+        );
+        assert!(
+            !location.contains("token="),
+            "legacy ?token= must not survive in the redirect (FE expects ?t=): {location}"
+        );
     }
 
     #[tokio::test]
@@ -1117,48 +1050,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_redirect_target_rejects_external() {
-        for evil in [
-            "https://evil.example/x",
-            "//evil.example",
-            "/\\evil.example",
-        ] {
-            let (app, token) = make_app();
-            let resp = app
-                .oneshot(
-                    HttpRequest::builder()
-                        .uri(format!("/auth?token={}&redirect={evil}", token.0))
-                        .header(header::HOST, TEST_HOST)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-            let location = resp
-                .headers()
-                .get(header::LOCATION)
-                .unwrap()
-                .to_str()
-                .unwrap();
-            assert_eq!(location, "/", "evil input {evil:?} must normalise to '/'");
-        }
-    }
-
-    #[tokio::test]
     async fn cookie_auth_works_after_login() {
         let (app, token) = make_app();
+        // D13: cookies are minted by `POST /auth/login`, not the legacy
+        // `GET /auth?token=` server-rendered handler.
+        let login_body = serde_json::to_vec(&json!({ "token": token.0 })).unwrap();
         let auth_resp = app
             .clone()
             .oneshot(
                 HttpRequest::builder()
-                    .uri(format!("/auth?token={}", token.0))
+                    .method(Method::POST)
+                    .uri("/auth/login")
                     .header(header::HOST, TEST_HOST)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(login_body))
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(auth_resp.status(), StatusCode::OK);
         let name_value = auth_resp
             .headers()
             .get(header::SET_COOKIE)
@@ -1200,17 +1110,22 @@ mod tests {
     #[tokio::test]
     async fn auth_logout_clears_cookie_and_revokes() {
         let (app, token) = make_app();
+        // D13: cookies are minted by `POST /auth/login`.
+        let login_body = serde_json::to_vec(&json!({ "token": token.0 })).unwrap();
         let auth_resp = app
             .clone()
             .oneshot(
                 HttpRequest::builder()
-                    .uri(format!("/auth?token={}", token.0))
+                    .method(Method::POST)
+                    .uri("/auth/login")
                     .header(header::HOST, TEST_HOST)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(login_body))
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(auth_resp.status(), StatusCode::OK);
         let name_value = auth_resp
             .headers()
             .get(header::SET_COOKIE)
@@ -2623,18 +2538,108 @@ mod tests {
         assert_eq!(detach(&app, &token, "beta").await, StatusCode::OK);
     }
 
+    /// `POST /attach` followed by `POST /attach` with the *same cookie*
+    /// must be idempotent — second call 200, same lock retained. ADR-0019
+    /// D3: refresh races and silent reattach (plan-0008 Phase 2) rely on
+    /// this contract to avoid spuriously surfacing the "in use" modal.
     #[tokio::test]
-    async fn attach_409_when_already_held_same_server() {
+    async fn attach_idempotent_for_same_cookie_same_session() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (app, token, _) = make_app_with_workspace(&dir);
+        let (app, token, workspace_dir) = make_app_with_workspace(&dir);
         create_session(&app, &token, "gamma").await;
-        assert_eq!(attach(&app, &token, "gamma").await, StatusCode::OK);
-        // Same server, same session — second attach must 409 (no takeover).
-        assert_eq!(attach(&app, &token, "gamma").await, StatusCode::CONFLICT);
-        assert_eq!(detach(&app, &token, "gamma").await, StatusCode::OK);
-        // After release the lock is free again.
-        assert_eq!(attach(&app, &token, "gamma").await, StatusCode::OK);
-        assert_eq!(detach(&app, &token, "gamma").await, StatusCode::OK);
+        let cookie_value = "same-cookie-aaa";
+        let make_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/api/sessions/gamma/attach")
+                .header(header::HOST, TEST_HOST)
+                .header(header::AUTHORIZATION, bearer(&token))
+                .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let r1 = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let b1 = to_bytes(r1.into_body(), 64 * 1024).await.unwrap();
+        let v1: Value = serde_json::from_slice(&b1).unwrap();
+        assert_eq!(v1["attached"], json!(true));
+        assert_eq!(v1["name"], json!("gamma"));
+        assert!(workspace_dir.join(".locks/gamma.lock").exists());
+
+        // Second attach with the *same* cookie must be 200 idempotent —
+        // the existing lock is reused, body shape matches the first call.
+        let r2 = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let b2 = to_bytes(r2.into_body(), 64 * 1024).await.unwrap();
+        let v2: Value = serde_json::from_slice(&b2).unwrap();
+        assert_eq!(v2["attached"], json!(true));
+        assert_eq!(v2["name"], json!("gamma"));
+        assert_eq!(v2["server_id"], v1["server_id"]);
+        // Lock file must still exist (no implicit release fired).
+        assert!(workspace_dir.join(".locks/gamma.lock").exists());
+
+        // A single DELETE releases the lock.
+        let release = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/gamma/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(release.status(), StatusCode::OK);
+    }
+
+    /// `POST /attach` from a *different cookie* while the session is held
+    /// must return 409 (no takeover, ADR-0019 D4). Counterpart of the
+    /// same-cookie idempotent contract above.
+    #[tokio::test]
+    async fn attach_409_when_held_by_different_cookie() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, workspace_dir) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "gamma").await;
+        let cookie_a = "cookie-aaa";
+        let cookie_b = "cookie-bbb";
+        let post = |cookie: &str| {
+            app.clone().oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/gamma/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        assert_eq!(post(cookie_a).await.unwrap().status(), StatusCode::OK);
+        // Different cookie attempting takeover → 409.
+        assert_eq!(post(cookie_b).await.unwrap().status(), StatusCode::CONFLICT);
+        // Owner releases.
+        let release = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/gamma/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_a}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(release.status(), StatusCode::OK);
+        assert!(!workspace_dir.join(".locks/gamma.lock").exists());
+        // Now cookie_b can acquire it.
+        assert_eq!(post(cookie_b).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -2670,9 +2675,12 @@ mod tests {
         // so we reconstruct one against the same workspace dir + simulate.
         // The unit-level coverage of release_lock_for_cookie is via the
         // standalone test below; here we verify the *integration* surface.
-        // Second attach (same cookie) must still 409 because takeover is
-        // forbidden — the auto-release path is the only way the lock goes
-        // away (apart from explicit DELETE).
+        // A second attach from a *different* cookie must 409 because takeover
+        // is forbidden (ADR-0019 D4) — the auto-release path is the only way
+        // the lock goes away (apart from explicit DELETE). Same-cookie
+        // reattach is now idempotent (D3) and is covered separately by
+        // `attach_idempotent_for_same_cookie_same_session`.
+        let other_cookie = "test-cookie-OTHER";
         let again = app
             .clone()
             .oneshot(
@@ -2681,7 +2689,7 @@ mod tests {
                     .uri("/api/sessions/auto-rel/attach")
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(&token))
-                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .header(header::COOKIE, format!("gtmux_auth={other_cookie}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3532,14 +3540,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_same_name_same_cookie_is_idempotent_409() {
-        // Re-attaching to the *same* session with the same cookie must keep
-        // the existing flock (no implicit release loop). The duplicate attach
-        // hits the `holders.contains_key(&name)` check and returns 409 —
-        // exposing leakage of the prior flock would be a regression.
+    async fn attach_same_name_same_cookie_is_idempotent_200() {
+        // ADR-0019 D3: re-attaching to the *same* session with the same
+        // cookie is idempotent — second call 200, existing flock retained.
+        // Refresh races (SPA reattach overtaking WS-close release) and
+        // plan-0008 Phase 2 silentReattach depend on this contract; flipping
+        // it to 409 would surface the "in use" modal against the very same
+        // webpage. Hub mirror also stays pointing at this session.
         let dir = tempfile::TempDir::new().unwrap();
         let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
-        let _hub = state.hub.as_ref().expect("hub wired").clone();
+        let hub = state.hub.as_ref().expect("hub wired").clone();
         std::fs::write(
             workspace_dir.join("solo.json"),
             serde_json::to_vec(&json!({
@@ -3566,9 +3576,17 @@ mod tests {
         };
         assert_eq!(app.clone().oneshot(make_req()).await.unwrap().status(), StatusCode::OK);
         assert!(workspace_dir.join(".locks/solo.lock").exists());
-        // Second attach (same cookie, same name) — 409, *and* the lock file
-        // must still exist (no implicit release fired).
-        assert_eq!(app.clone().oneshot(make_req()).await.unwrap().status(), StatusCode::CONFLICT);
+        assert_eq!(hub.session_for_cookie(cookie_value), Some("solo".into()));
+        // Second attach (same cookie, same name) — 200 idempotent. Lock
+        // file stays put (no implicit release fired) and the hub mirror
+        // is unchanged.
+        let r2 = app.clone().oneshot(make_req()).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r2.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["attached"], json!(true));
+        assert_eq!(v["name"], json!("solo"));
         assert!(workspace_dir.join(".locks/solo.lock").exists());
+        assert_eq!(hub.session_for_cookie(cookie_value), Some("solo".into()));
     }
 }

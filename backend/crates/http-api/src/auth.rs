@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use argon2::password_hash::SaltString;
 use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use axum::body::Body;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -410,56 +410,10 @@ pub(crate) fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<St
 //  Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-pub struct AuthPageQuery {
-    /// Token-mode entry: `/auth?token=<X>` — server-side verify + cookie
-    /// + 302 to `redirect` (default `/`).
-    pub token: Option<String>,
-    /// Optional redirect target after a successful login. Same hardening
-    /// as the legacy bootstrap path: must be a host-relative path, no
-    /// scheme, no protocol-relative `//`, no CR/LF.
-    pub redirect: Option<String>,
-}
-
-/// `GET /auth` — entry point that replaces the legacy inline-script
-/// bootstrap (ADR-0020 D8). Behaviour:
-///   * `?token=X` present → constant-time verify against the stable
-///     server token → issue cookie + 302.
-///   * `?token=X` absent → render a tiny HTML page. In token mode it
-///     instructs the operator to follow the URL printed by `gtmux start`.
-///     In password mode it serves a `<form>` that POSTs to
-///     `/auth/login`.
-///
-/// Returning HTML directly here (instead of forwarding to the SPA) keeps
-/// the auth gate independent of the JavaScript bundle — useful when the
-/// frontend build is stale or absent.
-pub async fn auth_page_handler(
-    State(state): State<AppState>,
-    Query(q): Query<AuthPageQuery>,
-) -> Response {
-    // ── token-query fast path ─────────────────────────────────────────────
-    if let Some(token) = q.token.as_deref().filter(|t| !t.is_empty()) {
-        if !verify_token(token, &state.token) {
-            state
-                .auth_failure_counter
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return auth_error_html("Invalid or expired token. Restart `gtmux start` for a fresh URL.", StatusCode::UNAUTHORIZED);
-        }
-        return issue_cookie_and_redirect(&state, AuthMode::Token, q.redirect.as_deref()).await;
-    }
-
-    // ── render landing page ──────────────────────────────────────────────
-    let mode = AuthMode::from_config_str(&state.config.auth.mode);
-    let body = render_auth_page(mode);
-    let mut resp = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(body))
-        .expect("static headers");
-    apply_security_headers(resp.headers_mut(), state.config.mode());
-    resp
-}
+// `/auth` GET is owned by the FE bundle (ADR-0020 D13) — no server-side
+// handler. The legacy `auth_page_handler` (server-rendered token-mode entry
+// + landing HTML) was removed when the SPA took over the sign-in surface;
+// `/auth/login` is now the single token/password exchange path.
 
 #[derive(Debug, Deserialize)]
 pub struct LoginBody {
@@ -575,35 +529,6 @@ pub async fn auth_logout_handler(State(state): State<AppState>, req: Request<Bod
 //  Handler helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn issue_cookie_and_redirect(
-    state: &AppState,
-    mode: AuthMode,
-    redirect_raw: Option<&str>,
-) -> Response {
-    let cookie_token = match state.session_table.issue(mode).await {
-        Ok(t) => t,
-        Err(e) => {
-            warn!(error = %e, "auth: failed to mint session cookie");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "auth init failed").into_response();
-        }
-    };
-    let target = normalise_redirect_target(redirect_raw);
-    let secure = matches!(state.config.mode(), Mode::Cloud);
-    let max_age = Duration::from_secs(
-        u64::from(state.config.auth.cookie_max_age_days).saturating_mul(24 * 3600),
-    );
-    let cookie = build_session_cookie(&cookie_token, max_age, secure);
-    let mut resp = Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header(header::SET_COOKIE, cookie)
-        .header(header::LOCATION, target)
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::empty())
-        .expect("static headers");
-    apply_security_headers(resp.headers_mut(), state.config.mode());
-    resp
-}
-
 async fn issue_cookie_response(
     state: &AppState,
     mode: AuthMode,
@@ -651,72 +576,6 @@ fn login_error(msg: &str, status: StatusCode) -> Response {
         Json(json!({ "error": "auth_failed", "message": msg })),
     )
         .into_response()
-}
-
-fn auth_error_html(msg: &str, status: StatusCode) -> Response {
-    let body = format!(
-        "<!doctype html><meta charset=utf-8><title>gtmux — auth error</title>\
-        <body style=\"font-family:system-ui;margin:2em\">\
-        <h1>Authentication failed</h1><p>{}</p></body>",
-        html_escape(msg)
-    );
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(body))
-        .expect("static headers")
-}
-
-fn render_auth_page(mode: AuthMode) -> String {
-    let inner = match mode {
-        AuthMode::Token => {
-            "<p>Open the <code>/auth?token=…</code> URL printed by \
-             <code>gtmux start</code>. Once your cookie is issued you'll \
-             be redirected automatically.</p>"
-                .to_string()
-        }
-        AuthMode::Password => r##"
-<form method="POST" action="/auth/login" enctype="application/x-www-form-urlencoded"
-      onsubmit="event.preventDefault(); login(this.password.value);">
-  <label>Password
-    <input type="password" name="password" autofocus required minlength="8">
-  </label>
-  <button type="submit">Log in</button>
-</form>
-<p id="msg" style="color:#c33"></p>
-<script>
-async function login(password) {
-  const r = await fetch('/auth/login', {
-    method: 'POST', credentials: 'same-origin',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ password }),
-  });
-  if (r.ok) {
-    const { redirect } = await r.json();
-    window.location.replace(redirect || '/');
-  } else {
-    const t = await r.text();
-    document.getElementById('msg').textContent =
-      r.status === 429 ? 'Too many attempts — try again in a few minutes.'
-                       : 'Login failed.';
-  }
-}
-</script>
-"##
-        .to_string(),
-    };
-    format!(
-        "<!doctype html><meta charset=utf-8><title>gtmux — sign in</title>\
-        <body style=\"font-family:system-ui;margin:2em;max-width:32rem\">\
-        <h1>gtmux</h1>{inner}</body>"
-    )
-}
-
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// Same hardening as the legacy bootstrap path — only `/<path>` survives.

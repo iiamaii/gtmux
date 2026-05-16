@@ -393,11 +393,27 @@ pub async fn attach_handler(
         }
     }
 
+    // ADR-0019 D3 — same-cookie same-session reattach is an idempotent
+    // 200 (not a 409). Surfaces when:
+    //   * refresh races where the SPA's reattach POST overtakes the WS
+    //     close → release_lock_for_cookie pipeline; and
+    //   * plan-0008 Phase 2 silent reattach (WS reconnecting→open or
+    //     visibility-change while still holding the lock).
+    // In both cases the *same* cookie already owns this session's lock,
+    // so no acquire runs — just re-classify the layout and reply OK.
+    {
+        let by_cookie = state.session_locks_by_cookie.lock().await;
+        if by_cookie.get(&cookie).map(|s| s == &name).unwrap_or(false) {
+            drop(by_cookie);
+            return reuse_existing_attach_response(&state, wm, &name).await;
+        }
+    }
+
     // Same-server serialisation (D6.6) — only one attach attempt at a time
     // per session name from *this* process.
     let mut holders = state.session_locks.lock().await;
     if holders.contains_key(&name) {
-        // Even from the same server, takeover is forbidden.
+        // Held by a *different* cookie on this server — no takeover.
         return lock_conflict_response(&state, wm, &name);
     }
 
@@ -762,6 +778,33 @@ async fn load_terminal_uuids(
             _ => None,
         })
         .collect())
+}
+
+/// ADR-0019 D3 idempotent re-attach response. The caller has already
+/// confirmed (via `session_locks_by_cookie`) that the current cookie
+/// owns the existing lock for `name`, so no flock acquire runs — we
+/// just re-run match-or-spawn classification (ADR-0018 D6) to mirror
+/// the body shape of the first-attach success path.
+async fn reuse_existing_attach_response(
+    state: &crate::AppState,
+    wm: &Arc<crate::workspace::WorkspaceManager>,
+    name: &str,
+) -> Response {
+    let (matched, unmatched) = match classify_layout_terminals(state, wm, name).await {
+        Ok(pair) => pair,
+        Err(e) => return e.into_response(),
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "name": name,
+            "attached": true,
+            "server_id": &*state.server_id,
+            "matched": matched,
+            "unmatched": unmatched,
+        })),
+    )
+        .into_response()
 }
 
 async fn release_attach(state: &crate::AppState, name: &str, cookie: &str) {
