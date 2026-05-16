@@ -1070,14 +1070,29 @@
     --xy-node-boxshadow-selected: none;
   }
 
-  .canvas-root :global(.svelte-flow__node),
+  /* ref/frontend-design/components.html §05 — Shared rules B/C:
+   *   - Selection 시각은 wrapper (.svelte-flow__node) 가 책임. 각 shape 컴포넌트
+   *     는 자체 outline 갖지 않음 (모두 outline: none) — 단일 source.
+   *   - box-shadow ring 패턴 (border-radius inherit) — outline 과 달리 shape 의
+   *     radius 를 따라간다. selection / hover 둘 다 동일 패턴.
+   *   - SvelteFlow 의 default `border`/`box-shadow` 는 XY variable 로 비활성화
+   *     (위 .svelte-flow 의 --xy-node-* 0/none). 우리 ring 만 표시. */
+  .canvas-root :global(.svelte-flow__node) {
+    border: 0 !important;
+    outline: none !important;
+    background: transparent !important;
+    box-shadow: none;
+    transition: box-shadow 120ms ease;
+  }
+
+  .canvas-root :global(.svelte-flow__node:hover) {
+    box-shadow: 0 0 0 1px var(--color-border-strong);
+  }
+
   .canvas-root :global(.svelte-flow__node.selected),
   .canvas-root :global(.svelte-flow__node:focus),
   .canvas-root :global(.svelte-flow__node:focus-visible) {
-    border: 0 !important;
-    outline: none !important;
-    box-shadow: none !important;
-    background: transparent !important;
+    box-shadow: 0 0 0 1.5px var(--color-accent);
   }
 
   /* Drag-to-create tool cursor — Batch 2 (rect/ellipse/line). */

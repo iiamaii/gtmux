@@ -7,8 +7,11 @@
   // - 헤더 바 = drag handle. label + badges (L/M/Min/I).
   // - 본문 = XtermHost.
   // - 선택 시각 (M):
-  //     * single  (.m-single) → solid 1.5px accent outline (Figma 정합)
-  //     * multi   (.m-multi)  → dashed 2px accent outline + 헤더 색조 변화
+  //     * outline 은 wrapper (.svelte-flow__node.selected) 가 단일 source —
+  //       1.5px accent box-shadow ring (Canvas.svelte §05 shared rules B).
+  //     * single (.m-single) / multi (.m-multi) 는 *비-outline* 시각 단서:
+  //       header 색조 변화 (.m-single .panel-header / .m-multi .panel-header).
+  //       multi 시 multi-drag affordance 강조.
   // - resize : NodeResizer (corner + edge handles). onResizeEnd 시 sessionStore
   //   + PUT /api/sessions/<name>/layout 으로 영속화.
   // - visibility=false → 렌더 X.
