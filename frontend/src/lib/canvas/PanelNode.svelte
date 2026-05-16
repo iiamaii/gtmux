@@ -15,19 +15,47 @@
 
   import { getContext } from 'svelte';
   import { NodeResizer } from '@xyflow/svelte';
+  import PanelDanglingOverlay from './PanelDanglingOverlay.svelte';
   import XtermHost from './XtermHost.svelte';
+  import InlineEditField from '$lib/common/InlineEditField.svelte';
+  import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
   import { panelsStore } from '$lib/stores/panels.svelte';
   import { ephemeralStore } from '$lib/stores/ephemeral.svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { putLayoutCommitCurrent } from '$lib/http/layout';
+  import { deleteItem, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+  import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
   import { sendCtrl } from '$lib/ws/ctrl-registry';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
   import type { WsClient } from '$lib/ws/client';
 
   interface WsClientHolder {
     current: WsClient | null;
   }
   const wsClientHolder = getContext<WsClientHolder>('wsClient');
+
+  // ContextMenu summoner — header (…) button opens the same menu the
+  // right-click would (ADR-0017 §D2 amend: panel header more menu).
+  interface ContextMenuHolder {
+    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null }) => void;
+  }
+  const contextMenuHolder = getContext<ContextMenuHolder | undefined>('contextMenu');
+
+  function onMoreClick(e: MouseEvent): void {
+    e.stopPropagation();
+    if (!contextMenuHolder) return;
+    const btn = e.currentTarget as HTMLElement | null;
+    const rect = btn?.getBoundingClientRect();
+    contextMenuHolder.openAt({
+      clientX: rect ? rect.right : e.clientX,
+      clientY: rect ? rect.bottom + 4 : e.clientY,
+      paneId: typeof data.pane_id === 'string' ? data.pane_id : null,
+      panelId: data.id,
+    });
+  }
 
   interface PanelData {
     id: string;
@@ -78,8 +106,7 @@
     typeof data.pane_id === 'string' && ephemeralStore.i === data.pane_id
   );
 
-  const panelW = $derived(data.w ?? 480);
-  const panelH = $derived(data.h ?? 320);
+  type ResizeParams = { x: number; y: number; width: number; height: number };
   const isLocked = $derived(data.locked === true);
 
   const TOKEN_STORAGE_KEY = 'gtmux_token';
@@ -94,8 +121,38 @@
   // NodeResizer onResizeEnd — { event, params: { x, y, width, height } }.
   // Resize 도중에는 SvelteFlow 가 controlled width/height 를 자체 업데이트
   // 하므로 본 핸들러는 *최종 값만* store + disk 로 commit (drag 와 동일 패턴).
-  type ResizeParams = { x: number; y: number; width: number; height: number };
   function onResizeEnd(_event: unknown, params: ResizeParams) {
+    if (useSessionStore && sessionStore.active !== null) {
+      const sessionName = sessionStore.active.name;
+      const nextW = Math.max(240, params.width);
+      const nextH = Math.max(140, params.height);
+      void mutateLayout(sessionName, (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          it.id === data.id && it.type === 'terminal'
+            ? ({
+                ...it,
+                x: params.x,
+                y: params.y,
+                w: nextW,
+                h: nextH,
+              } as TerminalItem)
+            : it,
+        ),
+      }))
+        .then(({ layout }) => sessionStore.loadLayout(layout))
+        .catch((err: unknown) => {
+          if (err instanceof UnauthorizedError) {
+            window.location.href = '/auth';
+            return;
+          }
+          toastStore.show({
+            message: `Resize failed: ${err instanceof Error ? err.message : String(err)}`,
+            tone: 'error',
+          });
+        });
+      return;
+    }
     panelsStore.resizePanel(data.id, params.x, params.y, params.width, params.height);
     const token = readToken();
     if (token === null) {
@@ -107,34 +164,83 @@
     });
   }
 
-  // ─ Stage G — close button (S7-FE-CLOSE-GUARD) ──────────────────────────
+  /** Multi-session 흐름 활성 여부. */
+  const useSessionStore = $derived(sessionStore.active !== null);
+
+  /**
+   * Multi-session terminal item 의 UUID→PaneId binding (0x88 TERMINAL_SPAWNED 가
+   * source). undefined → spawn 직후 또는 dangling 상태 → connecting placeholder.
+   * 정수 → XtermHost mount 가능.
+   */
+  const terminalPaneId = $derived(
+    useSessionStore ? terminalPool.paneIdFor(data.id) : undefined,
+  );
+
+  // ─ Close button enablement (0036 §3 P0-B) ─────────────────────────────
   //
-  // CONTEXT.md "Pane lifecycle invariant" — 마지막 살아 있는 child 일 때
-  // close 비활성화. 사후 recovery 가 아닌 사전 prevention.
+  // legacy single-session: CONTEXT.md "Pane lifecycle invariant" — 마지막
+  // 살아 있는 child 일 때 close 비활성화 (Session shutdown 사용 유도).
+  //
+  // v2 multi-session: terminal item.id 는 UUID — legacy `%N` paneNumeric
+  // 조건은 무관. liveCount 도 무관 (terminal kill 은 mirror 보호를 위해
+  // PanelCloseConfirmModal 안에서 사용자 명시 선택). 항상 enabled.
   const liveCount = $derived(
     [...muxStore.panes.values()].filter((p) => p.dead !== true).length
   );
 
-  // Live count = 1 + this panel's pane is the one alive ⇒ disabled.
-  // We also disable when the underlying pane is not registered yet
-  // (no pane_id) to avoid the close racing the spawn.
   const paneNumeric = $derived.by(() => {
     if (typeof data.pane_id !== 'string' || data.pane_id[0] !== '%') return null;
     const n = Number.parseInt(data.pane_id.slice(1), 10);
     return Number.isNaN(n) ? null : n;
   });
-  const closeDisabled = $derived(liveCount <= 1 || paneNumeric === null);
-  const closeTooltip = $derived(
-    closeDisabled && liveCount <= 1
-      ? "Last live pane — use Session shutdown"
-      : "Close panel"
-  );
+
+  /** legacy 인지 — v2 path 와 confuse 하지 않기 위한 명시 분기. */
+  const isLegacyPane = $derived(!useSessionStore && paneNumeric !== null);
+
+  const closeDisabled = $derived.by(() => {
+    if (useSessionStore) return false;
+    // legacy 1-pane 보호 + pane spawn race 방지.
+    return liveCount <= 1 || paneNumeric === null;
+  });
+  const closeTooltip = $derived.by(() => {
+    if (!closeDisabled) return 'Close panel';
+    return liveCount <= 1
+      ? 'Last live pane — use Session shutdown'
+      : 'Close panel';
+  });
 
   let closing = $state(false);
+  let confirmOpen = $state(false);
 
-  async function onClose(e: MouseEvent): Promise<void> {
+  /** 현 panel 의 terminal 이 다른 session 에서 reference 되는 list (현 session 제외). */
+  const otherSessions = $derived.by((): string[] => {
+    if (!useSessionStore) return [];
+    const active = sessionStore.active;
+    if (active === null) return [];
+    const t = terminalPool.byId(data.id);
+    if (t === null) return [];
+    return t.attached_sessions.filter((s) => s !== active.name);
+  });
+
+  const attachCount = $derived.by((): number => {
+    if (!useSessionStore) return 0;
+    const t = terminalPool.byId(data.id);
+    return t?.attach_count ?? 0;
+  });
+
+  function onClose(e: MouseEvent): void {
     e.stopPropagation();
     if (closeDisabled || closing) return;
+    if (useSessionStore) {
+      // Multi-session — 3-option confirm dialog (G25).
+      confirmOpen = true;
+      return;
+    }
+    // Legacy single-session — sendCtrl('kill-pane') 흐름 유지.
+    void closeLegacy();
+  }
+
+  async function closeLegacy(): Promise<void> {
     const client = wsClientHolder?.current;
     if (!client || paneNumeric === null) {
       toastStore.show({ message: 'WebSocket not ready', tone: 'error' });
@@ -142,8 +248,6 @@
     }
     closing = true;
     try {
-      // 1) Remove from layout first — so the visual disappears immediately
-      //    (responsiveness UX). PUT commits the new state to disk.
       panelsStore.removePanel(data.id);
       const token = readToken();
       if (token !== null) {
@@ -151,8 +255,6 @@
           console.warn('[gtmux] close commit (layout) failed:', e);
         });
       }
-      // 2) Fire CTRL kill-pane — backend kills PTY + child shell,
-      //    broadcasts pane-died NOTIFY → dispatcher updates muxStore.
       const { response } = sendCtrl(client, 'kill-pane', [String(paneNumeric)], {
         timeoutMs: 5_000,
       });
@@ -172,6 +274,94 @@
       closing = false;
     }
   }
+
+  // ─ Inline label rename (0033 §8.2 P1 — InlineEditField consumer wire) ─
+  //
+  // multi-session 의 terminal panel header label 을 더블 클릭 → 인라인 편집 →
+  // commit 시 PATCH /api/terminals/:id { label }. terminalPool 즉시 refresh 로
+  // 다른 surface (TerminalsPanel, PaneInfoPanel) 와 정합.
+  //
+  // legacy single-session 시에는 backend 가 PATCH endpoint 의 *UUID* 기반 →
+  // legacy `%N` paneNumeric 은 endpoint 호출 불가. 따라서 useSessionStore 일
+  // 때만 인라인 편집 활성. legacy 는 텍스트 표시 only (P3 의 별 rename UX).
+  let labelEditing = $state(false);
+  let labelCommitting = $state(false);
+
+  function validateLabel(s: string): string | null {
+    const bytes = new TextEncoder().encode(s).length;
+    if (bytes > TERMINAL_LABEL_MAX_BYTES) {
+      return `Label too long (${bytes} / ${TERMINAL_LABEL_MAX_BYTES} bytes).`;
+    }
+    return null;
+  }
+
+  function onLabelStartEdit(e: MouseEvent): void {
+    // 더블 클릭만 trigger — 일반 클릭은 drag handle 로 통과.
+    if (!useSessionStore) return;
+    e.stopPropagation();
+    labelEditing = true;
+  }
+
+  async function onLabelCommit(next: string): Promise<void> {
+    const trimmed = next.trim();
+    if (trimmed === (data.label ?? '')) {
+      labelEditing = false;
+      return;
+    }
+    labelCommitting = true;
+    try {
+      await patchTerminalLabel(data.id, trimmed);
+      // sessionStore.items 안 label 도 갱신 — layout 의 다음 GET 으로 정합되지만
+      // immediate visual feedback 을 위해 in-memory 도 동시 set.
+      const cur = sessionStore.items.get(data.id);
+      if (cur !== undefined) {
+        sessionStore.items.set(data.id, { ...cur, label: trimmed });
+      }
+      void terminalPool.refresh();
+      labelEditing = false;
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Rename failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    } finally {
+      labelCommitting = false;
+    }
+  }
+
+  async function performClose(killTerminal: boolean): Promise<void> {
+    confirmOpen = false;
+    const active = sessionStore.active;
+    if (active === null) return;
+    closing = true;
+    try {
+      await deleteItem(active.name, data.id, killTerminal);
+      sessionStore.items.delete(data.id);
+      sessionStore.M.delete(data.id);
+      void terminalPool.refresh();
+      toastStore.show({
+        message: killTerminal
+          ? `Panel + terminal closed.${otherSessions.length > 0 ? ` ${otherSessions.length} mirror panel(s) now dangling.` : ''}`
+          : 'Panel removed. Terminal still in pool.',
+        tone: 'success',
+      });
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Close failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    } finally {
+      closing = false;
+    }
+  }
 </script>
 
 {#if isVisible}
@@ -181,7 +371,7 @@
     class:m-multi={isMultiM}
     class:i-active={isInI}
     class:locked={isLocked}
-    style="width: {panelW}px; height: {panelH}px;"
+    style="width: 100%; height: 100%;"
     role="group"
     aria-label={`Panel ${headerLabel}`}
   >
@@ -196,7 +386,32 @@
       {onResizeEnd}
     />
     <header class="panel-header" aria-label={`Drag handle for ${headerLabel}`}>
-      <span class="panel-label">{headerLabel}</span>
+      {#if useSessionStore && labelEditing}
+        <span class="panel-label-host" role="presentation">
+          <InlineEditField
+            value={data.label ?? ''}
+            editing={true}
+            allowEmpty={true}
+            placeholder={data.id.slice(0, 8)}
+            class="panel-label-edit"
+            validate={validateLabel}
+            onCommit={(next: string) => void onLabelCommit(next)}
+            onCancel={() => (labelEditing = false)}
+          />
+          {#if labelCommitting}
+            <span class="panel-label-saving" aria-hidden="true">…</span>
+          {/if}
+        </span>
+      {:else if useSessionStore}
+        <span
+          class="panel-label panel-label-editable"
+          title="Double-click to rename"
+          ondblclick={onLabelStartEdit}
+          role="presentation"
+        >{headerLabel}</span>
+      {:else}
+        <span class="panel-label">{headerLabel}</span>
+      {/if}
       <span class="panel-actions">
         <span class="panel-badges">
           {#if isLocked}
@@ -209,6 +424,21 @@
             <span class="badge badge-input" aria-label="Input target">I</span>
           {/if}
         </span>
+        <button
+          type="button"
+          class="panel-more"
+          aria-label="Panel actions"
+          aria-haspopup="menu"
+          title="Panel actions (arrange · change terminal · remove)"
+          onclick={onMoreClick}
+          onmousedown={(e: MouseEvent) => e.stopPropagation()}
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <circle cx="5" cy="12" r="1.6"/>
+            <circle cx="12" cy="12" r="1.6"/>
+            <circle cx="19" cy="12" r="1.6"/>
+          </svg>
+        </button>
         <button
           type="button"
           class="panel-close"
@@ -226,12 +456,41 @@
       </span>
     </header>
     <div class="panel-body">
-      {#if isStreaming && typeof data.pane_id === 'string'}
-        <XtermHost paneId={data.pane_id.replace(/^%/, '')} />
+      {#if isStreaming}
+        {#if isLegacyPane && typeof data.pane_id === 'string'}
+          <XtermHost paneId={data.pane_id.replace(/^%/, '')} />
+        {:else if useSessionStore && terminalPaneId !== undefined}
+          <!-- 0039 §3 Option C1 — terminalPool 의 UUID→PaneId binding (0x88
+               TERMINAL_SPAWNED) 이 도착했으므로 numeric PaneId 로 XtermHost mount.
+               같은 paneId 에 multiple panel 가 subscribe 하면 dispatcher 의
+               multi-subscriber 패턴 (ADR-0021 D1 mirror) 으로 모두에게 fan-out. -->
+          <XtermHost paneId={String(terminalPaneId)} />
+        {:else if useSessionStore}
+          <!-- binding 미도착 — `[New Terminal]` spawn race 의 짧은 구간 또는 page
+               reload 후 첫 0x88 도착 전. terminal_died 상태는 PanelDanglingOverlay
+               가 우선. -->
+          <div class="panel-pending" role="status" aria-live="polite">
+            <div class="pending-title">Terminal stream connecting…</div>
+            <div class="pending-hint">Waiting for spawn handshake.</div>
+          </div>
+        {/if}
+      {/if}
+      {#if useSessionStore}
+        <PanelDanglingOverlay terminalId={data.id} />
       {/if}
     </div>
   </div>
 {/if}
+
+<PanelCloseConfirmModal
+  open={confirmOpen}
+  panelLabel={typeof data.label === 'string' && data.label.length > 0 ? data.label : data.id.slice(0, 8)}
+  {attachCount}
+  {otherSessions}
+  onCancel={() => (confirmOpen = false)}
+  onPanelOnly={() => void performClose(false)}
+  onPanelAndTerminal={() => void performClose(true)}
+/>
 
 <style>
   .panel {
@@ -250,8 +509,7 @@
 
   /* Single-select — solid 1.5px accent (Figma signature). */
   .panel.m-single {
-    outline: 1.5px solid var(--color-accent);
-    outline-offset: 0;
+    outline: none;
   }
   .panel.m-single .panel-header {
     background: color-mix(in srgb, var(--color-accent) 12%, var(--color-surface-2));
@@ -260,8 +518,7 @@
 
   /* Multi-select — dashed 2px accent + 헤더 색조 강화. */
   .panel.m-multi {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 0;
+    outline: none;
   }
   .panel.m-multi .panel-header {
     background: color-mix(in srgb, var(--color-accent) 22%, var(--color-surface-2));
@@ -300,6 +557,32 @@
     font-weight: var(--weight-medium);
   }
 
+  .panel-label-editable {
+    cursor: text;
+  }
+
+  .panel-label-host {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-4);
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .panel-label-host :global(.panel-label-edit) {
+    /* InlineEditField input — panel-label 의 height/typography 따라가도록. */
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
+    height: 22px;
+    min-width: 0;
+  }
+
+  .panel-label-saving {
+    color: var(--color-fg-muted);
+    font-size: var(--text-sm);
+    flex: 0 0 auto;
+  }
+
   .panel-actions {
     display: inline-flex;
     align-items: center;
@@ -309,6 +592,31 @@
   .panel-badges {
     display: inline-flex;
     gap: var(--space-4);
+  }
+
+  /* More-actions button — 16×16 ghost. Same surface as panel-close but
+   * neutral hover (not destructive). Summons the shared ContextMenu so
+   * the action set stays single-sourced. */
+  .panel-more {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    border: 0;
+    color: var(--color-fg-muted);
+    cursor: pointer;
+    padding: 0;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  .panel-more:hover {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
   }
 
   /* Close button — 16×16 ghost. disabled 시 opacity 낮춤 + cursor 변경. */
@@ -371,7 +679,44 @@
     flex: 1 1 auto;
     min-height: 0;
     position: relative;
-    background: var(--color-bg);
+    /* xterm theme.background 와 동기 — .xterm-screen 의 cell-정수배수 px
+     * height 와 컨테이너 사이 잔여 영역이 같은 색이라 resize 중에도
+     * 검은색 갭이 노출되지 않음. */
+    background: var(--xterm-bg);
+  }
+
+  .panel-pending {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-4);
+    padding: var(--space-12);
+    color: var(--color-fg-muted);
+    text-align: center;
+    font-family: var(--font-sans);
+    background:
+      repeating-linear-gradient(
+        135deg,
+        transparent 0,
+        transparent 14px,
+        color-mix(in srgb, var(--color-fg-muted) 6%, transparent) 14px,
+        color-mix(in srgb, var(--color-fg-muted) 6%, transparent) 16px
+      );
+  }
+
+  .pending-title {
+    font-size: var(--text-md);
+    font-weight: var(--weight-medium);
+    color: var(--color-fg);
+  }
+
+  .pending-hint {
+    font-size: var(--text-sm);
+    max-width: 28ch;
+    line-height: 1.4;
   }
 
   /* NodeResizer handle / line styling (Figma white-fill with accent border). */

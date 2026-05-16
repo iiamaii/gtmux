@@ -33,16 +33,30 @@
   // 만들어지지만 cell width/height 가 0 으로 잡혀 글자가 화면에 보이지 않음.
   import '@xterm/xterm/css/xterm.css';
   import { SECURE_XTERM_OPTIONS } from '$lib/xterm/options';
+  import { xtermTheme } from '$lib/xterm/xtermTheme';
   import { registerPaneOut, unregisterPaneOut } from '$lib/ws/dispatcher.svelte';
   import { encodePaneIn, encodePaneResize, FRAME_TYPE } from '$lib/ws/decode';
+  import { themeStore } from '$lib/stores/theme.svelte';
   import type { WsClient } from '$lib/ws/client';
 
+  // paneId 는 항상 numeric (legacy `%N` 의 N 또는 0x88 binding 으로 얻은 PaneId).
+  // multi-session terminal item 의 UUID 는 본 컴포넌트에 도달하기 전에 PanelNode
+  // 가 terminalPool.paneIdFor(uuid) 로 resolve 후 numeric 만 전달. binding 미도착
+  // 동안 PanelNode 가 본 컴포넌트를 마운트 X (connecting placeholder 대신 표시).
   let { paneId }: { paneId: string } = $props();
 
   let containerEl: HTMLDivElement | undefined = $state(undefined);
 
-  // R2 F8 resize debounce — 150ms. fit() 폭주 방지 (DOM 측정 → reflow 비용).
-  const RESIZE_DEBOUNCE_MS = 150;
+  /** Component-scope ref to the live Terminal instance — exposed so a
+   *  sibling $effect can hot-reload `options.theme` whenever the chrome
+   *  theme flips. `null` while unmounted. */
+  let termRef = $state<Terminal | null>(null);
+
+  // R2 F8 resize debounce — fit() 폭주 방지 (DOM 측정 → reflow 비용).
+  // NodeResizer 드래그 중에는 컨테이너만 커지고 xterm 내부 .xterm-screen 의
+  // cell-정수배수 inline-px height 는 fit() 호출 후에만 갱신. 그동안 갭이
+  // 노출되므로 debounce 짧게 — 50ms 면 인지 X + fit() 폭주 회피 모두 충족.
+  const RESIZE_DEBOUNCE_MS = 50;
   // FE-2 송신 debounce — fit() 직후의 미세 rebound 흡수. lastSent dedup 과 함께 작동.
   const RESIZE_SEND_DEBOUNCE_MS = 100;
 
@@ -71,7 +85,11 @@
     const rect0 = containerEl.getBoundingClientRect();
     console.debug('[xterm] mount pane=%s container=%dx%d', paneId, rect0.width, rect0.height);
 
-    const term = new Terminal(SECURE_XTERM_OPTIONS);
+    const term = new Terminal({
+      ...SECURE_XTERM_OPTIONS,
+      theme: xtermTheme(themeStore.resolved),
+    });
+    termRef = term;
     const fitAddon = new FitAddon();
     const unicode11Addon = new Unicode11Addon();
     term.loadAddon(fitAddon);
@@ -88,7 +106,12 @@
     // PaneOut 등록 — WS dispatcher 가 이 paneId 로 도착한 PANE_OUT(0x02) 을 본
     // 핸들러로 라우팅. `cb` 는 R2 F4 백프레셔 watermark 갱신 콜백 (term.write 가
     // 내부 buffer 플러시 후 호출).
-    registerPaneOut(paneId, (buf, cb) => term.write(buf, cb));
+    //
+    // Mirror (ADR-0021 D1): 같은 paneId 에 여러 XtermHost 가 동시 마운트될 수 있음 —
+    // dispatcher 가 Set<handler> fan-out 으로 모두에게 같은 bytes 를 흘려보낸다.
+    // unregister 시 *handler identity* 가 필요하므로 inline 화살표 함수를 변수로 캡처.
+    const paneOutHandler = (buf: Uint8Array, cb: () => void) => term.write(buf, cb);
+    registerPaneOut(paneId, paneOutHandler);
 
     // ── FE-1: 사용자 키 입력 → PANE_IN (0x03) ───────────────────────────────
     // ADR-0004 D4: UTF-8 바이트 그대로 송신. WsClient 가 connected 가 아니면
@@ -171,9 +194,22 @@
       }
       ro.disconnect();
       dataDisposable.dispose();
-      unregisterPaneOut(paneId);
+      unregisterPaneOut(paneId, paneOutHandler);
+      termRef = null;
       term.dispose();
     };
+  });
+
+  /* ── G27: hot-reload xterm theme when chrome theme flips ─────────────
+   * SECURE_XTERM_OPTIONS 의 theme 은 mount 시 1회 — 이후 themeStore.resolved
+   * (system mode 의 OS preference 변경 포함) 가 바뀌면 본 effect 가 live
+   * Terminal 의 `options.theme` 를 교체. xterm v6 의 `options` setter 는
+   * shallow merge + 즉시 repaint. */
+  $effect(() => {
+    const term = termRef;
+    const resolved = themeStore.resolved;
+    if (term === null) return;
+    term.options.theme = xtermTheme(resolved);
   });
 </script>
 
@@ -184,13 +220,26 @@
      panel-body 측 flex: 1 + min-height: 0 이 본 컨테이너를 가시 크기로 끌어준다.
      `nowheel` / `nodrag` 클래스는 SvelteFlow 의 휠/드래그 인터셉터 차단 — 터미널 안에서
      마우스 휠 스크롤(scrollback), 드래그(선택)이 캔버스 pan/drag 와 충돌하지 않도록. */
+  /* Background MUST match xterm theme.background — .xterm-screen 의
+   * cell-정수배수 inline px height 와 컨테이너 사이의 잔여 영역 (특히
+   * resize 중 fit() debounce window 동안) 이 같은 색이라 보이지 않게.
+   * --xterm-bg 는 xtermTheme.ts 의 LIGHT/DARK.background 와 동기. */
   .xterm-host {
     width: 100%;
     height: 100%;
-    background: #000;
+    background: var(--xterm-bg);
   }
   .xterm-host :global(.xterm) {
     height: 100%;
+  }
+  /* xterm.css 의 default 는 .xterm / .xterm-viewport 의 background 를
+   * xterm.options.theme.background 로 inline-set 하거나 검은색으로 둠.
+   * resize 중 .xterm-screen 의 inline px height 가 컨테이너보다 짧을 때
+   * 노출되는 영역이 검게 보이지 않도록 세 layer 모두 강제 매칭. */
+  .xterm-host :global(.xterm),
+  .xterm-host :global(.xterm-viewport),
+  .xterm-host :global(.xterm-screen) {
+    background-color: var(--xterm-bg) !important;
   }
   .xterm-host :global(.xterm-viewport),
   .xterm-host :global(.xterm-screen) {

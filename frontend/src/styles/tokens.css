@@ -34,7 +34,11 @@
 
   /* ── Canvas ─────────────────────────────────────────── */
   --canvas-bg: #f3f3f3;
-  --canvas-grid: rgba(0, 0, 0, 0.05);
+  --canvas-grid: rgba(0, 0, 0, 0.12);
+  /* xterm panel body background — MUST match xtermTheme.ts LIGHT.background.
+     panel body / .xterm-host 가 이 색을 쓰면 .xterm-screen 의 cell-정수배수
+     px height 와 컨테이너 사이 잔여 영역이 같은 색이라 보이지 않음. */
+  --xterm-bg: #fdf6e3;
 
   /* ── Spacing (8px base + finer steps for Figma chrome) ─ */
   --space-2: 2px;
@@ -134,7 +138,9 @@
    * theme-agnostic, semantic colors keep identity across themes. */
 
   --canvas-bg: #1a1a1a;
-  --canvas-grid: rgba(255, 255, 255, 0.04);
+  --canvas-grid: rgba(255, 255, 255, 0.10);
+  /* xterm panel body background — MUST match xtermTheme.ts DARK.background. */
+  --xterm-bg: #1a1a1a;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4),
                0 0 0 0.5px rgba(255, 255, 255, 0.06);
