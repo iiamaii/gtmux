@@ -237,12 +237,25 @@
       }
 
       // Step 2 — Auth gate. cookie 가 있어야 200 통과.
+      //
+      // 본 블록의 모든 비-redirect 종료 경로에서 reconnectGate.state 가 'booting'
+      // 을 벗어나도록 보장 — 그렇지 않으면 canMountApp=false 로 boot-screen 영구.
+      // 5s timeout — BE 느리거나 hang 시 fallback markIdle (사용자가 SessionMenu
+      // 또는 모달로 자체 복구 가능).
       try {
-        const res = await fetch('/api/sessions', {
-          method: 'GET',
-          credentials: 'include',
-          headers: { Accept: 'application/json' },
-        });
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5_000);
+        let res: Response;
+        try {
+          res = await fetch('/api/sessions', {
+            method: 'GET',
+            credentials: 'include',
+            headers: { Accept: 'application/json' },
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timeoutId);
+        }
         if (res.status === 401) {
           window.location.href = '/auth';
           return;
@@ -259,10 +272,32 @@
             reconnectGate.markIdle();
             workspaceSwitcher.open();
           }
+        } else {
+          // res 가 200 이지만 sessionStore.active !== null (defensive — 첫 mount
+          // 에서는 발생 X), 또는 200 외 (e.g. 500/503). 어느 쪽이든 booting 에서
+          // 벗어나야 하고, fresh attach UI 노출이 안전한 default.
+          reconnectGate.markIdle();
+          if (sessionStore.active === null) workspaceSwitcher.open();
+          if (!res.ok) {
+            toastStore.show({
+              message: `Auth gate returned HTTP ${res.status}. Try again or sign in.`,
+              tone: 'warning',
+              durationMs: 6_000,
+            });
+          }
         }
       } catch (e) {
+        const aborted = e instanceof DOMException && e.name === 'AbortError';
         console.warn('[gtmux] auth ping failed', e);
         reconnectGate.markIdle();
+        if (sessionStore.active === null) workspaceSwitcher.open();
+        toastStore.show({
+          message: aborted
+            ? 'Auth gate timed out. Use the menu to pick a session.'
+            : 'Auth ping failed — network or server unreachable.',
+          tone: 'warning',
+          durationMs: 6_000,
+        });
       }
 
       // Step 3 — WS bootstrap. Cookie-additive auth (0035 §3.3 α, BE 의 D10 α)

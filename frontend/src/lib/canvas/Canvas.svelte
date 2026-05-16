@@ -394,6 +394,39 @@
   const isMultiSelection = $derived(sessionStore.M.size > 1);
   const sessionGroupsById = $derived(new Map(sessionStore.groups));
 
+  /* ── flowNodes id-cache + signature (0045 P0-A) ────────────────────
+   *
+   * Naïve `items.values().map(itemToNode)` 는 매 reactive pass 마다 새
+   * Node array + 새 Node object 를 생성 → SvelteFlow 가 prop identity
+   * 변경으로 판단 → 내부 측정/정렬 effect → parent rebuild →
+   * `effect_update_depth_exceeded`. (0045 §6 P0-A)
+   *
+   * Cache 전략:
+   *  - 각 item 의 SvelteFlow-relevant payload 를 signature 로 직렬화.
+   *  - signature 가 동일하면 이전 Node object reference 재사용.
+   *  - signature 는 모든 mutable field 포함:
+   *      * common: full JSON.stringify(item) — id/type/parent_id/x/y/w/h/z/
+   *        visibility/locked/minimized/label + type payload (line.x2/y2,
+   *        text.text/font_size/align, shape.stroke/fill 등) 모두 cover.
+   *      * derived: effectiveVisible / effectiveLocked (groups 영향) +
+   *        selected (M.has) + m_multi (M.size > 1).
+   *  - Map 은 매 pass 재생성 — 삭제된 id 자연 GC. 50 entry 기준 < 1ms.
+   *
+   * 주의: signature 누락 시 stale render — 본 cache 가 의도와 다른
+   * 동작을 발견하면 가장 먼저 makeSignature 의 누락 field 의심.
+   */
+  let nodeCache = new Map<string, { sig: string; node: Node }>();
+
+  function makeSignature(
+    item: CanvasItem,
+    effVisible: boolean,
+    effLocked: boolean,
+    selected: boolean,
+    mMulti: boolean,
+  ): string {
+    return `${effVisible ? 1 : 0}|${effLocked ? 1 : 0}|${selected ? 1 : 0}|${mMulti ? 1 : 0}|${JSON.stringify(item)}`;
+  }
+
   /**
    * sessionStore CanvasItem → SvelteFlow Node 어댑터.
    *
@@ -477,7 +510,7 @@
     };
   }
 
-  /* ── SvelteFlow nodes — one-way from sessionStore ──────────────────────
+  /* ── SvelteFlow nodes — one-way from sessionStore, identity-stable ────
    *
    * SvelteFlow writes measured dimensions back into its local `nodes`
    * prop during `updateNodeInternals()`. Binding that prop to parent state
@@ -486,8 +519,35 @@
    * a Svelte effect-depth loop on initial hydrate. Keep the source of truth
    * one-way: sessionStore -> flowNodes. Drag/resize commits still write to
    * sessionStore explicitly through event handlers.
+   *
+   * P0-A (0045): id-cache + signature 로 identity 안정화. 동일 signature
+   * 면 이전 Node object reference 재사용 → SvelteFlow 가 prop unchanged 로
+   * 판단 → 내부 측정 effect 가 무한 트리거되지 않음.
    */
-  const flowNodes = $derived(Array.from(sessionStore.items.values()).map(itemToNode));
+  const flowNodes = $derived.by<Node[]>(() => {
+    const items = sessionStore.items;
+    const groupsById = sessionGroupsById;
+    const mMulti = isMultiSelection;
+    const next = new Map<string, { sig: string; node: Node }>();
+    const out: Node[] = [];
+    for (const item of items.values()) {
+      const visible = effectiveVisibility(item.visibility, item.parent_id, groupsById);
+      const locked = effectiveLocked(item.locked, item.parent_id, groupsById);
+      const selected = sessionStore.M.has(item.id);
+      const sig = makeSignature(item, visible, locked, selected, mMulti);
+      const cached = nodeCache.get(item.id);
+      if (cached !== undefined && cached.sig === sig) {
+        out.push(cached.node);
+        next.set(item.id, cached);
+      } else {
+        const node = itemToNode(item);
+        out.push(node);
+        next.set(item.id, { sig, node });
+      }
+    }
+    nodeCache = next;
+    return out;
+  });
 
   function onmove(_event: MouseEvent | TouchEvent | null, viewport: Viewport): void {
     if (applyingStoreViewport) return;
@@ -640,43 +700,67 @@
     }
   }
 
-  function onnodedragstop({ targetNode }: { targetNode: Node | null }) {
-    if (!targetNode) return;
-    const { id, position } = targetNode;
+  /**
+   * 노드 drag stop — 단일 / 다중 선택 모두 동일 path. xyflow 는 두 컴포넌트
+   * 에서 본 callback 을 발화:
+   *   - 단일 drag → `NodeWrapper` → `{ targetNode, nodes }` (nodes.length≥1)
+   *   - 다중 group drag → `NodeSelection` → `{ targetNode: null, nodes }`
+   *
+   * 따라서 `targetNode === null` 가드를 두면 **multi-drag commit 전체가 skip**
+   * 되어 BE PUT 안 됨 → 응답의 `loadLayout` 이 원래 position 으로 store 회귀
+   * → 사용자가 선택 해제 후 position 회귀 시각 확인 (회귀 버그).
+   *
+   * 처리: nodes array 만 확인. line 은 endpoint delta 처리. 일괄
+   * mutateLayout(callback) 으로 BE PUT 1회.
+   */
+  function onnodedragstop({
+    nodes,
+  }: { targetNode: Node | null; nodes: Node[] }) {
+    if (nodes.length === 0) return;
     const active = sessionStore.active;
     if (active === null) return;
     const sessionName = active.name;
-    const item = sessionStore.items.get(id);
-    if (item === undefined) return;
-    let moved: CanvasItem;
-    if (item.type === 'line') {
-      // Line 은 (x,y), (x2,y2) 가 절대 좌표 → SvelteFlow Node.position 의
-      // 새 값 - 옛 bounding-box-TL = delta 만큼 두 endpoint 모두 이동.
-      const oldBox = lineBoxFromEndpoints(
-        { x: item.x, y: item.y },
-        { x: item.x2, y: item.y2 },
-      );
-      const dx = position.x - oldBox.x;
-      const dy = position.y - oldBox.y;
-      const nextP1 = { x: item.x + dx, y: item.y + dy };
-      const nextP2 = { x: item.x2 + dx, y: item.y2 + dy };
-      const nextBox = lineBoxFromEndpoints(nextP1, nextP2);
-      moved = {
-        ...item,
-        x: nextP1.x,
-        y: nextP1.y,
-        x2: nextP2.x,
-        y2: nextP2.y,
-        w: nextBox.w,
-        h: nextBox.h,
-      };
-    } else {
-      moved = { ...item, x: position.x, y: position.y };
+
+    // id → moved item map. 단일 drag 시 nodes.length === 1.
+    const movedById = new Map<string, CanvasItem>();
+    for (const n of nodes) {
+      const cur = sessionStore.items.get(n.id);
+      if (cur === undefined) continue;
+      const pos = n.position;
+      let next: CanvasItem;
+      if (cur.type === 'line') {
+        const oldBox = lineBoxFromEndpoints(
+          { x: cur.x, y: cur.y },
+          { x: cur.x2, y: cur.y2 },
+        );
+        const dx = pos.x - oldBox.x;
+        const dy = pos.y - oldBox.y;
+        const nextP1 = { x: cur.x + dx, y: cur.y + dy };
+        const nextP2 = { x: cur.x2 + dx, y: cur.y2 + dy };
+        const nextBox = lineBoxFromEndpoints(nextP1, nextP2);
+        next = {
+          ...cur,
+          x: nextP1.x,
+          y: nextP1.y,
+          x2: nextP2.x,
+          y2: nextP2.y,
+          w: nextBox.w,
+          h: nextBox.h,
+        };
+      } else {
+        next = { ...cur, x: pos.x, y: pos.y };
+      }
+      movedById.set(n.id, next);
     }
-    sessionStore.items.set(id, moved);
+    if (movedById.size === 0) return;
+
+    // Optimistic store update — bind:nodes 양방향 sync 의 idempotent 결과.
+    for (const [id, next] of movedById) {
+      sessionStore.items.set(id, next);
+    }
     void mutateLayout(sessionName, (cur) => ({
       ...cur,
-      items: cur.items.map((it) => (it.id === id ? moved : it)),
+      items: cur.items.map((it) => movedById.get(it.id) ?? it),
     }))
       .then(({ layout }) => sessionStore.loadLayout(layout))
       .catch((e) => console.warn('[gtmux] drag commit failed:', e));
@@ -695,6 +779,35 @@
       paneId: null,
       panelId: null,
     });
+  }
+
+  /**
+   * Selection box (lasso) 변화 sync — Cmd/Ctrl click 의 toggle 과 동등 취급.
+   * Layer panel 등 sessionStore.M 의 모든 consumer 가 자동 갱신.
+   *
+   * `selectionOnDrag={true}` 로 left-drag 이 selection box. 사용자가 한 번
+   * 드래그하면 SvelteFlow internal 이 영역 안 node 들의 `selected` 를 set 후
+   * 본 callback fire — 우리는 그 결과를 store M 으로 sync.
+   *
+   * 단일 click (onnodeclick) 흐름과 충돌 우려: onnodeclick 이 먼저 fire 후
+   * onselectionchange 가 *같은 단일 id* set — 동일 결과 (no-op). modifier
+   * click 의 toggleM 도 그 후 store 와 internal 이 동기적.
+   */
+  function onselectionchange({ nodes }: { nodes: Node[]; edges: unknown[] }) {
+    if (isHandTool) return;
+    const ids = nodes.map((n) => n.id);
+    // Fast no-op — 동일 set 이면 skip (callback frequency 높음, drag 중 매 frame).
+    if (ids.length === sessionStore.M.size) {
+      let same = true;
+      for (const id of ids) {
+        if (!sessionStore.M.has(id)) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return;
+    }
+    sessionStore.setM(ids);
   }
 
   function onnodecontextmenu({ event, node }: { event: MouseEvent | TouchEvent; node: Node }) {
@@ -740,7 +853,9 @@
     {onmove}
     {onpanecontextmenu}
     {onnodecontextmenu}
+    {onselectionchange}
     panOnDrag={panOnDragMask}
+    selectionOnDrag={!isSpacePressed && !isHandTool && !isDragTool}
     minZoom={0.05}
     maxZoom={3}
     fitView={false}

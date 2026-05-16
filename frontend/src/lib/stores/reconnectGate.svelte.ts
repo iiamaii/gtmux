@@ -24,14 +24,16 @@ import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 
 export type ReconnectState =
   | 'booting'      // auth gate / session hint 검사 중 — 본 화면 mount 금지
-  | 'idle'         // hint 없음 / cancel 후
-  | 'loading'
-  | 'in_use'
-  | 'not_found'
-  | 'unreachable'
-  | 'success';     // attemptReattach 200 — 본 화면 mount 가능
+  | 'idle'         // hint 없음 / cancel 후 — workspaceSwitcher 가 attach 결정
+  | 'attaching'    // POST /attach 진행 중 (loading)
+  | 'hydrating'    // 200 응답 후 GET /layout + loadLayout 진행 중
+  | 'in_use'       // 409 — 다른 webpage 가 보유
+  | 'not_found'    // 404 — session 사라짐
+  | 'unreachable'  // 5xx / network
+  | 'ready';       // hydrate 완료 — 본 화면 mount 허용
 
-export type ReconnectModalState = Exclude<ReconnectState, 'booting' | 'idle' | 'success'>;
+/** ReconnectModal 이 다루는 4 mode — `attaching`/`hydrating` 는 'loading' 로 normalize. */
+export type ReconnectModalState = 'loading' | 'in_use' | 'not_found' | 'unreachable';
 
 class ReconnectGate {
   state = $state<ReconnectState>('booting');
@@ -44,26 +46,30 @@ class ReconnectGate {
   #controller: AbortController | null = null;
 
   /**
-   * 본 화면 mount 게이트. ADR-0019 D5.4 + plan-0008 §4.4.
+   * 본 화면 mount 게이트. ADR-0019 D5.4 + plan-0008 §4.4 + 0045 P0.
    *
-   * - 'booting' = bootstrap 판단 전 — 빈 Canvas mount 금지.
+   * - 'booting' / 'attaching' / 'hydrating' = bootstrap/attach 진행 중 — 빈/
+   *   partial Canvas mount 금지. boot screen 또는 ReconnectModal 'loading' 노출.
    * - 'idle' = hint 없거나 사용자 cancel 후 — workspaceSwitcher 가 mount 결정.
-   * - 'success' = 정상 reattach 후 본 화면 mount 허용.
-   * - 그 외 = ReconnectModal 만 mount, 본 화면 차단.
+   *   (workspaceSwitcher modal 이 canvas 를 cover 하므로 빈 canvas flicker 허용.)
+   * - 'ready' = 정상 reattach + hydrate 완료 후 본 화면 mount 허용.
+   * - 그 외 (failed) = ReconnectModal 만 mount, 본 화면 차단.
    */
-  canMountApp = $derived(this.state === 'success' || this.state === 'idle');
+  canMountApp = $derived(this.state === 'ready' || this.state === 'idle');
 
   /** ReconnectModal 이 실제로 다룰 수 있는 user-actionable 상태. */
   modalState = $derived.by((): ReconnectModalState | null => {
     switch (this.state) {
-      case 'loading':
+      case 'attaching':
+      case 'hydrating':
+        return 'loading';
       case 'in_use':
       case 'not_found':
       case 'unreachable':
         return this.state;
       case 'booting':
       case 'idle':
-      case 'success':
+      case 'ready':
         return null;
     }
   });
@@ -79,7 +85,7 @@ class ReconnectGate {
   async start(name: string): Promise<void> {
     this.attemptName = name;
     this.attempt = 1;
-    this.state = 'loading';
+    this.state = 'attaching';
     this.error = null;
     await this.#run(name);
   }
@@ -87,7 +93,7 @@ class ReconnectGate {
   async retry(): Promise<void> {
     if (this.attemptName === null) return;
     this.attempt += 1;
-    this.state = 'loading';
+    this.state = 'attaching';
     this.error = null;
     await this.#run(this.attemptName);
   }
@@ -108,20 +114,32 @@ class ReconnectGate {
     sessionStorageHint.clear();
   }
 
-  /** attemptReattach 200 분기에서 호출 — sessionStore 가 이미 active/layout set. */
+  /** attemptReattach 200 + loadLayout 완료 후 호출 — sessionStore active/layout set. */
+  markReady(): void {
+    this.state = 'ready';
+  }
+
+  /** @deprecated 0045 P0 — markSuccess → markReady rename. 호환 alias. */
   markSuccess(): void {
-    this.state = 'success';
+    this.markReady();
   }
 
   async #run(name: string): Promise<void> {
     this.#controller?.abort();
     this.#controller = new AbortController();
     const signal = this.#controller.signal;
+    // attemptReattach 내부 흐름: POST /attach → (200 시) GET /layout → loadLayout.
+    // attaching → hydrating 전이는 attemptReattach 의 attach 200 응답 직후이지만
+    // 본 wrapper 가 그 boundary 를 볼 수 없으므로 attaching 단일 phase 로 시작 후,
+    // success 시 markReady 로 직접 진입. (5-state 의 hydrating 은 attemptReattach
+    // 가 분해되어 호출자가 attach + loadLayout 을 따로 호출하는 미래 refactor 의
+    // hook — 본 P0 fix 에선 modalState='loading' 으로 normalize 되어 사용자 perception
+    // 차이 없음.)
     const result = await sessionStore.attemptReattach(name, signal);
     if (signal.aborted) return; // cancel 됨 — state 변경 안 함
     switch (result.kind) {
       case 'success':
-        this.markSuccess();
+        this.markReady();
         return;
       case 'in_use':
         this.state = 'in_use';

@@ -34,6 +34,7 @@
     listSessions,
     UnauthorizedError,
   } from '$lib/http/sessions';
+  import { reconnectGate } from '$lib/stores/reconnectGate.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
@@ -106,6 +107,7 @@
     if (res.kind === 'ok') {
       sessionStore.setActiveSession({ name });
       sessionStore.loadLayout(res.layout);
+      reconnectGate.markSuccess();
       toastStore.show({
         message: `Attached to session "${name}".`,
         tone: 'success',
@@ -160,6 +162,7 @@
       // Layout fetch — confirm 후엔 모두 match-able 상태.
       const { layout } = await getLayout(name);
       sessionStore.loadLayout(layout);
+      reconnectGate.markSuccess();
       void terminalPool.refresh();
       workspaceSwitcher.close();
     } catch (err) {

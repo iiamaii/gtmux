@@ -161,12 +161,10 @@
 
 <nav class="toolbar" aria-label="Canvas tools">
   <div class="left">
-    <button type="button" class="page-pill" aria-haspopup="true" disabled>
-      <span>Page 1</span>
-      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <polyline points="6 9 12 15 18 9" />
-      </svg>
-    </button>
+    <!-- ADR-0019 D9 + UX 결정: active session 버튼은 *SessionListModal 직접
+         진입*. session *생성* 진입점은 SessionMenu 의 "Switch workspace session…"
+         (workspaceSwitcher.open() → AuthDialog 의 [New session]) 만. -->
+    <ActiveSessionDropdown onSwitch={() => workspaceSwitcher.goList()} />
   </div>
 
   <div class="center">
@@ -211,10 +209,6 @@
     {#if locked}
       <span class="lock-indicator" title="Tool locked (Q to release)">Q</span>
     {/if}
-    <!-- ADR-0019 D9 + UX 결정: 우측 active session 버튼은 *SessionListModal 직접
-         진입*. session *생성* 진입점은 SessionMenu 의 "Switch workspace session…"
-         (workspaceSwitcher.open() → AuthDialog 의 [New session]) 만. -->
-    <ActiveSessionDropdown onSwitch={() => workspaceSwitcher.goList()} />
   </div>
 </nav>
 
@@ -252,19 +246,6 @@
     align-items: center;
     gap: var(--space-6);
     min-width: 1px;
-  }
-
-  .page-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-6);
-    height: 28px;
-    padding: 0 var(--space-10);
-    border-radius: var(--radius-md);
-    background: transparent;
-    color: var(--color-fg-muted);
-    font-size: var(--text-md);
-    cursor: not-allowed;
   }
 
   .center {

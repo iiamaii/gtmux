@@ -105,8 +105,18 @@ class SessionStore {
   /* ────────────────────────────────────────────────────────────────────── */
 
   /**
-   * Layout 적용. attach 성공 / LAYOUT_CHANGED rebuild 시 호출.
-   * 기존 state 는 모두 폐기 (M/I/maximize 포함) — session 단위 fresh load.
+   * Layout 적용. attach 성공 / LAYOUT_CHANGED rebuild / self-mutate PUT 후 응답
+   * 등 *모든* layout refresh path 에서 호출.
+   *
+   * **M 은 의도적으로 clear 하지 않음** — 사용자 요구 "이동/정렬/크기변경/제거
+   * 외 모든 선택 후 동작 은 자동 해제 안 함". layoutMutation 의 응답으로
+   * loadLayout 이 호출돼도 사용자의 selection 의도는 carry over.
+   *
+   * 외부 source (session 진입 / LAYOUT_CHANGED 으로 *전혀 다른* layout) 일 때는
+   * caller (setActiveSession / WS dispatcher) 가 명시 clear 책임.
+   *
+   * `I` (input target) / `maximizedItemId` / focusMode 도 동일 정책 — *유지*.
+   * 단 *layout 에서 사라진 id* 는 stale 이지만 next user gesture 가 cleanup.
    */
   loadLayout(layout: CanvasLayout): void {
     this.items.clear();
@@ -118,10 +128,6 @@ class SessionStore {
       this.groups.set(g.id, g);
     }
     this.viewport = { ...layout.viewport };
-    this.M.clear();
-    this.I = null;
-    this.maximizedItemId = null;
-    this.focusMode = { enabled: false, targetPanelId: null };
   }
 
   /**
@@ -130,10 +136,17 @@ class SessionStore {
    *
    * sessionStorage hint 도 함께 set — ADR-0019 D5.4 + plan-0008 §4.5.
    * AppPage 다음 reload 시점에 ReconnectModal trigger 의 입력.
+   *
+   * Session 진입은 *외부 source* — 이전 session 의 ephemeral state (M / I /
+   * maximize / focus) 를 carry over 해선 안 되므로 본 메서드가 명시 reset.
    */
   setActiveSession(session: ActiveSession): void {
     this.active = session;
     sessionStorageHint.set(session.name);
+    this.M.clear();
+    this.I = null;
+    this.maximizedItemId = null;
+    this.focusMode = { enabled: false, targetPanelId: null };
   }
 
   /**
@@ -403,14 +416,24 @@ class SessionStore {
    * 에 보관. 호출자가 결과에 따라:
    *  - 'success': mutation 계속 진행.
    *  - 'in_use'/'not_found'/'unauthorized'/'unreachable': caller 가 modal/toast.
+   *
+   * P0-B (0045) — 사용자 변경 보존: silent 의도 상 viewport 는 사용자가
+   * silentReattach 발화를 인지하지 못해야 함. attemptReattach 내부의
+   * loadLayout 이 viewport 를 layout 의 저장값으로 reset 하므로, wrapper 가
+   * 직전 snapshot 을 잡고 200 성공 후 복원. M/I/maximize/focusMode 의 reset 은
+   * G20 ephemeral 정책 그대로 (server 가 권위).
    */
   silentReattach(name: string, signal?: AbortSignal): Promise<ReattachResult> {
     if (this.#silentReattachPromise !== null) return this.#silentReattachPromise;
     this.reattachInProgress = true;
+    const preReattachViewport = { ...this.viewport };
     const promise = (async (): Promise<ReattachResult> => {
       try {
         const result = await this.attemptReattach(name, signal);
         this.lastSilentReattachResult = result;
+        if (result.kind === 'success') {
+          this.viewport = preReattachViewport;
+        }
         return result;
       } finally {
         this.reattachInProgress = false;
