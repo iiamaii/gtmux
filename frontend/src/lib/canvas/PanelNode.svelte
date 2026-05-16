@@ -85,7 +85,17 @@
 
   const isVisible = $derived(data.visibility !== false);
   const isStreaming = $derived(isVisible && data.minimized !== true);
-  const headerLabel = $derived(data.label ?? data.pane_id ?? data.id);
+  // Label source priority (Task 2 fix):
+  //   1) terminalPool 의 terminal_meta label (server-wide, PATCH /api/terminals 의
+  //      single source of truth — ADR-0021 D7 + terminals.rs:46-48). 빈 문자열은
+  //      미설정 으로 간주.
+  //   2) layout item.label (legacy — disk 의 layout file 안 stale 가능)
+  //   3) pane_id / id fallback.
+  // 옛 우선 (data.label → pane_id) 은 session 진입 시 회귀 — layout 안 label 이
+  // PATCH 와 join 되지 않아 stale. terminal_meta 우선이 정답.
+  const headerLabel = $derived(
+    terminalPool.byId(data.id)?.label?.trim() || data.label || data.pane_id || data.id,
+  );
 
   const isInM = $derived(selected || sessionStore.M.has(data.id));
   const isMultiM = $derived(isInM && data.m_multi === true);

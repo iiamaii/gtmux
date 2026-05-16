@@ -18,6 +18,7 @@
   import { SvelteSet } from 'svelte/reactivity';
   import { muxStore } from '$lib/stores/mux.svelte';
   import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, CanvasItemType } from '$lib/types/canvas';
@@ -225,10 +226,17 @@
     return Number.isNaN(n) ? null : n;
   }
 
-  // Panel 행 표시 라벨 우선순위 (Stage B 이후 — tmux window 어휘 폐기):
-  //   1) Panel.label (사용자 지정)
-  //   2) "%${paneNum}" — pane id fallback
+  // Panel 행 표시 라벨 우선순위 (Task 2 fix — terminal_meta 우선):
+  //   1) terminalPool 의 terminal_meta label (server-wide, ADR-0021 D7) — terminal/
+  //      panel type 에만 적용. 빈 문자열은 미설정 으로 간주.
+  //   2) layout Panel.label (legacy, disk stale 가능)
+  //   3) "%${paneNum}" — pane id fallback
   function panelDisplayLabel(p: PanelData): string {
+    const isTerminal = p.type === 'terminal' || p.type === 'panel' || p.type == null;
+    if (isTerminal) {
+      const poolLabel = terminalPool.byId(p.id)?.label?.trim();
+      if (poolLabel != null && poolLabel.length > 0) return poolLabel;
+    }
     if (p.label != null && p.label.length > 0) return p.label;
     const n = paneNumeric(p.pane_id);
     if (n !== null) return `%${n}`;
