@@ -47,6 +47,7 @@ mod auth;
 mod schema;
 mod session_lock;
 mod sessions;
+mod settings;
 mod storage;
 mod terminal_map;
 mod terminals;
@@ -63,6 +64,7 @@ pub use schema::{
 };
 pub use session_lock::{fresh_server_id, Lease, LockError, LockGuard, LockState};
 pub use sessions::{SessionCache, SessionError, SessionLayout};
+pub use settings::{default_behavior_settings, BehaviorSettings};
 pub use storage::{LayoutStore, StorageError};
 pub use terminal_map::{fresh_terminal_uuid, MapError as TerminalMapError, TerminalMap};
 pub use terminals::{TerminalInfo, TerminalMetadata, TerminalMetadataStore};
@@ -196,6 +198,10 @@ pub struct AppState {
     /// Per-terminal label + created_at, keyed by the same UUID as
     /// `terminal_map`. In-memory only — recreated each boot (Stage 4-B).
     pub terminal_meta: Arc<TerminalMetadataStore>,
+    /// Stage 7 BE-9 / Slice D-1: runtime-mutable behavior toggles
+    /// exposed via `GET/PATCH /api/settings`. In-memory only for the
+    /// minimal slice — restart resets to defaults. See `settings.rs`.
+    pub behavior_settings: Arc<RwLock<BehaviorSettings>>,
 }
 
 impl AppState {
@@ -224,6 +230,7 @@ impl AppState {
             store: None,
             workspace: None,
             session_cache: Arc::new(SessionCache::new()),
+            behavior_settings: default_behavior_settings(),
         }
     }
 
@@ -449,6 +456,7 @@ impl AppState {
             store: Some(Arc::new(store)),
             workspace: None,
             session_cache: Arc::new(SessionCache::new()),
+            behavior_settings: default_behavior_settings(),
         }
     }
 }
@@ -632,6 +640,10 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         .route(
             "/api/terminals/{id}/respawn",
             axum::routing::post(terminals::respawn_handler),
+        )
+        .route(
+            "/api/settings",
+            get(settings::get_handler).patch(settings::patch_handler),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1846,6 +1858,7 @@ mod tests {
             )),
             terminal_map: Arc::new(TerminalMap::new()),
             terminal_meta: Arc::new(TerminalMetadataStore::new()),
+            behavior_settings: default_behavior_settings(),
         };
         let app = router_with_state(state);
         (app, token, layout_path)
@@ -2033,6 +2046,7 @@ mod tests {
             )),
             terminal_map: Arc::new(TerminalMap::new()),
             terminal_meta: Arc::new(TerminalMetadataStore::new()),
+            behavior_settings: default_behavior_settings(),
         };
         let app2 = router_with_state(state);
         let etag2 = current_etag(&app2, &token).await;
@@ -2069,6 +2083,7 @@ mod tests {
             )),
             terminal_map: Arc::new(TerminalMap::new()),
             terminal_meta: Arc::new(TerminalMetadataStore::new()),
+            behavior_settings: default_behavior_settings(),
         };
         let app = router_with_state(state);
         let resp = app
@@ -4031,5 +4046,137 @@ mod tests {
         assert_eq!(hub.session_for_cookie("cookie-B"), None);
         // Cookie-C pointed at a different session; must survive.
         assert_eq!(hub.session_for_cookie("cookie-C"), Some("other".into()));
+    }
+
+    // ── Implicit detach-on-reattach (session switch UX) ──────────────────
+
+    #[tokio::test]
+    async fn attach_implicitly_releases_previous_session_for_same_cookie() {
+        // ADR-0019 D3 single-attach: when the same cookie attaches to a
+        // *different* session, the previous session's flock must auto-release.
+        // Without this, the previous session stays `active=true` forever and
+        // the WorkspaceSwitcher's session-shift UX leaks state.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        for name in ["one", "two"] {
+            std::fs::write(
+                workspace_dir.join(format!("{name}.json")),
+                serde_json::to_vec(&json!({
+                    "schema_version": 2,
+                    "groups": [],
+                    "items": [],
+                    "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let app = router_with_state(state);
+        let cookie_value = "switch-cookie-zzz";
+        // 1) attach 'one'
+        let r1 = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/one/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert!(workspace_dir.join(".locks/one.lock").exists());
+        assert_eq!(hub.session_for_cookie(cookie_value), Some("one".into()));
+
+        // 2) attach 'two' with the SAME cookie — must implicitly release 'one'.
+        let r2 = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/two/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        // 'one' lock must be gone, 'two' lock present.
+        assert!(!workspace_dir.join(".locks/one.lock").exists());
+        assert!(workspace_dir.join(".locks/two.lock").exists());
+        // hub mirror must now point at 'two'.
+        assert_eq!(hub.session_for_cookie(cookie_value), Some("two".into()));
+
+        // 3) Listing — 'one' active=false, 'two' active=true.
+        let list = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(list.into_body(), 4096)
+            .await
+            .unwrap();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let one = rows.iter().find(|r| r["name"] == "one").expect("one row");
+        let two = rows.iter().find(|r| r["name"] == "two").expect("two row");
+        assert_eq!(one["active"], json!(false), "previous session must be released");
+        assert_eq!(two["active"], json!(true), "new session must be active");
+    }
+
+    #[tokio::test]
+    async fn attach_same_name_same_cookie_is_idempotent_409() {
+        // Re-attaching to the *same* session with the same cookie must keep
+        // the existing flock (no implicit release loop). The duplicate attach
+        // hits the `holders.contains_key(&name)` check and returns 409 —
+        // exposing leakage of the prior flock would be a regression.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let _hub = state.hub.as_ref().expect("hub wired").clone();
+        std::fs::write(
+            workspace_dir.join("solo.json"),
+            serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "groups": [],
+                "items": [],
+                "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let app = router_with_state(state);
+        let cookie_value = "solo-cookie-yyy";
+        let make_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/api/sessions/solo/attach")
+                .header(header::HOST, TEST_HOST)
+                .header(header::AUTHORIZATION, bearer(&token))
+                .header(header::COOKIE, format!("gtmux_auth={cookie_value}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(app.clone().oneshot(make_req()).await.unwrap().status(), StatusCode::OK);
+        assert!(workspace_dir.join(".locks/solo.lock").exists());
+        // Second attach (same cookie, same name) — 409, *and* the lock file
+        // must still exist (no implicit release fired).
+        assert_eq!(app.clone().oneshot(make_req()).await.unwrap().status(), StatusCode::CONFLICT);
+        assert!(workspace_dir.join(".locks/solo.lock").exists());
     }
 }
