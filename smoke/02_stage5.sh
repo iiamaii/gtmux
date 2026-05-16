@@ -625,6 +625,59 @@ rm -rf "$FP_DIR"
 pass "5-9  /api/file-path/* allowlist + check + open denial (ADR-0023 D2/D5)"
 
 # ─────────────────────────────────────────────────────────────────────
+#  Gate 5-10 — Slice D-3 Auth Stage 7 (ADR-0020 D4 + D12)
+# ─────────────────────────────────────────────────────────────────────
+# Covers:
+#   * password rotation 의 503 (password_not_set — token mode 의 정상 분기)
+#   * logout-all 의 caller-cookie 보존 + 다른 session revoke + 403 (bearer-only)
+# Skip: real password rotation 의 happy path 는 password mode 진입 (config 변경
+# + 재기동) 필요 — release-binary 가 token mode 로 시작했으므로 happy path 는
+# unit test 로 보장. smoke 는 endpoint wire + auth invariant 만 검증.
+echo
+echo "──── gate 5-10: /api/settings/password (503 token mode) + /logout-all ────"
+
+# Token mode 의 password 변경 시도 → 503 password_not_set
+PW_STATUS=$(curl -sS -o /tmp/gtmux-smoke-stage5-pw.json -w '%{http_code}' \
+  -X POST "http://$HOST/api/settings/password" \
+  -H "$HOSTH" -H "$COOKIEH" -H 'Content-Type: application/json' \
+  -d '{"current_password":"x","new_password":"newpw123"}')
+[ "$PW_STATUS" = "503" ] || fail "5-10: password rotation in token mode expected 503, got $PW_STATUS"
+python3 - <<PY || fail "5-10: password 503 body shape mismatch"
+import json
+d = json.loads(open("/tmp/gtmux-smoke-stage5-pw.json").read())
+assert d["error"] == "password_not_set", d
+PY
+
+# Logout-all 의 happy path — caller 는 보존되어야 함. 따라서 후속 GET 가
+# 통과해야. 검증: revoked_count + caller cookie 살아있음.
+LA_BODY=$(curl -fsS -X POST "http://$HOST/api/settings/logout-all" \
+  -H "$HOSTH" -H "$COOKIEH")
+python3 - <<PY || fail "5-10: logout-all body shape mismatch"
+import json
+d = json.loads("""$LA_BODY""")
+assert isinstance(d["revoked_count"], int), d
+assert d["revoked_count"] >= 0, d
+PY
+
+# Caller cookie 가 여전히 valid — GET /api/settings 가 통과해야.
+POST_LA_GET=$(curl -sS -o /dev/null -w '%{http_code}' \
+  "http://$HOST/api/settings" -H "$HOSTH" -H "$COOKIEH")
+[ "$POST_LA_GET" = "200" ] || fail "5-10: caller cookie revoked after logout-all (got $POST_LA_GET)"
+
+# Bearer-only request → 403 session_cookie_required
+LA_BEARER_STATUS=$(curl -sS -o /tmp/gtmux-smoke-stage5-la-bearer.json -w '%{http_code}' \
+  -X POST "http://$HOST/api/settings/logout-all" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN")
+[ "$LA_BEARER_STATUS" = "403" ] || fail "5-10: logout-all bearer-only expected 403, got $LA_BEARER_STATUS"
+python3 - <<PY || fail "5-10: 403 body shape mismatch"
+import json
+d = json.loads(open("/tmp/gtmux-smoke-stage5-la-bearer.json").read())
+assert d["error"] == "session_cookie_required", d
+PY
+
+pass "5-10 /api/settings/password 503 + /logout-all caller-preserved + 403 bearer (ADR-0020 D12)"
+
+# ─────────────────────────────────────────────────────────────────────
 print_summary
 echo
 echo "──── ALL STAGE 5 GATES PASSED ────"

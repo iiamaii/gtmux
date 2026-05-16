@@ -117,7 +117,11 @@ struct SettingsSnapshot {
     auth: AuthInfo,
 }
 
-fn build_snapshot(state: &AppState, behavior: BehaviorSettings) -> SettingsSnapshot {
+fn build_snapshot(
+    state: &AppState,
+    behavior: BehaviorSettings,
+    password_set: bool,
+) -> SettingsSnapshot {
     SettingsSnapshot {
         build: BuildInfo::current(),
         server: ServerInfo {
@@ -129,7 +133,7 @@ fn build_snapshot(state: &AppState, behavior: BehaviorSettings) -> SettingsSnaps
         behavior,
         auth: AuthInfo {
             token_present: !state.token.0.is_empty(),
-            password_set: state.password_hash.is_some(),
+            password_set,
             argon2: ArgonParams {
                 // Mirror the constants in `auth.rs`. Re-exposing them
                 // here as literals keeps the response stable even if the
@@ -143,11 +147,16 @@ fn build_snapshot(state: &AppState, behavior: BehaviorSettings) -> SettingsSnaps
     }
 }
 
+async fn current_password_set(state: &AppState) -> bool {
+    state.password_hash.read().await.is_some()
+}
+
 /// `GET /api/settings` — returns the boot-immutable info + the current
 /// behavior snapshot.
 pub(crate) async fn get_handler(State(state): State<AppState>) -> Response {
     let behavior = *state.behavior_settings.read().await;
-    Json(build_snapshot(&state, behavior)).into_response()
+    let password_set = current_password_set(&state).await;
+    Json(build_snapshot(&state, behavior, password_set)).into_response()
 }
 
 /// `PATCH /api/settings` — accepts a partial JSON body. Only `behavior`
@@ -173,7 +182,8 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
     // probe pattern.
     if body_bytes.is_empty() {
         let behavior = *state.behavior_settings.read().await;
-        return Json(build_snapshot(&state, behavior)).into_response();
+        let password_set = current_password_set(&state).await;
+        return Json(build_snapshot(&state, behavior, password_set)).into_response();
     }
 
     let parsed: Value = match serde_json::from_slice(&body_bytes) {
@@ -234,7 +244,8 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
         // If `behavior` itself is missing the body is just `{}` — treat
         // as a no-op and return the current snapshot.
         let behavior = *state.behavior_settings.read().await;
-        return Json(build_snapshot(&state, behavior)).into_response();
+        let password_set = current_password_set(&state).await;
+        return Json(build_snapshot(&state, behavior, password_set)).into_response();
     };
 
     // Start from the *current* behavior so partial updates merge
@@ -284,7 +295,246 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
         let mut w = state.behavior_settings.write().await;
         *w = next;
     }
-    Json(build_snapshot(&state, next)).into_response()
+    let password_set = current_password_set(&state).await;
+    Json(build_snapshot(&state, next, password_set)).into_response()
+}
+
+// ─── Slice D-3: Auth Stage 7 (POST /api/settings/password) ────────────
+
+/// Minimum length per ADR-0020 D5. zxcvbn is P2+.
+const MIN_PASSWORD_LENGTH: usize = 8;
+
+#[derive(Debug, serde::Deserialize)]
+struct PasswordChangeRequest {
+    current_password: String,
+    new_password: String,
+}
+
+fn weak_password_response() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "weak_password",
+            "min_length": MIN_PASSWORD_LENGTH,
+        })),
+    )
+        .into_response()
+}
+
+fn password_validates(new_password: &str) -> bool {
+    if new_password.len() < MIN_PASSWORD_LENGTH {
+        return false;
+    }
+    // ADR-0020 D5: "8자 + 영문 + 숫자 (zxcvbn 검사 P2+)" — MVP enforces
+    // the letter+digit half of the rule. Full zxcvbn lands later.
+    let has_letter = new_password.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = new_password.chars().any(|c| c.is_ascii_digit());
+    has_letter && has_digit
+}
+
+/// `POST /api/settings/password` — ADR-0020 D4 password rotation.
+///
+/// Body: `{ current_password, new_password }`.
+///
+/// Outcomes:
+/// - 200 + `Set-Cookie: gtmux_auth=<new>` — verified, rehashed, persisted,
+///   caller re-issued, **every other session revoked** (revoked_count
+///   echoed). The caller's old cookie is replaced by the new one in
+///   the response.
+/// - 400 `weak_password` (min_length echoed) — new password failed validation.
+/// - 401 `current_password_mismatch` — Argon2 verify of `current_password`
+///   failed.
+/// - 503 `password_not_set` — server is in token mode or the password
+///   hash is missing; caller must set the password via the CLI first.
+/// - 500 `save_failed` — disk write failed.
+///
+/// Side-effect ordering (atomic w.r.t. callers via the
+/// `AppState.password_hash` `RwLock`):
+/// 1. Read + verify current hash.
+/// 2. Validate new password.
+/// 3. Compute new Argon2id hash.
+/// 4. Atomically persist to disk (`save_password_hash` mode 0600).
+/// 5. Swap in-memory hash.
+/// 6. Revoke all sessions *except* the caller, then re-issue the
+///    caller's cookie under a fresh value so even the old cookie of
+///    the caller is dead (any other tab that happened to share it loses
+///    auth).
+pub(crate) async fn password_handler(
+    State(state): State<AppState>,
+    req: axum::extract::Request<axum::body::Body>,
+) -> Response {
+    use crate::auth::extract_session_cookie;
+
+    let caller_cookie = match extract_session_cookie(req.headers()) {
+        Some(c) => c,
+        None => {
+            // `/api/*` middleware should have already gated this — but
+            // defend against bearer-only requests reaching us.
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "session_cookie_required" })),
+            )
+                .into_response();
+        }
+    };
+
+    let bytes = match axum::body::to_bytes(req.into_body(), 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "body_read_failed", "message": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let parsed: PasswordChangeRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_json", "message": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+
+    // 1. Verify current.
+    let current_ok = {
+        let guard = state.password_hash.read().await;
+        match guard.as_deref() {
+            Some(h) => crate::auth::verify_password(&parsed.current_password, h),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "password_not_set",
+                        "message": "server is in token mode or password is not yet set; \
+                                    run `gtmux set-password` first",
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+    if !current_ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "current_password_mismatch" })),
+        )
+            .into_response();
+    }
+
+    // 2. Validate new.
+    if !password_validates(&parsed.new_password) {
+        return weak_password_response();
+    }
+
+    // 3. Hash new.
+    let new_hash = match crate::auth::hash_password(&parsed.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "password rotation: hash failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "hash_failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    // 4. Persist.
+    if let Some(path) = state.password_hash_path.as_ref() {
+        if let Err(e) = crate::auth::save_password_hash(path, &new_hash) {
+            tracing::error!(error = %e, "password rotation: save failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "save_failed", "message": e.to_string() })),
+            )
+                .into_response();
+        }
+    } else {
+        // Production wiring always sets the path; missing it is a
+        // boot-misconfiguration. Fail loud rather than silently dropping
+        // the new hash.
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "save_failed", "reason": "no_hash_path" })),
+        )
+            .into_response();
+    }
+
+    // 5. In-memory swap.
+    *state.password_hash.write().await = Some(new_hash);
+
+    // 6. Revoke others, then re-issue caller cookie so even the old
+    //    cookie is dead (defence in depth — another tab sharing this
+    //    cookie loses auth too). Per ADR-0020 D4 the caller's *previous*
+    //    cookie token is now revoked along with every other one; the
+    //    fresh token replaces it via Set-Cookie.
+    let revoked = state.session_table.revoke_others(&caller_cookie).await;
+    state.session_table.revoke(&caller_cookie).await;
+
+    let new_token = match state
+        .session_table
+        .issue(crate::auth::AuthMode::Password)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, "password rotation: issue new cookie failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "issue_failed" })),
+            )
+                .into_response();
+        }
+    };
+    let secure = matches!(state.config.mode(), gtmux_config::Mode::Cloud);
+    let cookie_header =
+        crate::auth::build_session_cookie(&new_token, state.session_table.max_age(), secure);
+
+    let mut resp = (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "revoked_count": revoked,
+        })),
+    )
+        .into_response();
+    if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie_header) {
+        resp.headers_mut().insert(axum::http::header::SET_COOKIE, hv);
+    }
+    resp
+}
+
+#[derive(Debug, serde::Serialize)]
+struct LogoutAllResponse {
+    revoked_count: usize,
+}
+
+/// `POST /api/settings/logout-all` — ADR-0020 D4 "logout all".
+///
+/// Revokes every session *except* the caller's. The caller stays
+/// logged in via the same cookie; every other tab / device hits 401
+/// on its next request and bounces back to the auth page.
+pub(crate) async fn logout_all_handler(
+    State(state): State<AppState>,
+    req: axum::extract::Request<axum::body::Body>,
+) -> Response {
+    use crate::auth::extract_session_cookie;
+    let Some(caller_cookie) = extract_session_cookie(req.headers()) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "session_cookie_required" })),
+        )
+            .into_response();
+    };
+    let revoked = state.session_table.revoke_others(&caller_cookie).await;
+    Json(LogoutAllResponse {
+        revoked_count: revoked,
+    })
+    .into_response()
 }
 
 /// Convenience constructor for the `behavior_settings` field on
@@ -310,6 +560,29 @@ mod tests {
 
     fn bearer(token: &TokenString) -> String {
         format!("Bearer {}", token.0)
+    }
+
+    /// Test state with a password hash + a per-test on-disk path so
+    /// `POST /api/settings/password` can persist a rotation. Returns a
+    /// `(state, token, tempdir, cookie_value)` tuple — the cookie is
+    /// pre-issued through `SessionTable::issue` so the test can pass
+    /// it directly in `Cookie: gtmux_auth=...` without round-tripping
+    /// `/auth/login`.
+    async fn password_test_state(
+        initial_password: &str,
+    ) -> (AppState, TokenString, tempfile::TempDir, String) {
+        let (state, token) = test_state();
+        let initial_hash = crate::auth::hash_password(initial_password).expect("hash");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("password.argon2");
+        let state = state.with_password_hash_path(path);
+        *state.password_hash.write().await = Some(initial_hash);
+        let cookie = state
+            .session_table
+            .issue(crate::auth::AuthMode::Password)
+            .await
+            .expect("issue cookie");
+        (state, token, tmp, cookie)
     }
 
     /// Minimal `AppState` for the settings handler tests. The handler
@@ -561,5 +834,242 @@ mod tests {
             v["behavior"]["auto_kill_terminal_on_panel_close"],
             serde_json::Value::Bool(false)
         );
+    }
+
+    // ─── Slice D-3: POST /api/settings/password ─────────────────────
+
+    #[tokio::test]
+    async fn password_change_happy_path_persists_and_reissues_cookie() {
+        let (state, _token, _tmp, cookie) = password_test_state("oldpw123").await;
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/settings/password")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"current_password":"oldpw123","new_password":"newpw456"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Set-Cookie is issued, replacing the caller's cookie.
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("Set-Cookie present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with("gtmux_auth="));
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v["revoked_count"].is_number());
+        // The disk file now contains a hash that verifies the new password.
+        let disk_hash = std::fs::read_to_string(
+            state.password_hash_path.as_ref().unwrap().as_ref(),
+        )
+        .unwrap();
+        assert!(crate::auth::verify_password("newpw456", disk_hash.trim()));
+        assert!(!crate::auth::verify_password("oldpw123", disk_hash.trim()));
+        // The in-memory hash matches, so a follow-up login flow would verify.
+        let mem = state.password_hash.read().await.clone();
+        assert!(crate::auth::verify_password("newpw456", mem.as_deref().unwrap()));
+        // The caller's *old* cookie is dead (we revoked + re-issued).
+        assert!(state.session_table.validate(&cookie).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn password_change_wrong_current_returns_401() {
+        let (state, _token, _tmp, cookie) = password_test_state("oldpw123").await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/settings/password")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"current_password":"wrong","new_password":"newpw456"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "current_password_mismatch");
+    }
+
+    #[tokio::test]
+    async fn password_change_weak_new_returns_400() {
+        let (state, _token, _tmp, cookie) = password_test_state("oldpw123").await;
+        let app = router(state);
+        // Both branches of weak validation: too short, and long enough
+        // but missing a digit.
+        for body in [
+            r#"{"current_password":"oldpw123","new_password":"short1"}"#,
+            r#"{"current_password":"oldpw123","new_password":"nodigits"}"#,
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri("/api/settings/password")
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body={body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["error"], "weak_password");
+            assert_eq!(v["min_length"], MIN_PASSWORD_LENGTH);
+        }
+    }
+
+    #[tokio::test]
+    async fn password_change_without_password_set_returns_503() {
+        // No initial hash + no path → password_not_set.
+        let (state, _token) = test_state();
+        let cookie = state
+            .session_table
+            .issue(crate::auth::AuthMode::Token)
+            .await
+            .unwrap();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/settings/password")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"current_password":"x","new_password":"newpw456"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "password_not_set");
+    }
+
+    #[tokio::test]
+    async fn password_change_revokes_others_keeps_caller_pending_reissue() {
+        let (state, _token, _tmp, cookie) = password_test_state("oldpw123").await;
+        // Pre-seed 3 *other* sessions; each must be revoked.
+        for _ in 0..3 {
+            state
+                .session_table
+                .issue(crate::auth::AuthMode::Password)
+                .await
+                .unwrap();
+        }
+        assert_eq!(state.session_table.len().await, 4); // 3 + caller
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/settings/password")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"current_password":"oldpw123","new_password":"newpw456"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        // Revoked_count is the 3 other sessions (the caller's cookie is
+        // revoked *after* `revoke_others`, so it's not counted in the
+        // wire response).
+        assert_eq!(v["revoked_count"], 3);
+        // Exactly one live session remains — the freshly issued caller
+        // cookie from the Set-Cookie header.
+        assert_eq!(state.session_table.len().await, 1);
+    }
+
+    // ─── Slice D-3: POST /api/settings/logout-all ───────────────────
+
+    #[tokio::test]
+    async fn logout_all_revokes_others_keeps_caller() {
+        let (state, _token, _tmp, cookie) = password_test_state("oldpw123").await;
+        for _ in 0..2 {
+            state
+                .session_table
+                .issue(crate::auth::AuthMode::Password)
+                .await
+                .unwrap();
+        }
+        assert_eq!(state.session_table.len().await, 3);
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/settings/logout-all")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["revoked_count"], 2);
+        // Caller still validates.
+        assert!(state.session_table.validate(&cookie).await.is_some());
+        // Other sessions gone.
+        assert_eq!(state.session_table.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn logout_all_without_cookie_returns_403() {
+        // Bearer-only request — should be blocked by the explicit
+        // session-cookie check inside the handler.
+        let (state, token) = test_state();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/settings/logout-all")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "session_cookie_required");
     }
 }

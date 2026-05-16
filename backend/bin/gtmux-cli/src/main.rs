@@ -608,6 +608,14 @@ fn build_app_state(
     if let Some(h) = password_hash {
         app_state = app_state.with_password_hash(h);
     }
+    // Slice D-3: pin the on-disk password hash path so the
+    // `POST /api/settings/password` handler can persist a rotation. We
+    // always set this — even in token mode, the FE may switch via
+    // `gtmux set-password` and a future restart in password mode picks
+    // up the hash from this exact path.
+    if let Ok(path) = gtmux_http_api::default_password_hash_path() {
+        app_state = app_state.with_password_hash_path(path);
+    }
     app_state
 }
 

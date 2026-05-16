@@ -176,10 +176,19 @@ pub struct AppState {
     pub session_table: Arc<SessionTable>,
     /// Per-IP rate limiter for `POST /auth/login` (ADR-0020 D5).
     pub rate_limiter: Arc<RateLimiter>,
-    /// PHC-encoded Argon2id hash for password-mode auth (ADR-0020 D5). `None`
-    /// in token mode or when the password file doesn't exist yet (login then
-    /// 503s with a hint to run `gtmux set-password`).
-    pub password_hash: Option<Arc<String>>,
+    /// PHC-encoded Argon2id hash for password-mode auth (ADR-0020 D5).
+    /// `None` (inside the lock) in token mode or when the password file
+    /// doesn't exist yet (login then 503s with a hint to run
+    /// `gtmux set-password`). Runtime-mutable so Slice D-3's
+    /// `POST /api/settings/password` can rotate the hash without a
+    /// process restart — D-1's `GET /api/settings` reads the boolean
+    /// presence, login reads the inner string.
+    pub password_hash: Arc<RwLock<Option<String>>>,
+    /// Disk location of the password hash file (ADR-0020 D5 — under
+    /// `${XDG_STATE_HOME}/gtmux/`). Captured at boot so the password
+    /// rotation handler can persist a new hash without re-resolving the
+    /// XDG path. `None` in tests that don't exercise the disk path.
+    pub password_hash_path: Option<Arc<std::path::PathBuf>>,
     /// UUID v4 minted once per server boot (ADR-0019 D6.1). Written into
     /// `.locks/<name>.lock` bodies so other servers can disambiguate
     /// holders that happen to share a PID.
@@ -222,7 +231,8 @@ impl AppState {
         Self {
             session_table,
             rate_limiter: default_rate_limiter(),
-            password_hash: None,
+            password_hash: Arc::new(RwLock::new(None)),
+            password_hash_path: None,
             server_id: Arc::from(fresh_server_id()),
             session_locks: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -248,8 +258,18 @@ impl AppState {
     /// Attach a pre-loaded Argon2id password hash (read from the file
     /// produced by `gtmux set-password`). Without this `POST /auth/login`
     /// returns 503 in password mode.
-    pub fn with_password_hash(mut self, hash: String) -> Self {
-        self.password_hash = Some(Arc::new(hash));
+    pub fn with_password_hash(self, hash: String) -> Self {
+        // Use `blocking_write` because this builder runs synchronously
+        // during boot, before any axum handler holds the lock. There is
+        // no live contention to block on.
+        *self.password_hash.blocking_write() = Some(hash);
+        self
+    }
+
+    /// Pin the on-disk location of the password hash file so the Slice
+    /// D-3 rotation handler can re-save without re-resolving XDG.
+    pub fn with_password_hash_path(mut self, path: std::path::PathBuf) -> Self {
+        self.password_hash_path = Some(Arc::new(path));
         self
     }
 
@@ -449,7 +469,8 @@ impl AppState {
         Self {
             session_table,
             rate_limiter: default_rate_limiter(),
-            password_hash: None,
+            password_hash: Arc::new(RwLock::new(None)),
+            password_hash_path: None,
             server_id: Arc::from(fresh_server_id()),
             session_locks: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -656,6 +677,14 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         .route(
             "/api/settings",
             get(settings::get_handler).patch(settings::patch_handler),
+        )
+        .route(
+            "/api/settings/password",
+            axum::routing::post(settings::password_handler),
+        )
+        .route(
+            "/api/settings/logout-all",
+            axum::routing::post(settings::logout_all_handler),
         )
         .route(
             "/api/file-path/allowlist",
@@ -1874,7 +1903,8 @@ mod tests {
             session_cache: Arc::new(crate::sessions::SessionCache::new()),
             session_table: crate::auth::default_session_table(7),
             rate_limiter: crate::auth::default_rate_limiter(),
-            password_hash: None,
+            password_hash: Arc::new(RwLock::new(None)),
+            password_hash_path: None,
             server_id: Arc::from(crate::session_lock::fresh_server_id()),
             session_locks: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -2063,7 +2093,8 @@ mod tests {
             session_cache: Arc::new(crate::sessions::SessionCache::new()),
             session_table: crate::auth::default_session_table(7),
             rate_limiter: crate::auth::default_rate_limiter(),
-            password_hash: None,
+            password_hash: Arc::new(RwLock::new(None)),
+            password_hash_path: None,
             server_id: Arc::from(crate::session_lock::fresh_server_id()),
             session_locks: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -2101,7 +2132,8 @@ mod tests {
             session_cache: Arc::new(crate::sessions::SessionCache::new()),
             session_table: crate::auth::default_session_table(7),
             rate_limiter: crate::auth::default_rate_limiter(),
-            password_hash: None,
+            password_hash: Arc::new(RwLock::new(None)),
+            password_hash_path: None,
             server_id: Arc::from(crate::session_lock::fresh_server_id()),
             session_locks: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),

@@ -191,6 +191,17 @@ impl SessionTable {
         map.clear();
     }
 
+    /// Drop every active session except the caller's cookie. Returns the
+    /// number of sessions revoked. Slice D-3 (`POST /api/settings/password`,
+    /// `POST /api/settings/logout-all`) per ADR-0020 D4 / D5: the caller
+    /// stays logged in while every other tab / device is logged out.
+    pub async fn revoke_others(&self, except: &str) -> usize {
+        let mut map = self.inner.lock().await;
+        let before = map.len();
+        map.retain(|cookie, _| cookie == except);
+        before.saturating_sub(map.len())
+    }
+
     /// Test/debug helper — number of live entries.
     #[doc(hidden)]
     pub async fn len(&self) -> usize {
@@ -514,16 +525,19 @@ pub async fn auth_login_handler(
                     StatusCode::BAD_REQUEST,
                 );
             };
-            let hash = match state.password_hash.as_deref() {
-                Some(h) => h,
-                None => {
-                    return login_error(
-                        "password mode is configured but no password is set; run `gtmux set-password`",
-                        StatusCode::SERVICE_UNAVAILABLE,
-                    );
+            let hash = {
+                let guard = state.password_hash.read().await;
+                match guard.as_deref() {
+                    Some(h) => h.to_string(),
+                    None => {
+                        return login_error(
+                            "password mode is configured but no password is set; run `gtmux set-password`",
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        );
+                    }
                 }
             };
-            if !verify_password(password, hash) {
+            if !verify_password(password, &hash) {
                 state
                     .auth_failure_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
