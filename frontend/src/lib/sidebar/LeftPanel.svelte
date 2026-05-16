@@ -17,6 +17,7 @@
    *     expands the panel AND switches to that tab (chromeStore.setLeftPanelTab).
    */
 
+  import { onDestroy } from 'svelte';
   import { chromeStore, type LeftPanelTab } from '$lib/stores/chrome.svelte';
   import LayerTreeView from './LayerTreeView.svelte';
   import TerminalListView from './TerminalListView.svelte';
@@ -24,6 +25,10 @@
 
   const collapsed = $derived(chromeStore.state.sidebarCollapsed);
   const activeTab = $derived(chromeStore.state.leftPanelTab);
+  const panelWidth = $derived(chromeStore.state.leftPanelWidth);
+
+  let panelEl = $state<HTMLElement | null>(null);
+  let resizing = $state(false);
 
   function selectTab(tab: LeftPanelTab): void {
     chromeStore.setLeftPanelTab(tab);
@@ -32,6 +37,34 @@
   function expandAndSelect(tab: LeftPanelTab): void {
     chromeStore.setLeftPanelTab(tab); // also flips sidebarCollapsed → false
   }
+
+  function onResizePointerDown(e: PointerEvent): void {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    resizing = true;
+    window.addEventListener('pointermove', onResizePointerMove);
+    window.addEventListener('pointerup', onResizePointerUp, { once: true });
+    window.addEventListener('pointercancel', onResizePointerUp, { once: true });
+  }
+
+  function onResizePointerMove(e: PointerEvent): void {
+    if (!resizing || panelEl === null) return;
+    const rect = panelEl.getBoundingClientRect();
+    chromeStore.setLeftPanelWidth(e.clientX - rect.left);
+  }
+
+  function onResizePointerUp(): void {
+    resizing = false;
+    window.removeEventListener('pointermove', onResizePointerMove);
+    window.removeEventListener('pointerup', onResizePointerUp);
+    window.removeEventListener('pointercancel', onResizePointerUp);
+  }
+
+  onDestroy(() => {
+    window.removeEventListener('pointermove', onResizePointerMove);
+    window.removeEventListener('pointerup', onResizePointerUp);
+    window.removeEventListener('pointercancel', onResizePointerUp);
+  });
 </script>
 
 {#if collapsed}
@@ -77,7 +110,13 @@
     </button>
   </aside>
 {:else}
-  <aside class="left-panel" aria-label="Left panel">
+  <aside
+    bind:this={panelEl}
+    class="left-panel"
+    class:resizing
+    aria-label="Left panel"
+    style:width={`${panelWidth}px`}
+  >
     <header class="left-panel-head">
       <div class="panel-tabs" role="tablist" aria-label="Left panel tabs">
         <button
@@ -112,6 +151,13 @@
         <TerminalListView />
       {/if}
     </div>
+    <button
+      type="button"
+      class="resize-handle"
+      aria-label="Resize left panel"
+      title="Resize left panel"
+      onpointerdown={onResizePointerDown}
+    ></button>
   </aside>
 {/if}
 
@@ -122,7 +168,6 @@
     top: var(--space-8);
     bottom: var(--space-8);
     left: var(--space-8);
-    width: var(--layout-sidebar-w);
     box-sizing: border-box;
     background: var(--color-surface);
     color: var(--color-fg);
@@ -133,6 +178,37 @@
     flex-direction: column;
     overflow: hidden;
     user-select: none;
+  }
+
+  .resize-handle {
+    position: absolute;
+    top: 0;
+    right: -5px;
+    bottom: 0;
+    width: 10px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: ew-resize;
+    z-index: 2;
+    touch-action: none;
+  }
+
+  .resize-handle::after {
+    content: '';
+    position: absolute;
+    top: var(--space-8);
+    right: 4px;
+    bottom: var(--space-8);
+    width: 1px;
+    border-radius: 999px;
+    background: transparent;
+    transition: background var(--motion-fast) var(--motion-easing);
+  }
+
+  .resize-handle:hover::after,
+  .left-panel.resizing .resize-handle::after {
+    background: var(--color-accent);
   }
 
   .left-panel-head {

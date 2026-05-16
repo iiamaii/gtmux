@@ -16,17 +16,25 @@ export type RightPanelTab = 'inspect';
 export type ChromeState = {
   sidebarCollapsed: boolean;
   leftPanelTab: LeftPanelTab;
+  leftPanelWidth: number;
   paneInfoCollapsed: boolean;
   rightPanelTab: RightPanelTab;
+  rightPanelWidth: number;
 };
 
 const STORAGE_KEY = 'gtmux-chrome';
+const LEFT_PANEL_MIN_WIDTH = 220;
+const LEFT_PANEL_MAX_WIDTH = 520;
+const RIGHT_PANEL_MIN_WIDTH = 240;
+const RIGHT_PANEL_MAX_WIDTH = 560;
 
 const DEFAULT: ChromeState = {
   sidebarCollapsed: false,
   leftPanelTab: 'layers',
+  leftPanelWidth: 248,
   paneInfoCollapsed: false,
   rightPanelTab: 'inspect',
+  rightPanelWidth: 268,
 };
 
 class ChromeStore {
@@ -57,9 +65,25 @@ class ChromeStore {
     this.persist();
   }
 
+  setLeftPanelWidth(width: number): void {
+    this.state = {
+      ...this.state,
+      leftPanelWidth: clamp(width, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
+    };
+    this.persist();
+  }
+
+  setRightPanelWidth(width: number): void {
+    this.state = {
+      ...this.state,
+      rightPanelWidth: clamp(width, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
+    };
+    this.persist();
+  }
+
   /** Force a specific state — used by tests / scripted demos. */
   set(next: Partial<ChromeState>): void {
-    this.state = { ...this.state, ...next };
+    this.state = normalizeState({ ...this.state, ...next });
     this.persist();
   }
 
@@ -83,7 +107,7 @@ function resolveInitial(): ChromeState {
     const obj = parsed as Record<string, unknown>;
     const leftTab = obj.leftPanelTab;
     const rightTab = obj.rightPanelTab;
-    return {
+    return normalizeState({
       sidebarCollapsed:
         typeof obj.sidebarCollapsed === 'boolean'
           ? obj.sidebarCollapsed
@@ -95,11 +119,32 @@ function resolveInitial(): ChromeState {
           ? obj.paneInfoCollapsed
           : DEFAULT.paneInfoCollapsed,
       rightPanelTab: rightTab === 'inspect' ? rightTab : DEFAULT.rightPanelTab,
-    };
+      leftPanelWidth:
+        typeof obj.leftPanelWidth === 'number'
+          ? obj.leftPanelWidth
+          : DEFAULT.leftPanelWidth,
+      rightPanelWidth:
+        typeof obj.rightPanelWidth === 'number'
+          ? obj.rightPanelWidth
+          : DEFAULT.rightPanelWidth,
+    });
   } catch (e) {
     console.debug('[gtmux] chrome read failed', e);
     return DEFAULT;
   }
+}
+
+function normalizeState(state: ChromeState): ChromeState {
+  return {
+    ...state,
+    leftPanelWidth: clamp(state.leftPanelWidth, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
+    rightPanelWidth: clamp(state.rightPanelWidth, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
+  };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.round(value)));
 }
 
 export const chromeStore = new ChromeStore();
