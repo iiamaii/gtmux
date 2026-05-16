@@ -212,7 +212,7 @@
 
 <SessionListModal
   open={workspaceSwitcher.stage === 'list'}
-  onClose={() => workspaceSwitcher.open()}
+  onClose={() => workspaceSwitcher.closeList()}
   onSelect={onSessionPicked}
   onUnauthorized={redirectToAuth}
 />
