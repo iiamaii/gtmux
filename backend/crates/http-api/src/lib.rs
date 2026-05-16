@@ -44,6 +44,7 @@
 #![warn(missing_docs)]
 
 mod auth;
+mod file_open;
 mod schema;
 mod session_lock;
 mod sessions;
@@ -63,6 +64,10 @@ pub use schema::{
     Layout, Point, SchemaShape, ValidationError, Viewport, Visibility, SCHEMA_VERSION,
 };
 pub use session_lock::{fresh_server_id, Lease, LockError, LockGuard, LockState};
+pub use file_open::{
+    default_allowlist_path, default_audit_dir, Allowlist, AllowlistEntry, AllowlistMatch,
+    AuditLog, FileOpenContext,
+};
 pub use sessions::{SessionCache, SessionError, SessionLayout};
 pub use settings::{default_behavior_settings, BehaviorSettings};
 pub use storage::{LayoutStore, StorageError};
@@ -202,6 +207,11 @@ pub struct AppState {
     /// exposed via `GET/PATCH /api/settings`. In-memory only for the
     /// minimal slice — restart resets to defaults. See `settings.rs`.
     pub behavior_settings: Arc<RwLock<BehaviorSettings>>,
+    /// Slice D-2 (ADR-0023) — `/api/file-path/*` allowlist + audit
+    /// log context. The allowlist is loaded from disk at boot (cold)
+    /// and persisted on every `POST/DELETE /allowlist`. See
+    /// `file_open/mod.rs` for the wire surface.
+    pub file_open: FileOpenContext,
 }
 
 impl AppState {
@@ -231,6 +241,7 @@ impl AppState {
             workspace: None,
             session_cache: Arc::new(SessionCache::new()),
             behavior_settings: default_behavior_settings(),
+            file_open: FileOpenContext::production(),
         }
     }
 
@@ -457,6 +468,7 @@ impl AppState {
             workspace: None,
             session_cache: Arc::new(SessionCache::new()),
             behavior_settings: default_behavior_settings(),
+            file_open: FileOpenContext::production(),
         }
     }
 }
@@ -644,6 +656,20 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         .route(
             "/api/settings",
             get(settings::get_handler).patch(settings::patch_handler),
+        )
+        .route(
+            "/api/file-path/allowlist",
+            get(file_open::allowlist_get_handler)
+                .post(file_open::allowlist_post_handler)
+                .delete(file_open::allowlist_delete_handler),
+        )
+        .route(
+            "/api/file-path/allowlist-check",
+            get(file_open::allowlist_check_handler),
+        )
+        .route(
+            "/api/file-path/open",
+            axum::routing::post(file_open::open_handler),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1859,6 +1885,7 @@ mod tests {
             terminal_map: Arc::new(TerminalMap::new()),
             terminal_meta: Arc::new(TerminalMetadataStore::new()),
             behavior_settings: default_behavior_settings(),
+            file_open: FileOpenContext::production(),
         };
         let app = router_with_state(state);
         (app, token, layout_path)
@@ -2047,6 +2074,7 @@ mod tests {
             terminal_map: Arc::new(TerminalMap::new()),
             terminal_meta: Arc::new(TerminalMetadataStore::new()),
             behavior_settings: default_behavior_settings(),
+            file_open: FileOpenContext::production(),
         };
         let app2 = router_with_state(state);
         let etag2 = current_etag(&app2, &token).await;
@@ -2084,6 +2112,7 @@ mod tests {
             terminal_map: Arc::new(TerminalMap::new()),
             terminal_meta: Arc::new(TerminalMetadataStore::new()),
             behavior_settings: default_behavior_settings(),
+            file_open: FileOpenContext::production(),
         };
         let app = router_with_state(state);
         let resp = app

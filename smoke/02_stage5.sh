@@ -82,6 +82,13 @@ if [ ! -x "$BIN" ]; then
 fi
 
 echo "[setup] workspace=$WORKDIR port=$PORT primary=$SESSION_PRIMARY"
+# Isolate XDG_{CONFIG,STATE}_HOME inside the per-run tempdir so the
+# file_open allowlist + audit log + token + pidfile don't collide with
+# (or inherit from) the dev host's real `~/.config/gtmux` and
+# `~/.local/state/gtmux`. Both the gtmux process and the rest of this
+# smoke script read these vars, so export them for the shell as well.
+export XDG_CONFIG_HOME="$WORKDIR/xdg-config"
+export XDG_STATE_HOME="$WORKDIR/xdg-state"
 env -u TMUX "$BIN" start \
   --session "$SESSION_PRIMARY" \
   --port "$PORT" \
@@ -519,6 +526,103 @@ BAD_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
 [ "$BAD_STATUS" = "400" ] || fail "5-8: boot-immutable PATCH expected 400, got $BAD_STATUS"
 
 pass "5-8  GET/PATCH /api/settings + boot-immutable rejection (D-1 ship)"
+
+# ─────────────────────────────────────────────────────────────────────
+#  Gate 5-9 — Slice D-2 file_path allowlist + check (ADR-0023)
+# ─────────────────────────────────────────────────────────────────────
+# Covers GET empty / POST canonicalize / GET non-empty / check allowed +
+# denied / open denied without confirm. Skips the actual OS open spawn
+# (5-7-equivalent end-to-end is not feasible on a smoke CI without
+# launching a GUI handler). The wire validation here is the same code
+# path the FE will trip in production.
+echo
+echo "──── gate 5-9: /api/file-path/* (allowlist + check + open denied) ────"
+
+# GET empty.
+FP_EMPTY=$(curl -fsS "http://$HOST/api/file-path/allowlist" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN")
+python3 - <<PY || fail "5-9: GET empty shape mismatch"
+import json
+d = json.loads("""$FP_EMPTY""")
+assert isinstance(d["entries"], list) and d["entries"] == [], d
+PY
+
+# Prep a real directory + file to drive POST + check.
+FP_DIR=$(mktemp -d -t gtmux-smoke-fp-XXXX)
+FP_FILE_MD="$FP_DIR/spec.md"
+FP_FILE_SH="$FP_DIR/payload.sh"
+echo "# Spec" >"$FP_FILE_MD"
+echo "#!/bin/sh" >"$FP_FILE_SH"
+
+# POST allowlist entry (ext=md, prefix=$FP_DIR/).
+POST_BODY=$(printf '{"ext":"md","prefix":"%s","label":"smoke"}' "$FP_DIR/")
+FP_CREATED=$(curl -fsS -X POST "http://$HOST/api/file-path/allowlist" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d "$POST_BODY")
+python3 - <<PY || { rm -rf "$FP_DIR"; fail "5-9: POST response shape mismatch"; }
+import json
+d = json.loads("""$FP_CREATED""")
+assert d["ext"] == "md", d
+assert d["prefix"].endswith("/"), d
+assert d["label"] == "smoke", d
+PY
+# Re-capture the canonical prefix that the BE stored — macOS resolves
+# `/tmp` to `/private/tmp` during canonicalize, so the original
+# `$FP_DIR/` won't match for DELETE.
+FP_PREFIX_CANON=$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['prefix'])" "$FP_CREATED")
+
+# GET after POST → 1 entry.
+FP_LIST=$(curl -fsS "http://$HOST/api/file-path/allowlist" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN")
+python3 - <<PY || { rm -rf "$FP_DIR"; fail "5-9: GET after POST mismatch"; }
+import json
+d = json.loads("""$FP_LIST""")
+assert len(d["entries"]) == 1, d
+PY
+
+# allowlist-check on .md → allowed.
+CHECK_OK=$(curl -fsS "http://$HOST/api/file-path/allowlist-check?path=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$FP_FILE_MD")" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN")
+python3 - <<PY || { rm -rf "$FP_DIR"; fail "5-9: .md check should be allowed"; }
+import json
+d = json.loads("""$CHECK_OK""")
+assert d["allowed"] is True, d
+assert d["matched_entry"]["ext"] == "md", d
+PY
+
+# allowlist-check on .sh (same prefix) → DENIED — the core ADR-0023 D2
+# security invariant: the `*.sh` modal-bypass attack is prevented.
+CHECK_SH=$(curl -fsS "http://$HOST/api/file-path/allowlist-check?path=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$FP_FILE_SH")" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN")
+python3 - <<PY || { rm -rf "$FP_DIR"; fail "5-9: .sh check must be denied (ADR-0023 D2 guard)"; }
+import json
+d = json.loads("""$CHECK_SH""")
+assert d["allowed"] is False, d
+assert d["reason"] == "not_in_allowlist", d
+PY
+
+# POST /open without user_confirmed on the unmatched .sh → 403.
+OPEN_BODY=$(printf '{"path":"%s","user_confirmed":false}' "$FP_FILE_SH")
+OPEN_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+  -X POST "http://$HOST/api/file-path/open" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d "$OPEN_BODY")
+[ "$OPEN_STATUS" = "403" ] || { rm -rf "$FP_DIR"; fail "5-9: open unmatched without confirm expected 403, got $OPEN_STATUS"; }
+
+# DELETE round-trip. Use the canonical prefix the BE returned, not the
+# raw `$FP_DIR/` — see the comment after the POST above.
+DEL_PREFIX=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$FP_PREFIX_CANON")
+DEL_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+  -X DELETE "http://$HOST/api/file-path/allowlist?ext=md&prefix=$DEL_PREFIX" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN")
+[ "$DEL_STATUS" = "204" ] || { rm -rf "$FP_DIR"; fail "5-9: DELETE expected 204, got $DEL_STATUS"; }
+DEL_STATUS_2=$(curl -sS -o /dev/null -w '%{http_code}' \
+  -X DELETE "http://$HOST/api/file-path/allowlist?ext=md&prefix=$DEL_PREFIX" \
+  -H "$HOSTH" -H "Authorization: Bearer $TOKEN")
+[ "$DEL_STATUS_2" = "404" ] || { rm -rf "$FP_DIR"; fail "5-9: double-DELETE expected 404, got $DEL_STATUS_2"; }
+
+rm -rf "$FP_DIR"
+pass "5-9  /api/file-path/* allowlist + check + open denial (ADR-0023 D2/D5)"
 
 # ─────────────────────────────────────────────────────────────────────
 print_summary
