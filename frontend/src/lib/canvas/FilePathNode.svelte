@@ -52,6 +52,44 @@
   let editing = $state(false);
   type ResizeParams = { x: number; y: number; width: number; height: number };
 
+  // ref/frontend-design/components.html §03 — display 시 path/name 분리:
+  //   path = "/foo/bar/baz.ts" → fp-path "foo/bar/" + fp-name "baz.ts"
+  //   path = "/foo/bar/"        → fp-path "foo/" + fp-name "bar/"
+  //   path = "baz.ts"           → fp-path "" + fp-name "baz.ts"
+  const splitPath = $derived.by(() => {
+    const raw = data.path ?? '';
+    const trimmed = raw.replace(/^\/+/, '');
+    const lastSlash = trimmed.replace(/\/+$/, '').lastIndexOf('/');
+    if (lastSlash < 0) return { dir: '', name: trimmed };
+    return { dir: trimmed.slice(0, lastSlash + 1), name: trimmed.slice(lastSlash + 1) };
+  });
+
+  // 확장자 → lang badge token. 시안 §03 의 per-lang palette.
+  type LangBadge = { label: string; cls: string };
+  const langBadge = $derived.by((): LangBadge | null => {
+    const { name } = splitPath;
+    if (data.kind === 'directory') return null;
+    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1).toLowerCase() : '';
+    switch (ext) {
+      case 'ts': return { label: 'TS', cls: 'ts' };
+      case 'tsx': return { label: 'TSX', cls: 'tsx' };
+      case 'js': return { label: 'JS', cls: 'js' };
+      case 'jsx': return { label: 'JSX', cls: 'jsx' };
+      case 'css': return { label: 'CSS', cls: 'css' };
+      case 'md': return { label: 'MD', cls: 'md' };
+      case 'svg': return { label: 'SVG', cls: 'svg' };
+      case 'json': return { label: 'JSON', cls: 'json' };
+      case 'rs': return { label: 'RS', cls: 'rs' };
+      case 'svelte': return { label: 'SV', cls: 'svelte' };
+      case 'html': return { label: 'HTML', cls: 'html' };
+      case 'toml': return { label: 'TOML', cls: 'toml' };
+      case 'yml':
+      case 'yaml': return { label: 'YAML', cls: 'yaml' };
+      case '': return null;
+      default: return { label: ext.slice(0, 4).toUpperCase(), cls: 'generic' };
+    }
+  });
+
   function onDblClick(e: MouseEvent): void {
     if (isLocked) return;
     e.stopPropagation();
@@ -119,7 +157,7 @@
 
 {#if isVisible}
   <div
-    class="file-path-node"
+    class="file-path-node shape-filepath"
     class:m-single={isInM}
     class:locked={isLocked}
     style="width: 100%; height: 100%;"
@@ -129,71 +167,68 @@
     <NodeResizer
       nodeId={data.id}
       isVisible={isInM && !isLocked}
-      minWidth={160}
-      minHeight={32}
+      minWidth={200}
+      minHeight={64}
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
       {onResizeEnd}
     />
-    <svg
-      class="file-icon"
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-    >
-      {#if data.kind === 'directory'}
-        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-      {:else}
-        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-        <polyline points="14 2 14 8 20 8" />
-      {/if}
-    </svg>
-    <div
-      class="path-host"
-      ondblclick={onDblClick}
-      role="presentation"
-    >
-      {#if editing}
-        <InlineEditField
-          value={data.path}
-          editing={true}
-          allowEmpty={true}
-          placeholder="/path/to/file"
-          class="path-edit"
-          onCommit={(next: string) => void onCommit(next)}
-          onCancel={() => (editing = false)}
-        />
-      {:else if data.path.length === 0}
-        <span class="path-placeholder">Double-click to set path</span>
-      {:else}
-        <span class="path-text" title={data.path}>{data.path}</span>
-      {/if}
+    <!-- Main row — icon + meta (path / name) (시안 §03 fp-main). -->
+    <div class="fp-main" ondblclick={onDblClick} role="presentation">
+      <div class="fp-icon" aria-hidden="true">
+        <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round">
+          {#if data.kind === 'directory'}
+            <path d="M1.5 3.5a1 1 0 0 1 1-1h3l1.2 1.5h5.3a1 1 0 0 1 1 1V11a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1V3.5z" />
+          {:else}
+            <path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/>
+            <path d="M8 1.5v3h3"/>
+          {/if}
+        </svg>
+      </div>
+      <div class="fp-meta">
+        {#if editing}
+          <InlineEditField
+            value={data.path}
+            editing={true}
+            allowEmpty={true}
+            placeholder="/path/to/file"
+            class="path-edit"
+            onCommit={(next: string) => void onCommit(next)}
+            onCancel={() => (editing = false)}
+          />
+        {:else if data.path.length === 0}
+          <span class="path-placeholder">Double-click to set path</span>
+        {:else}
+          {#if splitPath.dir.length > 0}
+            <div class="fp-path" title={data.path}>{splitPath.dir}</div>
+          {/if}
+          <div class="fp-name" title={data.path}>{splitPath.name}</div>
+        {/if}
+      </div>
     </div>
-    <!-- Open icon — ADR-0023 의 FileOpenConfirmModal 시 wire. 현재는 placeholder. -->
-    <span class="open-disabled" title="Open — coming with ADR-0023" aria-hidden="true">↗</span>
+    <!-- Foot row — badge (per-lang) + future meta (lines / KB / branch — placeholder
+         until BE-side stat 추가, ADR amend 후). 시안 §03 fp-foot. -->
+    {#if !editing && data.path.length > 0 && langBadge !== null}
+      <div class="fp-foot">
+        <span class="fp-badge {langBadge.cls}">{langBadge.label}</span>
+        <span class="fp-foot-spacer"></span>
+      </div>
+    {/if}
   </div>
 {/if}
 
 <style>
+  /* ref/frontend-design/components.html §03 — file path tile. mono throughout. */
   .file-path-node {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
+    display: grid;
+    grid-template-rows: 1fr auto;
     box-sizing: border-box;
-    padding: 0 var(--space-8);
     background: var(--color-surface);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-md);
     color: var(--color-fg);
     font-family: var(--font-mono);
-    font-size: var(--text-sm);
     overflow: hidden;
   }
 
@@ -205,40 +240,109 @@
     cursor: default;
   }
 
-  .file-icon {
-    flex: 0 0 auto;
-    color: var(--color-fg-muted);
-  }
-
-  .path-host {
-    flex: 1 1 auto;
+  .fp-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 12px 10px;
     min-width: 0;
     cursor: text;
   }
 
-  .path-text {
+  .fp-icon {
+    width: 24px;
+    height: 24px;
+    flex: 0 0 24px;
+    display: grid;
+    place-items: center;
+    border-radius: 4px;
+    background: var(--color-glass-2);
+    color: var(--color-fg-muted);
+  }
+
+  .fp-meta {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .fp-path {
+    font-size: 10px;
+    letter-spacing: 0.2px;
+    color: var(--color-fg-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    display: block;
+  }
+
+  .fp-name {
+    font-size: 13px;
+    font-weight: 540;
+    letter-spacing: -0.1px;
+    color: var(--color-fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .path-placeholder {
     color: var(--color-fg-subtle);
     font-style: italic;
+    font-size: 12px;
     user-select: none;
   }
 
-  .open-disabled {
-    flex: 0 0 auto;
-    color: var(--color-fg-subtle);
-    cursor: not-allowed;
-    user-select: none;
+  /* Foot row — surface-2 strip with 1px top border. */
+  .fp-foot {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px 7px;
+    background: var(--color-surface-2);
+    border-top: 1px solid var(--color-border);
+    font-size: 9.5px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--color-fg-muted);
   }
+
+  .fp-foot-spacer {
+    flex: 1 1 auto;
+  }
+
+  /* Lang badge — per-lang background color (시안 §03 palette). */
+  .fp-badge {
+    display: inline-flex;
+    align-items: center;
+    height: 14px;
+    padding: 0 5px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 540;
+    letter-spacing: 0.8px;
+    color: #ffffff;
+    background: var(--color-fg-muted);
+  }
+
+  .fp-badge.ts { background: #3178c6; }
+  .fp-badge.tsx { background: #61dafb; color: #002233; }
+  .fp-badge.js { background: #f7df1e; color: #1a1a00; }
+  .fp-badge.jsx { background: #61dafb; color: #002233; }
+  .fp-badge.css { background: #2965f1; }
+  .fp-badge.md { background: #555555; }
+  .fp-badge.svg { background: #ff9a3c; color: #2a1500; }
+  .fp-badge.json { background: #2b2b2b; }
+  .fp-badge.rs { background: #ce422b; }
+  .fp-badge.svelte { background: #ff3e00; }
+  .fp-badge.html { background: #e34c26; }
+  .fp-badge.toml { background: #9c4221; }
+  .fp-badge.yaml { background: #cb171e; }
+  .fp-badge.generic { background: var(--color-fg-muted); }
 
   :global(.path-edit) {
     width: 100%;
     font-family: inherit;
-    font-size: inherit;
+    font-size: 13px;
   }
 </style>
