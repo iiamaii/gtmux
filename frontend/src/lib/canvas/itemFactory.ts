@@ -33,7 +33,7 @@ const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
 // middle / bottom 차이가 ±12.5px 만큼 가시. 너무 작으면 (예 h<40) 정렬 차이가
 // 거의 안 보여 fit-perception 가짐.
 const DEFAULT_TEXT_SIZE = { w: 160, h: 56 } as const;
-const DEFAULT_NOTE_SIZE = { w: 280, h: 160 } as const;
+const DEFAULT_NOTE_SIZE = { w: 300, h: 96 } as const;
 const DEFAULT_FILE_PATH_SIZE = { w: 320, h: 48 } as const;
 const DEFAULT_SHAPE_SIZE = { w: 200, h: 140 } as const;
 const DEFAULT_LINE_SIZE = { w: 240, h: 80 } as const;
@@ -131,7 +131,7 @@ export function createCanvasItem(
         h: DEFAULT_NOTE_SIZE.h,
         title: '',
         body: '',
-        color: 'var(--color-warning)',
+        color: 'var(--color-accent)',
       };
     case 'file_path':
       return {

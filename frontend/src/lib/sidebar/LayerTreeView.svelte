@@ -847,7 +847,16 @@
               onclick={(e: MouseEvent) => selectNode(node.id, e)}
               title={panelDisplayLabel(p)}
             >
-              <span class="type-icon" aria-hidden="true">{panelTypeIcon(p)}</span>
+              <span class="type-icon" aria-hidden="true">
+                {#if p.type === 'note'}
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
+                    <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
+                    <path d="M3.6 5.2h4.8"/>
+                  </svg>
+                {:else}
+                  {panelTypeIcon(p)}
+                {/if}
+              </span>
               <span class="label">{panelDisplayLabel(p)}{dead ? ' (Dead)' : ''}</span>
               {#if layerMode === 'z' && typeof p.z === 'number'}
                 <span class="z-tag mono" title="z-index">z={p.z}</span>
@@ -1083,7 +1092,10 @@
   .type-icon {
     flex: 0 0 16px;
     width: 16px;
-    text-align: center;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     font-family: var(--font-mono);
     font-size: var(--text-base);
     color: var(--color-fg-muted);
