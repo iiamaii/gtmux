@@ -74,18 +74,12 @@ pub const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 /// Envelope header: 1-byte type + 4-byte little-endian length.
 const HEADER_LEN: usize = 5;
 
-/// Heartbeat ping cadence (ADR-0021 D6 / ADR-0019 D6.2). The server pings
-/// every 15s; clients are expected to reply with Pong frames before the
-/// next ping. Cross-server session-attach leases are refreshed in lock-step
-/// with this cadence so a dead webpage releases its session within
-/// `PONG_TIMEOUT` after going silent.
-const PING_INTERVAL: Duration = Duration::from_secs(15);
-
-/// Pong-grace timeout (ADR-0021 D6). If no pong arrives within this window
-/// after the *most recent* ping, the connection is considered dead and the
-/// socket is closed with code 1011 (Internal). 30s is the explicit value
-/// in ADR-0019 D6.2 / ADR-0021 D6.
-const PONG_TIMEOUT: Duration = Duration::from_secs(30);
+// Heartbeat ping cadence + pong-grace timeout (ADR-0021 D6 / ADR-0019 D6.2)
+// live as the production defaults on `Hub::heartbeat_timings`:
+//   * 15s ping interval — clients reply with Pong before the next tick.
+//   * 30s pong timeout — silence beyond this closes the socket with 1011
+//     (Internal) and fires the disconnect sink (auto-release of the
+//     session lock). Tests override via `Hub::set_heartbeat_timings`.
 
 /// Per-connection pause/resume debounce window (legacy `ADR-0001 D8` +
 /// `0010-grill-amendments.md` D16). Identical bytes-on-the-wire to the
@@ -642,7 +636,11 @@ async fn handle_socket(
         }
     }
 
-    let mut ping_timer = tokio::time::interval(PING_INTERVAL);
+    // Snapshot heartbeat timings once per upgrade (defaults match
+    // PING_INTERVAL/PONG_TIMEOUT in production; tests shrink them via
+    // `Hub::set_heartbeat_timings`).
+    let heartbeat = hub.heartbeat_timings();
+    let mut ping_timer = tokio::time::interval(heartbeat.ping_interval);
     ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ping_timer.tick().await;
     let mut last_pong = Instant::now();
@@ -1150,7 +1148,7 @@ async fn handle_socket(
                 }
             }
             _ = ping_timer.tick() => {
-                if last_pong.elapsed() > PONG_TIMEOUT {
+                if last_pong.elapsed() > heartbeat.pong_timeout {
                     info!("ws timeout: no pong for {:?}", last_pong.elapsed());
                     let _ = sink.send(close_frame(
                         close_codes::INTERNAL,
@@ -2690,6 +2688,129 @@ bind = "127.0.0.1"
         let json: serde_json::Value = serde_json::from_slice(&env.payload[1..]).unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["code"], "ERR_BACKEND");
+    }
+
+    /// ADR-0021 D6 — abrupt close timeout fires Close(1011) and emits the
+    /// connection's cookie on the disconnect sink (so the http-api layer
+    /// auto-releases the session lock). Uses [`Hub::set_heartbeat_timings`]
+    /// to shrink the 15s/30s production cadence into milliseconds.
+    #[tokio::test]
+    async fn heartbeat_timeout_closes_1011_and_emits_disconnect() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let cfg = test_config();
+        let backend = PtyBackend::new();
+        let hub = Hub::new(backend);
+        // 50ms ping / 150ms pong-timeout — enough margin for the server to
+        // tick twice before the close path fires.
+        hub.set_heartbeat_timings(crate::hub::HeartbeatTimings {
+            ping_interval: std::time::Duration::from_millis(50),
+            pong_timeout: std::time::Duration::from_millis(150),
+        });
+        // Observe the disconnect path — the WS handler emits the cookie
+        // value onto this sink when the socket closes (including timeout).
+        let (disc_tx, mut disc_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        hub.set_disconnect_sink(disc_tx);
+
+        let app = router(&cfg, &token, hub.clone());
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cookie = "test-cookie-hbeat";
+        // Connect, then deliberately stop polling so tokio_tungstenite's
+        // auto-pong (which only fires inside `poll_next`) never sends a
+        // Pong. The server's `last_pong.elapsed() > pong_timeout` branch
+        // closes the socket once the third ping tick lands.
+        let mut ws = connect_authed_with_cookie(addr, &token, cookie).await;
+
+        // Sleep well past `pong_timeout` so the server has fired its close
+        // path. 400ms vs 150ms timeout leaves slack for CI jitter.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // Now drain frames until we see the server-initiated Close. The
+        // catch-up replay may have left binary frames in the buffer; skip
+        // them. Pings/pongs that arrive late are still possible.
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        let close_code = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+                Ok(Some(Ok(TM::Close(Some(cf))))) => break Some(cf.code),
+                Ok(Some(Ok(TM::Close(None)))) => break None,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break None,
+                Err(_) => panic!("timed out waiting for server-initiated Close after heartbeat timeout"),
+            }
+        };
+        // tungstenite maps the canonical 1011 (Internal) to `CloseCode::Error`.
+        assert_eq!(
+            close_code,
+            Some(CloseCode::Error),
+            "expected Close(1011 / CloseCode::Error) on heartbeat timeout"
+        );
+
+        // The handle_socket return path also fires `disconnect_sink` with
+        // the cookie value, which is how `release_lock_for_cookie` runs
+        // in production.
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(2), disc_rx.recv())
+                .await
+                .expect("disconnect emission within 2s")
+                .expect("disc channel still open");
+        assert_eq!(received, cookie);
+    }
+
+    /// ADR-0021 D6.2 — a live PONG reply keeps the connection alive and
+    /// fires the heartbeat sink (which the http-api layer wires to
+    /// `refresh_lease_for_cookie`). Pairs with the timeout test above to
+    /// cover both arms of the heartbeat state machine.
+    #[tokio::test]
+    async fn heartbeat_pong_reply_emits_heartbeat_sink() {
+        let token = gtmux_auth::issue_token().unwrap();
+        let cfg = test_config();
+        let backend = PtyBackend::new();
+        let hub = Hub::new(backend);
+        // Same shrunk cadence; the timeout is long enough that the polling
+        // loop below can auto-pong before it elapses.
+        hub.set_heartbeat_timings(crate::hub::HeartbeatTimings {
+            ping_interval: std::time::Duration::from_millis(40),
+            pong_timeout: std::time::Duration::from_millis(500),
+        });
+        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        hub.set_heartbeat_sink(hb_tx);
+
+        let app = router(&cfg, &token, hub.clone());
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let cookie = "test-cookie-pong";
+        let ws = connect_authed_with_cookie(addr, &token, cookie).await;
+        // tokio_tungstenite's auto-Pong fires inside `poll_next`, so we
+        // need a continuous poll to drive it. Spawn a tiny pump that
+        // discards every frame (including Pings, which the stream handles
+        // internally before yielding them) and lives for the test span.
+        let (_ws_sink, mut ws_stream) = ws.split();
+        let _ws_pump = tokio::spawn(async move {
+            while ws_stream.next().await.is_some() {
+                // drain & let the auto-Pong path run
+            }
+        });
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            hb_rx.recv(),
+        )
+        .await
+        .expect("heartbeat sink emission within 2s")
+        .expect("hb channel still open");
+        assert_eq!(received, cookie);
     }
 
     async fn expect_binary(

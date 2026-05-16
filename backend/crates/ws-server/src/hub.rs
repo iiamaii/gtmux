@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -260,6 +261,25 @@ pub struct ManipulationEvent {
     pub payload: Bytes,
 }
 
+/// Per-connection heartbeat timings (ADR-0021 D6). Production defaults are
+/// 15s ping / 30s pong timeout. Snapshotted once per WS upgrade so a runtime
+/// override (via [`Hub::set_heartbeat_timings`]) only affects subsequent
+/// connections — mirrors the disconnect/heartbeat sink snapshot pattern.
+#[derive(Clone, Copy, Debug)]
+pub struct HeartbeatTimings {
+    pub ping_interval: Duration,
+    pub pong_timeout: Duration,
+}
+
+impl Default for HeartbeatTimings {
+    fn default() -> Self {
+        Self {
+            ping_interval: Duration::from_secs(15),
+            pong_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// `Hub` is cheap to clone — internal state is `Arc<…>` + broadcast senders.
 #[derive(Clone)]
 pub struct Hub {
@@ -291,6 +311,11 @@ pub struct Hub {
     /// field — keeping the modal expiry hint accurate without blocking the
     /// OS-flock truth.
     heartbeat_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    /// Heartbeat timings (ADR-0021 D6). Defaults to 15s ping / 30s pong
+    /// timeout. Tests override via [`set_heartbeat_timings`] to shrink the
+    /// timeout path. Snapshotted at WS upgrade time so a runtime change only
+    /// affects subsequent connections.
+    heartbeat_timings: Arc<std::sync::RwLock<HeartbeatTimings>>,
     /// Cookie → session_name registry (Stage 5-A / ADR-0021 D5). The
     /// http-api `attach_handler` writes here after a successful flock + cookie
     /// reverse-map insert; `detach_handler` (and the WS-disconnect-driven
@@ -404,6 +429,7 @@ impl Hub {
             _mux_task: Arc::new(mux_task),
             disconnect_tx: Arc::new(std::sync::Mutex::new(None)),
             heartbeat_tx: Arc::new(std::sync::Mutex::new(None)),
+            heartbeat_timings: Arc::new(std::sync::RwLock::new(HeartbeatTimings::default())),
             session_table: Arc::new(std::sync::RwLock::new(HashMap::new())),
             terminal_died_events,
             terminal_list_change_events,
@@ -450,6 +476,26 @@ impl Hub {
     /// the cloning rationale.
     pub fn heartbeat_sink(&self) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
         self.heartbeat_tx.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// Override the per-connection heartbeat timings (ADR-0021 D6). Production
+    /// callers leave the defaults (15s ping / 30s pong timeout); test code
+    /// shrinks them so the timeout path is exercised in milliseconds. The
+    /// snapshot taken in [`heartbeat_timings`] is per-WS-upgrade, so an
+    /// override after a connection is live does not retro-apply.
+    pub fn set_heartbeat_timings(&self, timings: HeartbeatTimings) {
+        if let Ok(mut slot) = self.heartbeat_timings.write() {
+            *slot = timings;
+        }
+    }
+
+    /// Snapshot of the active heartbeat timings. See [`disconnect_sink`] for
+    /// the cloning rationale — `handle_socket` calls this once at upgrade.
+    pub fn heartbeat_timings(&self) -> HeartbeatTimings {
+        self.heartbeat_timings
+            .read()
+            .map(|s| *s)
+            .unwrap_or_default()
     }
 
     /// Record that `cookie` is currently attached to `session_name`
