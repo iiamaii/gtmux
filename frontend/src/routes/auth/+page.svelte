@@ -21,14 +21,13 @@
   import { themeStore } from '$lib/stores/theme.svelte';
   import { login } from '$lib/http/auth';
 
-  // ⚠️ 본 SPA 페이지는 BE 의 server-rendered `/auth` (auth.rs:408) 에 의해
-  // shadowed 되어 일반 흐름에서는 도달하지 않는다 (BE 가 JS bundle 무관하게
-  // auth 게이트를 책임지는 의도, auth.rs:405). main.ts 의 path dispatch 에서도
-  // /auth 분기를 제거했다. 본 파일은 *별 path* (예: 디자인 preview) 로
-  // 마운트될 때 사용. 디자인 ref/frontend-design/auth.html 의 fancy 버전.
+  // ADR-0020 D13 — 본 컴포넌트가 `/auth` page 의 *단일 source*. BE 는
+  // SPA fallback (index.html) 만 응답 — main.ts 의 pickPage 가 `/auth` →
+  // AuthPage mount. `/auth-preview` 는 디자인 demo alias (동일 컴포넌트).
+  // 시안 ref/frontend-design/auth.html — 동일 디자인 + 실제 login 동작.
   //
   // Mode 는 *서버 config.auth.mode* 가 결정 — 클라이언트가 선택하지 않는다.
-  // 본 페이지는 *demo / preview* 목적이라 두 mode 모두 보여주되, 실제 submit
+  // 두 mode UI 모두 노출 — 활성 모드의 credential 만 BE 에 보냄. 실제 submit
   // 은 활성 모드의 credential 만 BE 에 보낸다.
   type LocalMode = 'token' | 'password';
   let mode = $state<LocalMode>('token');
