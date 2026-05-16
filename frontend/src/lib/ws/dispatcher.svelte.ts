@@ -25,7 +25,9 @@
 
 import { connectionStore } from '$lib/stores/connection.svelte';
 import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
+import { heartbeatStore } from '$lib/ws/heartbeat.svelte';
 import { muxStore } from '$lib/stores/mux.svelte';
+import { reconnectGate } from '$lib/stores/reconnectGate.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { terminalPool } from '$lib/stores/terminalPool.svelte';
 import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
@@ -168,6 +170,9 @@ export function createDispatcher(opts: DispatcherOptions): WsClient {
 
 /** Frame fan-out — 단일 메인 스레드 entry. */
 export function dispatch(env: Envelope): void {
+  // Heartbeat: server liveness watchdog (ADR-0021 D6). 매 frame 의 수신
+  // timestamp 갱신 — Phase 2 의 stale detection 입력.
+  heartbeatStore.markFrame();
   switch (env.kind) {
     case FRAME_TYPE.PANE_OUT:
       return handlePaneOut(env.payload);
@@ -508,6 +513,9 @@ function handleFocusModeChanged(payload: Uint8Array): void {
 
 // ── ConnectionStore 어댑터 ─────────────────────────────────────────────────
 
+/** 직전 state — Phase 2 의 reconnecting → open 전이 감지용. */
+let prevWsState: ConnectionState = 'closed';
+
 function adaptStateChange(state: ConnectionState, attempt: number): void {
   connectionStore.setState(state);
   // setState 가 open 진입 시 attempt 를 0 으로 리셋하므로, 그 이후 라이프사이클에서만
@@ -515,6 +523,23 @@ function adaptStateChange(state: ConnectionState, attempt: number): void {
   if (state !== 'open') {
     connectionStore.attempt = attempt;
   }
+  // Phase 2 (plan-0008 §6) — WS 가 reconnect 후 open 진입 시 silent reattach
+  // 시도. server restart 등으로 cookie-side attach binding 이 사라졌을 가능성
+  // 대비. canMountApp 가드가 켜진 동안 (idle/success) 만 trigger — Phase 1
+  // 의 blocking modal 흐름과 충돌 방지.
+  if (prevWsState === 'reconnecting' && state === 'open') {
+    const active = sessionStore.active;
+    if (active !== null && reconnectGate.canMountApp) {
+      void sessionStore
+        .silentReattach(active.name)
+        .then((result) => {
+          if (result.kind !== 'success') {
+            console.debug('[gtmux] silent reattach failed', result);
+          }
+        });
+    }
+  }
+  prevWsState = state;
 }
 
 function adaptClose(code: number, reason: string): void {

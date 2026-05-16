@@ -225,6 +225,14 @@
     confirmOpen = false;
     const active = sessionStore.active;
     if (active === null) return;
+    const guard = await sessionStore.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message: 'Session reconnect failed — close aborted.',
+        tone: 'error',
+      });
+      return;
+    }
     closing = true;
     try {
       await deleteItem(active.name, data.id, killTerminal);

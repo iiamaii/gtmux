@@ -371,6 +371,73 @@ class SessionStore {
     }
     return { kind: 'success' };
   }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Silent reattach + mutation guard — plan-0008 Phase 2 (Case II)         */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Phase 2 — silent reattach in-flight 여부. visibilitychange / WS reconnect
+   * 등의 trigger 가 호출. mutation guard 가 본 promise 를 await.
+   */
+  reattachInProgress = $state<boolean>(false);
+
+  /** Phase 2 의 마지막 silent reattach 결과 — failure 분기 입력. */
+  lastSilentReattachResult = $state<ReattachResult | null>(null);
+
+  /** Internal promise — 동시 호출 dedup. */
+  #silentReattachPromise: Promise<ReattachResult> | null = null;
+
+  /**
+   * Silent reattach utility — Phase 2 trigger 가 호출.
+   *
+   * 동시 호출은 동일 promise share (dedup). 결과는 `lastSilentReattachResult`
+   * 에 보관. 호출자가 결과에 따라:
+   *  - 'success': mutation 계속 진행.
+   *  - 'in_use'/'not_found'/'unauthorized'/'unreachable': caller 가 modal/toast.
+   */
+  silentReattach(name: string, signal?: AbortSignal): Promise<ReattachResult> {
+    if (this.#silentReattachPromise !== null) return this.#silentReattachPromise;
+    this.reattachInProgress = true;
+    const promise = (async (): Promise<ReattachResult> => {
+      try {
+        const result = await this.attemptReattach(name, signal);
+        this.lastSilentReattachResult = result;
+        return result;
+      } finally {
+        this.reattachInProgress = false;
+        this.#silentReattachPromise = null;
+      }
+    })();
+    this.#silentReattachPromise = promise;
+    return promise;
+  }
+
+  /**
+   * Mutation guard — outgoing write 진입점 (mutateLayout / deleteItem /
+   * attachConfirm 등) 의 *바로 직전* 에 await 하는 helper.
+   *
+   * 동작:
+   *  - reattach in-flight 면 끝날 때까지 await + result === success 면 통과.
+   *  - lastSilentReattachResult 가 fail 상태면 그 결과 그대로 반환 (caller
+   *    가 modal/toast 분기). caller 는 `await ... ; if (!ok) return;` 패턴.
+   *  - 아무 trigger 도 없었으면 ok 반환 (no-op).
+   *
+   * 호출 예:
+   *   const guard = await sessionStore.guardOutgoingMutation();
+   *   if (!guard.ok) return;
+   *   await mutateLayout(...);
+   */
+  async guardOutgoingMutation(): Promise<{ ok: boolean; result?: ReattachResult }> {
+    if (this.#silentReattachPromise !== null) {
+      const result = await this.#silentReattachPromise;
+      return { ok: result.kind === 'success', result };
+    }
+    if (this.lastSilentReattachResult !== null && this.lastSilentReattachResult.kind !== 'success') {
+      return { ok: false, result: this.lastSilentReattachResult };
+    }
+    return { ok: true };
+  }
 }
 
 /** Single session-scoped store instance. */

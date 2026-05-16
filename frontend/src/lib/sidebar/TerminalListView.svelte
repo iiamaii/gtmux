@@ -18,9 +18,11 @@
    * - 빈 pool → "No terminals" placeholder.
    * - Header 우측 fold 버튼 → chromeStore.toggleTerminals().
    *
-   * 후속 (BE Phase 4-C/D 후):
-   * - [Change terminal...] entry to panel context menu
-   * - Cross-session filter (0039 §3.2)
+   * Cross-session leak filter (0039 §3.2 step 4):
+   * - Default: 현 active session 에 attach 됐거나 unplaced (attach_count === 0)
+   *   인 것만 표시. 다른 session 에만 attach 된 것은 hide — 사용자가 의도치
+   *   않게 cross-session terminal 을 현 canvas 에 attach 하는 leak 차단.
+   * - Toggle [All]: server-wide pool 전체 노출 (debug / admin).
    */
 
   import { onMount } from 'svelte';
@@ -38,10 +40,29 @@
 
   let attaching = $state<Set<string>>(new Set());
   let killing = $state<Set<string>>(new Set());
+  let showAllSessions = $state<boolean>(false);
 
-  let terminals = $derived(terminalPool.terminals);
+  let allTerminals = $derived(terminalPool.terminals);
   let loading = $derived(terminalPool.loading);
   let errorMessage = $derived(terminalPool.errorMessage);
+
+  // Cross-session leak filter (0039 §3.2 step 4) — default 시 다른 session 에만
+  // attach 된 entry 를 hide. unplaced (attach_count === 0) 와 현 active session
+  // attach 는 모두 노출.
+  let terminals = $derived.by<TerminalInfo[]>(() => {
+    if (showAllSessions) return allTerminals;
+    const active = sessionStore.active;
+    if (active === null) return allTerminals;
+    return allTerminals.filter(
+      (t) =>
+        t.attach_count === 0 ||
+        t.attached_sessions.includes(active.name),
+    );
+  });
+
+  let hiddenCount = $derived(
+    showAllSessions ? 0 : Math.max(0, allTerminals.length - terminals.length),
+  );
 
   onMount(() => {
     return terminalPool.subscribe();
@@ -84,6 +105,14 @@
       toastStore.show({
         message: 'Terminal already on this canvas.',
         tone: 'info',
+      });
+      return;
+    }
+    const guard = await sessionStore.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message: 'Session reconnect failed — attach aborted.',
+        tone: 'error',
       });
       return;
     }
@@ -138,6 +167,14 @@
   async function killOne(t: TerminalInfo): Promise<void> {
     const uuid = t.id;
     if (killing.has(uuid)) return;
+    const guard = await sessionStore.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message: 'Session reconnect failed — kill aborted.',
+        tone: 'error',
+      });
+      return;
+    }
     killing.add(uuid);
     killing = new Set(killing);
     try {
@@ -175,7 +212,24 @@
     <span class="count-text">
       <span class="count-num">{terminals.length}</span>
       <span class="count-suffix">terminal{terminals.length === 1 ? '' : 's'}</span>
+      {#if hiddenCount > 0}
+        <span class="hidden-hint" title={`${hiddenCount} 개가 다른 session 에만 attach 됨 — [All] 토글로 노출`}>
+          (+{hiddenCount} hidden)
+        </span>
+      {/if}
     </span>
+    <button
+      type="button"
+      class="filter-toggle"
+      class:active={showAllSessions}
+      title={showAllSessions
+        ? 'Currently showing all sessions — click to filter to current session + unplaced'
+        : 'Currently filtered to current session + unplaced — click to show all'}
+      aria-pressed={showAllSessions}
+      onclick={() => (showAllSessions = !showAllSessions)}
+    >
+      {showAllSessions ? 'All' : 'Mine'}
+    </button>
   </div>
 
   <div class="terminals-body">
@@ -269,6 +323,7 @@
   .terminals-toolbar {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: var(--space-6);
     padding: var(--space-6) var(--space-12);
     border-bottom: 1px solid var(--color-border);
@@ -284,6 +339,39 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-4);
+  }
+
+  .hidden-hint {
+    color: var(--color-fg-subtle);
+    text-transform: lowercase;
+    letter-spacing: 0;
+    font-size: var(--text-sm);
+  }
+
+  .filter-toggle {
+    padding: 1px var(--space-6);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface);
+    color: var(--color-fg-muted);
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    cursor: pointer;
+    transition: background var(--motion-fast) var(--motion-easing);
+  }
+
+  .filter-toggle:hover {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
+  }
+
+  .filter-toggle.active {
+    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+    color: var(--color-accent);
+    border-color: color-mix(in srgb, var(--color-accent) 30%, transparent);
   }
 
   .count-num {

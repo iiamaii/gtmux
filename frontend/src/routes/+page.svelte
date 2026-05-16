@@ -26,7 +26,9 @@
   import ToolbarSubbar from '$lib/toolbar/ToolbarSubbar.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
   import Toast from '$lib/ui/Toast.svelte';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
   import { createDispatcher } from '$lib/ws/dispatcher.svelte';
+  import { heartbeatStore } from '$lib/ws/heartbeat.svelte';
   import { login } from '$lib/http/auth';
   import { bindZShortcuts } from '$lib/keyboard/zShortcuts.svelte';
   import { bindChromeShortcuts } from '$lib/keyboard/chromeShortcuts.svelte';
@@ -127,6 +129,53 @@
   let unbindZShortcuts: (() => void) | null = null;
   let unbindChromeShortcuts: (() => void) | null = null;
   let unbindSystemTheme: (() => void) | null = null;
+  let unbindVisibility: (() => void) | null = null;
+
+  /**
+   * Phase 2 (plan-0008 §6, Case II) — tab 이 background 에 있다가 다시 활성화
+   * 되거나 사용자가 idle 후 첫 입력 시 silent reattach 시도. 결과 fail 이면
+   * mutation guard 가 차후 mutation 진입 차단 + ReconnectModal 노출.
+   *
+   * Trigger 조건:
+   *   - document.visibilityState === 'visible' 로 전환
+   *   - heartbeat 의 isIdle (15s+ user idle) 가 true
+   *   - reconnectGate.canMountApp (idle/success) 진행 중
+   *   - sessionStore.active 가 있고 already in-flight 아니면
+   */
+  function maybeSilentReattach(): void {
+    if (typeof document === 'undefined') return;
+    if (document.visibilityState !== 'visible') return;
+    if (!reconnectGate.canMountApp) return;
+    const active = sessionStore.active;
+    if (active === null) return;
+    if (sessionStore.reattachInProgress) return;
+    // 사용자가 활성 / 막 입력했으면 굳이 reattach 안 해도 됨 (server frame 이
+    // 곧 흐를 가능성). isIdle 일 때만 — Phase 2 의 Case II 정의.
+    if (!heartbeatStore.isIdle) return;
+    void sessionStore.silentReattach(active.name).then((result) => {
+      if (result.kind === 'success') {
+        heartbeatStore.reset();
+        return;
+      }
+      // Phase 2 fail — toast 로 silent 안내 + 사용자 명시 분기 (ReconnectModal
+      // 까지는 escalation 안 함, Case II 의 무거운 modal 회피).
+      if (result.kind === 'unauthorized') {
+        window.location.href = '/auth';
+        return;
+      }
+      const message =
+        result.kind === 'in_use'
+          ? `Session "${active.name}" is in use by another webpage.`
+          : result.kind === 'not_found'
+            ? `Session "${active.name}" no longer exists on the server.`
+            : `Reconnect failed: ${result.message}`;
+      toastStore.show({
+        message,
+        tone: result.kind === 'unreachable' ? 'warning' : 'error',
+        durationMs: 8_000,
+      });
+    });
+  }
 
   onMount(() => {
     // Theme — re-apply on mount so the in-memory state and <html class>
@@ -138,6 +187,16 @@
     // OS preference listener — keeps `system` mode in sync when the OS
     // flips between light/dark while the app is open.
     unbindSystemTheme = themeStore.bindSystemListener();
+    // WS heartbeat watchdog (ADR-0021 D6) — activity / frame timestamp 추적.
+    // Phase 2 silent reattach 와 stale detection 의 입력.
+    heartbeatStore.start();
+
+    // Phase 2 (plan-0008 §6) — visibility transition listener.
+    const onVisibility = () => maybeSilentReattach();
+    document.addEventListener('visibilitychange', onVisibility);
+    unbindVisibility = () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
 
     // Z-index keyboard shortcuts ([/]/⇧[/⇧]). M.size === 1 일 때만, editable
     // focus 제외. ADR-0024 D2 + 0033 §8.2. Routed through shortcutRegistry.
@@ -217,6 +276,11 @@
   });
 
   onDestroy(() => {
+    heartbeatStore.stop();
+    if (unbindVisibility !== null) {
+      unbindVisibility();
+      unbindVisibility = null;
+    }
     const client = wsClientHolder.current;
     if (client) {
       client.stop();

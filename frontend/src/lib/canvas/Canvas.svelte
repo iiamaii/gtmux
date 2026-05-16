@@ -141,6 +141,14 @@
   async function deleteSelected(): Promise<void> {
     const active = sessionStore.active;
     if (active === null) return;
+    const guard = await sessionStore.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message: 'Session reconnect failed — delete aborted.',
+        tone: 'error',
+      });
+      return;
+    }
     const ids = Array.from(sessionStore.M);
     if (ids.length === 0) return;
     let ok = 0;
@@ -560,6 +568,14 @@
   async function spawnMultiSessionTerminal(coords: { x: number; y: number }): Promise<void> {
     const active = sessionStore.active;
     if (active === null) return;
+    const guard = await sessionStore.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message: 'Session reconnect failed — terminal spawn aborted. Use Switch session…',
+        tone: 'error',
+      });
+      return;
+    }
     const name = active.name;
     const fresh = createTerminalItem(coords);
     try {
