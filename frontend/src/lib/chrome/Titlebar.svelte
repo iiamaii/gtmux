@@ -14,6 +14,7 @@
   import SessionMenu from './SessionMenu.svelte';
   import ThemeToggle from '$lib/ui/ThemeToggle.svelte';
   import FocusToggle from './FocusToggle.svelte';
+  import brandLogoUrl from '$lib/assets/brand-G.png';
 
   const TOKEN_STORAGE_KEY = 'gtmux_token';
   const SESSION_STORAGE_KEY = 'gtmux_session';
@@ -51,7 +52,7 @@
   <div class="titlebar-left">
     <SessionMenu {sessionName} />
     <div class="brand" aria-label="gtmux">
-      <div class="brand-mark" aria-hidden="true"></div>
+      <img class="brand-mark" src={brandLogoUrl} alt="" aria-hidden="true" />
       <span class="brand-name">gtmux</span>
     </div>
   </div>
@@ -121,12 +122,12 @@
   }
 
   .brand-mark {
-    width: 20px;
-    height: 20px;
+    width: 22px;
+    height: 22px;
     border-radius: var(--radius-md);
-    background: conic-gradient(from 220deg, #0acf83, #a259ff, #f24e1e, #ff7262, #1abcfe, #0acf83);
-    box-shadow: var(--shadow-sm);
+    object-fit: cover;
     flex-shrink: 0;
+    display: block;
   }
 
   .brand-name {

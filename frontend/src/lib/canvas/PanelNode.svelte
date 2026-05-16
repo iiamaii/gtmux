@@ -87,7 +87,10 @@
   } = $props();
 
   const isVisible = $derived(data.visibility !== false);
-  const isStreaming = $derived(isVisible && data.minimized !== true);
+  // maximized in modal — MaximizedPanelModal 이 XtermHost 를 호스트하므로 in-flow
+  // PanelNode 는 마운트하지 않음 (동일 paneId 의 xterm 가 둘 동시 mount 금지).
+  const isMaximizedInModal = $derived(sessionStore.maximizedItemId === data.id);
+  const isStreaming = $derived(isVisible && data.minimized !== true && !isMaximizedInModal);
   // Label source priority (Task 2 fix):
   //   1) terminalPool 의 terminal_meta label (server-wide, PATCH /api/terminals 의
   //      single source of truth — ADR-0021 D7 + terminals.rs:46-48). 빈 문자열은
@@ -337,58 +340,13 @@
     }
   }
 
-  async function onMaximizeClick(e: MouseEvent): Promise<void> {
+  function onMaximizeClick(e: MouseEvent): void {
     e.stopPropagation();
     e.preventDefault();
-    const active = sessionStore.active;
-    if (active === null) return;
-    const cur = sessionStore.items.get(data.id);
-    if (cur === undefined) return;
-    if (!(await ensureMutationOk('Maximize aborted — session reconnect failed.'))) return;
-    const wasMaximized = sessionStore.maximizedItemId === data.id;
-    let nextGeom: { x: number; y: number; w: number; h: number } = {
-      x: cur.x, y: cur.y, w: cur.w, h: cur.h,
-    };
-    if (!wasMaximized) {
-      // → maximize: 옛 geom backup + viewport visible extent 로 set
-      sessionStore.backupItemGeom(data.id, { x: cur.x, y: cur.y, w: cur.w, h: cur.h });
-      const canvas = document.querySelector('.canvas-root') as HTMLElement | null;
-      const vw = canvas?.clientWidth ?? window.innerWidth;
-      const vh = canvas?.clientHeight ?? window.innerHeight;
-      const vp = sessionStore.viewport;
-      // flow-coord = (screen - viewport offset) / zoom. visible extent 의 top-left
-      // 는 (-vp.x / vp.zoom, -vp.y / vp.zoom), w/h 는 (vw/zoom, vh/zoom).
-      nextGeom = {
-        x: -vp.x / vp.zoom,
-        y: -vp.y / vp.zoom,
-        w: vw / vp.zoom,
-        h: vh / vp.zoom,
-      };
-    } else {
-      // → restore: 백업 복원 (없으면 현 geom 그대로 — fallback safety)
-      const backup = sessionStore.getRestoredGeom(data.id);
-      if (backup !== null) nextGeom = backup;
-      sessionStore.clearRestoredGeom(data.id);
-    }
+    // Maximize 는 modal overlay (MaximizedPanelModal) 로 처리 — schema 의 geom
+    // 변경 없음. sessionStore.maximizedItemId 토글 만으로 modal 가시성 결정.
+    // Canvas.svelte 가 maximizedItemId 를 watch 해 modal 렌더링 + pan/zoom 잠금.
     sessionStore.toggleMaximize(data.id);
-    try {
-      const { layout } = await mutateLayout(active.name, (cur2) => ({
-        ...cur2,
-        items: cur2.items.map((it) =>
-          it.id === data.id ? ({ ...it, ...nextGeom } as typeof it) : it,
-        ),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Maximize failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
   }
 </script>
 

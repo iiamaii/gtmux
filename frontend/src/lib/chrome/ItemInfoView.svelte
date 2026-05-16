@@ -100,6 +100,24 @@
     return fallback;
   }
 
+  /**
+   * Note 의 `title` 은 의미상 Common label 과 동일 — Inspector 의 label field 가
+   * note 의 title 을 read/write 한다. mixed 판정도 type-별 source 를 정규화 후 비교.
+   */
+  function noteAwareLabel(it: CanvasItem): string {
+    return it.type === 'note' ? it.title : (it.label ?? '');
+  }
+  function commonNoteAwareLabel(): string | 'Mixed' | null {
+    if (selectedItems.length === 0) return null;
+    const first = selectedItems[0];
+    if (first === undefined) return null;
+    const firstVal = noteAwareLabel(first);
+    for (const it of selectedItems) {
+      if (noteAwareLabel(it) !== firstVal) return 'Mixed';
+    }
+    return firstVal;
+  }
+
   const selectedPanel = $derived.by((): Record<string, unknown> | null => {
     if (selectedPanelId === null) return null;
     const it = sessionStore.items.get(selectedPanelId);
@@ -214,10 +232,13 @@
   }
 
   async function applyCommonLabel(next: string): Promise<void> {
-    await broadcastMutation('Edit aborted — session reconnect failed.', (it) => ({
-      ...it,
-      label: next,
-    }));
+    // Note 는 title 이 label 의미 — type-aware broadcast (ADR-0027 D1/D6 변형).
+    await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
+      if (it.type === 'note') {
+        return { ...it, title: next } as CanvasItem;
+      }
+      return { ...it, label: next } as CanvasItem;
+    });
   }
 
   async function applyCommonBool(key: CommonBoolKey, next: boolean): Promise<void> {
@@ -226,8 +247,49 @@
         const v: Visibility = next ? 'visible' : 'hidden';
         return { ...it, visibility: v } as CanvasItem;
       }
+      if (key === 'minimized') {
+        return applyMinimizeGeom(it, next);
+      }
       return { ...it, [key]: next } as CanvasItem;
     });
+  }
+
+  // PanelNode / NoteNode 의 onMinimizeClick 와 동일 패턴 — schema geom 변경 +
+  // sessionStore.restoredItemGeoms 백업. 둘 다 같은 backup map 을 공유하므로
+  // node-side button 과 inspector button 어느 쪽에서 토글해도 일관.
+  // - terminal / note: h = 32 (header-strip), w 유지
+  // 그 외 type (rect/ellipse/line/text/free_draw/file_path/image/document) 은
+  // minimize 시각 정의 없음 — inspector 의 minimize 버튼이 selectedTypes 에
+  // terminal/note 가 하나도 없으면 hide. (selectionSupportsMinimize)
+  function applyMinimizeGeom(it: CanvasItem, next: boolean): CanvasItem {
+    if (it.minimized === next) return it;
+    if (it.type !== 'terminal' && it.type !== 'note') {
+      return { ...it, minimized: next } as CanvasItem;
+    }
+    const NOTE_RESTORE_H = 96;
+    const PANEL_RESTORE_H = 220;
+    const MIN_STRIP_H = 32;
+    if (next === true) {
+      sessionStore.backupItemGeom(it.id, { x: it.x, y: it.y, w: it.w, h: it.h });
+      return { ...it, minimized: true, h: MIN_STRIP_H } as CanvasItem;
+    }
+    const backup = sessionStore.getRestoredGeom(it.id);
+    sessionStore.clearRestoredGeom(it.id);
+    const defaultH = it.type === 'note' ? NOTE_RESTORE_H : PANEL_RESTORE_H;
+    const h = backup?.h ?? defaultH;
+    return { ...it, minimized: false, h } as CanvasItem;
+  }
+
+  // selectedItems 중 minimize 지원 (terminal / note) 가 하나라도 있는지.
+  // figure 만 선택된 경우 inspector 의 minimize 버튼 숨김.
+  const selectionSupportsMinimize = $derived.by(() =>
+    selectedItems.some((it) => it.type === 'terminal' || it.type === 'note'),
+  );
+
+  function focusFirstSelected(): void {
+    const id = selectedIds[0];
+    if (id === undefined) return;
+    sessionStore.zoomToItem(id);
   }
 
   async function applyLineEndpoint(field: 'x2' | 'y2', value: number): Promise<void> {
@@ -455,10 +517,10 @@
           <InspectorField
             k="label"
             value={(() => {
-              const v = commonField('label');
+              const v = commonNoteAwareLabel();
               return typeof v === 'string' ? v : '';
             })()}
-            mixed={commonField('label') === 'Mixed'}
+            mixed={commonNoteAwareLabel() === 'Mixed'}
             placeholder="—"
             ariaLabel="Label"
             oncommit={(next) => void applyCommonLabel(next)}
@@ -614,6 +676,7 @@
                 <span class="k">stroke</span>
                 <ColorPicker
                   value={sessionItem.stroke}
+                  allowTransparent={true}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
                 />
               </div>
@@ -623,6 +686,7 @@
                 <span class="k">fill</span>
                 <ColorPicker
                   value={sessionItem.fill}
+                  allowTransparent={true}
                   oncommit={(hex) => void applyShapeColor('fill', hex)}
                 />
               </div>
@@ -652,6 +716,7 @@
                 <span class="k">stroke</span>
                 <ColorPicker
                   value={line.stroke}
+                  allowTransparent={true}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
                 />
               </div>
@@ -772,12 +837,6 @@
             </div>
           {:else if sessionItem.type === 'note'}
             <div class="prop-row full">
-              <div class="display-row">
-                <span class="k">title</span>
-                <span class="display-val">{strOr(sessionItem.title, 'Untitled')}</span>
-              </div>
-            </div>
-            <div class="prop-row full">
               <div class="display-row picker">
                 <span class="k">color</span>
                 <ColorPicker
@@ -854,28 +913,45 @@
             {#if lockedState === null}<span class="dash" aria-hidden="true"></span>{/if}
           </button>
 
+          {#if selectionSupportsMinimize}
+            <button
+              type="button"
+              class="state-btn"
+              class:active={minimizedState === true}
+              class:mixed={minimizedState === null}
+              aria-pressed={minimizedState === true}
+              aria-label={minimizedState === true ? 'Restore' : 'Minimize'}
+              title={minimizedState === null ? 'Minimized · Mixed' : minimizedState ? 'Minimized (click to restore)' : 'Visible (click to minimize)'}
+              onclick={() => void applyCommonBool('minimized', !(minimizedState ?? false))}
+            >
+              {#if minimizedState === true}
+                <!-- restore -->
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="4" y="4" width="16" height="16" rx="1.5"/>
+                </svg>
+              {:else}
+                <!-- minimize (underscore) -->
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <line x1="5" y1="18" x2="19" y2="18"/>
+                </svg>
+              {/if}
+              {#if minimizedState === null}<span class="dash" aria-hidden="true"></span>{/if}
+            </button>
+          {/if}
+
           <button
             type="button"
-            class="state-btn"
-            class:active={minimizedState === true}
-            class:mixed={minimizedState === null}
-            aria-pressed={minimizedState === true}
-            aria-label={minimizedState === true ? 'Restore' : 'Minimize'}
-            title={minimizedState === null ? 'Minimized · Mixed' : minimizedState ? 'Minimized (click to restore)' : 'Visible (click to minimize)'}
-            onclick={() => void applyCommonBool('minimized', !(minimizedState ?? false))}
+            class="state-btn action-only"
+            aria-label="Focus item"
+            title={selectionCount > 1 ? 'Focus first selected — zoom viewport' : 'Focus — zoom viewport to item'}
+            disabled={selectionCount === 0}
+            onclick={focusFirstSelected}
           >
-            {#if minimizedState === true}
-              <!-- restore -->
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="4" width="16" height="16" rx="1.5"/>
-              </svg>
-            {:else}
-              <!-- minimize (underscore) -->
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <line x1="5" y1="18" x2="19" y2="18"/>
-              </svg>
-            {/if}
-            {#if minimizedState === null}<span class="dash" aria-hidden="true"></span>{/if}
+            <!-- target / focus reticle (LayerTreeView 의 focus icon 정합) -->
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" />
+              <circle cx="12" cy="12" r="3" fill="currentColor" />
+            </svg>
           </button>
         </div>
         {#if selectionCount === 1 && isSelectedTerminal}
@@ -1215,6 +1291,16 @@
   .state-btn:focus-visible {
     outline: 2px dashed var(--color-accent);
     outline-offset: 1px;
+  }
+
+  /* action-only: focus 같은 trigger 버튼 — toggle state 없음. disabled 시 dim. */
+  .state-btn.action-only:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+  .state-btn.action-only:disabled:hover {
+    background: transparent;
+    color: var(--color-fg-subtle);
   }
 
   /* Mixed: dash overlay across the icon (indeterminate marker — ADR-0027 D3). */

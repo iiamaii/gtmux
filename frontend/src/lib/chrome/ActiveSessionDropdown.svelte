@@ -26,9 +26,18 @@
   const { onSwitch }: Props = $props();
 
   let active = $derived(sessionStore.active);
-  let poolSize = $derived(terminalPool.terminals.length);
+  // Badge — 활성 session 의 canvas 에 attach 된 terminal 수 (server-wide pool size 아님).
+  // sessionStore.items 중 type==='terminal' 카운트 = 현 canvas 의 terminal panel 수.
+  let sessionTerminalCount = $derived.by(() => {
+    if (active === null) return 0;
+    let n = 0;
+    for (const item of sessionStore.items.values()) {
+      if (item.type === 'terminal') n += 1;
+    }
+    return n;
+  });
 
-  // Pool 폴링 구독 — 본 컴포넌트가 mount 되어 있는 동안 유지.
+  // Pool 폴링 구독 유지 — TerminalListView 등 다른 consumer 가 폴링 상태 의존.
   onMount(() => terminalPool.subscribe());
 </script>
 
@@ -46,9 +55,9 @@
       <em>No session</em>
     {/if}
   </span>
-  {#if poolSize > 0}
-    <span class="pool-badge" title="{poolSize} terminal(s) in server pool">
-      {poolSize}
+  {#if sessionTerminalCount > 0}
+    <span class="pool-badge" title="{sessionTerminalCount} terminal(s) in this session">
+      {sessionTerminalCount}
     </span>
   {/if}
 </button>

@@ -57,10 +57,10 @@
   let bodyEditing = $state(false);
   type ResizeParams = { x: number; y: number; width: number; height: number };
 
-  // Minimize: schema-driven geom (w=h=32, minimized=true) + in-memory backup.
-  // PanelNode 와 동일 패턴 — `sessionStore.restoredItemGeoms` 사용.
-  const MIN_CHIP = 32;
-  const RESTORE_DEFAULT_W = 240;
+  // Minimize: schema-driven geom (h=32 strip, w 유지, minimized=true) + in-memory
+  // backup. PanelNode 와 동일 패턴 — `sessionStore.restoredItemGeoms` 사용.
+  // header-strip 모드 — 시안의 Panel header 와 동일하게 head 만 표시.
+  const MIN_STRIP_H = 32;
   const RESTORE_DEFAULT_H = 96;
 
   function onTitleDblClick(e: MouseEvent): void {
@@ -148,15 +148,12 @@
     if (!(await ensureMutationOk('Minimize aborted — session reconnect failed.'))) return;
     const wasMinimized = cur.minimized === true;
     const next = !wasMinimized;
-    let nextW = cur.w;
     let nextH = cur.h;
     if (next === true) {
       sessionStore.backupItemGeom(data.id, { x: cur.x, y: cur.y, w: cur.w, h: cur.h });
-      nextW = MIN_CHIP;
-      nextH = MIN_CHIP;
+      nextH = MIN_STRIP_H;
     } else {
       const backup = sessionStore.getRestoredGeom(data.id);
-      nextW = backup !== null ? backup.w : RESTORE_DEFAULT_W;
       nextH = backup !== null ? backup.h : RESTORE_DEFAULT_H;
       sessionStore.clearRestoredGeom(data.id);
     }
@@ -165,7 +162,7 @@
         ...cur2,
         items: cur2.items.map((it) =>
           it.id === data.id
-            ? ({ ...it, minimized: next, w: nextW, h: nextH } as typeof it)
+            ? ({ ...it, minimized: next, h: nextH } as typeof it)
             : it,
         ),
       }));
@@ -239,13 +236,21 @@
         <button
           type="button"
           class="note-btn"
-          title="Minimize"
-          aria-label="Minimize"
+          title={isMinimized ? 'Restore' : 'Minimize'}
+          aria-label={isMinimized ? 'Restore' : 'Minimize'}
           onclick={(e) => void onMinimizeClick(e)}
         >
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true">
-            <path d="M2.5 7h5"/>
-          </svg>
+          {#if isMinimized}
+            <!-- restore (small square) -->
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="2" width="6" height="6" rx="0.6"/>
+            </svg>
+          {:else}
+            <!-- minimize (underscore) -->
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true">
+              <path d="M2.5 7h5"/>
+            </svg>
+          {/if}
         </button>
       {/if}
     </div>
@@ -267,11 +272,6 @@
         <pre class="note-body">{data.body}</pre>
       {/if}
     </div>
-
-    <svg class="note-chip" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-      <path d="M2 3h10v6.4H7L4.5 12V9.4H2z"/>
-      <path d="M4.4 6h5.2"/>
-    </svg>
   </div>
 {/if}
 
@@ -371,27 +371,25 @@
     user-select: none;
   }
 
-  .note-chip {
-    display: none;
-    width: 14px; height: 14px;
-    color: var(--color-fg);
-  }
-
-  /* Minimized — rounded square icon button.
-     Wrapper is set to 32×32 via schema (w=h=32). Head + body hidden, chip glyph centered. */
+  /* Minimized — header-strip 모드. Wrapper h=32 (schema), w 유지.
+     Panel header 시안 정합 — head row 만 표시, body 숨김. 전체 strip 클릭으로 restore. */
   .note-node.is-min {
     grid-template-rows: 1fr;
-    padding: 0;
-    place-items: center;
+    padding: 0 6px 0 12px;
+    align-items: center;
     cursor: pointer;
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-sm);
   }
-  .note-node.is-min .note-head,
   .note-node.is-min .note-body-wrap { display: none; }
-  .note-node.is-min .note-chip { display: block; }
+  .note-node.is-min .note-head {
+    height: 100%;
+  }
+  /* minimized state 에서는 .note-btn 의 hover-only opacity 동작 무시 — 항상 보임,
+     restore 아이콘 으로 시각 변환. */
+  .note-node.is-min .note-btn {
+    opacity: 1;
+  }
   .note-node.is-min:hover {
-    background: var(--color-surface-2);
+    background: color-mix(in srgb, var(--note-accent, var(--color-accent)) 4%, var(--color-surface));
   }
   .note-node.is-min:focus-visible {
     outline: 1px dashed var(--color-accent);

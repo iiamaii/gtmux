@@ -20,6 +20,7 @@
   import { onMount, untrack } from 'svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
   import { login } from '$lib/http/auth';
+  import brandLogoUrl from '$lib/assets/brand-G.png';
 
   // ADR-0020 D13 — 본 컴포넌트가 `/auth` page 의 *단일 source*. BE 는
   // SPA fallback (index.html) 만 응답 — main.ts 의 pickPage 가 `/auth` →
@@ -146,7 +147,7 @@
 
 <header class="topbar">
   <div class="brand">
-    <div class="brand-mark" aria-hidden="true"></div>
+    <img class="brand-mark" src={brandLogoUrl} alt="" aria-hidden="true" />
     <span>gtmux</span>
   </div>
   <div class="topbar-actions">
@@ -309,8 +310,8 @@
     width: 22px;
     height: 22px;
     border-radius: var(--radius-md);
-    background: conic-gradient(from 220deg, #0acf83, #a259ff, #f24e1e, #ff7262, #1abcfe, #0acf83);
-    box-shadow: var(--shadow-sm);
+    object-fit: cover;
+    display: block;
   }
 
   .topbar-actions {

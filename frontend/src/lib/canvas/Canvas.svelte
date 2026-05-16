@@ -31,6 +31,7 @@
   import FilePathNode from './FilePathNode.svelte';
   import ShapeNode from './ShapeNode.svelte';
   import LineNode from './LineNode.svelte';
+  import MaximizedPanelModal from './MaximizedPanelModal.svelte';
   import {
     commitNewItem,
     createCanvasItem,
@@ -230,6 +231,11 @@
    * (G29) *or* when Hand tool is active (Figma convention: H = pan mode).
    */
   const isHandTool = $derived(toolStore.current === 'hand');
+  // Select mode 만 SvelteFlow 의 selection/drag 활성 — 다른 mode (hand / 도구) 는
+  // 캔버스 위 component 선택 금지. (사용자 요구: 입력 중 클릭 시 selection 회귀)
+  const isSelectMode = $derived(toolStore.current === 'select');
+  // Maximize 동안 viewport pan/zoom 잠금 — panel 이 100% scale 로 캔버스 전면 유지.
+  const isMaximizedActive = $derived(sessionStore.maximizedItemId !== null);
   const panOnDragMask = $derived(
     isSpacePressed || isHandTool ? [0, 1, 2] : [1, 2],
   );
@@ -718,8 +724,8 @@
   //   plain    : single (clear + add)
   //   meta/ctrl/shift : toggle in/out
   function onnodeclick({ node, event }: { node: Node; event: MouseEvent | TouchEvent }) {
-    // Hand tool — exploration mode, clicks do not mutate selection (Figma).
-    if (isHandTool) return;
+    // Select mode 만 selection 허용 — hand / 도구 mode 는 click no-op (Figma).
+    if (!isSelectMode) return;
     const id = node.id;
     const isModifierClick =
       event instanceof MouseEvent &&
@@ -935,7 +941,9 @@
    * click 의 toggleM 도 그 후 store 와 internal 이 동기적.
    */
   function onselectionchange({ nodes }: { nodes: Node[]; edges: unknown[] }) {
-    if (isHandTool) return;
+    // Select mode 외에는 selection sync 안 함 — elementsSelectable={false} 가
+    // SvelteFlow internal 의 selection 자체를 막지만 defensive guard 유지.
+    if (!isSelectMode) return;
     const ids = nodes.map((n) => n.id);
     // Fast no-op — 동일 set 이면 skip (callback frequency 높음, drag 중 매 frame).
     if (ids.length === sessionStore.M.size) {
@@ -995,8 +1003,14 @@
     {onpanecontextmenu}
     {onnodecontextmenu}
     {onselectionchange}
-    panOnDrag={panOnDragMask}
-    selectionOnDrag={!isSpacePressed && !isHandTool && !isDragTool}
+    panOnDrag={isMaximizedActive ? [] : panOnDragMask}
+    panOnScroll={!isMaximizedActive}
+    zoomOnScroll={!isMaximizedActive}
+    zoomOnPinch={!isMaximizedActive}
+    zoomOnDoubleClick={!isMaximizedActive}
+    selectionOnDrag={isSelectMode && !isSpacePressed && !isMaximizedActive}
+    nodesDraggable={isSelectMode && !isMaximizedActive}
+    elementsSelectable={isSelectMode}
     minZoom={0.05}
     maxZoom={3}
     fitView={false}
@@ -1048,6 +1062,10 @@
       style="left: {terminalGhost.x}px; top: {terminalGhost.y}px; width: {terminalGhost.w}px; height: {terminalGhost.h}px;"
       aria-hidden="true"
     ></div>
+  {/if}
+
+  {#if sessionStore.maximizedItemId !== null}
+    <MaximizedPanelModal itemId={sessionStore.maximizedItemId} />
   {/if}
 </div>
 

@@ -86,9 +86,9 @@ class SessionStore {
   I = $state<string | null>(null);
 
   /**
-   * FE-only ephemeral. Canvas viewport-fill 로 확대된 panel 의 id.
+   * FE-only ephemeral. Maximize 된 panel 의 id — modal overlay 표시 기준.
    * 한 session 1 panel (G20 amend). attach/switch 시 자동 null 로 reset.
-   * schema 영속 X — 즉 어떤 PUT/GET 도 이 값을 노출하지 않음.
+   * schema 영속 X — Canvas.svelte 가 본 값으로 MaximizedPanelModal 렌더링.
    */
   maximizedItemId = $state<string | null>(null);
 
