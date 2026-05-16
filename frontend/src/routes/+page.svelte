@@ -21,6 +21,7 @@
   import GroupCloseConfirmModal from '$lib/chrome/GroupCloseConfirmModal.svelte';
   import SettingsOverlay from '$lib/chrome/SettingsOverlay.svelte';
   import WorkspaceSwitcher from '$lib/chrome/WorkspaceSwitcher.svelte';
+  import WorkspaceEmptyPlaceholder from '$lib/chrome/WorkspaceEmptyPlaceholder.svelte';
   import ReconnectModal from '$lib/chrome/ReconnectModal.svelte';
   import Toolbar2 from '$lib/toolbar/Toolbar2.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
@@ -351,6 +352,11 @@
         <RightPanel />
         <ViewportCtrl />
         <ContextMenu bind:this={contextMenuRef} />
+        {#if sessionStore.active === null && workspaceSwitcher.stage === 'closed'}
+          <!-- Modal cancel / 첫 진입 시 사용자가 빈 canvas 만 보고 혼란스럽지
+               않도록 — centered placeholder 가 New / Open 진입점 단독 제공. -->
+          <WorkspaceEmptyPlaceholder />
+        {/if}
       </div>
     </SvelteFlowProvider>
   {:else if reconnectGate.state === 'booting' || reconnectGate.state === 'attaching' || reconnectGate.state === 'hydrating'}
