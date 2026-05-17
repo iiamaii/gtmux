@@ -202,6 +202,12 @@ class SessionStore {
    * / session [Delete] 흐름 모두 통과. 다음 reload 도 dialog 흐름으로 자연 회귀.
    */
   clear(): void {
+    // Pending viewport debounce timer 도 같이 취소. 안 하면 직전 session 의
+    // pan/zoom 이 500ms 안에 switch 됐을 때 잘못된 active 로 flush 됨.
+    if (this.#viewportTimer !== null) {
+      clearTimeout(this.#viewportTimer);
+      this.#viewportTimer = null;
+    }
     this.active = null;
     this.items.clear();
     this.groups.clear();
@@ -336,19 +342,23 @@ class SessionStore {
     }
     this.viewport = { ...v };
     if (this.active === null) return;
+    // 예약 시점의 session/viewport 를 closure 로 캡처. 500ms 사이에 session
+    // switch 가 일어나도 flush 가 현재 active 에 직전 session 의 viewport 를
+    // 쓰는 race 차단 — flush 에서 sessionName 비교로 폐기.
+    const sessionName = this.active.name;
+    const snapshot: Viewport = { ...v };
     if (this.#viewportTimer !== null) clearTimeout(this.#viewportTimer);
     this.#viewportTimer = setTimeout(() => {
       this.#viewportTimer = null;
-      void this.#flushViewport();
+      void this.#flushViewport(sessionName, snapshot);
     }, SessionStore.VIEWPORT_DEBOUNCE_MS);
   }
 
-  async #flushViewport(): Promise<void> {
+  async #flushViewport(sessionName: string, viewport: Viewport): Promise<void> {
     const active = this.active;
-    if (active === null) return;
-    const v = { ...this.viewport };
+    if (active === null || active.name !== sessionName) return;
     try {
-      await mutateLayout(active.name, (cur) => ({ ...cur, viewport: v }));
+      await mutateLayout(sessionName, (cur) => ({ ...cur, viewport }));
     } catch (err) {
       console.debug('[gtmux] viewport persist failed', err);
     }
