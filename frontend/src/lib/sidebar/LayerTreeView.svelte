@@ -630,12 +630,8 @@
     }));
   }
 
-  // plan-0010 Task 1 — focus row action.
-  // min/max 는 PanelNode header 가 단일 entry — LayerTreeView 에서 제거.
-  function focusPanel(id: string, e: MouseEvent): void {
-    stopRowAction(e);
-    sessionStore.zoomToItem(id);
-  }
+  // Focus 는 ViewportCtrl 로 이동 — Layer row 의 select 후 ViewportCtrl 에서
+  // focus 트리거. focusPanel / zoomToItem 호출은 본 file 에서 제거.
 
   // Z-mode 의 reorder — bringForward / sendBackward 와 동일. List 가 z desc 정렬이므로
   // 위 = z+ (bringForward), 아래 = z- (sendBackward).
@@ -957,20 +953,8 @@
                   </svg>
                 {/if}
               </button>
-              <!-- min/max 는 LayerTreeView 에서 제거 — PanelNode header 가 단일 entry.
-                   focus 만 유지 (모든 type 에서 viewport zoom-to-item). -->
-              <button
-                type="button"
-                class="icon"
-                title="Focus item — zoom viewport to item"
-                aria-label="Focus item"
-                onclick={(e: MouseEvent) => focusPanel(node.id, e)}
-              >
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="12" cy="12" r="9" />
-                  <circle cx="12" cy="12" r="3" fill="currentColor" />
-                </svg>
-              </button>
+              <!-- Focus 는 ViewportCtrl 의 focus 버튼으로 이동 — Layer row 의
+                   click 으로 selection 후 viewport 컨트롤에서 focus 트리거. -->
             </span>
             {/snippet}
             {@render panelIcons()}

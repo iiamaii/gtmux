@@ -286,12 +286,6 @@
     selectedItems.some((it) => it.type === 'terminal' || it.type === 'note'),
   );
 
-  function focusFirstSelected(): void {
-    const id = selectedIds[0];
-    if (id === undefined) return;
-    sessionStore.zoomToItem(id);
-  }
-
   async function applyLineEndpoint(field: 'x2' | 'y2', value: number): Promise<void> {
     await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
       if (it.type !== 'line' || it.locked) return it;
@@ -940,20 +934,7 @@
             </button>
           {/if}
 
-          <button
-            type="button"
-            class="state-btn action-only"
-            aria-label="Focus item"
-            title={selectionCount > 1 ? 'Focus first selected — zoom viewport' : 'Focus — zoom viewport to item'}
-            disabled={selectionCount === 0}
-            onclick={focusFirstSelected}
-          >
-            <!-- target / focus reticle (LayerTreeView 의 focus icon 정합) -->
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <circle cx="12" cy="12" r="9" />
-              <circle cx="12" cy="12" r="3" fill="currentColor" />
-            </svg>
-          </button>
+          <!-- Focus 는 ViewportCtrl 의 focus 버튼으로 이동. -->
         </div>
         {#if selectionCount === 1 && isSelectedTerminal}
           <div class="prop-row full">
@@ -1292,16 +1273,6 @@
   .state-btn:focus-visible {
     outline: 2px dashed var(--color-accent);
     outline-offset: 1px;
-  }
-
-  /* action-only: focus 같은 trigger 버튼 — toggle state 없음. disabled 시 dim. */
-  .state-btn.action-only:disabled {
-    opacity: 0.35;
-    cursor: not-allowed;
-  }
-  .state-btn.action-only:disabled:hover {
-    background: transparent;
-    color: var(--color-fg-subtle);
   }
 
   /* Mixed: dash overlay across the icon (indeterminate marker — ADR-0027 D3). */

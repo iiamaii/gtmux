@@ -665,44 +665,59 @@
     });
   });
 
-  /* ── plan-0010 Task 1 — Focus / zoom-to-item ───────────────────────────
-   * Layer 패널 의 focus 버튼 클릭 시 sessionStore.zoomToItem(id) →
-   * pendingZoomToItemId set. 본 effect 가 watch — item BBox 를 viewport
-   * 중앙 + 가득 채움 으로 setViewport. 처리 후 1-shot clear.
+  /* ── Focus / zoom-to-selection (ViewportCtrl 의 focus 버튼) ──────────────
+   * sessionStore.zoomToIds(ids) → pendingZoomToIds set. 본 effect 가 watch
+   * — items 의 union BBox 를 viewport 중앙 + 가득 채움 으로 setViewport.
+   * 처리 후 1-shot clear.
    *
-   * BBox: item.x/y/w/h. line 은 (x,y)~(x2,y2) 의 BBox 사용. fit 의 padding
-   * = 12% (Figma "Zoom to selection" 비율). zoom 은 viewport 가로/세로
-   * 중 더 작은 비율 채택.
+   * BBox: item.x/y/w/h 의 union. line 은 (x,y)~(x2,y2) 의 BBox 사용.
+   * padding = 12% (88% 채움). zoom 은 viewport 가로/세로 중 더 작은 비율 채택,
+   * [0.05, 3] clamp.
    */
   $effect(() => {
-    const targetId = sessionStore.pendingZoomToItemId;
-    if (targetId === null) return;
+    const ids = sessionStore.pendingZoomToIds;
+    if (ids === null || ids.length === 0) return;
     untrack(() => {
-      const item = sessionStore.items.get(targetId);
-      if (item === undefined) {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      let found = 0;
+      for (const id of ids) {
+        const item = sessionStore.items.get(id);
+        if (item === undefined) continue;
+        let bx = item.x;
+        let by = item.y;
+        let bw = item.w;
+        let bh = item.h;
+        if (item.type === 'line') {
+          const x2 = (item as { x2: number }).x2;
+          const y2 = (item as { y2: number }).y2;
+          bx = Math.min(item.x, x2);
+          by = Math.min(item.y, y2);
+          bw = Math.abs(x2 - item.x) || 1;
+          bh = Math.abs(y2 - item.y) || 1;
+        }
+        if (bx < minX) minX = bx;
+        if (by < minY) minY = by;
+        if (bx + bw > maxX) maxX = bx + bw;
+        if (by + bh > maxY) maxY = by + bh;
+        found += 1;
+      }
+      if (found === 0) {
         sessionStore.clearPendingZoom();
         return;
       }
-      let bx = item.x;
-      let by = item.y;
-      let bw = item.w;
-      let bh = item.h;
-      if (item.type === 'line') {
-        const x2 = (item as { x2: number }).x2;
-        const y2 = (item as { y2: number }).y2;
-        bx = Math.min(item.x, x2);
-        by = Math.min(item.y, y2);
-        bw = Math.abs(x2 - item.x) || 1;
-        bh = Math.abs(y2 - item.y) || 1;
-      }
+      const bw = Math.max(1, maxX - minX);
+      const bh = Math.max(1, maxY - minY);
       const root = (document.querySelector('.canvas-root') as HTMLElement) ?? null;
       const vw = root?.clientWidth ?? window.innerWidth;
       const vh = root?.clientHeight ?? window.innerHeight;
       const padding = 0.88;
       const zoom = Math.min((vw / bw) * padding, (vh / bh) * padding, 3);
       const zoomClamped = Math.max(0.05, zoom);
-      const cx = bx + bw / 2;
-      const cy = by + bh / 2;
+      const cx = minX + bw / 2;
+      const cy = minY + bh / 2;
       const next = {
         x: vw / 2 - cx * zoomClamped,
         y: vh / 2 - cy * zoomClamped,

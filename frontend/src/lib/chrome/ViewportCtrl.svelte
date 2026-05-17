@@ -12,6 +12,8 @@
    *   - 100%  / current zoom label (click → reset to 1.0)
    *   - + Zoom in
    *   - ⊟ Fit (fitView)
+   *   - ⊙ Focus selection — 선택된 item(들) 의 union BBox 로 viewport 이동.
+   *     M.size === 0 일 때 disabled.
    *   - M:N  current Manipulation Selection count badge (live)
    */
 
@@ -38,6 +40,9 @@
   function onFit(): void {
     void flow.fitView({ duration: 200, padding: 0.2 });
   }
+  function onFocusSelection(): void {
+    sessionStore.zoomToSelection();
+  }
 </script>
 
 <div class="viewport-ctrl" role="toolbar" aria-label="Viewport controls">
@@ -62,6 +67,20 @@
       <polyline points="20 10 20 4 14 4"/>
       <line x1="14" y1="10" x2="21" y2="3"/>
       <line x1="3" y1="21" x2="10" y2="14"/>
+    </svg>
+  </button>
+  <button
+    type="button"
+    class="vp-btn"
+    aria-label={mCount > 1 ? `Focus ${mCount} selected items` : 'Focus selected item'}
+    title={mCount === 0 ? 'Focus selection (select item first)' : mCount > 1 ? `Focus ${mCount} selected — viewport fits all` : 'Focus selected — viewport fits item'}
+    disabled={mCount === 0}
+    onclick={onFocusSelection}
+  >
+    <!-- target reticle -->
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="9"/>
+      <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/>
     </svg>
   </button>
   <span class="vp-divider" aria-hidden="true"></span>
@@ -102,8 +121,13 @@
     transition: background var(--motion-fast) var(--motion-easing);
   }
 
-  .vp-btn:hover {
+  .vp-btn:hover:not(:disabled) {
     background: var(--color-glass-1);
+  }
+
+  .vp-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.35;
   }
 
   .vp-zoom {
