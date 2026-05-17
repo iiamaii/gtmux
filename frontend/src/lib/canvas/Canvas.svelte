@@ -1110,6 +1110,8 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
+    // 0065 FE-2 — priorSnapshot 명시 → applyMutation 이 PUT 실패 시 store 를
+    // 복원 (drag-stop 의 optimistic update 가 silent 로 회귀 안 되도록).
     void sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -1117,7 +1119,7 @@
       }),
       {
         abortMessage: 'Drag commit aborted — session reconnect failed.',
-        failMessage: 'Drag commit failed',
+        failMessage: 'Drag commit failed — reverted to previous position.',
         priorSnapshot,
       },
     );

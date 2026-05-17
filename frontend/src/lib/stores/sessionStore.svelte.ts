@@ -643,8 +643,9 @@ class SessionStore {
       return { ok: false };
     }
     const captureHistory = options.captureHistory !== false;
+    const priorSnapshot = options.priorSnapshot ?? null;
     const before = captureHistory
-      ? (options.priorSnapshot ?? this.layoutSnapshot())
+      ? (priorSnapshot ?? this.layoutSnapshot())
       : null;
     try {
       const { layout } = await mutateLayout(active.name, transform);
@@ -655,6 +656,14 @@ class SessionStore {
       if (err instanceof UnauthorizedError) {
         window.location.href = '/auth';
         return { ok: false };
+      }
+      // 0065 FE-2 — caller 가 priorSnapshot 을 명시했다는 것은 호출 *전* store
+      // 를 optimistic 갱신했다는 신호 (drag stop / NodeResizer / z-order 등).
+      // failure 시 priorSnapshot 으로 store 를 복원해 "FE 는 변경된 상태로
+      // 보이지만 BE 는 옛 상태" 의 silent 회귀를 차단한다. priorSnapshot 미지정
+      // = optimistic update 없는 path (Inspector edit 등) — 별도 복원 무필요.
+      if (priorSnapshot !== null) {
+        this.loadLayout(priorSnapshot);
       }
       toastStore.show({
         message:
