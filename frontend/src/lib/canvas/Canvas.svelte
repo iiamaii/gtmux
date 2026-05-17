@@ -955,6 +955,10 @@
     }
     if (movedById.size === 0) return;
 
+    // PRE-state snapshot — optimistic update 직전에 잡아 history capture 의
+    // 입력으로 명시 (ADR-0028 D7). 그렇지 않으면 layoutSnapshot() 이 이미
+    // 새 position 으로 갱신된 후 호출되어 PRE === POST → Cmd+Z 가 no-op.
+    const priorSnapshot = sessionStore.layoutSnapshot();
     // Optimistic store update — bind:nodes 양방향 sync 의 idempotent 결과.
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
@@ -967,6 +971,7 @@
       {
         abortMessage: 'Drag commit aborted — session reconnect failed.',
         failMessage: 'Drag commit failed',
+        priorSnapshot,
       },
     );
   }

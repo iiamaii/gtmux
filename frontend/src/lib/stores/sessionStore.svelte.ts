@@ -583,6 +583,13 @@ class SessionStore {
       abortMessage?: string;
       failMessage?: string;
       captureHistory?: boolean;
+      /**
+       * PRE-mutation snapshot — caller 가 명시. Drag commit 처럼 store 가
+       * optimistic 갱신된 *후* 에 applyMutation 호출하는 path 는 본 옵션으로
+       * "optimistic 직전" snapshot 을 전달. 미지정 시 호출 시점의 store snapshot
+       * 사용 (Inspector edit 등 optimistic 없는 path 의 기본 동작).
+       */
+      priorSnapshot?: CanvasLayout;
     } = {},
   ): Promise<{ ok: boolean; layout?: CanvasLayout }> {
     const active = this.active;
@@ -599,7 +606,9 @@ class SessionStore {
       return { ok: false };
     }
     const captureHistory = options.captureHistory !== false;
-    const before = captureHistory ? this.layoutSnapshot() : null;
+    const before = captureHistory
+      ? (options.priorSnapshot ?? this.layoutSnapshot())
+      : null;
     try {
       const { layout } = await mutateLayout(active.name, transform);
       this.loadLayout(layout);
