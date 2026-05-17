@@ -189,10 +189,12 @@
       </div>
     </div>
     <!-- Foot row — badge (per-lang) + placeholder meta (lines / size /
-         branch). 실 데이터 wire 는 BE file-stat endpoint 의존 (별 ADR /
-         work-package). 현재는 시안 §03 의 visual frame 만 — 모든 meta 는
-         dim em-dash placeholder. 시안 v3 의 .sep / .right 정합. -->
-    {#if !editing && data.path.length > 0}
+         branch). 실 데이터 wire 는 BE file-stat endpoint 의존
+         (ADR-0034 / 0060 work-package). 현 placeholder = v3 시안 §03 의
+         visual frame — em-dash dim. *항상 표시* (path 빈 상태도) —
+         사용자가 visual frame 으로 file_path 임을 인지. editing 중에만
+         hide (InlineEdit 의 chrome 와 시각 충돌 방지). -->
+    {#if !editing}
       <div class="fp-foot">
         {#if langBadge !== null}
           <span class="fp-badge {langBadge.cls}">{langBadge.label}</span>
