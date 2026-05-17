@@ -172,6 +172,7 @@
             value={data.path}
             editing={true}
             allowEmpty={true}
+            plain={true}
             placeholder="/path/to/file"
             class="path-edit"
             onCommit={(next: string) => void onCommit(next)}

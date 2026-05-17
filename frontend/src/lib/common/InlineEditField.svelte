@@ -33,6 +33,12 @@
     allowEmpty?: boolean;
     /** Real-time validator. null = OK, string = error message. */
     validate?: (s: string) => string | null;
+    /**
+     * Chrome-less inline edit — wrapper border/background/outline 없이 원
+     * 위치에서 편집. Canvas item (Panel label, Note title, FilePath, …) 의
+     * 더블 클릭 활성화 시 시각적 jump 회피. has-error 시 text color 만 변경.
+     */
+    plain?: boolean;
   }
 
   const {
@@ -44,6 +50,7 @@
     placeholder = '',
     allowEmpty = false,
     validate,
+    plain = false,
   }: Props = $props();
 
   // $state init 시 prop 의 *최초 값* 만 capture — 실 동기화는 $effect 가 담당.
@@ -115,6 +122,7 @@
     bind:value={draft}
     {placeholder}
     class="inline-edit-input {extraClass}"
+    class:plain
     class:has-error={validationError !== null}
     aria-invalid={validationError !== null}
     {onkeydown}
@@ -150,6 +158,26 @@
 
   .inline-edit-input.has-error {
     border-color: var(--color-danger);
+  }
+
+  /* Chrome-less variant — wrapper 안에서 원 위치 그대로 편집. */
+  .inline-edit-input.plain {
+    height: auto;
+    padding: 0;
+    background: transparent;
+    border: 0;
+    border-radius: 0;
+    outline: none;
+  }
+
+  .inline-edit-input.plain:focus-visible {
+    outline: none;
+    border-color: transparent;
+  }
+
+  .inline-edit-input.plain.has-error {
+    border-color: transparent;
+    color: var(--color-danger);
   }
 
   .inline-edit-error {

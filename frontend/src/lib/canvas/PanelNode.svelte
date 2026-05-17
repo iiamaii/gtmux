@@ -360,6 +360,7 @@
             value={data.label ?? ''}
             editing={true}
             allowEmpty={true}
+            plain={true}
             placeholder={data.id.slice(0, 8)}
             class="panel-label-edit"
             validate={validateLabel}

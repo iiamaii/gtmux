@@ -211,6 +211,7 @@
             value={data.title}
             editing={true}
             allowEmpty={true}
+            plain={true}
             placeholder="Title…"
             class="note-title-edit"
             onCommit={(next: string) => void commit('title', next)}
@@ -269,6 +270,7 @@
           value={data.body}
           editing={true}
           allowEmpty={true}
+          plain={true}
           placeholder="Body…"
           class="note-body-edit"
           onCommit={(next: string) => void commit('body', next)}

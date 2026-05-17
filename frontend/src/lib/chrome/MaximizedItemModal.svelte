@@ -162,6 +162,7 @@
               value={item.type === 'note' ? item.title : ''}
               editing={true}
               allowEmpty={true}
+              plain={true}
               placeholder="Title…"
               onCommit={(next: string) => void commitNoteField('title', next)}
               onCancel={() => (titleEditing = false)}
@@ -224,6 +225,7 @@
                 value={item.body}
                 editing={true}
                 allowEmpty={true}
+                plain={true}
                 placeholder="Body…"
                 onCommit={(next: string) => void commitNoteField('body', next)}
                 onCancel={() => (bodyEditing = false)}
