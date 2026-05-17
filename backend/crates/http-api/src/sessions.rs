@@ -1267,11 +1267,30 @@ pub async fn delete_item_handler(
     }
 
     if q.kill_terminal {
-        if let Some(uuid) = removed_terminal_id {
-            kill_and_unregister_terminal(&state, &uuid).await;
-            // The schema item is gone for good — drop metadata too so
-            // `GET /api/terminals` does not surface a phantom row.
-            state.terminal_meta.forget(&uuid).await;
+        match removed_terminal_id.as_deref() {
+            Some(uuid) => {
+                tracing::info!(
+                    session = %name,
+                    item_id = %id,
+                    uuid,
+                    "delete_item: kill_terminal=true → SIGTERM + forget metadata"
+                );
+                kill_and_unregister_terminal(&state, uuid).await;
+                // The schema item is gone for good — drop metadata too so
+                // `GET /api/terminals` does not surface a phantom row.
+                state.terminal_meta.forget(uuid).await;
+            }
+            None => {
+                // 사용자가 kill 의도로 query 를 보냈으나 layout 의 해당 id 가
+                // Terminal variant 가 아니면 본 branch 진입 (e.g., text/note).
+                // FE 가 잘못된 id 를 송신했거나 schema 변환 race — 어느 쪽이든
+                // 진단 의도가 좌절되었으므로 warn 으로 surface.
+                tracing::warn!(
+                    session = %name,
+                    item_id = %id,
+                    "delete_item: kill_terminal=true but item is not a terminal variant"
+                );
+            }
         }
     }
 
@@ -1310,15 +1329,39 @@ fn item_id(item: &crate::schema::Item) -> &str {
 pub(crate) async fn kill_and_unregister_terminal(state: &crate::AppState, uuid: &str) {
     let pane = match state.terminal_map.lookup_pane(uuid).await {
         Some(p) => p,
-        None => return,
+        None => {
+            // dangling (terminal-died → already unregistered) 또는 lazy-spawn
+            // 대기 중 (아직 PaneId 미 binding). 어느 쪽이든 *child process 살아있는
+            // 동안* terminal_map binding 이 빠지는 상황은 invariant 위반이므로,
+            // 본 분기 진입 자체가 *진단 가치* 있음 — warn 으로 격상.
+            tracing::warn!(
+                uuid,
+                "kill_and_unregister_terminal: UUID has no PaneId binding (no-op)"
+            );
+            return;
+        }
     };
-    if let Some(hub) = state.hub.as_ref() {
-        if let Err(e) = hub.backend().kill(pane) {
-            tracing::debug!(
+    match state.hub.as_ref() {
+        Some(hub) => match hub.backend().kill(pane) {
+            Ok(()) => {
+                tracing::info!(uuid, pane = ?pane, "terminal: SIGTERM sent");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    uuid,
+                    pane = ?pane,
+                    error = %e,
+                    "terminal: kill returned error (e.g. already dead) — child process \
+                     may still be alive if SIGTERM never reached"
+                );
+            }
+        },
+        None => {
+            tracing::warn!(
                 uuid,
                 pane = ?pane,
-                error = %e,
-                "terminal: kill returned non-fatal error (likely already dead)"
+                "terminal: hub is None — cannot signal pane. UUID will be \
+                 unregistered but child process remains alive."
             );
         }
     }
