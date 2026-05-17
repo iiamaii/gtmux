@@ -28,6 +28,12 @@ class TerminalPoolStore {
   errorMessage = $state<string | null>(null);
 
   /**
+   * id ↔ TerminalInfo 의 O(1) lookup map. `terminals` 와 1:1 같이 갱신.
+   * PanelNode / LayerTreeView 가 row 마다 호출하는 `byId` 의 linear find 제거.
+   */
+  terminalsById = $state<SvelteMap<string, TerminalInfo>>(new SvelteMap());
+
+  /**
    * UUID ↔ numeric PaneId 매핑 (0039 §2.3.3, BE 0x88 TERMINAL_SPAWNED 의 단일
    * source-of-truth). XtermHost 의 terminal 모드가 본 map 을 조회 → numeric
    * PaneId 로 PANE_OUT subscriber 등록 + PANE_IN/RESIZE 송신 키.
@@ -63,6 +69,8 @@ class TerminalPoolStore {
     try {
       const res = await listTerminals();
       this.terminals = res.terminals;
+      this.terminalsById.clear();
+      for (const t of res.terminals) this.terminalsById.set(t.id, t);
       this.loading = false;
       this.errorMessage = null;
     } catch (err) {
@@ -76,9 +84,9 @@ class TerminalPoolStore {
     }
   }
 
-  /** id 로 1건 조회. */
+  /** id 로 1건 조회. O(1) — `terminalsById` map 활용. */
   byId(id: string): TerminalInfo | null {
-    return this.terminals.find((t) => t.id === id) ?? null;
+    return this.terminalsById.get(id) ?? null;
   }
 
   /** UUID → numeric PaneId 등록 (0x88 TERMINAL_SPAWNED dispatcher 가 호출). */
