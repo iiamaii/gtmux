@@ -531,18 +531,31 @@ async fn handle_socket(
     // the filter set rebuilds without a full reconnect.
     let mut session_change_rx = hub.subscribe_session_change();
 
-    // Slice next-2 (ADR-0025 D1/D2/D3): per-WS owned `PaneId` filter
-    // set. `None` = legacy demo path (server-wide pass per D5).
-    // `Some(set)` = forward only when `pane_id ∈ set`. The set is
-    // *owned* by this task (no `Arc<RwLock>`) so the hot `contains`
-    // check in the `pane_output` arm is lock-free.
+    // ADR-0025 D1/D2/D3 + amend ③ (2026-05-17, 0067 Phase 2): per-WS
+    // owned `PaneId` filter set. `None` = legacy demo path (server-wide
+    // pass per D5). `Some(set)` = forward only when `pane_id ∈ set`. The
+    // set is *owned* by this task (no `Arc<RwLock>`) so the hot
+    // `contains` check is lock-free.
     //
-    // `filter_armed` = false during catch-up replay so the cold-load
-    // race (handshake racing a layout PUT) doesn't drop the user's
-    // own session history. Live frames are filtered (true) once the
-    // catch-up replay completes.
-    let mut session_pane_set: Option<std::collections::HashSet<u64>> = None;
-    let mut filter_armed = false;
+    // amend ③: the cold-load now happens *before* the catch-up replay so
+    // the replay itself (pane-spawned NOTIFY + PANE_OUT ring buffer
+    // dump) is filtered too. The `filter_armed` flag is gone — the same
+    // `session_pane_set` predicate covers catch-up and live phases. The
+    // cold-load race that the old `filter_armed=false` arm was defending
+    // against is handled by D3's hot-update channels (layout_events /
+    // terminal_spawned_events / session_change_events) under the
+    // false-negative-safe invariant.
+    let mut session_pane_set: Option<std::collections::HashSet<u64>> =
+        if let (Some(provider), Some(cookie)) =
+            (hub.session_pane_set_provider(), cookie_value.as_deref())
+        {
+            match hub.session_for_cookie(cookie) {
+                Some(session_name) => Some(provider.pane_ids_for_session(&session_name).await),
+                None => None,
+            }
+        } else {
+            None
+        };
 
     // Send the initial LAYOUT_CHANGED hello so the client knows the
     // server is alive and can decide whether to re-fetch `/api/layout`.
@@ -595,7 +608,18 @@ async fn handle_socket(
     // Catch-up: for each alive pane, send a `pane-spawned` NOTIFY (so the
     // frontend's panel store learns the id) followed by the ring-buffer
     // bytes as one or more 0x02 PANE_OUT envelopes.
+    //
+    // ADR-0025 D1 amend ③ (0067 Phase 2 / 0066 §BE-1): cookie-attached
+    // path skips panes outside the session's `session_pane_set`. Legacy
+    // demo path (`session_pane_set == None`) keeps the unfiltered
+    // server-wide replay — D5.
     for id in backend.pane_ids() {
+        if !pane_id_in_session_set(
+            u32::try_from(id.0).unwrap_or(u32::MAX),
+            session_pane_set.as_ref(),
+        ) {
+            continue;
+        }
         let spawned = Envelope::new(
             FrameType::NotifyMirror,
             Bytes::from(payload::encode_notify_mirror(
@@ -654,23 +678,9 @@ async fn handle_socket(
     let mut suspended: std::collections::HashSet<PaneId> = std::collections::HashSet::new();
     let mut last_pause_event: HashMap<PaneId, Instant> = HashMap::new();
 
-    // Slice next-2 (ADR-0025 D2): cold-load the session pane-set at
-    // the live-phase boundary — catch-up replay above ran without the
-    // filter (D1.catch-up-replay-policy), and we transition into the
-    // filtered live phase here.
-    //
-    // No provider → legacy demo path (`session_pane_set = None`).
-    // Has provider but cookie not attached → legacy demo path too —
-    // bearer-only automation clients keep working unchanged.
-    if let (Some(provider), Some(cookie)) =
-        (hub.session_pane_set_provider(), cookie_value.as_deref())
-    {
-        if let Some(session_name) = hub.session_for_cookie(cookie) {
-            let set = provider.pane_ids_for_session(&session_name).await;
-            session_pane_set = Some(set);
-        }
-    }
-    filter_armed = true;
+    // ADR-0025 D1 amend ③: the cold-load + `filter_armed = true` boundary
+    // that used to sit here is gone — the set is now loaded *before*
+    // catch-up replay so the same filter covers both phases.
 
     loop {
         tokio::select! {
@@ -752,16 +762,14 @@ async fn handle_socket(
                         if suspended.contains(&id) {
                             continue;
                         }
-                        // Slice next-2 (ADR-0025 D1): session-scoped
-                        // filter. `filter_armed = false` during the
-                        // catch-up replay above — no filter. After
-                        // catch-up, `Some(set)` enforces ownership;
+                        // ADR-0025 D1 + amend ③ (2026-05-17): session-scoped
+                        // filter. `Some(set)` enforces ownership;
                         // `None` (legacy demo path, D5) passes through.
-                        if filter_armed {
-                            if let Some(set) = session_pane_set.as_ref() {
-                                if !set.contains(&id.0) {
-                                    continue;
-                                }
+                        // The `filter_armed` flag is gone — the same set
+                        // already filtered the catch-up replay above.
+                        if let Some(set) = session_pane_set.as_ref() {
+                            if !set.contains(&id.0) {
+                                continue;
                             }
                         }
                         let env = Envelope::new(
@@ -2287,6 +2295,193 @@ bind = "127.0.0.1"
         assert!(
             burst.is_empty(),
             "no provider registered → no 0x88 expected, got: {burst:?}"
+        );
+    }
+
+    // ── ADR-0025 D1 amend ③ (0066 §BE-1 / 0067 Phase 2): catch-up replay
+    //    is now filtered by `session_pane_set` for cookie-attached paths. ─
+
+    /// Stub `SessionPaneSetProvider` that returns a fixed PaneId set for
+    /// any session name.
+    struct PaneSetStubProvider(std::collections::HashSet<u64>);
+
+    #[async_trait::async_trait]
+    impl SessionPaneSetProvider for PaneSetStubProvider {
+        async fn pane_ids_for_session(&self, _: &str) -> std::collections::HashSet<u64> {
+            self.0.clone()
+        }
+    }
+
+    /// Decode the leading varint pane_id out of a NotifyMirror envelope
+    /// whose JSON body exactly equals `body_match`. Returns `None`
+    /// otherwise so the collector can skip unrelated frames.
+    fn notify_mirror_pane_id_if_body_matches(env: &Envelope, body_match: &str) -> Option<u32> {
+        if env.kind != FrameType::NotifyMirror {
+            return None;
+        }
+        let (pane_id, n) = crate::varint::decode(&env.payload)?;
+        let body = std::str::from_utf8(env.payload.get(n..)?).ok()?;
+        if body != body_match {
+            return None;
+        }
+        u32::try_from(pane_id).ok()
+    }
+
+    /// Spin up a test server with a backend pre-seeded with `pane_count`
+    /// alive panes (real `/bin/sh`), give them ~150ms to write their
+    /// initial prompt into the ring buffer, and return the (addr, hub,
+    /// pane_ids). Caller may then register a `SessionPaneSetProvider` /
+    /// cookie-session binding before connecting a WS client.
+    async fn spawn_test_server_with_panes(
+        token: TokenString,
+        pane_count: usize,
+    ) -> (SocketAddr, Hub, Vec<u64>) {
+        let cfg = test_config();
+        let backend = PtyBackend::new();
+        let mut pane_ids = Vec::with_capacity(pane_count);
+        for _ in 0..pane_count {
+            let spec = gtmux_pty_backend::SpawnSpec {
+                command: Some("/bin/sh".into()),
+                args: vec![],
+                cwd: None,
+                env: vec![("PS1".into(), "$ ".into()), ("ENV".into(), "/dev/null".into())],
+                rows: 24,
+                cols: 80,
+            };
+            let id = backend.spawn(spec).expect("spawn sh");
+            pane_ids.push(id.0);
+        }
+        // Let the shells write their initial prompts into the ring buffer
+        // so catch-up has actual PANE_OUT bytes to potentially replay.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let hub = Hub::new(backend);
+        let app = router(&cfg, &token, hub.clone());
+        let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, hub, pane_ids)
+    }
+
+    /// Collect every `pane-spawned` NotifyMirror pane_id emitted within
+    /// `timeout` (or until the connection idles past 150ms with no
+    /// frame). The catch-up replay is bursty, so this idle-cutoff is the
+    /// natural signal that replay has ended.
+    async fn collect_catchup_pane_spawned(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        timeout: std::time::Duration,
+    ) -> Vec<u32> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let idle = std::time::Duration::from_millis(150);
+        let mut out = Vec::new();
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = (deadline - now).min(idle);
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(TM::Binary(buf)))) => {
+                    if let Ok((env, _)) = Envelope::decode(buf.as_ref()) {
+                        if let Some(pid) = notify_mirror_pane_id_if_body_matches(
+                            &env,
+                            r#"{"kind":"pane-spawned"}"#,
+                        ) {
+                            out.push(pid);
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => break, // idle cutoff = replay done
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn catchup_replay_filtered_to_session_panes() {
+        // amend ③: provider returns set = {id_a} only; the WS handshake
+        // must catch-up only id_a's `pane-spawned` NOTIFY (and any
+        // PANE_OUT for it), and must NOT emit id_b's pane-spawned NOTIFY.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub, pane_ids) = spawn_test_server_with_panes(token.clone(), 2).await;
+        let id_a = pane_ids[0];
+        let id_b = pane_ids[1];
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(id_a);
+        hub.set_session_pane_set_provider(std::sync::Arc::new(PaneSetStubProvider(set)));
+        hub.set_session_for_cookie("c1", "sess-a");
+
+        let mut ws = connect_authed_with_cookie(addr, &token, "c1").await;
+        let spawned =
+            collect_catchup_pane_spawned(&mut ws, std::time::Duration::from_secs(2)).await;
+        let got: std::collections::HashSet<u64> =
+            spawned.iter().map(|p| u64::from(*p)).collect();
+        assert!(
+            got.contains(&id_a),
+            "in-set pane {id_a} must catch-up, got: {got:?}"
+        );
+        assert!(
+            !got.contains(&id_b),
+            "out-of-set pane {id_b} must NOT catch-up, got: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catchup_replay_unfiltered_when_no_cookie() {
+        // amend ③ legacy demo path (D5) — no cookie → no session →
+        // session_pane_set stays None → catch-up server-wide. Both
+        // panes' pane-spawned NOTIFY must reach the client.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub, pane_ids) = spawn_test_server_with_panes(token.clone(), 2).await;
+        let id_a = pane_ids[0];
+        let id_b = pane_ids[1];
+        // Provider set even though cookie path is unused — exercises
+        // the "provider present but cookie absent" leg of D5.
+        let mut set = std::collections::HashSet::new();
+        set.insert(id_a); // intentionally narrow; cookie absence must override
+        hub.set_session_pane_set_provider(std::sync::Arc::new(PaneSetStubProvider(set)));
+
+        let mut ws = connect_authed(addr, &token).await;
+        let spawned =
+            collect_catchup_pane_spawned(&mut ws, std::time::Duration::from_secs(2)).await;
+        let got: std::collections::HashSet<u64> =
+            spawned.iter().map(|p| u64::from(*p)).collect();
+        assert!(
+            got.contains(&id_a) && got.contains(&id_b),
+            "legacy demo (no cookie) must catch-up every pane, got: {got:?} expected both {id_a} and {id_b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catchup_replay_unfiltered_when_provider_unset() {
+        // amend ③ legacy demo path (D5) — provider not configured →
+        // session_pane_set stays None even with a cookie. Both panes'
+        // pane-spawned NOTIFY must reach the client.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub, pane_ids) = spawn_test_server_with_panes(token.clone(), 2).await;
+        let id_a = pane_ids[0];
+        let id_b = pane_ids[1];
+        // Cookie bound to a session but no SessionPaneSetProvider —
+        // matches bootstrap / migration windows where the http-api
+        // wiring hasn't installed the provider yet.
+        hub.set_session_for_cookie("c1", "sess-a");
+
+        let mut ws = connect_authed_with_cookie(addr, &token, "c1").await;
+        let spawned =
+            collect_catchup_pane_spawned(&mut ws, std::time::Duration::from_secs(2)).await;
+        let got: std::collections::HashSet<u64> =
+            spawned.iter().map(|p| u64::from(*p)).collect();
+        assert!(
+            got.contains(&id_a) && got.contains(&id_b),
+            "no provider → server-wide catch-up, got: {got:?} expected both {id_a} and {id_b}"
         );
     }
 
