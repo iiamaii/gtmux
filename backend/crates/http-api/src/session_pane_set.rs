@@ -39,24 +39,14 @@ impl gtmux_ws_server::SessionPaneSetProvider for AppState {
                 })
                 .collect()
         };
-        if uuids.is_empty() {
-            return HashSet::new();
-        }
-        // Resolve UUIDs → PaneIds via a single TerminalMap snapshot
-        // (one lock acquisition for the whole set). Unmatched UUIDs
-        // (dangling terminal references, ADR-0021 D10) are omitted —
-        // the false-negative-is-safe invariant (ADR-0025 D3) ensures
-        // they get added later via `0x88 TERMINAL_SPAWNED` once the
-        // user clicks the dangling panel to spawn-on-demand.
-        let snapshot = self.terminal_map.snapshot().await;
-        let by_uuid: std::collections::HashMap<String, u64> = snapshot
-            .into_iter()
-            .map(|(uuid, pane)| (uuid, pane.0))
-            .collect();
-        uuids
-            .into_iter()
-            .filter_map(|u| by_uuid.get(&u).copied())
-            .collect()
+        // Resolve UUIDs → PaneIds via the TerminalMap bulk API (one read
+        // lock, O(N) lookups — no full pool clone). 0067 BE-5(a) / 0066
+        // §BE-5. Unmatched UUIDs (dangling terminal references, ADR-0021
+        // D10) are omitted — the false-negative-is-safe invariant
+        // (ADR-0025 D3) ensures they get added later via
+        // `0x88 TERMINAL_SPAWNED` once the user clicks the dangling
+        // panel to spawn-on-demand.
+        self.terminal_map.resolve_uuids_to_panes(&uuids).await
     }
 }
 

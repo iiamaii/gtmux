@@ -688,6 +688,7 @@ async fn handle_socket(
                             &hub,
                             cookie_value.as_deref(),
                             &connection_id,
+                            session_pane_set.as_ref(),
                         ).await;
                         if close_now {
                             return;
@@ -1172,6 +1173,27 @@ async fn handle_socket(
 /// needed for manipulation broadcast) — keeping them as parameters
 /// rather than a context struct preserves the per-frame call ergonomics
 /// in the `select!` loop. Clippy's 7-arg threshold is informational.
+/// Session-scoped client→server input filter (0067 BE-3 / 0066 §BE-3).
+///
+/// Mirrors the outbound `pane_output` filter (ADR-0025 D1) onto the
+/// inbound `PANE_IN`/`PANE_RESIZE`/`PANE_PAUSE`/`PANE_RESUME` arms.
+///
+/// * `Some(set)` — cookie-attached path: only `pane_id ∈ set` is forwarded
+///   to the backend. Stale clients carrying a former-session pane id (or
+///   a malicious frame from the same cookie) are silently dropped at the
+///   WS boundary.
+/// * `None` — legacy bearer-only / pre-attach path: pass through (matches
+///   `pane_output` arm's legacy semantics).
+fn pane_id_in_session_set(
+    pane_id: u32,
+    set: Option<&std::collections::HashSet<u64>>,
+) -> bool {
+    match set {
+        None => true,
+        Some(s) => s.contains(&u64::from(pane_id)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_envelope(
     buf: &[u8],
@@ -1182,6 +1204,7 @@ async fn handle_client_envelope(
     hub: &Hub,
     cookie_value: Option<&str>,
     connection_id: &Arc<str>,
+    session_pane_set: Option<&std::collections::HashSet<u64>>,
 ) -> bool {
     let (env, _) = match Envelope::decode(buf) {
         Ok(t) => t,
@@ -1208,6 +1231,13 @@ async fn handle_client_envelope(
                     .await;
                 return true;
             };
+            if !pane_id_in_session_set(p.pane_id, session_pane_set) {
+                debug!(
+                    pane_id = p.pane_id,
+                    "drop PANE_IN: pane not in session set (0067 BE-3)"
+                );
+                return false;
+            }
             if !p.bytes.is_empty() {
                 let _ = backend.send_input(PaneId(u64::from(p.pane_id)), p.bytes.to_vec());
             }
@@ -1223,6 +1253,13 @@ async fn handle_client_envelope(
                     .await;
                 return true;
             };
+            if !pane_id_in_session_set(r.pane_id, session_pane_set) {
+                debug!(
+                    pane_id = r.pane_id,
+                    "drop PANE_RESIZE: pane not in session set (0067 BE-3)"
+                );
+                return false;
+            }
             let rows = u16::try_from(r.rows).unwrap_or(u16::MAX);
             let cols = u16::try_from(r.cols).unwrap_or(u16::MAX);
             let _ = backend.resize(PaneId(u64::from(r.pane_id)), rows, cols);
@@ -1238,6 +1275,13 @@ async fn handle_client_envelope(
                     .await;
                 return true;
             };
+            if !pane_id_in_session_set(pane_id, session_pane_set) {
+                debug!(
+                    pane_id,
+                    "drop PANE_PAUSE: pane not in session set (0067 BE-3)"
+                );
+                return false;
+            }
             let id = PaneId(u64::from(pane_id));
             if !debounce_pause(last_pause_event, id) {
                 suspended.insert(id);
@@ -1254,6 +1298,13 @@ async fn handle_client_envelope(
                     .await;
                 return true;
             };
+            if !pane_id_in_session_set(pane_id, session_pane_set) {
+                debug!(
+                    pane_id,
+                    "drop PANE_RESUME: pane not in session set (0067 BE-3)"
+                );
+                return false;
+            }
             let id = PaneId(u64::from(pane_id));
             if !debounce_pause(last_pause_event, id) {
                 suspended.remove(&id);
@@ -1474,6 +1525,32 @@ fn close_frame(code: u16, reason: &'static str) -> Message {
 mod tests {
     use super::*;
     use gtmux_pty_backend::PtyBackend;
+
+    // ── Session-scoped input filter (0067 BE-3) ───────────────────────────
+
+    #[test]
+    fn pane_id_in_session_set_none_passes_through() {
+        // Legacy bearer-only / pre-attach path — `None` means no
+        // session is attached on this WS, so every pane id passes
+        // (mirrors the `pane_output` arm's legacy semantics).
+        assert!(pane_id_in_session_set(42, None));
+        assert!(pane_id_in_session_set(0, None));
+    }
+
+    #[test]
+    fn pane_id_in_session_set_filters_when_set_is_some() {
+        let mut set = std::collections::HashSet::new();
+        set.insert(7u64);
+        set.insert(11u64);
+        // Pane id present in the set → allowed.
+        assert!(pane_id_in_session_set(7, Some(&set)));
+        assert!(pane_id_in_session_set(11, Some(&set)));
+        // Pane id not in the set → dropped (the cross-session input case).
+        assert!(!pane_id_in_session_set(42, Some(&set)));
+        // Empty set drops everything — matches "session has no terminals yet".
+        let empty: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        assert!(!pane_id_in_session_set(7, Some(&empty)));
+    }
 
     // ── Subprotocol parser ────────────────────────────────────────────────
 

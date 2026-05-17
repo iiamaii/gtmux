@@ -79,19 +79,58 @@ async fn gate1_signal_ctrl_c_interrupts_sleep() {
     // Drain initial prompt.
     sleep(Duration::from_millis(150)).await;
 
+    // 0067 BE-6 / 0066 §BE-6 — flake stabilization, two-part fix:
+    //
+    // 1. Disable line-discipline echo so the literal input string
+    //    `echo BEFORE … echo AFTER\n` is not echoed back as PTY output.
+    //    Without this:
+    //      * `read_until(BEFORE)` would match the *input echo* before
+    //        the shell parsed the line — Ctrl-C then races with the
+    //        shell's fork→exec of `sleep`.
+    //      * The final assertion `!acc.contains("AFTER")` would
+    //        false-positive on the literal `echo AFTER` in the input
+    //        echo, even when the shell never executed it.
+    //    Same trick as `gate3_alt_screen_sequences_passthrough`.
+    //
+    // 2. Chain the three commands with `&&` instead of `;` so the
+    //    witness ("AFTER must not print") is deterministic across
+    //    shell variants. SIGINT-killed `sleep` exits with status 130
+    //    (128+SIGINT), which short-circuits `&& echo AFTER` regardless
+    //    of whether the shell breaks its command list on SIGINT. With
+    //    `;`, macOS bash 3.2 in POSIX mode (the platform `/bin/sh`)
+    //    continues through the sequence and prints AFTER even when
+    //    sleep died from SIGINT — see the failure log in 0066 §BE-6:
+    //    `^C\r\nAFTER\r\n$ `.
+    backend
+        .send_input(id, b"stty -echo\n".to_vec())
+        .expect("send stty");
+    sleep(Duration::from_millis(200)).await;
+
     // Launch a long sleep that echoes "BEFORE" first, then "AFTER" after
     // the sleep returns. Ctrl-C should interrupt the sleep; "AFTER" must
     // NOT appear before the prompt comes back.
     backend
-        .send_input(id, b"echo BEFORE; sleep 30; echo AFTER\n".to_vec())
+        .send_input(id, b"echo BEFORE && sleep 30 && echo AFTER\n".to_vec())
         .expect("send");
     let _ = read_until(&mut rx, b"BEFORE", Duration::from_secs(3)).await;
 
-    // Send Ctrl-C (0x03). The shell traps SIGINT, the sleep terminates,
-    // and the prompt returns.
+    // Seeing "BEFORE" means the shell wrote the first command's output,
+    // but the shell may not have fork(2)+exec(2)'d `sleep` yet at that
+    // instant. Sending SIGINT before there is a foreground `sleep` to
+    // kill leaves the shell to run `sleep` afterwards (which then runs
+    // to completion since the SIGINT is already consumed). Give the
+    // fork→exec syscall chain a comfortable margin to settle into a
+    // SIGINT-able state.
+    sleep(Duration::from_millis(200)).await;
+
+    // Send Ctrl-C (0x03). The shell delivers SIGINT to the foreground
+    // process group; `sleep` dies with exit status 130 and `&&` aborts
+    // the chain before `echo AFTER` can run. The prompt returns.
     backend.send_input(id, vec![0x03]).expect("send ctrl-c");
 
-    let acc = read_until(&mut rx, b"$ ", Duration::from_secs(3)).await;
+    // 0067 BE-6 — widen the prompt-return budget from 3s → 5s for CI
+    // headroom under parallel `cargo test --workspace` scheduling.
+    let acc = read_until(&mut rx, b"$ ", Duration::from_secs(5)).await;
     assert!(
         !acc.windows(5).any(|w| w == b"AFTER"),
         "Ctrl-C did not interrupt sleep; output contained AFTER: {:?}",

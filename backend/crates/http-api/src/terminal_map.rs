@@ -28,7 +28,7 @@
 //!     caller (`AppState::spawn_terminal_with_uuid`) uses this to detect a
 //!     concurrent same-UUID spawn race and clean up the duplicate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -122,6 +122,25 @@ impl TerminalMap {
     pub async fn snapshot(&self) -> Vec<(String, PaneId)> {
         let g = self.inner.read().await;
         g.by_uuid.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    /// Bulk UUID → PaneId resolution under a single read lock (0067 BE-5(a)
+    /// / 0066 §BE-5). Returns the set of PaneIds (as `u64`) that the
+    /// supplied UUIDs currently resolve to; UUIDs absent from the map are
+    /// silently dropped (false-negative-safe — matches ADR-0025 D3).
+    ///
+    /// Replaces the prior `snapshot → HashMap<String, PaneId> → filter_map`
+    /// chain inside `SessionPaneSetProvider`, which cloned the full pool on
+    /// every call. With this API, the cost scales with `uuids.len()` only.
+    pub async fn resolve_uuids_to_panes(&self, uuids: &[String]) -> HashSet<u64> {
+        if uuids.is_empty() {
+            return HashSet::new();
+        }
+        let g = self.inner.read().await;
+        uuids
+            .iter()
+            .filter_map(|u| g.by_uuid.get(u).map(|p| p.0))
+            .collect()
     }
 
     /// Number of bindings.
@@ -273,6 +292,41 @@ mod tests {
         // Mutating after snapshot does not affect the snapshot vec.
         map.unregister_pane(PaneId(1)).await;
         assert_eq!(snap.len(), 2);
+    }
+
+    // ── resolve_uuids_to_panes (0067 BE-5(a)) ─────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_uuids_to_panes_matches_individual_lookup() {
+        let map = TerminalMap::new();
+        map.register("u1".into(), PaneId(10)).await.unwrap();
+        map.register("u2".into(), PaneId(20)).await.unwrap();
+        map.register("u3".into(), PaneId(30)).await.unwrap();
+        let uuids: Vec<String> = vec!["u1".into(), "u2".into(), "u3".into()];
+        let got = map.resolve_uuids_to_panes(&uuids).await;
+        let expected: HashSet<u64> = [10, 20, 30].into_iter().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn resolve_uuids_to_panes_empty_uuids_returns_empty_set() {
+        let map = TerminalMap::new();
+        map.register("u1".into(), PaneId(10)).await.unwrap();
+        let got = map.resolve_uuids_to_panes(&[]).await;
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_uuids_to_panes_drops_dangling_uuids() {
+        // Layout references a dangling UUID (no terminal in the pool).
+        // Per ADR-0025 D3 (false-negative-safe) the missing entry is
+        // silently omitted from the result set.
+        let map = TerminalMap::new();
+        map.register("alive".into(), PaneId(7)).await.unwrap();
+        let uuids: Vec<String> = vec!["alive".into(), "dangling".into()];
+        let got = map.resolve_uuids_to_panes(&uuids).await;
+        let expected: HashSet<u64> = [7].into_iter().collect();
+        assert_eq!(got, expected);
     }
 
     #[tokio::test]
