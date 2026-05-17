@@ -23,7 +23,7 @@
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 import { debugCount } from '$lib/common/debugCounts';
-import { EtagMismatchError, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+import { deleteItem, EtagMismatchError, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
 import { historyStore } from '$lib/stores/historyStore.svelte';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -627,6 +627,71 @@ class SessionStore {
       });
       return { ok: false };
     }
+  }
+
+  /**
+   * ADR-0028 D1 — item 제거 (deleteItem) 의 history capture 통합 entry.
+   *
+   * `deleteItem` 은 별도 BE endpoint (`DELETE /api/sessions/:name/items/:id`) 라
+   * `mutateLayout` 우회 — 본 helper 가 PRE-state snapshot + 각 deleteItem
+   * 호출 + store 동기 + history capture 책임.
+   *
+   * Partial 실패 허용: 성공한 id 만 store 에서 제거, history 는 (변경된 항목
+   * 있을 때) 1 entry 로 capture (PRE-state). undo 시 mutateLayout 으로 PRE
+   * 복원 → BE 가 items[] 에 panel 재추가. terminal 이면 pool 잔존 시 mirror
+   * 자연 회복 (ADR-0028 D1.2), 사라진 경우 D9 toast.
+   *
+   * `killTerminal=true` 호출 시 — terminal 도 죽이므로 undo 시 unmatched 가
+   * 더 흔함. caller (PanelNode performClose 의 kill 선택지) 가 명시 책임.
+   */
+  async applyDeletion(
+    ids: readonly string[],
+    options: {
+      killTerminal?: boolean;
+      abortMessage?: string;
+    } = {},
+  ): Promise<{ ok: number; fail: number }> {
+    const active = this.active;
+    if (active === null) return { ok: 0, fail: 0 };
+    const guard = await this.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message:
+          options.abortMessage ??
+          'Session reconnect failed — delete aborted.',
+        tone: 'error',
+      });
+      return { ok: 0, fail: 0 };
+    }
+    if (ids.length === 0) return { ok: 0, fail: 0 };
+    const before = this.layoutSnapshot();
+    const kill = options.killTerminal === true;
+    let ok = 0;
+    let fail = 0;
+    let unauthorized = false;
+    for (const id of ids) {
+      try {
+        await deleteItem(active.name, id, kill);
+        this.items.delete(id);
+        this.M.delete(id);
+        ok += 1;
+      } catch (err) {
+        if (err instanceof UnauthorizedError) {
+          unauthorized = true;
+          break;
+        }
+        console.warn('[gtmux] deleteItem failed', id, err);
+        fail += 1;
+      }
+    }
+    if (unauthorized) {
+      window.location.href = '/auth';
+      return { ok, fail };
+    }
+    if (ok > 0) {
+      historyStore.capture(active.name, before);
+    }
+    return { ok, fail };
   }
 
   /**

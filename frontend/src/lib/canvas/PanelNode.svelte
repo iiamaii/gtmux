@@ -24,7 +24,7 @@
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
   import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
-  import { deleteItem, UnauthorizedError } from '$lib/http/sessions';
+  import { UnauthorizedError } from '$lib/http/sessions';
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
@@ -232,37 +232,27 @@
 
   async function performClose(killTerminal: boolean): Promise<void> {
     confirmOpen = false;
-    const active = sessionStore.active;
-    if (active === null) return;
-    const guard = await sessionStore.guardOutgoingMutation();
-    if (!guard.ok) {
-      toastStore.show({
-        message: 'Session reconnect failed — close aborted.',
-        tone: 'error',
-      });
-      return;
-    }
+    if (sessionStore.active === null) return;
     closing = true;
     try {
-      await deleteItem(active.name, data.id, killTerminal);
-      sessionStore.items.delete(data.id);
-      sessionStore.M.delete(data.id);
-      void terminalPool.refresh();
-      toastStore.show({
-        message: killTerminal
-          ? `Panel + terminal closed.${otherSessions.length > 0 ? ` ${otherSessions.length} mirror panel(s) now dangling.` : ''}`
-          : 'Panel removed. Terminal still in pool.',
-        tone: 'success',
+      const { ok, fail } = await sessionStore.applyDeletion([data.id], {
+        killTerminal,
+        abortMessage: 'Session reconnect failed — close aborted.',
       });
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
+      if (ok > 0) {
+        void terminalPool.refresh();
+        toastStore.show({
+          message: killTerminal
+            ? `Panel + terminal closed.${otherSessions.length > 0 ? ` ${otherSessions.length} mirror panel(s) now dangling.` : ''}`
+            : 'Panel removed. Terminal still in pool.',
+          tone: 'success',
+        });
+      } else if (fail > 0) {
+        toastStore.show({
+          message: 'Close failed.',
+          tone: 'error',
+        });
       }
-      toastStore.show({
-        message: `Close failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
     } finally {
       closing = false;
     }

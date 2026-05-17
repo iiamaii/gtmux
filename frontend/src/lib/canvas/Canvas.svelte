@@ -21,7 +21,7 @@
   import { debugCount } from '$lib/common/debugCounts';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toolStore } from '$lib/stores/toolStore.svelte';
-  import { attachConfirm, deleteItem, UnauthorizedError } from '$lib/http/sessions';
+  import { attachConfirm, UnauthorizedError } from '$lib/http/sessions';
   import type { CanvasItem } from '$lib/types/canvas';
   import { effectiveLocked, effectiveVisibility } from '$lib/types/group';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -180,35 +180,12 @@
    * - 부분 실패 허용 — 성공한 것만 store 에서 빼고 토스트로 카운트 표시.
    */
   async function deleteSelected(): Promise<void> {
-    const active = sessionStore.active;
-    if (active === null) return;
-    const guard = await sessionStore.guardOutgoingMutation();
-    if (!guard.ok) {
-      toastStore.show({
-        message: 'Session reconnect failed — delete aborted.',
-        tone: 'error',
-      });
-      return;
-    }
     const ids = Array.from(sessionStore.M);
     if (ids.length === 0) return;
-    let ok = 0;
-    let fail = 0;
-    for (const id of ids) {
-      try {
-        await deleteItem(active.name, id, false);
-        sessionStore.items.delete(id);
-        sessionStore.M.delete(id);
-        ok += 1;
-      } catch (err) {
-        if (err instanceof UnauthorizedError) {
-          window.location.href = '/auth';
-          return;
-        }
-        console.warn('[gtmux] deleteItem failed', id, err);
-        fail += 1;
-      }
-    }
+    const { ok, fail } = await sessionStore.applyDeletion(ids, {
+      killTerminal: false,
+    });
+    if (ok === 0 && fail === 0) return;
     if (fail === 0) {
       toastStore.show({
         message: `Removed ${ok} item${ok === 1 ? '' : 's'}.`,

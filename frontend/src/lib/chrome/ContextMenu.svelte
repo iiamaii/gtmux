@@ -24,7 +24,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { zStore } from '$lib/stores/zStore.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
-  import { deleteItem, UnauthorizedError } from '$lib/http/sessions';
+  import { UnauthorizedError } from '$lib/http/sessions';
   import {
     commitNewItem,
     createCanvasItem,
@@ -222,26 +222,21 @@
 
   /** Delete (multi-session): item only — terminal pool 미touch. */
   async function onDeleteItem(): Promise<void> {
-    const active = sessionStore.active;
-    if (active === null || !panelIdStr) {
+    if (sessionStore.active === null || !panelIdStr) {
       close();
       return;
     }
-    try {
-      await deleteItem(active.name, panelIdStr, false);
-      sessionStore.items.delete(panelIdStr);
-      sessionStore.M.delete(panelIdStr);
+    const { ok, fail } = await sessionStore.applyDeletion([panelIdStr], {
+      killTerminal: false,
+    });
+    if (ok > 0) {
       toastStore.show({
         message: 'Panel removed from canvas. Terminal still in pool.',
         tone: 'success',
       });
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
+    } else if (fail > 0) {
       toastStore.show({
-        message: `Delete failed: ${err instanceof Error ? err.message : String(err)}`,
+        message: 'Delete failed.',
         tone: 'error',
       });
     }
