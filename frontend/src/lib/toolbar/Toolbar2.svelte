@@ -185,7 +185,12 @@
             aria-label={tool.name}
             aria-pressed={current === tool.id}
             data-tool-id={tool.id}
-            onclick={() => toolStore.set(tool.id)}
+            onclick={(e) => {
+              toolStore.set(tool.id);
+              // 클릭 후 button focus retention 차단 — ESC 로 tool 취소 시 옛 button 의
+              // :focus-visible outline 잔류 회피. Tab navigation focus 는 그대로.
+              (e.currentTarget as HTMLButtonElement).blur();
+            }}
           >
             <svg
               width="18"
@@ -220,7 +225,10 @@
         title="Undo (⌘Z)"
         aria-label="Undo"
         disabled={!historyStore.canUndo}
-        onclick={() => void sessionStore.undo()}
+        onclick={(e) => {
+          void sessionStore.undo();
+          (e.currentTarget as HTMLButtonElement).blur();
+        }}
       >
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M3 7v6h6"/>
@@ -233,7 +241,10 @@
         title="Redo (⇧⌘Z)"
         aria-label="Redo"
         disabled={!historyStore.canRedo}
-        onclick={() => void sessionStore.redo()}
+        onclick={(e) => {
+          void sessionStore.redo();
+          (e.currentTarget as HTMLButtonElement).blur();
+        }}
       >
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M21 7v6h-6"/>
