@@ -145,22 +145,6 @@
   }
 </script>
 
-<header class="topbar">
-  <div class="topbar-actions">
-    <button
-      class="icon-btn"
-      type="button"
-      aria-label="Toggle theme"
-      title="Toggle theme"
-      onclick={() => themeStore.toggle()}
-    >
-      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M13.5 9.5A5.5 5.5 0 016.5 2.5a5.5 5.5 0 107 7z" />
-      </svg>
-    </button>
-  </div>
-</header>
-
 <main>
   <section class="card" aria-labelledby="auth-title">
     <div class="brand-header">
@@ -283,25 +267,6 @@
    * Tokens come from the global tokens.css (ADR-0016 + 2026-05-15 amend).
    */
 
-  .topbar {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: 56px;
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    padding: 0 var(--space-24);
-    z-index: 10;
-  }
-
-  .topbar-actions {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-  }
-
   .brand-header {
     display: flex;
     flex-direction: row;
@@ -317,20 +282,6 @@
     border-radius: var(--radius-md);
     object-fit: cover;
     display: block;
-  }
-
-  .icon-btn {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
-    color: var(--color-fg);
-    display: grid;
-    place-items: center;
-    transition: background var(--motion-fast) var(--motion-easing);
-  }
-
-  .icon-btn:hover {
-    background: var(--color-glass-1);
   }
 
   main {
