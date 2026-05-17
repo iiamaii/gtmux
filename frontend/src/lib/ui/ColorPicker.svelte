@@ -406,6 +406,12 @@
   let hueEl: HTMLDivElement | undefined = $state();
   let alphaEl: HTMLDivElement | undefined = $state();
 
+  /** Inline hex input — trigger 옆 항상 보이는 색상값 표시 + 명시적 입력.
+   *  popover 의 cp-input 과 별도 state — outer 는 *항상 hex* 만 (format toggle
+   *  적용 X), popover 는 formatMode 따라. alpha 는 alphaInput 공유. */
+  let inlineHexInput = $state('');
+  let inlineEditing = $state(false);
+
   type FormatMode = 'hex' | 'rgb' | 'hsl' | 'oklch';
   let formatMode = $state<FormatMode>('hex');
   let formatMenuOpen = $state(false);
@@ -488,6 +494,14 @@
   });
   $effect(() => {
     if (!editingAlpha) alphaInput = String(Math.round(effectiveAlpha));
+  });
+  // Inline 의 표시값 — 항상 hex (#rrggbb), '#' 제거 + uppercase.
+  $effect(() => {
+    if (!inlineEditing) {
+      if (mixed) inlineHexInput = '';
+      else if (isTransparent) inlineHexInput = '';
+      else inlineHexInput = hexRgb(effectiveHex).replace('#', '').toUpperCase();
+    }
   });
 
   // ── Click-outside close + popover position tracking ─────────────
@@ -578,6 +592,32 @@
       commitColor(combineHexAlpha(hex, Number.isNaN(a) ? 100 : a));
     } else {
       commitColor(hex);
+    }
+  }
+
+  /** Inline hex input commit — outer 는 hex 만. transparent literal 도 허용. */
+  function onInlineHexCommit(): void {
+    const trimmed = inlineHexInput.trim().toLowerCase();
+    if (allowTransparent && !allowAlpha && isTransparentValue(trimmed)) {
+      if (value !== 'transparent') oncommit('transparent');
+      inlineHexInput = '';
+      return;
+    }
+    const norm = normalizeHex(inlineHexInput);
+    if (norm === null) {
+      // revert
+      inlineHexInput = isTransparent || mixed ? '' : hexRgb(effectiveHex).replace('#', '').toUpperCase();
+      return;
+    }
+    if (allowAlpha) {
+      if (/^#[0-9a-f]{8}$/.test(norm)) {
+        commitColor(norm);
+      } else {
+        const a = Math.max(0, Math.min(100, Number.parseInt(alphaInput || '100', 10)));
+        commitColor(combineHexAlpha(norm, Number.isNaN(a) ? 100 : a));
+      }
+    } else {
+      commitColor(norm);
     }
   }
 
@@ -783,6 +823,54 @@
       {/if}
     </span>
   </button>
+
+  <!-- Inline hex value — trigger 옆 항상 표시 + 명시적 입력. popover 와 별도. -->
+  <input
+    type="text"
+    class="inline-hex mono"
+    value={inlineHexInput}
+    oninput={(e) => {
+      inlineEditing = true;
+      inlineHexInput = (e.currentTarget as HTMLInputElement).value;
+    }}
+    placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : '000000'}
+    {disabled}
+    onfocus={() => (inlineEditing = true)}
+    onblur={() => {
+      inlineEditing = false;
+      onInlineHexCommit();
+    }}
+    onkeydown={(e) => {
+      if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+    }}
+    spellcheck="false"
+    autocomplete="off"
+    aria-label="Color hex"
+  />
+  {#if allowAlpha}
+    <input
+      type="number"
+      class="inline-alpha mono"
+      min="0"
+      max="100"
+      step="1"
+      value={editingAlpha ? alphaInput : String(Math.round(effectiveAlpha))}
+      oninput={(e) => {
+        if (editingAlpha) alphaInput = (e.currentTarget as HTMLInputElement).value;
+      }}
+      {disabled}
+      onfocus={() => (editingAlpha = true)}
+      onblur={() => {
+        editingAlpha = false;
+        onAlphaChange();
+      }}
+      onkeydown={(e) => {
+        if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+      }}
+      aria-label="Alpha percent"
+    />
+    <span class="inline-alpha-pct" aria-hidden="true">%</span>
+  {/if}
 
   {#if open}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1022,9 +1110,69 @@
     position: relative;
     display: inline-flex;
     align-items: center;
+    gap: var(--space-4);
     height: 22px;
   }
   .color-picker.disabled { opacity: 0.55; }
+
+  /* Inline hex / alpha — trigger 옆 항상 보이는 값 표시 + 직접 입력. */
+  .inline-hex,
+  .inline-alpha {
+    height: 22px;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-fg);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0;
+    padding: 0 6px;
+    box-sizing: border-box;
+    text-transform: lowercase;
+    outline: none;
+    transition: border-color var(--motion-fast) var(--motion-easing);
+  }
+  .inline-hex {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 76px;
+  }
+  .inline-alpha {
+    width: 44px;
+    padding: 0 4px;
+    text-align: right;
+    -moz-appearance: textfield;
+    appearance: textfield;
+  }
+  .inline-alpha::-webkit-outer-spin-button,
+  .inline-alpha::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  .inline-hex::placeholder,
+  .inline-alpha::placeholder {
+    color: var(--color-fg-subtle);
+    font-style: italic;
+  }
+  .inline-hex:hover:not(:disabled),
+  .inline-alpha:hover:not(:disabled) {
+    border-color: var(--color-border-strong);
+  }
+  .inline-hex:focus,
+  .inline-alpha:focus {
+    border-color: var(--color-accent);
+  }
+  .inline-hex:disabled,
+  .inline-alpha:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+  .inline-alpha-pct {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--color-fg-subtle);
+    margin-left: -2px;
+  }
 
   .swatch-trigger {
     width: 22px;
