@@ -733,6 +733,11 @@
      * height 와 컨테이너 사이 잔여 영역이 같은 색이라 resize 중에도
      * 검은색 갭이 노출되지 않음. */
     background: var(--xterm-bg);
+    /* xterm 의 .xterm-viewport / .xterm-screen 이 cell-정수배 inline-px
+     * height 를 가져 panel-body 보다 클 수 있음 → 하단 resize handle 영역
+     * 침범. panel 의 overflow:visible 은 corner handle visibility 보장용 —
+     * inner content overflow 는 본 .panel-body 가 격리. */
+    overflow: hidden;
   }
 
   /* xterm DOM portal — XtermHost 의 containerEl 가 본 div 의 직접 child.

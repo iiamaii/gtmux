@@ -228,14 +228,27 @@
     const resolved = themeStore.resolved;
     if (term === null) return;
     term.options.theme = xtermTheme(resolved);
-    // theme options swap 만으로는 cell texture cache 가 stale — 빈 영역 / 옛
-    // 색 그대로 남는 회귀 (사용자 보고 2026-05-17). 강제 redraw 로 모든 row
-    // 의 cell 을 새 theme 으로 다시 그림.
+    // theme options swap 만으로는 cell texture cache + cell DOM 의 inline
+    // style 이 stale — 빈 영역 / 옛 색 그대로 남는 회귀 (사용자 보고
+    // 2026-05-17 2회). 두 단계 강제 redraw:
+    //   1. clearTextureAtlas + refresh(0, rows-1) — xterm 의 cell-buffer 재 paint
+    //   2. .xterm root 의 display 토글 → 강제 reflow — 모든 child renderer
+    //      (canvas / dom) 의 inline color 가 새 theme 으로 재 commit.
     try {
       term.clearTextureAtlas?.();
       term.refresh(0, term.rows - 1);
     } catch {
-      // refresh 가 인식 안 되는 alt-screen 등의 edge case — silent.
+      // alt-screen 등 edge — silent.
+    }
+    if (containerEl !== undefined) {
+      const xtermRoot = containerEl.querySelector('.xterm') as HTMLElement | null;
+      if (xtermRoot !== null) {
+        const prev = xtermRoot.style.display;
+        xtermRoot.style.display = 'none';
+        // 강제 reflow — getBoundingClientRect / offsetHeight 가 layout flush.
+        void xtermRoot.offsetHeight;
+        xtermRoot.style.display = prev;
+      }
     }
   });
 </script>
