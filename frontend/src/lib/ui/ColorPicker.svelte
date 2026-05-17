@@ -1,12 +1,37 @@
 <script module lang="ts">
   /**
    * Module-scope recent-color history — singleton 공유 (모든 picker instance
-   * 가 같은 LRU 본다). Phase 3 의 swatch row "Recent". max 10, FIFO. 새로고침
-   * 시 손실 (clipboard 와 동일 정책 — Figma 도 session-scope).
+   * 가 같은 LRU 본다). max 10, FIFO. Phase 4: localStorage 영속 (ADR-0016 D11).
+   * private/incognito 등 storage 차단 시 in-memory fallback.
    */
-  // svelte module-script 안의 $state — 모든 instance 공유 (proxy).
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const _recent: { list: string[] } = $state({ list: [] });
+  const STORAGE_KEY = 'gtmux:colorpicker:recent';
+  const MAX = 10;
+
+  function loadFromStorage(): string[] {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (raw === null) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter((v): v is string => typeof v === 'string' && /^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(v))
+        .slice(0, MAX);
+    } catch {
+      return [];
+    }
+  }
+
+  function saveToStorage(list: readonly string[]): void {
+    if (typeof window === 'undefined') return;
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+    } catch {
+      // private/incognito or quota exceeded — silent.
+    }
+  }
+
+  const _recent: { list: string[] } = $state({ list: loadFromStorage() });
 
   export function recentColorList(): readonly string[] {
     return _recent.list;
@@ -18,7 +43,8 @@
     const i = _recent.list.indexOf(norm);
     if (i !== -1) _recent.list.splice(i, 1);
     _recent.list.unshift(norm);
-    if (_recent.list.length > 10) _recent.list.length = 10;
+    if (_recent.list.length > MAX) _recent.list.length = MAX;
+    saveToStorage(_recent.list);
   }
 </script>
 
@@ -29,15 +55,12 @@
    *
    * Phase 1: visual shell — trigger swatch + popover layout (v4 시안).
    * Phase 2: SV / hue / alpha drag — pointerdown→move→up, draft preview, 1회 commit.
-   * Phase 3 (현 commit):
-   *   - Format toggle (Hex / RGB / HSL) — cp-format pill 클릭 → dropdown.
-   *     cp-input 의 display + parsing 이 format mode 따라.
-   *   - Eyedropper — `window.EyeDropper` 지원 시 button 활성, onclick → pick.
-   *   - Recent swatch history — module-scope LRU, commit 마다 prepend, max 10.
-   *
-   * Phase 4 (후속):
-   *   - OKLCH format 지원 + ADR-0016 amend (token-aware preset palette)
-   *   - localStorage 로 recent 영속화 (option)
+   * Phase 3: Format toggle (Hex / RGB / HSL), Eyedropper, Recent (session-scope).
+   * Phase 4 (현 commit):
+   *   - OKLCH format 추가 (ADR-0016 D12).
+   *   - Recent 의 localStorage 영속 (ADR-0016 D11, key `gtmux:colorpicker:recent`).
+   *   - Token-aware Document palette (ADR-0016 D10) — 시안 hardcoded 색 →
+   *     semantic color token 10 개의 resolved hex.
    *
    * 입력 (props):
    *   - value: string | null | undefined  — 현재 색 (#rrggbb / #rrggbbaa /
@@ -273,6 +296,77 @@
       .join('');
   }
 
+  // ── Phase 4: OKLCH 변환 (Björn Ottosson formula) ─────────────────
+  // sRGB ↔ linear ↔ OKLab ↔ OKLCH. 입력은 sRGB hex.
+
+  function srgbToLinear(c: number): number {
+    return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+
+  function linearToSrgb(c: number): number {
+    return c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+  }
+
+  /** sRGB hex → OKLCH { L, C, H }. L: 0-1 도메인, C: 0~0.4 정도, H: 0-360 degree. */
+  function hexToOklch(hex: string): { L: number; C: number; H: number } {
+    const { r, g, b } = hexToRgbParts(hex);
+    const rl = srgbToLinear(r / 255);
+    const gl = srgbToLinear(g / 255);
+    const bl = srgbToLinear(b / 255);
+    // OKLab cone responses (Ottosson).
+    const l = 0.4122214708 * rl + 0.5363325363 * gl + 0.0514459929 * bl;
+    const m = 0.2119034982 * rl + 0.6806995451 * gl + 0.1073969566 * bl;
+    const s = 0.0883024619 * rl + 0.2817188376 * gl + 0.6299787005 * bl;
+    const l_ = Math.cbrt(l);
+    const m_ = Math.cbrt(m);
+    const s_ = Math.cbrt(s);
+    const L = 0.2104542553 * l_ + 0.793617785 * m_ - 0.0040720468 * s_;
+    const A = 1.9779984951 * l_ - 2.428592205 * m_ + 0.4505937099 * s_;
+    const B = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.808675766 * s_;
+    const C = Math.sqrt(A * A + B * B);
+    let H = (Math.atan2(B, A) * 180) / Math.PI;
+    if (H < 0) H += 360;
+    return { L, C, H };
+  }
+
+  function hexToOklchString(hex: string): string {
+    const { L, C, H } = hexToOklch(hex);
+    return `${Math.round(L * 100)}%, ${C.toFixed(3)}, ${Math.round(H)}`;
+  }
+
+  /** OKLCH 좌표 → sRGB hex (gamut clip). */
+  function oklchToHex(L: number, C: number, H: number): string {
+    const hr = (H * Math.PI) / 180;
+    const A = C * Math.cos(hr);
+    const B = C * Math.sin(hr);
+    const l_ = L + 0.3963377774 * A + 0.2158037573 * B;
+    const m_ = L - 0.1055613458 * A - 0.0638541728 * B;
+    const s_ = L - 0.0894841775 * A - 1.291485548 * B;
+    const l = l_ * l_ * l_;
+    const m = m_ * m_ * m_;
+    const s = s_ * s_ * s_;
+    const rl = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+    const gl = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+    const bl = -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s;
+    const r = Math.max(0, Math.min(1, linearToSrgb(rl)));
+    const g = Math.max(0, Math.min(1, linearToSrgb(gl)));
+    const b = Math.max(0, Math.min(1, linearToSrgb(bl)));
+    return '#' + [r, g, b]
+      .map((v2) => Math.round(v2 * 255).toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  /** "L%, C, H" → hex. */
+  function parseOklchString(s: string): string | null {
+    const m = s.trim().match(/^(\d+(?:\.\d+)?)%?\s*[,\s]\s*(\d+(?:\.\d+)?)\s*[,\s]\s*(\d+(?:\.\d+)?)$/);
+    if (m === null) return null;
+    const Lp = Number.parseFloat(m[1] ?? '0');
+    const C = Number.parseFloat(m[2] ?? '0');
+    const H = Number.parseFloat(m[3] ?? '0');
+    const L = Math.max(0, Math.min(100, Lp)) / 100;
+    return oklchToHex(L, Math.max(0, Math.min(0.4, C)), ((H % 360) + 360) % 360);
+  }
+
   // ── 파생값 ────────────────────────────────────────────────────────
   const resolvedHex = $derived.by(() => {
     if (mixed) return null;
@@ -312,7 +406,7 @@
   let hueEl: HTMLDivElement | undefined = $state();
   let alphaEl: HTMLDivElement | undefined = $state();
 
-  type FormatMode = 'hex' | 'rgb' | 'hsl';
+  type FormatMode = 'hex' | 'rgb' | 'hsl' | 'oklch';
   let formatMode = $state<FormatMode>('hex');
   let formatMenuOpen = $state(false);
 
@@ -335,6 +429,7 @@
     const baseHex = hexRgb(effectiveHex);
     if (formatMode === 'rgb') return hexToRgbString(baseHex);
     if (formatMode === 'hsl') return hexToHslString(baseHex);
+    if (formatMode === 'oklch') return hexToOklchString(baseHex);
     return baseHex.replace('#', '').toUpperCase();
   });
 
@@ -421,6 +516,7 @@
     let normRgb: string | null = null;
     if (formatMode === 'rgb') normRgb = parseRgbString(textInput);
     else if (formatMode === 'hsl') normRgb = parseHslString(textInput);
+    else if (formatMode === 'oklch') normRgb = parseOklchString(textInput);
     else normRgb = normalizeHex(textInput);
 
     if (normRgb === null) {
@@ -607,11 +703,31 @@
     }
   }
 
-  // ── Preset palette (Phase 4 에서 token-aware) ────────────────────
-  const documentSwatches: readonly string[] = [
-    '#0d99ff', '#1abc9c', '#2dc26b', '#ffc857', '#f97316',
-    '#e5484d', '#b894ff', '#000000', '#6b6b6b',
+  // ── Phase 4: Token-aware Document palette (ADR-0016 D10) ────────
+  // Semantic color token 10 종을 *현재 theme 의 resolved hex* 로 변환. theme
+  // 전환 시 reactive — themeStore 변경 → CSS computed value 도 변경 → 다음 read.
+  // resolveCssColor 는 document 의존이라 SSR 환경에선 null fallback.
+  const TOKEN_NAMES: readonly { token: string; label: string }[] = [
+    { token: 'var(--color-fg)', label: 'Foreground' },
+    { token: 'var(--color-fg-muted)', label: 'Muted' },
+    { token: 'var(--color-fg-subtle)', label: 'Subtle' },
+    { token: 'var(--color-bg)', label: 'Background' },
+    { token: 'var(--color-surface-2)', label: 'Surface 2' },
+    { token: 'var(--color-accent)', label: 'Accent' },
+    { token: 'var(--color-success)', label: 'Success' },
+    { token: 'var(--color-warning)', label: 'Warning' },
+    { token: 'var(--color-danger)', label: 'Danger' },
+    { token: 'var(--color-info)', label: 'Info' },
   ];
+  const documentSwatches = $derived.by((): readonly { hex: string; label: string }[] => {
+    if (!open) return []; // popover 열린 후 에야 measure
+    return TOKEN_NAMES
+      .map(({ token, label }) => {
+        const hex = resolveCssColor(token);
+        return hex !== null ? { hex: hexRgb(hex), label } : null;
+      })
+      .filter((v): v is { hex: string; label: string } => v !== null);
+  });
   const recentSwatches = $derived(recentColorList());
 </script>
 
@@ -768,7 +884,7 @@
             }
           }}
         >
-          {formatMode === 'hex' ? 'HEX' : formatMode === 'rgb' ? 'RGB' : 'HSL'}
+          {formatMode === 'hex' ? 'HEX' : formatMode === 'rgb' ? 'RGB' : formatMode === 'hsl' ? 'HSL' : 'OKLCH'}
           <span class="caret" aria-hidden="true">▾</span>
         </div>
         <div class="cp-input">
@@ -778,7 +894,7 @@
             oninput={(e) => {
               if (editing) textInput = (e.currentTarget as HTMLInputElement).value;
             }}
-            placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : formatMode === 'hex' ? '000000' : formatMode === 'rgb' ? '0, 0, 0' : '0, 0%, 0%'}
+            placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : formatMode === 'hex' ? '000000' : formatMode === 'rgb' ? '0, 0, 0' : formatMode === 'hsl' ? '0, 0%, 0%' : '0%, 0, 0'}
             {disabled}
             onfocus={() => (editing = true)}
             onblur={() => {
@@ -824,7 +940,7 @@
         {#if formatMenuOpen}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div class="cp-format-menu is-open" role="menu" aria-label="Color format">
-            {#each ['hex', 'rgb', 'hsl'] as const as m}
+            {#each ['hex', 'rgb', 'hsl', 'oklch'] as const as m}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <div
                 class="item"
@@ -855,12 +971,13 @@
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <span
                 class="sw"
-                class:selected={resolvedHex !== null && hexRgb(resolvedHex) === sw}
-                style:--c={sw}
+                class:selected={resolvedHex !== null && hexRgb(resolvedHex) === sw.hex}
+                style:--c={sw.hex}
                 role="button"
                 tabindex="0"
-                aria-label={`Set color ${sw}`}
-                onclick={() => onSwatchClick(sw)}
+                aria-label={`${sw.label} (${sw.hex})`}
+                title={`${sw.label} · ${sw.hex}`}
+                onclick={() => onSwatchClick(sw.hex)}
               ></span>
             {/each}
             {#if allowTransparent && !allowAlpha}
