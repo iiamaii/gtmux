@@ -1,5 +1,7 @@
 # gtmux frontend
 
+> **English** · [한국어](README.ko.md)
+
 Svelte 5 + Vite 7 + TypeScript single-page app. Talks to the Rust
 backend over HTTP (`/api/*`) and a binary WebSocket protocol. xterm.js
 renders terminal output; `@xyflow/svelte` powers the infinite canvas.

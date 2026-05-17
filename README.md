@@ -1,5 +1,7 @@
 # gtmux
 
+> **English** · [한국어](README.ko.md)
+
 > Single-user web-canvas workspace with a Rust supervisor and a Svelte 5
 > frontend. Spawns PTY-backed shells, lays each one out as a draggable
 > panel on an infinite canvas, and serves the whole thing from one

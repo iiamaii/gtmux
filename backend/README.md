@@ -1,5 +1,7 @@
 # gtmux backend
 
+> **English** · [한국어](README.ko.md)
+
 Rust Cargo workspace — the supervisor process behind gtmux. Holds the
 HTTP API, the WebSocket protocol, the PTY backend, config + auth layers,
 and the `gtmux` CLI binary.
