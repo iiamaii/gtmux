@@ -86,11 +86,6 @@
     border-color: var(--color-border-strong);
   }
 
-  .active-session:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
-  }
-
   .dot {
     width: 8px;
     height: 8px;

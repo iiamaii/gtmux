@@ -363,8 +363,6 @@
   }
   .note-btn:focus-visible {
     opacity: 1;
-    outline: 1px dashed var(--color-accent);
-    outline-offset: 1px;
   }
 
   .note-body-wrap {
@@ -411,10 +409,6 @@
   .note-node.is-min .note-chip { display: block; }
   .note-node.is-min:hover {
     background: var(--color-surface-2);
-  }
-  .note-node.is-min:focus-visible {
-    outline: 1px dashed var(--color-accent);
-    outline-offset: 1px;
   }
 
   :global(.note-title-edit) {

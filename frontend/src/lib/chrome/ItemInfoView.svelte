@@ -1165,10 +1165,6 @@
     color: var(--color-fg);
   }
 
-  .align-btn:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
-  }
 
   .align-btn.active {
     background: var(--color-surface);
@@ -1214,11 +1210,6 @@
 
   .state-btn.active {
     color: var(--color-fg);
-  }
-
-  .state-btn:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
   }
 
   /* Mixed: dash overlay across the icon (indeterminate marker — ADR-0027 D3). */

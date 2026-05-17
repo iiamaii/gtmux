@@ -333,11 +333,6 @@
     background: var(--color-glass-1);
   }
 
-  .icon-btn:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
-  }
-
   main {
     display: grid;
     place-items: center;
@@ -408,11 +403,6 @@
 
   :global(:root.dark) .tab[aria-selected='true'] {
     background: var(--color-surface-2);
-  }
-
-  .tab:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 2px;
   }
 
   .panel {
@@ -504,11 +494,6 @@
     color: var(--color-fg);
   }
 
-  .toggle-eye:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
-  }
-
   .submit {
     width: 100%;
     height: 44px;
@@ -535,11 +520,6 @@
   .submit:disabled {
     opacity: 0.55;
     cursor: not-allowed;
-  }
-
-  .submit:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 2px;
   }
 
   .error {

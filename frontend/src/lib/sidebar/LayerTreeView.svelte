@@ -1122,10 +1122,6 @@
     background: var(--color-glass-1);
     color: var(--color-fg);
   }
-  .z-btn:focus-visible {
-    outline: 1px dashed var(--color-accent);
-    outline-offset: -1px;
-  }
   .z-btn:disabled {
     opacity: 0.3;
     cursor: not-allowed;

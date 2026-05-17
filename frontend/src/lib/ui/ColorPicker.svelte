@@ -1220,11 +1220,6 @@
     cursor: pointer;
     display: block;
   }
-  .swatch-trigger:focus-visible {
-    outline: 1px dashed var(--color-accent);
-    outline-offset: 2px;
-  }
-
   .swatch {
     display: block;
     width: 22px;
@@ -1291,7 +1286,6 @@
     transition: background var(--motion-fast) var(--motion-easing), color var(--motion-fast) var(--motion-easing);
   }
   .cp-btn:hover { background: var(--color-glass-2); color: var(--color-fg); }
-  .cp-btn:focus-visible { outline: 1px dashed var(--color-accent); outline-offset: 1px; }
 
   .cp-sv {
     position: relative;
@@ -1340,7 +1334,6 @@
   .cp-eye.has-feature { opacity: 1; }
   .cp-eye.has-feature:hover { background: var(--color-glass-1); }
   .cp-eye:disabled { cursor: not-allowed; }
-  .cp-eye:focus-visible { outline: 1px dashed var(--color-accent); outline-offset: 1px; }
 
   .cp-slider {
     position: relative;
@@ -1525,9 +1518,5 @@
       var(--color-danger) calc(50% + 0.5px),
       transparent calc(50% + 0.5px)
     );
-  }
-  .cp-swatches .sw:focus-visible {
-    outline: 1px dashed var(--color-accent);
-    outline-offset: 2px;
   }
 </style>

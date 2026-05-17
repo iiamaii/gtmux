@@ -338,10 +338,6 @@
     border-color: var(--color-border-strong);
   }
 
-  .row:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
-  }
 
   .row.disabled {
     opacity: 0.5;
@@ -413,10 +409,6 @@
     color: var(--color-danger);
   }
 
-  .row-kebab:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
-  }
 
   /* kebab 노출 시 chevron 가시 영역 안 겹치도록 right padding 보강. */
   .row-wrap:hover .row,

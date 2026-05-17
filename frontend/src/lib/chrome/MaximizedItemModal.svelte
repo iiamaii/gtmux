@@ -368,10 +368,6 @@
     background: var(--color-glass-1);
     color: var(--color-fg);
   }
-  .max-btn:focus-visible {
-    outline: 1px dashed var(--color-accent);
-    outline-offset: 1px;
-  }
 
   .max-body {
     background: var(--color-bg);

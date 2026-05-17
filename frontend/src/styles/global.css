@@ -23,14 +23,6 @@ body {
   box-sizing: border-box;
 }
 
-/* Figma-signature dashed accent focus ring. Components that need a
- * different focus style override on `:focus-visible` deliberately. */
-:focus-visible {
-  outline: 2px dashed var(--color-accent);
-  outline-offset: 1px;
-  border-radius: var(--radius-sm);
-}
-
 /* Dark scrollbar — matches surface-2 so it blends with sidebar /
  * panel chrome. */
 ::-webkit-scrollbar {

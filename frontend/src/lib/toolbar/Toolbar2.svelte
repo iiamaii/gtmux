@@ -343,11 +343,6 @@
     border-left: 1px solid var(--color-border);
   }
 
-  .tool:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
-  }
-
   .tool.active {
     background: var(--color-accent);
     color: var(--color-accent-fg);
