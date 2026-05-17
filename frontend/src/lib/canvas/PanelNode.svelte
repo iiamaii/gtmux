@@ -806,6 +806,10 @@
     width: 7px !important;
     height: 7px !important;
     border-radius: 1px !important;
+    /* xterm .xterm-viewport (position:absolute, default z-index 0) 가 stacking
+       context 안에서 handle 위로 그려져 하단 corner 가 가려지던 회귀
+       (2026-05-17 사용자 보고). 명시 z-index 로 handle 을 항상 위에. */
+    z-index: 10 !important;
   }
   :global(.panel-resize-line) {
     border-color: transparent !important;
