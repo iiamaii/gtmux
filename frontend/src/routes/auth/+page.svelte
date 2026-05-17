@@ -20,7 +20,7 @@
   import { onMount, untrack } from 'svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
   import { login } from '$lib/http/auth';
-  import brandLogoUrl from '$lib/assets/brand-G.png';
+  import brandLogoUrl from '$lib/assets/brand.png';
 
   // ADR-0020 D13 — 본 컴포넌트가 `/auth` page 의 *단일 source*. BE 는
   // SPA fallback (index.html) 만 응답 — main.ts 의 pickPage 가 `/auth` →

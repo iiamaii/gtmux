@@ -14,7 +14,7 @@
   import SessionMenu from './SessionMenu.svelte';
   import ThemeToggle from '$lib/ui/ThemeToggle.svelte';
   import FocusToggle from './FocusToggle.svelte';
-  import brandLogoUrl from '$lib/assets/brand-G.png';
+  import brandLogoUrl from '$lib/assets/brand.png';
 
   const TOKEN_STORAGE_KEY = 'gtmux_token';
   const SESSION_STORAGE_KEY = 'gtmux_session';
