@@ -24,6 +24,7 @@
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
   import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
+  import { themeStore } from '$lib/stores/theme.svelte';
   import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
@@ -480,9 +481,15 @@
           <!-- xterm-portal-host: MaximizedItemModal 이 maximize 시 본 div 의
                XtermHost DOM (containerEl) 을 modal 의 slot 으로 reparent.
                XtermHost 인스턴스는 PanelNode 가 계속 마운트 유지 — 단일 xterm
-               인스턴스 가 in-flow ↔ modal 로 DOM 만 이동, state/scroll 보존. -->
+               인스턴스 가 in-flow ↔ modal 로 DOM 만 이동, state/scroll 보존.
+               #key 로 themeStore.resolved 의존성 — theme 변경 시 XtermHost
+               강제 unmount + remount → 새 Terminal() 인스턴스 + dispatcher
+               새 register → BE 의 ring buffer replay (새로고침과 동일 effect).
+               옛 cell 의 stale 색은 dispose 와 함께 사라짐. -->
           <div class="xterm-portal-host" data-portal-id={data.id}>
-            <XtermHost paneId={String(terminalPaneId)} />
+            {#key themeStore.resolved}
+              <XtermHost paneId={String(terminalPaneId)} />
+            {/key}
           </div>
         {:else}
           <div class="panel-pending" role="status" aria-live="polite">

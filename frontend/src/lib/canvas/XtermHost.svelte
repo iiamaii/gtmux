@@ -228,41 +228,11 @@
     const resolved = themeStore.resolved;
     if (term === null) return;
     term.options.theme = xtermTheme(resolved);
-    // theme options swap 만으로는 v6 DOM renderer 의 cell DOM (.xterm-rows
-    // > div > span) 의 inline color / background-color 가 stale — 새로고침
-    // 외 복구 X. 가설: cell span 의 inline style.color / backgroundColor 가
-    // *cell write 시점에 commit* 된 옛 theme 의 sRGB. theme swap 후
-    // refresh(0, rows-1) 가 cached span fragment 를 *recycle* 못 함.
-    //
-    // 시도 C: cell span 의 inline color reset (= 옛 stale 색 제거) → refresh
-    // 가 새 theme 으로 재 paint. ANSI class (.xterm-fg-N, .xterm-bg-N) 는
-    // class 인데, *.xterm 의 inline <style>* 의 token 이 theme swap 시 자동
-    // 변경 — 그러나 cell 의 *inline color* 가 더 우선 (specificity) → inline
-    // 제거 후에야 class 의 새 색 falls through.
-    try {
-      term.clearTextureAtlas?.();
-    } catch {
-      // silent.
-    }
-    if (containerEl !== undefined) {
-      // NOTE: TS generic 표기 (kkwaeshhi 안 HTMLElement) 는 svelte parser
-      // 가 HTML tag 로 오인 → script unclosed. comment 안 raw text 도 동일
-      // — 꺾쇠 자체를 쓰지 말 것. runtime instanceof narrow 만 안전.
-      const cells = containerEl.querySelectorAll('.xterm-rows span');
-      cells.forEach((span) => {
-        if (span instanceof HTMLElement) {
-          // color / background-color 만 reset, 다른 inline style (font-weight,
-          // text-decoration 등) 은 보존.
-          span.style.color = '';
-          span.style.backgroundColor = '';
-        }
-      });
-    }
-    try {
-      term.refresh(0, term.rows - 1);
-    } catch {
-      // silent.
-    }
+    // 옛 in-place refresh 시도 (A/B/C) 모두 v6 의 cached cell DOM stale 색
+    // 회수 불가능. PanelNode 가 `#key themeStore.resolved` 로 XtermHost
+    // 자체를 force remount — 본 effect 는 *같은 mount 안 system theme
+    // OS preference 변경* 의 단발 swap 만 cover. cell repaint 까지는
+    // PanelNode 의 remount 에 의존.
   });
 </script>
 
