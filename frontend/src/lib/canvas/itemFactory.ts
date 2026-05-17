@@ -22,6 +22,8 @@ import type {
   EllipseItem,
   LineItem,
   TerminalItem,
+  ImageItem,
+  DocumentItem,
 } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
@@ -149,6 +151,57 @@ export function createCanvasItem(
         path: '',
       };
   }
+}
+
+/**
+ * Image item — placeholder spawn (ADR-0018 D4 P2+, asset endpoint 미land).
+ *
+ * 현 단계: asset_id = '' (empty placeholder). 사용자가 canvas click 으로 빈
+ * ImageNode 생성 → 추후 BE asset endpoint ship 시 inline file picker → upload
+ * → asset_id wire.
+ */
+export function createImageItem(pos: { x: number; y: number }): ImageItem {
+  return {
+    id: freshId(),
+    parent_id: null,
+    x: pos.x,
+    y: pos.y,
+    w: DEFAULT_IMAGE_SIZE.w,
+    h: DEFAULT_IMAGE_SIZE.h,
+    z: 0,
+    visibility: 'visible',
+    locked: false,
+    minimized: false,
+    type: 'image',
+    asset_id: '',
+    mime: '',
+  };
+}
+
+/**
+ * Document item — inline-stored mode placeholder (ADR-0018 D4 amend ②).
+ *
+ * 현 단계: content = '' (빈 markdown) + file_name = 'document'. BE schema 의
+ * inline-stored validation 정합 (asset_id 없음, content 있음, file_name set).
+ * 사용자가 더블 클릭으로 content / file_name inline edit 진입 — Slice-A2 FE
+ * wire 후속에서 InlineEdit + ColorPicker 등.
+ */
+export function createDocumentItem(pos: { x: number; y: number }): DocumentItem {
+  return {
+    id: freshId(),
+    parent_id: null,
+    x: pos.x,
+    y: pos.y,
+    w: DEFAULT_DOCUMENT_SIZE.w,
+    h: DEFAULT_DOCUMENT_SIZE.h,
+    z: 0,
+    visibility: 'visible',
+    locked: false,
+    minimized: false,
+    type: 'document',
+    file_name: 'document',
+    content: '',
+  };
 }
 
 /**

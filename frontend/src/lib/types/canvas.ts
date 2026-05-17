@@ -131,10 +131,18 @@ export interface ImageItem extends ItemCommon {
 
 export interface DocumentItem extends ItemCommon {
   type: 'document';
-  asset_id: string;
-  mime: string;
+  /**
+   * ADR-0018 D4 amend ② (2026-05-17, BE schema.rs ship) — 두 mode 상호
+   * 배타. (a) asset-based: `asset_id` set + `mime`/`file_name`/`size_bytes`.
+   * (b) inline-stored: `content` set (UTF-8 markdown, cap 64 KB) +
+   * `file_name` (display 용). 두 mode 모두 file_name 은 필요.
+   */
+  asset_id?: string;
+  mime?: string;
   file_name: string;
-  size_bytes: number;
+  size_bytes?: number;
+  /** Inline-stored mode 의 UTF-8 markdown content (cap 64 KB). */
+  content?: string;
 }
 
 export interface FilePathItem extends ItemCommon {

@@ -31,12 +31,16 @@
   import FilePathNode from './FilePathNode.svelte';
   import ShapeNode from './ShapeNode.svelte';
   import LineNode from './LineNode.svelte';
+  import ImageNode from './ImageNode.svelte';
+  import DocumentNode from './DocumentNode.svelte';
   import {
     commitNewItem,
     createCanvasItem,
     createShapeItem,
     createLineItem,
     createTerminalItem,
+    createImageItem,
+    createDocumentItem,
     lineBoxFromEndpoints,
     DEFAULT_TERMINAL_SIZE,
     DEFAULT_NOTE_SIZE,
@@ -423,6 +427,8 @@
     rect: ShapeNode,
     ellipse: ShapeNode,
     line: LineNode,
+    image: ImageNode,
+    document: DocumentNode,
   };
 
   // M cardinality — PanelNode 가 single/multi 분기를 위해 참조.
@@ -848,6 +854,25 @@
       }
       if (tool === 'note' || tool === 'file_path') {
         const item = createCanvasItem(tool, centered(tool));
+        void commitNewItem(item)
+          .then(() => toolStore.consume())
+          .catch(onSpawnError);
+        return;
+      }
+      if (tool === 'image') {
+        // Placeholder spawn — ADR-0018 D4 P2+, BE asset endpoint 미land.
+        // 빈 asset_id 로 시각만 만들고, 추후 file picker → upload → wire.
+        const item = createImageItem(centered('image'));
+        void commitNewItem(item)
+          .then(() => toolStore.consume())
+          .catch(onSpawnError);
+        return;
+      }
+      if (tool === 'document') {
+        // Inline-stored mode 의 빈 document — ADR-0018 D4 amend ② 정합 (BE
+        // schema land, content=""+file_name="document"). 더블 클릭 inline
+        // edit 진입은 plan-0011 FE Slice-A2 후속.
+        const item = createDocumentItem(centered('document'));
         void commitNewItem(item)
           .then(() => toolStore.consume())
           .catch(onSpawnError);
