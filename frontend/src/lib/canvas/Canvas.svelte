@@ -82,15 +82,42 @@
     /** Container-local screen coord — ghost overlay 의 left/top 계산용. */
     startLocal: { x: number; y: number };
     currentLocal: { x: number; y: number };
-    /** free_draw 만 — flow-coord 점들 (commit 용). startFlow 로 시작. */
-    points?: { x: number; y: number }[];
-    /** free_draw 만 — container-local 점들 (ghost preview SVG 용). */
-    pointsLocal?: { x: number; y: number }[];
   }
   let dragState = $state<DragState | null>(null);
 
-  /** ADR-0018 D4 — free_draw point cap. */
+  /** ADR-0018 D4 — free_draw point cap (저장 상한). */
   const FREE_DRAW_MAX_POINTS = 5000;
+
+  /** 0065 FE-1 — free_draw 입력 최소거리 prune (screen px²). 0.5 px 미만 sample
+   *  drop → typical 100-1000 Hz pointer event 가 1/4~1/100 로 압축. */
+  const FREE_DRAW_MIN_POINT_DELTA_SQ = 0.5 * 0.5;
+
+  /**
+   * 0065 FE-1 — free_draw 입력 buffer. **비반응** plain array — pointermove
+   * 마다의 spread copy + $state flush 비용 제거. ghostPreview 재계산 trigger
+   * 는 `freeDrawFrame` 의 rAF-당-1회 bump 로 coalesce.
+   */
+  let freeDrawPoints: { x: number; y: number }[] = [];
+  let freeDrawPointsLocal: { x: number; y: number }[] = [];
+  let freeDrawFrame = $state(0);
+  let freeDrawRafId: number | null = null;
+
+  function resetFreeDrawBuffers(): void {
+    freeDrawPoints = [];
+    freeDrawPointsLocal = [];
+    if (freeDrawRafId !== null) {
+      cancelAnimationFrame(freeDrawRafId);
+      freeDrawRafId = null;
+    }
+  }
+
+  function scheduleFreeDrawFrame(): void {
+    if (freeDrawRafId !== null) return;
+    freeDrawRafId = requestAnimationFrame(() => {
+      freeDrawRafId = null;
+      freeDrawFrame += 1;
+    });
+  }
 
   /**
    * Cursor hover preview — 점-spawn 도구 (terminal/note/file_path/image/
@@ -284,13 +311,11 @@
   /** Live preview overlay geometry (container-local, screen px). */
   const ghostPreview = $derived.by(() => {
     if (dragState === null) return null;
-    const sx = dragState.startLocal.x;
-    const sy = dragState.startLocal.y;
-    const cx = dragState.currentLocal.x;
-    const cy = dragState.currentLocal.y;
     if (dragState.tool === 'free_draw') {
-      // Free draw: pointsLocal 의 bounding box + 점 들의 local-coord path.
-      const pts = dragState.pointsLocal ?? [];
+      // 0065 FE-1 — freeDrawFrame 만 reactive dep. pointermove 마다의
+      // dragState reassign 없이 rAF tick (16ms) 마다 1회 재계산.
+      void freeDrawFrame;
+      const pts = freeDrawPointsLocal;
       const first = pts[0];
       if (first === undefined) return null;
       let minX = first.x, minY = first.y, maxX = first.x, maxY = first.y;
@@ -317,6 +342,10 @@
         path,
       };
     }
+    const sx = dragState.startLocal.x;
+    const sy = dragState.startLocal.y;
+    const cx = dragState.currentLocal.x;
+    const cy = dragState.currentLocal.y;
     if (dragState.tool === 'line') {
       const left = Math.min(sx, cx) - GHOST_LINE_PADDING;
       const top = Math.min(sy, cy) - GHOST_LINE_PADDING;
@@ -375,10 +404,15 @@
       startFlow: flow,
       startLocal: { x: localX, y: localY },
       currentLocal: { x: localX, y: localY },
-      // Free draw 만 — start 점을 points 의 첫 번째로 set.
-      points: tool === 'free_draw' ? [{ x: flow.x, y: flow.y }] : undefined,
-      pointsLocal: tool === 'free_draw' ? [{ x: localX, y: localY }] : undefined,
     };
+    if (tool === 'free_draw') {
+      // 0065 FE-1 — 비반응 buffer init. 직전 stroke 잔여 정리 (cancel/abort
+      // 후) + 시작점 push. ghostPreview 의 첫 paint 는 frame bump 로 trigger.
+      resetFreeDrawBuffers();
+      freeDrawPoints.push({ x: flow.x, y: flow.y });
+      freeDrawPointsLocal.push({ x: localX, y: localY });
+      scheduleFreeDrawFrame();
+    }
 
     root.setPointerCapture(e.pointerId);
   }
@@ -395,22 +429,30 @@
     const root = e.currentTarget as HTMLElement;
     const rect = root.getBoundingClientRect();
     const nextLocal = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-    let nextPoints = dragState.points;
-    let nextPointsLocal = dragState.pointsLocal;
-    if (dragState.tool === 'free_draw' && nextPoints !== undefined && nextPointsLocal !== undefined) {
-      // ADR-0018 D4 — point cap 5000. 도달 시 새 점 skip (드물 — typical
-      // freehand 한 stroke 는 수백 points).
-      if (nextPoints.length < FREE_DRAW_MAX_POINTS) {
-        const flowPt = screenToFlowPosition({ x: e.clientX, y: e.clientY });
-        nextPoints = [...nextPoints, { x: flowPt.x, y: flowPt.y }];
-        nextPointsLocal = [...nextPointsLocal, nextLocal];
+    if (dragState.tool === 'free_draw') {
+      // 0065 FE-1 — 비반응 buffer 직접 append. 최소거리 prune 으로 과도한
+      // sample 폐기 + rAF coalesce 로 preview 재계산 ≤ 1회/frame. cap 5000
+      // 도달 시 새 점 skip (ADR-0018 D4).
+      if (freeDrawPoints.length < FREE_DRAW_MAX_POINTS) {
+        const last = freeDrawPointsLocal[freeDrawPointsLocal.length - 1];
+        if (last !== undefined) {
+          const dx = nextLocal.x - last.x;
+          const dy = nextLocal.y - last.y;
+          if (dx * dx + dy * dy >= FREE_DRAW_MIN_POINT_DELTA_SQ) {
+            const flowPt = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+            freeDrawPoints.push({ x: flowPt.x, y: flowPt.y });
+            freeDrawPointsLocal.push(nextLocal);
+            scheduleFreeDrawFrame();
+          }
+        }
       }
+      // dragState reassign 생략 — free_draw 의 ghostPreview 는 freeDrawFrame
+      // 만 trigger 로 사용. currentLocal stale 도 ghostPreview 가 안 읽음.
+      return;
     }
     dragState = {
       ...dragState,
       currentLocal: nextLocal,
-      points: nextPoints,
-      pointsLocal: nextPointsLocal,
     };
   }
 
@@ -427,9 +469,10 @@
 
     let item;
     if (state.tool === 'free_draw') {
-      // Free draw: pointer move 로 수집한 points sequence. 점 수 < 2 면
+      // Free draw: 비반응 buffer 에 수집한 points sequence. 점 수 < 2 면
       // 의미없는 stroke (단순 click) — abort.
-      const pts = state.points ?? [];
+      const pts = freeDrawPoints.slice();
+      resetFreeDrawBuffers();
       if (pts.length < 2) {
         return;
       }
@@ -472,6 +515,9 @@
   function onCanvasPointerCancel(_e: PointerEvent) {
     // OS 가 capture 를 빼앗는 경우 (다른 modal 등) drag state 청소.
     dragState = null;
+    // 0065 FE-1 — pending rAF + buffer 정리 (다음 stroke 의 init 에서도
+    // resetFreeDrawBuffers 가 idempotent 호출되지만 cancel 시점에 즉시 정리).
+    resetFreeDrawBuffers();
   }
 
   /* ── 0045 P0-A root-cause 후속 fix — literal props 의 매-flush new reference
