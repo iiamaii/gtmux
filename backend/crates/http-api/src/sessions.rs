@@ -36,7 +36,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use ring::digest::{digest, SHA256};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -967,6 +967,152 @@ pub async fn import_handler(
         Json(json!({ "name": body.name, "created_at": created_at })),
     )
         .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Export (ADR-0029 D2 / D4) — `GET /api/sessions/:name/export`
+// ─────────────────────────────────────────────────────────────────────────────
+
+const EXPORT_ENVELOPE_KIND: &str = "gtmux.session.export";
+const EXPORT_ENVELOPE_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+struct ExportEnvelope<'a> {
+    kind: &'static str,
+    export_version: u32,
+    exported_at: String,
+    session_name: &'a str,
+    layout: &'a Layout,
+    metadata: ExportMetadata,
+}
+
+#[derive(Serialize)]
+struct ExportMetadata {
+    app: &'static str,
+    app_version: Option<&'static str>,
+}
+
+/// `GET /api/sessions/{name}/export` — ADR-0029 D2 / D4.
+///
+/// Reads the *persisted* layout (SessionCache 의 commit 된 snapshot, disk
+/// fallback) and wraps it in the export envelope. FE is responsible for
+/// flushing any pending mutation before export (ADR-0029 D13). Outcomes:
+///   * 200 OK — envelope JSON + `Content-Disposition: attachment`.
+///   * 400 invalid_session_name — name fails `validate_session_name`.
+///   * 404 not_found — session record absent.
+///   * 503 workspace_not_configured — server started without a workspace.
+///   * 500 save_failed — read/serialize error.
+pub async fn export_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    if let Err(e) = validate_session_name(&name) {
+        return SessionError::Workspace(e).into_response();
+    }
+
+    let entry = match state.session_cache.get_or_load(wm.as_ref(), &name).await {
+        Ok(arc) => arc,
+        Err(SessionError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "not_found", "name": name })),
+            )
+                .into_response();
+        }
+        Err(e) => return e.into_response(),
+    };
+    let guard = entry.read().await;
+
+    let envelope = ExportEnvelope {
+        kind: EXPORT_ENVELOPE_KIND,
+        export_version: EXPORT_ENVELOPE_VERSION,
+        exported_at: rfc3339_utc_now(),
+        session_name: &name,
+        layout: &guard.layout,
+        metadata: ExportMetadata {
+            app: "gtmux",
+            app_version: None,
+        },
+    };
+    let body = match serde_json::to_vec(&envelope) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "save_failed",
+                    "details": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let filename = sanitize_export_filename(&name);
+    let disposition = format!("attachment; filename=\"{filename}.gtmux-session.json\"");
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("static headers");
+    if let Ok(hv) = HeaderValue::from_str(&disposition) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, hv);
+    }
+    resp
+}
+
+/// ASCII-safe, path-safe basename for `Content-Disposition`. `validate_session_name`
+/// (ADR-0019 D7) already restricts names to `[A-Za-z0-9_-]{1,64}`, so this is a
+/// belt-and-braces filter; only the fallback (empty after sanitisation) is load-
+/// bearing.
+fn sanitize_export_filename(name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if safe.is_empty() {
+        "session".to_string()
+    } else {
+        safe
+    }
+}
+
+/// RFC3339 UTC timestamp from `SystemTime::now()` using Howard Hinnant's
+/// civil-from-days algorithm. Std-only — avoids pulling `chrono`/`time` just
+/// for one envelope field.
+fn rfc3339_utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (year, month, day, hour, minute, second) = civil_from_unix(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Convert a UNIX timestamp (seconds since 1970-01-01 UTC) to civil
+/// (year, month, day, hour, minute, second). Hinnant's algorithm — correct
+/// for the proleptic Gregorian calendar in the range `[-4800, +10000]` years.
+fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86400);
+    let time_of_day = secs.rem_euclid(86400) as u32;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m, d, hour, minute, second)
 }
 
 /// `POST /api/sessions { name }` — create an empty v2 record.

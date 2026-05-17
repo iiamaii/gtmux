@@ -551,6 +551,10 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             axum::routing::post(sessions::import_handler),
         )
         .route(
+            "/api/sessions/{name}/export",
+            get(sessions::export_handler),
+        )
+        .route(
             "/api/sessions/{name}",
             axum::routing::delete(sessions::delete_handler),
         )
@@ -1753,6 +1757,208 @@ mod tests {
         let bytes = to_bytes(list.into_body(), 8 * 1024).await.unwrap();
         let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
         assert!(rows.iter().any(|r| r["name"] == "ledger"));
+    }
+
+    // ── ADR-0029 D4: GET /api/sessions/:name/export (0052 work package) ──
+
+    /// Gate 0029-1 — happy path: existing session returns 200 + envelope +
+    /// `Content-Disposition: attachment; filename="<name>.gtmux-session.json"`.
+    #[tokio::test]
+    async fn export_returns_envelope_for_existing_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "alpha").await;
+
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/alpha/export")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let ct = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.starts_with("application/json"));
+        let dispo = res
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .expect("Content-Disposition present")
+            .to_str()
+            .unwrap();
+        assert!(
+            dispo.contains(r#"filename="alpha.gtmux-session.json""#),
+            "Content-Disposition must carry sanitized filename, got {dispo}"
+        );
+
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let env: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["kind"], "gtmux.session.export");
+        assert_eq!(env["export_version"], 1);
+        assert_eq!(env["session_name"], "alpha");
+        assert_eq!(env["layout"]["schema_version"], 2);
+        assert!(env["layout"]["items"].is_array());
+        assert!(env["layout"]["groups"].is_array());
+        assert_eq!(env["metadata"]["app"], "gtmux", "metadata.app must be 'gtmux'");
+        // RFC3339 shape — `YYYY-MM-DDTHH:MM:SSZ` (20 chars).
+        let exported_at = env["exported_at"].as_str().expect("exported_at string");
+        assert_eq!(exported_at.len(), 20, "RFC3339 length: {exported_at}");
+        assert!(exported_at.ends_with('Z'));
+        assert_eq!(exported_at.chars().nth(4), Some('-'));
+        assert_eq!(exported_at.chars().nth(10), Some('T'));
+    }
+
+    /// Gate 0029-2 — missing session returns 404 with `not_found` + the
+    /// requested name in the body.
+    #[tokio::test]
+    async fn export_404_for_missing_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/missing/export")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "not_found");
+        assert_eq!(v["name"], "missing");
+    }
+
+    /// Gate 0029-3 — without bearer auth the `/api/*` middleware returns
+    /// 401; no envelope leaks to anonymous callers.
+    #[tokio::test]
+    async fn export_401_without_auth() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "alpha").await;
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/alpha/export")
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get(header::CONTENT_DISPOSITION).is_none());
+    }
+
+    /// Gate 0029-4 — names that fail `validate_session_name` return 400 with
+    /// `invalid_session_name`. Belt-and-braces against path traversal — the
+    /// regex `[A-Za-z0-9_-]{1,64}` already rejects everything fancy, this
+    /// just asserts the response shape.
+    #[tokio::test]
+    async fn export_400_for_invalid_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/has.dot/export")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "invalid_session_name");
+    }
+
+    /// Gate 0029-5 — export → import-as-new-name round-trip. The reloaded
+    /// session's `GET /layout` must match the exported envelope's `layout`
+    /// (modulo ETag which is regenerated on import).
+    #[tokio::test]
+    async fn export_import_round_trip_equal_layout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "src").await;
+
+        // 1. Export.
+        let exp_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/src/export")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exp_res.status(), StatusCode::OK);
+        let envelope: Value =
+            serde_json::from_slice(&to_bytes(exp_res.into_body(), 1 << 20).await.unwrap())
+                .unwrap();
+        let exported_layout = envelope["layout"].clone();
+
+        // 2. Import the envelope's `layout` under a fresh name.
+        let import_body = serde_json::to_vec(&json!({
+            "name": "dst",
+            "layout": exported_layout.clone(),
+        }))
+        .unwrap();
+        let imp_res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(import_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imp_res.status(), StatusCode::CREATED);
+
+        // 3. GET the imported layout and compare.
+        let get_res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/dst/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+        let reloaded: Value =
+            serde_json::from_slice(&to_bytes(get_res.into_body(), 1 << 20).await.unwrap())
+                .unwrap();
+        assert_eq!(reloaded, exported_layout, "round-trip layout must match");
     }
 
     #[tokio::test]
