@@ -187,6 +187,32 @@
     });
   }
 
+  /**
+   * Theme 변경 시 silentReattach trigger — *새로고침과 동일한 effect*.
+   *
+   * 배경: xterm v6 의 cell DOM (.xterm-rows > span) 의 inline color 가
+   * cell write 시점에 fixed → `term.options.theme = newTheme` 만으로는
+   * stale (refresh / clearTextureAtlas / span reset 모두 효과 없음).
+   * 진짜 fix = WS connection reattach → BE 의 ring buffer replay (ADR-0021
+   * D8 mirror). PanelNode 의 `{#key themeStore.resolved}` 가 XtermHost 를
+   * dispose + 새 mount → BE replay PANE_OUT 흘러옴 → 새 cell paint.
+   *
+   * skipFirstTheme: onMount 직후 themeStore.resolved 의 첫 read 는 *초기 값*
+   * — silentReattach 안 trigger. 사용자 명시 toggle 만 trigger.
+   */
+  let skipFirstTheme = $state(true);
+  $effect(() => {
+    const _ = themeStore.resolved;  // dependency
+    if (skipFirstTheme) {
+      skipFirstTheme = false;
+      return;
+    }
+    const active = sessionStore.active;
+    if (active === null) return;
+    if (sessionStore.reattachInProgress) return;
+    void sessionStore.silentReattach(active.name);
+  });
+
   onMount(() => {
     // Theme — re-apply on mount so the in-memory state and <html class>
     // converge after Svelte hydrates. The inline FOUC-guard in index.html
