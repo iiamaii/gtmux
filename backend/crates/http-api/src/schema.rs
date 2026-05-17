@@ -40,6 +40,11 @@ pub const TEXT_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
 /// Maximum number of points in a `free_draw` item (ADR-0018 D8).
 pub const FREE_DRAW_POINT_CAP: usize = 5000;
 
+/// Maximum bytes for an inline-stored `document` item's `content` payload
+/// (ADR-0018 D10 amend ① — 2026-05-16 components batch). Matches the
+/// "UTF-8 markdown, cap 64 KB" wording in the ADR.
+pub const DOCUMENT_INLINE_MAX_BYTES: usize = 64 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Top-level Layout
 // ─────────────────────────────────────────────────────────────────────────────
@@ -258,13 +263,30 @@ pub enum Item {
         original_w: Option<u32>,
         original_h: Option<u32>,
     },
+    /// ADR-0018 D10 amend ① — two-mode document item:
+    ///   * (a) asset-based — `asset_id` is `Some(sha256)`, `content` is
+    ///     `None`. The actual bytes live behind `/api/assets/<asset_id>`
+    ///     (Stage 2, ADR-0030 to-be).
+    ///   * (b) inline-stored — `asset_id` is `None`, `content` is
+    ///     `Some(<utf-8 markdown>)` capped at [`DOCUMENT_INLINE_MAX_BYTES`].
+    /// The two modes are *mutually exclusive*; `validate()` enforces this
+    /// (`DocumentMissingSource` / `DocumentBothSources`).
     Document {
         #[serde(flatten)]
         common: ItemCommon,
-        asset_id: String,
+        /// (a) asset-based mode: sha256 → `/api/assets/<asset_id>`.
+        /// (b) inline-stored mode: `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asset_id: Option<String>,
         mime: String,
         file_name: String,
+        /// (a) asset-based: real binary size.
+        /// (b) inline-stored: `content.len()` bytes.
         size_bytes: u64,
+        /// (b) inline-stored UTF-8 markdown, capped at
+        /// [`DOCUMENT_INLINE_MAX_BYTES`]. (a) is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
     },
     FilePath {
         #[serde(flatten)]
@@ -322,6 +344,20 @@ pub enum ValidationError {
     TextTooLong,
     #[error("free_draw exceeds {} points", FREE_DRAW_POINT_CAP)]
     FreeDrawTooManyPoints,
+    /// ADR-0018 D10 amend ① — Document item carries neither an `asset_id`
+    /// (asset-based mode) nor a `content` (inline-stored mode).
+    #[error("document item must carry either asset_id or content")]
+    DocumentMissingSource,
+    /// ADR-0018 D10 amend ① — Document item carries *both* `asset_id` and
+    /// `content`. The two modes are mutually exclusive.
+    #[error("document item must not carry both asset_id and content")]
+    DocumentBothSources,
+    /// ADR-0018 D10 amend ① — inline-stored content exceeds the cap.
+    #[error(
+        "document inline content exceeds {} bytes",
+        DOCUMENT_INLINE_MAX_BYTES
+    )]
+    DocumentInlineTooLong,
 }
 
 impl ValidationError {
@@ -339,6 +375,9 @@ impl ValidationError {
             Self::DescriptionTooLong => "description_too_long",
             Self::TextTooLong => "text_too_long",
             Self::FreeDrawTooManyPoints => "free_draw_too_many_points",
+            Self::DocumentMissingSource => "document_missing_source",
+            Self::DocumentBothSources => "document_both_sources",
+            Self::DocumentInlineTooLong => "document_inline_too_long",
         }
     }
 }
@@ -410,6 +449,35 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
             Item::FreeDraw { points, .. } => {
                 if points.len() > FREE_DRAW_POINT_CAP {
                     return Err(ValidationError::FreeDrawTooManyPoints);
+                }
+            }
+            Item::Document {
+                asset_id, content, ..
+            } => {
+                // ADR-0018 D10 amend ① — exactly one of (a) `asset_id` or
+                // (b) `content` must be set. The two modes are mutually
+                // exclusive; the `asset_id` form references a future
+                // `/api/assets/<sha256>` (Stage 2), and the `content` form
+                // inlines a small markdown payload in the layout JSON.
+                match (asset_id.as_ref(), content.as_ref()) {
+                    (None, None) => {
+                        return Err(ValidationError::DocumentMissingSource);
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(ValidationError::DocumentBothSources);
+                    }
+                    (None, Some(c)) => {
+                        if c.len() > DOCUMENT_INLINE_MAX_BYTES {
+                            return Err(ValidationError::DocumentInlineTooLong);
+                        }
+                    }
+                    (Some(_), None) => {
+                        // asset-based mode. The sha256 hex-string shape
+                        // check lands alongside `/api/assets/*` ship —
+                        // until then we accept any non-empty string so the
+                        // existing on-disk records (asset_id strings the FE
+                        // never validated either) keep loading.
+                    }
                 }
             }
             _ => {}
@@ -687,6 +755,101 @@ mod tests {
         assert_eq!(
             validate(&l),
             Err(ValidationError::FreeDrawTooManyPoints)
+        );
+    }
+
+    // ── ADR-0018 D10 amend ① — Document inline-stored mode ──
+
+    /// Inline-stored mode: `asset_id=None`, `content=Some(...)`. ADR's
+    /// (b) branch. Must validate cleanly.
+    #[test]
+    fn document_inline_stored_validates() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Document {
+            common: item_common(UUID_A),
+            asset_id: None,
+            mime: "text/markdown".into(),
+            file_name: "notes.md".into(),
+            size_bytes: 5,
+            content: Some("# Hi\n".into()),
+        });
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// Asset-based mode: `asset_id=Some(...)`, `content=None`. ADR's (a)
+    /// branch. Must validate cleanly. The `asset_id` shape is intentionally
+    /// not regex-checked yet — the `/api/assets/*` ship will add that
+    /// alongside the binary endpoint (Stage 2, ADR-0030 to-be).
+    #[test]
+    fn document_asset_based_validates() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Document {
+            common: item_common(UUID_A),
+            asset_id: Some("dead".repeat(16)), // placeholder 64-char hex-ish
+            mime: "application/pdf".into(),
+            file_name: "spec.pdf".into(),
+            size_bytes: 12345,
+            content: None,
+        });
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// Neither field set → ADR's "mode is undefined". The handler should
+    /// surface this as a deterministic `document_missing_source` code so
+    /// the FE can render a precise error message.
+    #[test]
+    fn document_missing_source_rejected() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Document {
+            common: item_common(UUID_A),
+            asset_id: None,
+            mime: "text/plain".into(),
+            file_name: "ghost.txt".into(),
+            size_bytes: 0,
+            content: None,
+        });
+        assert_eq!(
+            validate(&l),
+            Err(ValidationError::DocumentMissingSource)
+        );
+    }
+
+    /// Both fields set → ADR's "mutually exclusive" rule is violated. The
+    /// FE must pick exactly one mode for a given Document.
+    #[test]
+    fn document_both_sources_rejected() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Document {
+            common: item_common(UUID_A),
+            asset_id: Some("abc".into()),
+            mime: "text/markdown".into(),
+            file_name: "conflicted.md".into(),
+            size_bytes: 4,
+            content: Some("body".into()),
+        });
+        assert_eq!(
+            validate(&l),
+            Err(ValidationError::DocumentBothSources)
+        );
+    }
+
+    /// Inline-stored content over [`DOCUMENT_INLINE_MAX_BYTES`] is
+    /// rejected; the FE is expected to switch to asset-based mode at that
+    /// scale (Stage 2 prerequisite).
+    #[test]
+    fn document_inline_cap_enforced() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Document {
+            common: item_common(UUID_A),
+            asset_id: None,
+            mime: "text/markdown".into(),
+            file_name: "huge.md".into(),
+            size_bytes: (DOCUMENT_INLINE_MAX_BYTES + 1) as u64,
+            content: Some("a".repeat(DOCUMENT_INLINE_MAX_BYTES + 1)),
+        });
+        assert_eq!(
+            validate(&l),
+            Err(ValidationError::DocumentInlineTooLong)
         );
     }
 
