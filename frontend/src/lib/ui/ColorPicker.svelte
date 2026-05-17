@@ -824,52 +824,59 @@
     </span>
   </button>
 
-  <!-- Inline hex value — trigger 옆 항상 표시 + 명시적 입력. popover 와 별도. -->
-  <input
-    type="text"
-    class="inline-hex mono"
-    value={inlineHexInput}
-    oninput={(e) => {
-      inlineEditing = true;
-      inlineHexInput = (e.currentTarget as HTMLInputElement).value;
-    }}
-    placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : '000000'}
-    {disabled}
-    onfocus={() => (inlineEditing = true)}
-    onblur={() => {
-      inlineEditing = false;
-      onInlineHexCommit();
-    }}
-    onkeydown={(e) => {
-      if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
-    }}
-    spellcheck="false"
-    autocomplete="off"
-    aria-label="Color hex"
-  />
-  {#if allowAlpha}
+  <!-- Inline hex value — trigger 옆 항상 표시 + 명시적 입력. InspectorField 와
+       동일 패턴 (label wrapper + .k prefix + native input). -->
+  <label class="inline-hex">
+    <span class="k" aria-hidden="true">HEX</span>
     <input
-      type="number"
-      class="inline-alpha mono"
-      min="0"
-      max="100"
-      step="1"
-      value={editingAlpha ? alphaInput : String(Math.round(effectiveAlpha))}
+      type="text"
+      class="field"
+      value={inlineHexInput}
       oninput={(e) => {
-        if (editingAlpha) alphaInput = (e.currentTarget as HTMLInputElement).value;
+        inlineEditing = true;
+        inlineHexInput = (e.currentTarget as HTMLInputElement).value;
       }}
+      placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : '000000'}
       {disabled}
-      onfocus={() => (editingAlpha = true)}
+      onfocus={() => (inlineEditing = true)}
       onblur={() => {
-        editingAlpha = false;
-        onAlphaChange();
+        inlineEditing = false;
+        onInlineHexCommit();
       }}
       onkeydown={(e) => {
         if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
       }}
-      aria-label="Alpha percent"
+      spellcheck="false"
+      autocomplete="off"
+      aria-label="Color hex"
     />
-    <span class="inline-alpha-pct" aria-hidden="true">%</span>
+  </label>
+  {#if allowAlpha}
+    <label class="inline-alpha">
+      <span class="k" aria-hidden="true">A</span>
+      <input
+        type="number"
+        class="field"
+        min="0"
+        max="100"
+        step="1"
+        value={editingAlpha ? alphaInput : String(Math.round(effectiveAlpha))}
+        oninput={(e) => {
+          if (editingAlpha) alphaInput = (e.currentTarget as HTMLInputElement).value;
+        }}
+        {disabled}
+        onfocus={() => (editingAlpha = true)}
+        onblur={() => {
+          editingAlpha = false;
+          onAlphaChange();
+        }}
+        onkeydown={(e) => {
+          if (e.key === 'Enter') (e.currentTarget as HTMLInputElement).blur();
+        }}
+        aria-label="Alpha percent"
+      />
+      <span class="suf" aria-hidden="true">%</span>
+    </label>
   {/if}
 
   {#if open}
@@ -1115,10 +1122,16 @@
   }
   .color-picker.disabled { opacity: 0.55; }
 
-  /* Inline hex / alpha — trigger 옆 항상 보이는 값 표시 + 직접 입력. */
+  /* Inline hex / alpha — trigger 옆 항상 보이는 값 표시 + 직접 입력.
+     InspectorField .inspector-input 과 동일 패턴 (label wrapper + .k prefix). */
   .inline-hex,
   .inline-alpha {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     height: 22px;
+    padding: 0 6px;
+    box-sizing: border-box;
     background: var(--color-bg);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
@@ -1126,10 +1139,7 @@
     font-family: var(--font-mono);
     font-size: 11px;
     letter-spacing: 0;
-    padding: 0 6px;
-    box-sizing: border-box;
-    text-transform: lowercase;
-    outline: none;
+    cursor: text;
     transition: border-color var(--motion-fast) var(--motion-easing);
   }
   .inline-hex {
@@ -1138,40 +1148,67 @@
     width: 76px;
   }
   .inline-alpha {
-    width: 44px;
-    padding: 0 4px;
+    width: 60px;
+  }
+  .inline-hex:hover,
+  .inline-alpha:hover {
+    border-color: var(--color-border-strong);
+  }
+  .inline-hex:focus-within,
+  .inline-alpha:focus-within {
+    border-color: var(--color-accent);
+  }
+
+  .inline-hex .k,
+  .inline-alpha .k {
+    flex: 0 0 auto;
+    color: var(--color-fg-muted);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.4px;
+    pointer-events: none;
+  }
+  .inline-alpha .suf {
+    flex: 0 0 auto;
+    color: var(--color-fg-subtle);
+    font-size: 10px;
+    pointer-events: none;
+  }
+
+  .inline-hex .field,
+  .inline-alpha .field {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 100%;
+    background: transparent;
+    border: 0;
+    outline: 0;
+    padding: 0;
+    margin: 0;
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: lowercase;
+  }
+  .inline-alpha .field {
     text-align: right;
     -moz-appearance: textfield;
     appearance: textfield;
   }
-  .inline-alpha::-webkit-outer-spin-button,
-  .inline-alpha::-webkit-inner-spin-button {
+  .inline-alpha .field::-webkit-outer-spin-button,
+  .inline-alpha .field::-webkit-inner-spin-button {
     -webkit-appearance: none;
     margin: 0;
   }
-  .inline-hex::placeholder,
-  .inline-alpha::placeholder {
+  .inline-hex .field::placeholder,
+  .inline-alpha .field::placeholder {
     color: var(--color-fg-subtle);
     font-style: italic;
   }
-  .inline-hex:hover:not(:disabled),
-  .inline-alpha:hover:not(:disabled) {
-    border-color: var(--color-border-strong);
-  }
-  .inline-hex:focus,
-  .inline-alpha:focus {
-    border-color: var(--color-accent);
-  }
-  .inline-hex:disabled,
-  .inline-alpha:disabled {
+  .inline-hex .field:disabled,
+  .inline-alpha .field:disabled {
     opacity: 0.6;
     cursor: not-allowed;
-  }
-  .inline-alpha-pct {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    color: var(--color-fg-subtle);
-    margin-left: -2px;
   }
 
   .swatch-trigger {
