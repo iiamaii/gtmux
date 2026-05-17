@@ -161,6 +161,26 @@
     return '#' + [r, g, b].map((v2) => Math.round(v2 * 255).toString(16).padStart(2, '0')).join('');
   }
 
+  /** Full HSV → hex (sat/val 0~100). */
+  function hsvToHex(h: number, s: number, v: number): string {
+    const sat = Math.max(0, Math.min(100, s)) / 100;
+    const val = Math.max(0, Math.min(100, v)) / 100;
+    const c = val * sat;
+    const hh = ((h % 360) + 360) % 360;
+    const x = c * (1 - Math.abs(((hh / 60) % 2) - 1));
+    const m = val - c;
+    let r = 0, g = 0, b = 0;
+    if (hh < 60) { r = c; g = x; }
+    else if (hh < 120) { r = x; g = c; }
+    else if (hh < 180) { g = c; b = x; }
+    else if (hh < 240) { g = x; b = c; }
+    else if (hh < 300) { r = x; b = c; }
+    else { r = c; b = x; }
+    return '#' + [r + m, g + m, b + m]
+      .map((v2) => Math.round(v2 * 255).toString(16).padStart(2, '0'))
+      .join('');
+  }
+
   // ── 파생값 ────────────────────────────────────────────────────────
   const resolvedHex = $derived.by(() => {
     if (mixed) return null;
@@ -201,6 +221,25 @@
   let editingAlpha = $state(false);
   let containerEl: HTMLDivElement | undefined = $state();
   let popoverEl: HTMLDivElement | undefined = $state();
+  let svEl: HTMLDivElement | undefined = $state();
+  let hueEl: HTMLDivElement | undefined = $state();
+  let alphaEl: HTMLDivElement | undefined = $state();
+
+  /**
+   * Drag preview — drag 중 picker 내부 visual 만 update (swatch/handles/hex).
+   * drag end (pointerup) 에 1회 commit → ADR-0028 history 1 entry.
+   * null = drag 비활성 (resolvedHex / hsv / alphaPercent 사용).
+   */
+  let draftHsv = $state<{ h: number; s: number; v: number } | null>(null);
+  let draftAlpha = $state<number | null>(null);
+
+  const effectiveHsv = $derived(draftHsv ?? hsv);
+  const effectiveAlpha = $derived(draftAlpha ?? alphaPercent);
+  const effectiveHex = $derived.by(() => {
+    if (draftHsv === null) return resolvedHex !== null ? hexRgb(resolvedHex) : '#000000';
+    return hsvToHex(draftHsv.h, draftHsv.s, draftHsv.v);
+  });
+  const effectiveHueColor = $derived(hueToHex(effectiveHsv.h));
   /** Popover 위치 — viewport (fixed) 기준 clamp. open 시 measure + scroll/resize 갱신. */
   let popoverPos = $state<{ top: number; left: number }>({ top: 0, left: 0 });
 
@@ -321,6 +360,117 @@
     }
   }
 
+  // ── Drag handlers (SV / hue / alpha) ─────────────────────────────
+  /**
+   * Pattern: pointerdown 에서 draft state 초기화 + setPointerCapture 으로 element
+   * 외 drag 도 추적. pointermove 마다 draft 만 update (picker 내부 visual).
+   * pointerup 시 draft 의 최종값을 1회 commit 후 draft = null.
+   *
+   * commit 시점: ADR-0028 정합 — drag 중 매 move commit 하면 history 가 dirty.
+   * drag end 1회 commit 으로 history 1 entry 유지. drag 중 visual preview 는
+   * draftHsv / draftAlpha 가 effective* 파생에 흘러가 swatch / handles / hex
+   * 모두 reactive update.
+   */
+  function clamp01(v: number): number {
+    return Math.max(0, Math.min(1, v));
+  }
+
+  function commitDraft(): void {
+    const h = draftHsv;
+    const a = draftAlpha;
+    if (h === null && a === null) return;
+    const baseRgb = h !== null
+      ? hsvToHex(h.h, h.s, h.v)
+      : (resolvedHex !== null ? hexRgb(resolvedHex) : '#000000');
+    const aPct = a !== null ? a : alphaPercent;
+    if (allowAlpha) {
+      commitColor(combineHexAlpha(baseRgb, aPct));
+    } else {
+      commitColor(baseRgb);
+    }
+  }
+
+  function onSvDown(e: PointerEvent): void {
+    if (disabled || svEl === undefined) return;
+    e.preventDefault();
+    svEl.setPointerCapture(e.pointerId);
+    const update = (ev: PointerEvent): void => {
+      if (svEl === undefined) return;
+      const r = svEl.getBoundingClientRect();
+      const sx = clamp01((ev.clientX - r.left) / r.width);
+      const sy = clamp01((ev.clientY - r.top) / r.height);
+      const h = (draftHsv ?? hsv).h;
+      draftHsv = { h, s: sx * 100, v: (1 - sy) * 100 };
+    };
+    update(e);
+    const onMove = (ev: PointerEvent): void => update(ev);
+    const onUp = (ev: PointerEvent): void => {
+      svEl?.removeEventListener('pointermove', onMove);
+      svEl?.removeEventListener('pointerup', onUp);
+      svEl?.removeEventListener('pointercancel', onUp);
+      commitDraft();
+      draftHsv = null;
+      draftAlpha = null;
+      if (svEl?.hasPointerCapture(ev.pointerId)) svEl.releasePointerCapture(ev.pointerId);
+    };
+    svEl.addEventListener('pointermove', onMove);
+    svEl.addEventListener('pointerup', onUp);
+    svEl.addEventListener('pointercancel', onUp);
+  }
+
+  function onHueDown(e: PointerEvent): void {
+    if (disabled || hueEl === undefined) return;
+    e.preventDefault();
+    hueEl.setPointerCapture(e.pointerId);
+    const update = (ev: PointerEvent): void => {
+      if (hueEl === undefined) return;
+      const r = hueEl.getBoundingClientRect();
+      const t = clamp01((ev.clientX - r.left) / r.width);
+      const cur = draftHsv ?? hsv;
+      draftHsv = { h: t * 360, s: cur.s, v: cur.v };
+    };
+    update(e);
+    const onMove = (ev: PointerEvent): void => update(ev);
+    const onUp = (ev: PointerEvent): void => {
+      hueEl?.removeEventListener('pointermove', onMove);
+      hueEl?.removeEventListener('pointerup', onUp);
+      hueEl?.removeEventListener('pointercancel', onUp);
+      commitDraft();
+      draftHsv = null;
+      draftAlpha = null;
+      if (hueEl?.hasPointerCapture(ev.pointerId)) hueEl.releasePointerCapture(ev.pointerId);
+    };
+    hueEl.addEventListener('pointermove', onMove);
+    hueEl.addEventListener('pointerup', onUp);
+    hueEl.addEventListener('pointercancel', onUp);
+  }
+
+  function onAlphaDown(e: PointerEvent): void {
+    if (disabled || !allowAlpha || alphaEl === undefined) return;
+    e.preventDefault();
+    alphaEl.setPointerCapture(e.pointerId);
+    const update = (ev: PointerEvent): void => {
+      if (alphaEl === undefined) return;
+      const r = alphaEl.getBoundingClientRect();
+      const t = clamp01((ev.clientX - r.left) / r.width);
+      draftAlpha = Math.round(t * 100);
+    };
+    update(e);
+    const onMove = (ev: PointerEvent): void => update(ev);
+    const onUp = (ev: PointerEvent): void => {
+      alphaEl?.removeEventListener('pointermove', onMove);
+      alphaEl?.removeEventListener('pointerup', onUp);
+      alphaEl?.removeEventListener('pointercancel', onUp);
+      commitDraft();
+      draftHsv = null;
+      draftAlpha = null;
+      if (alphaEl?.hasPointerCapture(ev.pointerId)) alphaEl.releasePointerCapture(ev.pointerId);
+    };
+    alphaEl.addEventListener('pointermove', onMove);
+    alphaEl.addEventListener('pointerup', onUp);
+    alphaEl.addEventListener('pointercancel', onUp);
+  }
+
   // ── Preset palette (phase 1 hardcoded; phase 4 token-aware) ──────
   const documentSwatches: readonly string[] = [
     '#0d99ff', '#1abc9c', '#2dc26b', '#ffc857', '#f97316',
@@ -349,8 +499,8 @@
   >
     <span
       class="swatch"
-      class:checker={isTransparent || (allowAlpha && alphaPercent < 100)}
-      style:background={mixed || isTransparent ? undefined : (allowAlpha && resolvedHex !== null && alphaPercent < 100 ? resolvedHex : swatchValue)}
+      class:checker={isTransparent || (allowAlpha && effectiveAlpha < 100)}
+      style:background={mixed || isTransparent ? undefined : (allowAlpha && effectiveAlpha < 100 ? combineHexAlpha(effectiveHex, effectiveAlpha) : effectiveHex)}
     >
       {#if mixed}
         <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
@@ -370,7 +520,7 @@
     <div
       class="shape-colorpicker"
       bind:this={popoverEl}
-      style="--cp-hue: {hueColor}; top: {popoverPos.top}px; left: {popoverPos.left}px;"
+      style="--cp-hue: {effectiveHueColor}; top: {popoverPos.top}px; left: {popoverPos.left}px;"
       role="dialog"
       aria-label="Color picker"
     >
@@ -411,24 +561,51 @@
         </button>
       </div>
 
-      <!-- SV square — phase 1: static handle, drag in phase 2. -->
-      <div class="cp-sv">
-        <div class="sv-handle" style:left="{hsv.s}%" style:top="{100 - hsv.v}%"></div>
+      <!-- SV square — drag in saturation/value 2D plane. -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="cp-sv"
+        bind:this={svEl}
+        onpointerdown={onSvDown}
+        aria-label={`Saturation ${Math.round(effectiveHsv.s)}, Value ${Math.round(effectiveHsv.v)}`}
+      >
+        <div class="sv-handle" style:left="{effectiveHsv.s}%" style:top="{100 - effectiveHsv.v}%"></div>
       </div>
 
-      <!-- Sliders — phase 1: static handles, drag in phase 2. -->
+      <!-- Sliders — hue + alpha. -->
       <div class="cp-sliders">
-        <button type="button" class="cp-eye" title="Eyedropper (P2)" disabled aria-disabled="true">
+        <button type="button" class="cp-eye" title="Eyedropper (P3+)" disabled aria-disabled="true">
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M9 1.5l3.5 3.5-1.5 1.5L8 4z"/>
             <path d="M8 4 3.2 8.8a1.4 1.4 0 0 0 0 2L4 11.6l-.6.6a.7.7 0 0 1-1-1l.6-.6.8-.8L8.8 4.8"/>
           </svg>
         </button>
-        <div class="cp-slider hue">
-          <div class="sl-handle" style:left="{(hsv.h / 360) * 100}%"></div>
+        <div
+          class="cp-slider hue"
+          bind:this={hueEl}
+          onpointerdown={onHueDown}
+          role="slider"
+          aria-label="Hue"
+          aria-valuemin="0"
+          aria-valuemax="360"
+          aria-valuenow={Math.round(effectiveHsv.h)}
+          tabindex="-1"
+        >
+          <div class="sl-handle" style:left="{(effectiveHsv.h / 360) * 100}%"></div>
         </div>
-        <div class="cp-slider alpha">
-          <div class="sl-handle" style:left="{alphaPercent}%"></div>
+        <div
+          class="cp-slider alpha"
+          class:disabled={!allowAlpha}
+          bind:this={alphaEl}
+          onpointerdown={onAlphaDown}
+          role="slider"
+          aria-label="Alpha"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow={Math.round(effectiveAlpha)}
+          tabindex="-1"
+        >
+          <div class="sl-handle" style:left="{effectiveAlpha}%"></div>
         </div>
       </div>
 
@@ -440,7 +617,10 @@
         <div class="cp-input">
           <input
             type="text"
-            bind:value={textInput}
+            value={editing ? textInput : (draftHsv !== null ? effectiveHex : textInput)}
+            oninput={(e) => {
+              if (editing) textInput = (e.currentTarget as HTMLInputElement).value;
+            }}
             placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : '#000000'}
             {disabled}
             onfocus={() => (editing = true)}
@@ -463,7 +643,10 @@
               min="0"
               max="100"
               step="1"
-              bind:value={alphaInput}
+              value={editingAlpha ? alphaInput : String(Math.round(effectiveAlpha))}
+              oninput={(e) => {
+                if (editingAlpha) alphaInput = (e.currentTarget as HTMLInputElement).value;
+              }}
               {disabled}
               onfocus={() => (editingAlpha = true)}
               onblur={() => {
@@ -476,7 +659,7 @@
               aria-label="Alpha percent"
             />
           {:else}
-            <span>{alphaPercent}</span>
+            <span>{Math.round(effectiveAlpha)}</span>
           {/if}
           <span class="pct">%</span>
         </div>
@@ -667,7 +850,8 @@
     position: relative;
     width: 100%;
     height: 156px;
-    cursor: not-allowed; /* P2: crosshair + drag */
+    cursor: crosshair;
+    touch-action: none;
     background:
       linear-gradient(to top, #000 0%, transparent 100%),
       linear-gradient(to right, #fff 0%, var(--cp-hue, #0d99ff) 100%);
@@ -709,7 +893,12 @@
     position: relative;
     height: 10px;
     border-radius: 50px;
-    cursor: not-allowed; /* P2: pointer */
+    cursor: pointer;
+    touch-action: none;
+  }
+  .cp-slider.disabled {
+    cursor: not-allowed;
+    opacity: 0.4;
   }
   .cp-slider.hue {
     background: linear-gradient(

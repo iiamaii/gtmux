@@ -45,6 +45,8 @@
 
 mod auth;
 mod file_open;
+mod file_stat;
+mod fs_list;
 mod schema;
 mod session_lock;
 mod session_pane_set;
@@ -644,6 +646,19 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         .route(
             "/api/file-path/open",
             axum::routing::post(file_open::open_handler),
+        )
+        .route(
+            // ADR-0034 — file_path fp-foot meta (lines / size / branch).
+            // Same allowlist gate as `/api/file-path/open` per ADR-0034 D2.
+            "/api/file-stat",
+            get(file_stat::file_stat_handler),
+        )
+        .route(
+            // ADR-0035 — file system picker. MVP scope = workspace dir only
+            // (implicit allow). External roots land in Stage 3 with the
+            // `[picker.roots]` toml schema mutation.
+            "/api/fs/list",
+            get(fs_list::fs_list_handler),
         )
         .route(
             "/api/shutdown",
