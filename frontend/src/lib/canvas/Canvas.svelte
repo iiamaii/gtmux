@@ -667,13 +667,44 @@
 
   /* ── Focus / zoom-to-selection (ViewportCtrl 의 focus 버튼) ──────────────
    * sessionStore.zoomToIds(ids) → pendingZoomToIds set. 본 effect 가 watch
-   * — items 의 union BBox 를 viewport 중앙 + 가득 채움 으로 setViewport.
-   * 처리 후 1-shot clear.
+   * — items 의 union BBox 를 *visible canvas* (left/right panel 또는 rail 이
+   * 차지한 영역 제외) 중앙 + 가득 채움 으로 setViewport. 처리 후 1-shot clear.
    *
    * BBox: item.x/y/w/h 의 union. line 은 (x,y)~(x2,y2) 의 BBox 사용.
-   * padding = 12% (88% 채움). zoom 은 viewport 가로/세로 중 더 작은 비율 채택,
+   * padding = 12% (88% 채움). zoom 은 visible 가로/세로 중 더 작은 비율 채택,
    * [0.05, 3] clamp.
    */
+  function computeVisibleCanvas(): { x: number; y: number; w: number; h: number } {
+    const root = document.querySelector('.canvas-root') as HTMLElement | null;
+    if (root === null) {
+      return { x: 0, y: 0, w: window.innerWidth, h: window.innerHeight };
+    }
+    const rootRect = root.getBoundingClientRect();
+    let visibleLeft = 0;
+    let visibleRight = rootRect.width;
+    const visibleTop = 0;
+    const visibleBottom = rootRect.height;
+    // LeftPanel (확장 시) 또는 LeftRail (축소 시).
+    const left = document.querySelector('.left-panel, .left-rail') as HTMLElement | null;
+    if (left !== null) {
+      const r = left.getBoundingClientRect();
+      const localRight = r.right - rootRect.left;
+      if (localRight > visibleLeft) visibleLeft = localRight;
+    }
+    const right = document.querySelector('.right-panel, .right-rail') as HTMLElement | null;
+    if (right !== null) {
+      const r = right.getBoundingClientRect();
+      const localLeft = r.left - rootRect.left;
+      if (localLeft < visibleRight) visibleRight = localLeft;
+    }
+    return {
+      x: visibleLeft,
+      y: visibleTop,
+      w: Math.max(1, visibleRight - visibleLeft),
+      h: Math.max(1, visibleBottom - visibleTop),
+    };
+  }
+
   $effect(() => {
     const ids = sessionStore.pendingZoomToIds;
     if (ids === null || ids.length === 0) return;
@@ -710,17 +741,18 @@
       }
       const bw = Math.max(1, maxX - minX);
       const bh = Math.max(1, maxY - minY);
-      const root = (document.querySelector('.canvas-root') as HTMLElement) ?? null;
-      const vw = root?.clientWidth ?? window.innerWidth;
-      const vh = root?.clientHeight ?? window.innerHeight;
+      const visible = computeVisibleCanvas();
       const padding = 0.88;
-      const zoom = Math.min((vw / bw) * padding, (vh / bh) * padding, 3);
+      const zoom = Math.min((visible.w / bw) * padding, (visible.h / bh) * padding, 3);
       const zoomClamped = Math.max(0.05, zoom);
       const cx = minX + bw / 2;
       const cy = minY + bh / 2;
+      // BBox center 가 visible 영역 의 center 와 일치 — sidebar 가 가린 영역 보정.
+      const targetScreenX = visible.x + visible.w / 2;
+      const targetScreenY = visible.y + visible.h / 2;
       const next = {
-        x: vw / 2 - cx * zoomClamped,
-        y: vh / 2 - cy * zoomClamped,
+        x: targetScreenX - cx * zoomClamped,
+        y: targetScreenY - cy * zoomClamped,
         zoom: zoomClamped,
       };
       sessionStore.updateViewport(next);

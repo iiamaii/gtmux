@@ -18,12 +18,18 @@
   const item = $derived(sessionStore.items.get(itemId));
   const terminalPaneId = $derived(terminalPool.paneIdFor(itemId));
 
+  const isNote = $derived(item?.type === 'note');
+  const noteColor = $derived(item?.type === 'note' ? item.color : null);
+
   const headerLabel = $derived.by(() => {
     const it = sessionStore.items.get(itemId);
     if (it === undefined) return '—';
+    // Note 는 title 우선 (Inspector 의 label 매핑과 정합).
+    if (it.type === 'note' && it.title.length > 0) return it.title;
     const poolLabel = terminalPool.byId(itemId)?.label?.trim();
     if (poolLabel !== undefined && poolLabel.length > 0) return poolLabel;
     if (it.label !== undefined && it.label !== null && it.label.length > 0) return it.label;
+    if (it.type === 'note') return 'Untitled';
     return itemId.slice(0, 8);
   });
 
@@ -64,18 +70,29 @@
     tabindex="-1"
     onclick={onBackdropClick}
   >
-    <div class="max-panel">
+    <div class="max-panel" class:is-note={isNote} style:--note-accent={noteColor ?? 'var(--color-accent)'}>
       <header class="panel-header">
-        <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/>
-          <path d="M3 5l1.8 1.4L3 7.8"/>
-          <path d="M6 8.4h4"/>
-        </svg>
+        {#if isNote}
+          <svg class="panel-glyph note-glyph" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+            <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
+            <path d="M3.6 5.2h4.8"/>
+          </svg>
+        {:else}
+          <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/>
+            <path d="M3 5l1.8 1.4L3 7.8"/>
+            <path d="M6 8.4h4"/>
+          </svg>
+        {/if}
         <span class="panel-title">{headerLabel}</span>
-        <span class="panel-status" aria-label="Panel status">
-          <span class="led" class:dead={isDead} aria-hidden="true"></span>
-          <span class="status-label">{isDead ? 'dead' : 'running'}</span>
-        </span>
+        {#if !isNote}
+          <span class="panel-status" aria-label="Panel status">
+            <span class="led" class:dead={isDead} aria-hidden="true"></span>
+            <span class="status-label">{isDead ? 'dead' : 'running'}</span>
+          </span>
+        {:else}
+          <span class="panel-spacer"></span>
+        {/if}
         <div class="panel-actions">
           <button
             type="button"
@@ -103,6 +120,14 @@
             </div>
           {/if}
           <PanelDanglingOverlay terminalId={itemId} />
+        {:else if item.type === 'note'}
+          <div class="note-body-max">
+            {#if item.body.length === 0}
+              <span class="note-placeholder">Empty note</span>
+            {:else}
+              <pre class="note-body-text">{item.body}</pre>
+            {/if}
+          </div>
         {/if}
       </div>
     </div>
@@ -210,6 +235,40 @@
     overflow: hidden;
     position: relative;
     min-height: 0;
+  }
+
+  /* Note 변형 — left accent rail + sans body. */
+  .max-panel.is-note {
+    border-left: 2px solid var(--note-accent);
+  }
+  .panel-spacer {
+    flex: 1 1 auto;
+  }
+  .note-glyph {
+    color: var(--note-accent) !important;
+    opacity: 1 !important;
+  }
+  .note-body-max {
+    width: 100%; height: 100%;
+    overflow: auto;
+    padding: 24px 36px;
+    background: var(--color-surface);
+  }
+  .note-body-text {
+    margin: 0;
+    font-family: var(--font-sans);
+    font-size: var(--text-lg);
+    line-height: 1.55;
+    letter-spacing: -0.1px;
+    color: var(--color-fg);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .note-placeholder {
+    color: var(--color-fg-subtle);
+    font-size: var(--text-md);
+    font-style: italic;
+    user-select: none;
   }
 
   .panel-pending {

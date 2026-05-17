@@ -57,10 +57,12 @@
   let bodyEditing = $state(false);
   type ResizeParams = { x: number; y: number; width: number; height: number };
 
-  // Minimize: schema-driven geom (h=32 strip, w 유지, minimized=true) + in-memory
-  // backup. PanelNode 와 동일 패턴 — `sessionStore.restoredItemGeoms` 사용.
-  // header-strip 모드 — 시안의 Panel header 와 동일하게 head 만 표시.
-  const MIN_STRIP_H = 32;
+  // Minimize: schema-driven geom (w=h=32 chip, minimized=true) + in-memory backup.
+  // PanelNode 와 동일 패턴 — `sessionStore.restoredItemGeoms` 사용.
+  // Note 는 chip (square icon button) 모드 — speech-bubble glyph 만 표시, 클릭 시
+  // restore. Inspector minimize 버튼 SVG 토글은 Panel 과 동일 (line ↔ square).
+  const MIN_CHIP = 32;
+  const RESTORE_DEFAULT_W = 240;
   const RESTORE_DEFAULT_H = 96;
 
   function onTitleDblClick(e: MouseEvent): void {
@@ -148,12 +150,15 @@
     if (!(await ensureMutationOk('Minimize aborted — session reconnect failed.'))) return;
     const wasMinimized = cur.minimized === true;
     const next = !wasMinimized;
+    let nextW = cur.w;
     let nextH = cur.h;
     if (next === true) {
       sessionStore.backupItemGeom(data.id, { x: cur.x, y: cur.y, w: cur.w, h: cur.h });
-      nextH = MIN_STRIP_H;
+      nextW = MIN_CHIP;
+      nextH = MIN_CHIP;
     } else {
       const backup = sessionStore.getRestoredGeom(data.id);
+      nextW = backup !== null ? backup.w : RESTORE_DEFAULT_W;
       nextH = backup !== null ? backup.h : RESTORE_DEFAULT_H;
       sessionStore.clearRestoredGeom(data.id);
     }
@@ -162,7 +167,7 @@
         ...cur2,
         items: cur2.items.map((it) =>
           it.id === data.id
-            ? ({ ...it, minimized: next, h: nextH } as typeof it)
+            ? ({ ...it, minimized: next, w: nextW, h: nextH } as typeof it)
             : it,
         ),
       }));
@@ -184,6 +189,14 @@
     void onMinimizeClick(e);
   }
 
+  // Maximize — PanelNode 와 동일. sessionStore.maximizedItemId 토글 만으로
+  // MaximizedPanelModal 이 렌더링.
+  const isMaximized = $derived(sessionStore.maximizedItemId === data.id);
+  function onMaximizeClick(e: MouseEvent): void {
+    e.stopPropagation();
+    e.preventDefault();
+    sessionStore.toggleMaximize(data.id);
+  }
 </script>
 
 {#if isVisible}
@@ -252,6 +265,26 @@
             </svg>
           {/if}
         </button>
+        <button
+          type="button"
+          class="note-btn"
+          title={isMaximized ? 'Restore' : 'Maximize'}
+          aria-label={isMaximized ? 'Restore' : 'Maximize'}
+          onclick={onMaximizeClick}
+        >
+          {#if isMaximized}
+            <!-- restore (two windows) -->
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
+              <rect x="1.5" y="3" width="5.4" height="5.3" rx="0.4"/>
+              <path d="M3.2 3V1.6h5.3V7H7"/>
+            </svg>
+          {:else}
+            <!-- maximize (square outline) -->
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2" y="2" width="6" height="6" rx="0.6"/>
+            </svg>
+          {/if}
+        </button>
       {/if}
     </div>
 
@@ -272,6 +305,12 @@
         <pre class="note-body">{data.body}</pre>
       {/if}
     </div>
+
+    <!-- 32×32 chip 모드 시 표시되는 speech-bubble glyph (note-head/body 는 hide). -->
+    <svg class="note-chip" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M2 3h10v6.4H7L4.5 12V9.4H2z"/>
+      <path d="M4.4 6h5.2"/>
+    </svg>
   </div>
 {/if}
 
@@ -371,25 +410,27 @@
     user-select: none;
   }
 
-  /* Minimized — header-strip 모드. Wrapper h=32 (schema), w 유지.
-     Panel header 시안 정합 — head row 만 표시, body 숨김. 전체 strip 클릭으로 restore. */
+  .note-chip {
+    display: none;
+    width: 14px; height: 14px;
+    color: var(--color-fg);
+  }
+
+  /* Minimized — 32×32 chip (square icon button). Wrapper w=h=32 (schema).
+     head + body 숨김, chip glyph centered. 전체 chip 클릭으로 restore. */
   .note-node.is-min {
     grid-template-rows: 1fr;
-    padding: 0 6px 0 12px;
-    align-items: center;
+    padding: 0;
+    place-items: center;
     cursor: pointer;
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
   }
+  .note-node.is-min .note-head,
   .note-node.is-min .note-body-wrap { display: none; }
-  .note-node.is-min .note-head {
-    height: 100%;
-  }
-  /* minimized state 에서는 .note-btn 의 hover-only opacity 동작 무시 — 항상 보임,
-     restore 아이콘 으로 시각 변환. */
-  .note-node.is-min .note-btn {
-    opacity: 1;
-  }
+  .note-node.is-min .note-chip { display: block; }
   .note-node.is-min:hover {
-    background: color-mix(in srgb, var(--note-accent, var(--color-accent)) 4%, var(--color-surface));
+    background: var(--color-surface-2);
   }
   .note-node.is-min:focus-visible {
     outline: 1px dashed var(--color-accent);
