@@ -245,16 +245,17 @@
       // silent.
     }
     if (containerEl !== undefined) {
-      // NOTE: TS generic `<HTMLElement>` 표기 (querySelectorAll<...> 또는
-      // NodeListOf<...> cast) 모두 svelte parser 가 HTML tag 로 오인 →
-      // script unclosed. generic 없는 cast 패턴 (`as HTMLElement`) 만 안전.
+      // NOTE: TS generic `<HTMLElement>` 표기는 어디서든 svelte parser 가
+      // HTML tag 로 오인 → script unclosed. `as HTMLElement` 도 동일.
+      // runtime `instanceof` narrow 가 generic-free + TS-safe.
       const cells = containerEl.querySelectorAll('.xterm-rows span');
-      cells.forEach((node) => {
-        const span = node as HTMLElement;
-        // color / background-color 만 reset, 다른 inline style (font-weight,
-        // text-decoration 등) 은 보존.
-        span.style.color = '';
-        span.style.backgroundColor = '';
+      cells.forEach((span) => {
+        if (span instanceof HTMLElement) {
+          // color / background-color 만 reset, 다른 inline style (font-weight,
+          // text-decoration 등) 은 보존.
+          span.style.color = '';
+          span.style.backgroundColor = '';
+        }
       });
     }
     try {
