@@ -104,26 +104,29 @@
         draggable="false"
       />
     {:else}
-      <div class="image-placeholder" aria-hidden="true">
+      <div class="empty-stub" aria-hidden="true">
         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="3" width="18" height="18" rx="2" />
           <circle cx="8.5" cy="8.5" r="1.5" />
           <polyline points="21 15 16 10 5 21" />
         </svg>
-        <span class="image-placeholder-label">Image</span>
-        <span class="image-placeholder-hint">Pending upload</span>
+        <div class="label">Drop an image here</div>
+        <span class="hint">Pending upload</span>
       </div>
     {/if}
   </div>
 {/if}
 
 <style>
+  /* ref/frontend-design/components-v3.html — .shape-image (empty/placeholder
+   * variant). Real asset rendering 은 P2+ (/api/assets/* ship 후). 현 단계는
+   * is-empty 패턴만 — dashed border + 중앙 stub. */
   .image-node {
     display: grid;
     place-items: center;
     box-sizing: border-box;
     background: var(--color-surface);
-    border: 1px dashed var(--color-border);
+    border: 1px dashed var(--color-border-strong);
     border-radius: var(--radius-md);
     color: var(--color-fg-muted);
     overflow: hidden;
@@ -144,25 +147,32 @@
     display: block;
   }
 
-  .image-placeholder {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 4px;
+  .empty-stub {
+    text-align: center;
     color: var(--color-fg-muted);
+    font-size: 12px;
+    letter-spacing: -0.1px;
+    line-height: 1.45;
+    padding: 12px;
+  }
+
+  .empty-stub svg {
+    opacity: 0.55;
+    margin-bottom: 6px;
+  }
+
+  .empty-stub .label {
+    font-family: var(--font-sans);
+    color: var(--color-fg-muted);
+  }
+
+  .empty-stub .hint {
+    display: block;
     font-family: var(--font-mono);
-  }
-
-  .image-placeholder-label {
-    font-size: var(--text-md);
-    font-weight: var(--weight-medium);
-    letter-spacing: 0.4px;
+    font-size: 9px;
+    letter-spacing: 0.6px;
     text-transform: uppercase;
-  }
-
-  .image-placeholder-hint {
-    font-size: var(--text-sm);
+    margin-top: 6px;
     color: var(--color-fg-subtle);
-    letter-spacing: 0.3px;
   }
 </style>

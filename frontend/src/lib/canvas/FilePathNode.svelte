@@ -221,9 +221,10 @@
     cursor: default;
   }
 
+  /* ref/frontend-design/components-v3.html §03 — .shape-filepath. */
   .fp-main {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 10px;
     padding: 11px 12px 10px;
     min-width: 0;
@@ -236,14 +237,15 @@
     flex: 0 0 24px;
     display: grid;
     place-items: center;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: var(--color-glass-2);
-    color: var(--color-fg-muted);
+    color: var(--color-fg);
   }
 
   .fp-meta {
     display: flex;
     flex-direction: column;
+    gap: 1px;
     min-width: 0;
     flex: 1 1 auto;
   }
@@ -274,11 +276,11 @@
     user-select: none;
   }
 
-  /* Foot row — surface-2 strip with 1px top border. */
+  /* Foot row — surface-2 strip with 1px top border. v3 §03 정합. */
   .fp-foot {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     padding: 6px 12px 7px;
     background: var(--color-surface-2);
     border-top: 1px solid var(--color-border);
@@ -291,6 +293,9 @@
   .fp-foot-spacer {
     flex: 1 1 auto;
   }
+
+  /* v3 시안의 .sep / .right 도 사용 가능 — 향후 lines / size / branch
+   * meta wire 시 적용 (현재는 placeholder 라 spacer 만 사용). */
 
   /* Lang badge — per-lang background color (시안 §03 palette). */
   .fp-badge {
