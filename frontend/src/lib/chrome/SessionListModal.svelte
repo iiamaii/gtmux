@@ -20,7 +20,10 @@
 
   import Modal from '$lib/ui/Modal.svelte';
   import Button from '$lib/ui/Button.svelte';
-  import { listSessions, UnauthorizedError } from '$lib/http/sessions';
+  import SessionDeleteConfirmModal from './SessionDeleteConfirmModal.svelte';
+  import { deleteSession, listSessions, UnauthorizedError } from '$lib/http/sessions';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { SessionInfo } from '$lib/types/sessions';
 
   interface Props {
@@ -85,6 +88,46 @@
     }
   });
 
+  // ADR-0019 D10.1 (G51 amend) — Available row 의 hover-kebab → Delete.
+  // 가시성 규칙:
+  //   - In use row 는 hover-kebab 없음 (그 자체 <span> non-button row).
+  //   - Available 안에서도 본 webpage 의 active row (= sessionStore.active.name
+  //     일치) 는 kebab 차단 — 본 entry 는 SessionMenu 의 "Delete current session…"
+  //     이 own (entry 분기 혼선 방지).
+  //   - 승인 후: deleteSession(name) → 1s polling (D6.4) 의 다음 tick 으로 row
+  //     자연 제거. 별도 즉시 refresh 트리거 없음 (race 단순화). 404 (race) 도
+  //     동일 (다음 poll 이 row 자연 제거).
+  let pendingDeleteName = $state<string | null>(null);
+
+  function canDelete(name: string): boolean {
+    return sessionStore.active?.name !== name;
+  }
+
+  function onRequestDelete(e: MouseEvent, name: string): void {
+    e.stopPropagation();
+    pendingDeleteName = name;
+  }
+
+  async function onConfirmDelete(): Promise<void> {
+    const name = pendingDeleteName;
+    if (name === null) return;
+    pendingDeleteName = null;
+    try {
+      await deleteSession(name);
+      // 404 (race) 는 deleteSession 가 silent return (sessions.ts:121).
+      // 다음 polling tick 에서 row 자연 제거.
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        onUnauthorized?.();
+        return;
+      }
+      toastStore.show({
+        message: `Delete failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
+  }
+
   function formatLastUsed(iso: string): string {
     try {
       const d = new Date(iso);
@@ -123,7 +166,7 @@
           <div class="section-head">Available</div>
           <ul class="list" role="listbox" aria-label="Available sessions">
             {#each available as s (s.name)}
-              <li>
+              <li class="row-wrap">
                 <button
                   type="button"
                   class="row"
@@ -153,6 +196,33 @@
                     <polyline points="9 18 15 12 9 6" />
                   </svg>
                 </button>
+                {#if canDelete(s.name)}
+                  <button
+                    type="button"
+                    class="row-kebab"
+                    aria-label="Delete session ‘{s.name}’"
+                    title="Delete session…"
+                    onclick={(e) => onRequestDelete(e, s.name)}
+                  >
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <polyline points="3 6 5 6 21 6" />
+                      <path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6" />
+                      <path d="M10 11v6" />
+                      <path d="M14 11v6" />
+                      <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
+                    </svg>
+                  </button>
+                {/if}
               </li>
             {/each}
           </ul>
@@ -195,6 +265,13 @@
     <Button variant="ghost" onclick={onClose}>Cancel</Button>
   {/snippet}
 </Modal>
+
+<SessionDeleteConfirmModal
+  open={pendingDeleteName !== null}
+  sessionName={pendingDeleteName ?? ''}
+  onCancel={() => (pendingDeleteName = null)}
+  onConfirm={() => void onConfirmDelete()}
+/>
 
 <style>
   .state {
@@ -295,6 +372,56 @@
   .row-chevron {
     color: var(--color-fg-subtle);
     flex-shrink: 0;
+  }
+
+  /* hover-kebab overlay (ADR-0019 D10.1) — row 위에 absolute. row 의 click
+   * 영역과 분리하기 위해 nested button (HTML invalid) 회피 + li position:relative. */
+  .row-wrap {
+    position: relative;
+  }
+
+  .row-kebab {
+    position: absolute;
+    top: 50%;
+    right: var(--space-12);
+    transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--color-fg-muted);
+    opacity: 0;
+    cursor: pointer;
+    transition:
+      opacity var(--motion-fast) var(--motion-easing),
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  .row-wrap:hover .row-kebab,
+  .row-kebab:focus-visible {
+    opacity: 1;
+  }
+
+  .row-kebab:hover {
+    background: color-mix(in srgb, var(--color-danger) 14%, transparent);
+    color: var(--color-danger);
+  }
+
+  .row-kebab:focus-visible {
+    outline: 2px dashed var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  /* kebab 노출 시 chevron 가시 영역 안 겹치도록 right padding 보강. */
+  .row-wrap:hover .row,
+  .row-wrap:focus-within .row {
+    padding-right: 44px;
   }
 
   .badge {

@@ -11,6 +11,7 @@
   import Dropdown from '$lib/ui/Dropdown.svelte';
   import IconButton from '$lib/ui/IconButton.svelte';
   import ShutdownModal from './ShutdownModal.svelte';
+  import SessionDeleteConfirmModal from './SessionDeleteConfirmModal.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { settingsDialog } from '$lib/stores/settingsDialog.svelte';
@@ -18,6 +19,8 @@
   import { sessionIODialog } from '$lib/stores/sessionIOdialog.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
+  import { reconnectGate } from '$lib/stores/reconnectGate.svelte';
+  import { deleteSession, UnauthorizedError } from '$lib/http/sessions';
   import { logout } from '$lib/http/auth';
 
   interface Props {
@@ -52,6 +55,50 @@
     toastStore.show({
       message: 'gtmux — tmux-backed web canvas workspace. ADR-0013 PTY-direct.',
       tone: 'info',
+    });
+  }
+
+  // ADR-0019 D10.1 (G51 amend) — "Delete current session…" entry point.
+  // 현 attached session 만 대상. 승인 후: deleteSession → sessionStore.clear()
+  // → reconnectGate.cancel() (sessionStorageHint.clear 포함) → workspaceSwitcher.open().
+  let deleteConfirmOpen = $state(false);
+
+  function onRequestDelete(): void {
+    if (sessionStore.active === null) return;
+    deleteConfirmOpen = true;
+  }
+
+  async function onConfirmDelete(): Promise<void> {
+    const active = sessionStore.active;
+    if (active === null) {
+      deleteConfirmOpen = false;
+      return;
+    }
+    const name = active.name;
+    deleteConfirmOpen = false;
+    try {
+      await deleteSession(name);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Delete failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+      return;
+    }
+    // D5.4 cancel 흐름 + D10 "현 attached 였으면 dialog 회귀" 정합.
+    // (reconnectGate.cancel 가 sessionStorageHint.clear 도 호출하지만 ADR-0019
+    // D10.1 명세 정합 위해 명시 4-step.)
+    sessionStore.clear();
+    reconnectGate.cancel();
+    sessionStorageHint.clear();
+    workspaceSwitcher.open();
+    toastStore.show({
+      message: `Session "${name}" deleted. Terminals remain in the server pool.`,
+      tone: 'success',
     });
   }
 </script>
@@ -129,6 +176,26 @@
     <button
       type="button"
       class="danger"
+      disabled={sessionStore.active === null}
+      title={sessionStore.active === null ? 'No active session to delete' : ''}
+      onclick={() => {
+        if (sessionStore.active === null) return;
+        onRequestDelete();
+        close();
+      }}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="3 6 5 6 21 6"/>
+        <path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>
+        <path d="M10 11v6"/>
+        <path d="M14 11v6"/>
+        <path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/>
+      </svg>
+      <span>Delete current session…</span>
+    </button>
+    <button
+      type="button"
+      class="danger"
       onclick={() => {
         shutdownDialog.show();
         close();
@@ -188,4 +255,11 @@
   open={shutdownDialog.open}
   {sessionName}
   onclose={() => shutdownDialog.close()}
+/>
+
+<SessionDeleteConfirmModal
+  open={deleteConfirmOpen}
+  sessionName={sessionStore.active?.name ?? ''}
+  onCancel={() => (deleteConfirmOpen = false)}
+  onConfirm={() => void onConfirmDelete()}
 />
