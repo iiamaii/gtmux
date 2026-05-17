@@ -31,7 +31,6 @@
   import FilePathNode from './FilePathNode.svelte';
   import ShapeNode from './ShapeNode.svelte';
   import LineNode from './LineNode.svelte';
-  import MaximizedPanelModal from './MaximizedPanelModal.svelte';
   import {
     commitNewItem,
     createCanvasItem,
@@ -127,6 +126,25 @@
   }
 
   function onWindowKeyDown(e: KeyboardEvent): void {
+    // ── Undo / Redo (ADR-0028 D8) — Cmd+Z / Cmd+Shift+Z (mac) / Ctrl+Z /
+    // Ctrl+Y (others). editable / xterm focus 시 무시 (native input undo
+    // 우선). active session 없으면 sessionStore.undo/redo 가 자체 noop.
+    if ((e.metaKey || e.ctrlKey) && !e.altKey) {
+      if (e.key === 'z' || e.key === 'Z') {
+        if (isEditableFocused()) return;
+        e.preventDefault();
+        if (e.shiftKey) void sessionStore.redo();
+        else void sessionStore.undo();
+        return;
+      }
+      if ((e.key === 'y' || e.key === 'Y') && !e.shiftKey) {
+        if (isEditableFocused()) return;
+        e.preventDefault();
+        void sessionStore.redo();
+        return;
+      }
+    }
+
     // ── Delete/Backspace — remove selected items (multi-session only) ────
     // SvelteFlow 의 builtin delete (deleteKey={null}) 는 비활성 — store 와
     // 미동기 상태로 nodes 만 임시 제거되어 "사라졌다 돌아오는" 회귀 야기.
@@ -505,14 +523,22 @@
   function itemToNode(item: CanvasItem): Node {
     const visible = effectiveVisibility(item.visibility, item.parent_id, sessionGroupsById);
     const locked = effectiveLocked(item.locked, item.parent_id, sessionGroupsById);
+    // Maximize 인 경우 in-memory geom override — schema item 은 그대로 두고
+    // 렌더링만 fullscreen. content (xterm / inline edit) 는 마운트 유지.
+    const isMax = sessionStore.maximizedItemId === item.id && sessionStore.maximizedGeom !== null;
+    const maxG = sessionStore.maximizedGeom;
+    const ox = isMax && maxG !== null ? maxG.x : item.x;
+    const oy = isMax && maxG !== null ? maxG.y : item.y;
+    const ow = isMax && maxG !== null ? maxG.w : item.w;
+    const oh = isMax && maxG !== null ? maxG.h : item.h;
     const common = {
       id: item.id,
-      position: { x: item.x, y: item.y },
-      draggable: !locked,
+      position: { x: ox, y: oy },
+      draggable: !locked && !isMax,
       selected: sessionStore.M.has(item.id),
-      zIndex: item.z,
-      width: item.w,
-      height: item.h,
+      zIndex: isMax ? 9999 : item.z,
+      width: ow,
+      height: oh,
     };
     if (item.type === 'terminal') {
       return {
@@ -1111,9 +1137,6 @@
     ></div>
   {/if}
 
-  {#if sessionStore.maximizedItemId !== null}
-    <MaximizedPanelModal itemId={sessionStore.maximizedItemId} />
-  {/if}
 </div>
 
 <style>

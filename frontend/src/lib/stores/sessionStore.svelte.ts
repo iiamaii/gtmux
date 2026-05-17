@@ -23,7 +23,8 @@
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 import { debugCount } from '$lib/common/debugCounts';
-import { mutateLayout } from '$lib/http/sessions';
+import { EtagMismatchError, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+import { historyStore } from '$lib/stores/historyStore.svelte';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 import { toastStore } from '$lib/ui/toast-store.svelte';
 import type { CanvasItem, CanvasLayout, Viewport } from '$lib/types/canvas';
@@ -86,11 +87,25 @@ class SessionStore {
   I = $state<string | null>(null);
 
   /**
-   * FE-only ephemeral. Maximize 된 panel 의 id — modal overlay 표시 기준.
-   * 한 session 1 panel (G20 amend). attach/switch 시 자동 null 로 reset.
-   * schema 영속 X — Canvas.svelte 가 본 값으로 MaximizedPanelModal 렌더링.
+   * FE-only ephemeral. Maximize 된 panel 의 id — Canvas.svelte 의 itemToNode 가
+   * 본 id 의 node 에 한해 in-memory geom override (fullscreen) 를 적용.
+   * schema 영속 X — 사용자의 원본 geom 은 그대로 유지, 시각만 fullscreen.
+   * 한 session 1 panel. attach/switch 시 자동 null 로 reset.
    */
   maximizedItemId = $state<string | null>(null);
+
+  /**
+   * Maximize 진입 시 viewport snapshot — unmaximize 시 복원.
+   * maximize 동안 viewport 를 (0, 0, 1) 으로 lock 해 panel 이 100% scale.
+   */
+  maximizedRestoreViewport = $state<Viewport | null>(null);
+
+  /**
+   * Maximize 진입 시 계산된 fullscreen geom (canvas 의 visible extent 기준,
+   * zoom=1). Canvas 의 itemToNode 가 maximizedItemId 와 match 되는 item 의
+   * position/dimensions 를 본 값으로 override.
+   */
+  maximizedGeom = $state<{ x: number; y: number; w: number; h: number } | null>(null);
 
   /**
    * Focus mode (ADR-0017 §D5). FE-only ephemeral — session 단위.
@@ -180,7 +195,11 @@ class SessionStore {
     this.M.clear();
     this.I = null;
     this.maximizedItemId = null;
+    this.maximizedRestoreViewport = null;
+    this.maximizedGeom = null;
     this.focusMode = { enabled: false, targetPanelId: null };
+    // ADR-0028 D4 — per-session history. 이전 session 의 stack 은 drop.
+    historyStore.setActive(session.name);
   }
 
   /**
@@ -197,8 +216,11 @@ class SessionStore {
     this.M.clear();
     this.I = null;
     this.maximizedItemId = null;
+    this.maximizedRestoreViewport = null;
+    this.maximizedGeom = null;
     this.focusMode = { enabled: false, targetPanelId: null };
     sessionStorageHint.clear();
+    historyStore.setActive(null);
   }
 
   /**
@@ -211,6 +233,7 @@ class SessionStore {
   switchSession(name: string): void {
     this.clear();
     this.active = { name };
+    historyStore.setActive(name);
   }
 
   /* ────────────────────────────────────────────────────────────────────── */
@@ -251,16 +274,38 @@ class SessionStore {
   /* Maximize — FE-only ephemeral, 1-at-a-time (G20)                        */
   /* ────────────────────────────────────────────────────────────────────── */
 
+  /**
+   * Maximize entry — viewport 를 (0, 0, 1) 으로 lock + maximizedGeom 을 canvas
+   * 의 visible extent 로 set. 사용자의 schema geom 은 그대로 유지 — 본 메서드
+   * 는 in-memory override 용 state 만 갱신.
+   */
   maximize(itemId: string): void {
+    const canvas = typeof document !== 'undefined'
+      ? (document.querySelector('.canvas-root') as HTMLElement | null)
+      : null;
+    const vw = canvas?.clientWidth ?? (typeof window !== 'undefined' ? window.innerWidth : 1280);
+    const vh = canvas?.clientHeight ?? (typeof window !== 'undefined' ? window.innerHeight : 720);
+    this.maximizedRestoreViewport = { ...this.viewport };
+    this.maximizedGeom = { x: 0, y: 0, w: vw, h: vh };
     this.maximizedItemId = itemId;
+    this.updateViewport({ x: 0, y: 0, zoom: 1 });
   }
 
   unmaximize(): void {
+    if (this.maximizedRestoreViewport !== null) {
+      this.updateViewport({ ...this.maximizedRestoreViewport });
+      this.maximizedRestoreViewport = null;
+    }
+    this.maximizedGeom = null;
     this.maximizedItemId = null;
   }
 
   toggleMaximize(itemId: string): void {
-    this.maximizedItemId = this.maximizedItemId === itemId ? null : itemId;
+    if (this.maximizedItemId === itemId) {
+      this.unmaximize();
+    } else {
+      this.maximize(itemId);
+    }
   }
 
   /* ────────────────────────────────────────────────────────────────────── */
@@ -533,6 +578,158 @@ class SessionStore {
       return { ok: false, result: this.lastSilentReattachResult };
     }
     return { ok: true };
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Layout mutation entry — ADR-0028 D12                                   */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Current layout 의 deep snapshot — undo/redo 의 history entry 단위 (D7).
+   *
+   * SvelteMap value 들은 frozen-ish 가 아니므로 spread 로 새 object 추출 — 이후
+   * store mutation 이 snapshot 을 mutate 하지 않도록 안전.
+   */
+  layoutSnapshot(): CanvasLayout {
+    return {
+      schema_version: 2,
+      groups: Array.from(this.groups.values()).map((g) => ({ ...g })),
+      items: Array.from(this.items.values()).map((it) => ({ ...it })),
+      viewport: { ...this.viewport },
+    };
+  }
+
+  /**
+   * ADR-0028 D12 — 모든 layout mutation 의 단일 entry point.
+   *
+   * 책임:
+   *  1. mutation guard (Phase 2 silentReattach 결과 검사)
+   *  2. PRE-state snapshot → historyStore.capture (D3 — 1 PUT = 1 entry)
+   *  3. mutateLayout(transform) — etag rebase 1회 자동
+   *  4. loadLayout(response) — store 동기
+   *  5. error 처리 (Unauthorized redirect, toast)
+   *
+   * 반환: `{ ok, layout? }` — ok=false 면 caller 가 추가 처리 없이 early return.
+   *
+   * 기존 직접 `mutateLayout` 호출은 본 helper 로 migration (D11 audit 정합).
+   * 단, history capture 가 부적절한 mutation (viewport debounce flush, undo/redo
+   * 자체) 은 `captureHistory: false` 로 skip.
+   */
+  async applyMutation(
+    transform: (cur: CanvasLayout) => CanvasLayout,
+    options: {
+      abortMessage?: string;
+      failMessage?: string;
+      captureHistory?: boolean;
+    } = {},
+  ): Promise<{ ok: boolean; layout?: CanvasLayout }> {
+    const active = this.active;
+    if (active === null) return { ok: false };
+    const guard = await this.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message:
+          options.abortMessage ??
+          'Session reconnect failed — action aborted.',
+        tone: 'error',
+        durationMs: 6_000,
+      });
+      return { ok: false };
+    }
+    const captureHistory = options.captureHistory !== false;
+    const before = captureHistory ? this.layoutSnapshot() : null;
+    try {
+      const { layout } = await mutateLayout(active.name, transform);
+      this.loadLayout(layout);
+      if (before !== null) historyStore.capture(active.name, before);
+      return { ok: true, layout };
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return { ok: false };
+      }
+      toastStore.show({
+        message:
+          options.failMessage ??
+          `Mutation failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+      return { ok: false };
+    }
+  }
+
+  /**
+   * ADR-0028 D8 — undo 1 step. Cmd+Z / Ctrl+Z 키바인드의 진입점.
+   *
+   * 동작:
+   *  1. mutation guard
+   *  2. historyStore.popUndo(currentSnapshot) → PRE-state
+   *  3. mutateLayout(() => pre) — full snapshot PUT
+   *  4. 성공 시 loadLayout, currentSnapshot 은 popUndo 가 redo 에 push
+   *  5. 실패 시 D9 — 양 stack reset + toast
+   *
+   * Undo 자체는 captureHistory:false — 그렇지 않으면 undo→stack push→…→cycle.
+   */
+  async undo(): Promise<void> {
+    const active = this.active;
+    if (active === null) return;
+    const guard = await this.guardOutgoingMutation();
+    if (!guard.ok) return;
+    const current = this.layoutSnapshot();
+    const pre = historyStore.popUndo(active.name, current);
+    if (pre === null) return;
+    try {
+      const { layout } = await mutateLayout(active.name, () => pre);
+      this.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      // D9 — etag mismatch (rebase 도 fail) 또는 D1.2 unmatched terminal.
+      historyStore.reset(active.name);
+      const reason =
+        err instanceof EtagMismatchError
+          ? 'layout changed by another source'
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      toastStore.show({
+        message: `Cannot undo — ${reason}. History cleared.`,
+        tone: 'warning',
+      });
+    }
+  }
+
+  /** ADR-0028 D8 — redo 1 step. Cmd+Shift+Z / Ctrl+Y 의 진입점. */
+  async redo(): Promise<void> {
+    const active = this.active;
+    if (active === null) return;
+    const guard = await this.guardOutgoingMutation();
+    if (!guard.ok) return;
+    const current = this.layoutSnapshot();
+    const next = historyStore.popRedo(active.name, current);
+    if (next === null) return;
+    try {
+      const { layout } = await mutateLayout(active.name, () => next);
+      this.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      historyStore.reset(active.name);
+      const reason =
+        err instanceof EtagMismatchError
+          ? 'layout changed by another source'
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      toastStore.show({
+        message: `Cannot redo — ${reason}. History cleared.`,
+        tone: 'warning',
+      });
+    }
   }
 }
 
