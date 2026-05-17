@@ -177,6 +177,24 @@ pub struct AppState {
     /// and persisted on every `POST/DELETE /allowlist`. See
     /// `file_open/mod.rs` for the wire surface.
     pub file_open: FileOpenContext,
+    /// Per-UUID lock for `POST /api/terminals/:id/respawn` (ADR-0021 D10.2,
+    /// 0053 §3.4 follow-up). The handler's kill-then-spawn sequence is not
+    /// atomic on its own — multi-webpage auto-respawn (FE
+    /// `PanelDanglingOverlay`) can race two requests on the same UUID and
+    /// briefly churn the PaneId binding. Per-UUID serialisation closes the
+    /// window: the second caller waits for the first to publish its new
+    /// PaneId, then sees the live binding and returns an idempotent 200
+    /// (`reused: true`) without killing the just-spawned Pane.
+    ///
+    /// Map entries are *not* GC'd on release — a single-user workload's
+    /// unique-UUID respawn set is bounded by terminal_pool cardinality, so
+    /// the leak is ~60 bytes per ever-respawned UUID (acceptable). A future
+    /// pass can switch to `Weak<Mutex<()>>` if needed.
+    pub respawn_locks: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+        >,
+    >,
 }
 
 impl AppState {
@@ -206,6 +224,9 @@ impl AppState {
             session_cache: Arc::new(SessionCache::new()),
             behavior_settings: default_behavior_settings(),
             file_open: FileOpenContext::production(),
+            respawn_locks: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -2547,6 +2568,71 @@ mod tests {
         // No entry — must not panic.
         state.handle_pane_died(PaneId(999), None).await;
         assert!(state.terminal_map.is_empty().await);
+    }
+
+    /// ADR-0021 D10.2 / 0053 §3.4 — two concurrent `POST /respawn` calls
+    /// on the same UUID must converge on a *single* alive PaneId binding.
+    /// The handler's per-UUID `respawn_locks` mutex serialises the
+    /// kill→spawn pair; the runner-up enters its critical section after
+    /// the winner has already published a fresh PaneId, finds the
+    /// `lookup_pane` hit, and returns the idempotent `{ reused: true }`
+    /// path. Without the lock, both callers would kill+spawn back-to-back
+    /// and the second's kill would orphan the first's just-bound output
+    /// stream.
+    #[tokio::test]
+    async fn respawn_concurrent_same_uuid_yields_single_alive_binding() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let uuid = "11111111-2222-4333-8444-555555555570";
+        let app = router_with_state(state.clone());
+
+        let make_req = || {
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri(format!("/api/terminals/{uuid}/respawn"))
+                .header(header::HOST, TEST_HOST)
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let (r1, r2) = tokio::join!(
+            app.clone().oneshot(make_req()),
+            app.clone().oneshot(make_req()),
+        );
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK, "first call must 200");
+        assert_eq!(r2.status(), StatusCode::OK, "second call must 200");
+
+        let b1: Value = serde_json::from_slice(
+            &to_bytes(r1.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        let b2: Value = serde_json::from_slice(
+            &to_bytes(r2.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(b1["id"], uuid);
+        assert_eq!(b2["id"], uuid);
+        let mut reused_flags = vec![
+            b1["reused"].as_bool().expect("reused bool"),
+            b2["reused"].as_bool().expect("reused bool"),
+        ];
+        reused_flags.sort();
+        assert_eq!(
+            reused_flags,
+            vec![false, true],
+            "exactly one caller must run the kill+spawn path (reused=false); \
+             the other must see the lookup_pane hit (reused=true). got {b1:?} / {b2:?}"
+        );
+
+        // Exactly one alive PaneId is bound — no duplicate PTY.
+        assert!(
+            state.terminal_map.lookup_pane(uuid).await.is_some(),
+            "the UUID must end up with a live binding"
+        );
+        // Cleanup so the TempDir Drop doesn't trip on a held flock.
+        crate::sessions::kill_and_unregister_terminal(&state, uuid).await;
     }
 
     #[tokio::test]

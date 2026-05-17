@@ -276,10 +276,22 @@ pub async fn kill_handler(
 /// bound to `id`, then spawn a fresh one and bind it to the same UUID
 /// (ADR-0021 D10.1 lazy fresh-spawn arm, but invoked explicitly here).
 /// The panels that reference this UUID re-attach automatically once the
-/// new PaneId broadcasts its first output. Returns:
-///   * 200 + `{ id }` on success
-///   * 503 when no hub is configured
-///   * 500 with the spawn error on backend failure
+/// new PaneId broadcasts its first output.
+///
+/// **Concurrency** (ADR-0021 D10.2, 0053 §3.4): the handler holds a
+/// per-UUID lock from [`AppState::respawn_locks`] across the kill→spawn
+/// pair so two simultaneous requests on the same UUID don't churn the
+/// PaneId binding. After acquiring the lock the second caller sees the
+/// first call's fresh PaneId already bound and short-circuits to an
+/// idempotent 200 (`reused: true`) — no kill, no fresh spawn. This is
+/// the multi-webpage `PanelDanglingOverlay` auto-respawn safety net.
+///
+/// Returns:
+///   * 200 + `{ id, reused: false }` — kill+spawn ran, fresh PaneId bound.
+///   * 200 + `{ id, reused: true }`  — another caller already published a
+///     fresh PaneId while we held the lock; their binding is returned.
+///   * 503 when no hub is configured.
+///   * 500 with the spawn error on backend failure.
 pub async fn respawn_handler(
     State(state): State<crate::AppState>,
     AxumPath(id): AxumPath<String>,
@@ -287,12 +299,37 @@ pub async fn respawn_handler(
     if state.hub.is_none() {
         return service_unavailable("hub_not_configured");
     }
+
+    // Per-UUID serialisation — fetch or create the lock for this UUID.
+    let per_uuid_lock = {
+        let mut map = state.respawn_locks.lock().await;
+        map.entry(id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = per_uuid_lock.lock().await;
+
+    // Lost-the-race idempotent arm: if another concurrent respawn already
+    // published a fresh PaneId for this UUID, treat ours as a no-op so we
+    // don't kill the just-bound Pane and orphan its output stream.
+    if state.terminal_map.lookup_pane(&id).await.is_some() {
+        return (
+            StatusCode::OK,
+            Json(json!({ "id": id, "reused": true })),
+        )
+            .into_response();
+    }
+
     // Best-effort kill of the existing pane. A UUID with no current binding
     // (dangling) just gets a fresh spawn; the kill_and_unregister is a no-op
     // in that case.
     crate::sessions::kill_and_unregister_terminal(&state, &id).await;
     match state.spawn_terminal_with_uuid(id.clone()).await {
-        Ok(_) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({ "id": id, "reused": false })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
