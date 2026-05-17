@@ -1,16 +1,80 @@
-# gtmux backend (Rust workspace)
+# gtmux backend
 
-본 디렉터리는 gtmux 백엔드의 Cargo workspace 루트다. ADR-0011 + R7 보고서가
-정한 7-crate 구성(`mux-router` / `ws-server` / `http-api` / `lifecycle` /
-`config` / `auth` / `gtmux-cli`)을 그대로 미러한다. C3 작업(`bin/gen-openapi`)도
-워크스페이스 멤버로 포함된다.
+Rust Cargo workspace — the supervisor process behind gtmux. Holds the
+HTTP API, the WebSocket protocol, the PTY backend, config + auth layers,
+and the `gtmux` CLI binary.
 
-## 빌드 / 테스트 / 교차 컴파일
+Five library crates + two binaries (ADR-0011 D10):
 
-빌드 (전체 워크스페이스): `cargo build --workspace`
+```
+crates/
+  ws-server      WebSocket frame routing + per-cookie session lock.
+  http-api       axum router — REST surface (sessions, terminals, file_open, …).
+  config         figment-based loader (CLI > env > TOML > defaults).
+  auth           Token + Argon2id password modes (ADR-0003 + ADR-0020).
+  pty-backend    Direct PTY supervision (ADR-0013, replaces tmux).
+bin/
+  gtmux-cli      The `gtmux` user-facing CLI.
+  gen-openapi    Emits shared/openapi.yaml from utoipa derives.
+```
 
-테스트 (전체 워크스페이스): `cargo test --workspace`
+Toolchain pinned to **Rust 1.85** via `rust-toolchain.toml` (clap·ring·
+rustls·config·rand common floor; see R7 §2).
 
-교차 컴파일 (R7 §8 D9, cargo-zigbuild 사용): `cargo zigbuild --target <target> --release` (예: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`)
+---
 
-Rust toolchain은 `rust-toolchain.toml`이 1.85로 pin한다 (R7 §2 — clap·ring·rustls·config의 공통 floor).
+## Build
+
+```bash
+cargo build --workspace             # debug
+cargo build --workspace --release   # release — `gtmux` ends up in target/release/
+```
+
+## Test
+
+```bash
+cargo test --workspace
+```
+
+## Run from source (dev)
+
+```bash
+cargo run -p gtmux-cli -- start --session dev
+```
+
+`-p gtmux-cli` selects the binary; everything after `--` is forwarded to
+`gtmux`. See the root `../README.md` for full CLI / config reference.
+
+## Cross-compile
+
+`cargo-zigbuild` (R7 §8 D9). Pre-pinned targets:
+
+```bash
+cargo zigbuild --target aarch64-apple-darwin       --release
+cargo zigbuild --target x86_64-apple-darwin        --release
+cargo zigbuild --target aarch64-unknown-linux-gnu  --release
+cargo zigbuild --target x86_64-unknown-linux-gnu   --release
+```
+
+## Codegen producer
+
+`bin/gen-openapi` emits the OpenAPI 3.1 document consumed by the
+frontend's `openapi-typescript` pipeline:
+
+```bash
+cargo run -p gen-openapi -- ../shared/openapi.yaml
+```
+
+The top-level `make codegen` wraps this and chains the TS generation.
+Never hand-edit `../shared/openapi.yaml`.
+
+## Layout invariants
+
+- **`ws-server` owns the WS protocol; `http-api` owns REST.** Cross-talk
+  only through the shared `AppState`.
+- **`pty-backend` is the *only* spawner of child processes.** Other
+  crates request via the trait.
+- **`config` is read-only at runtime** — boot loads it once.
+- **`auth` never logs token material.** All `Debug` impls redact.
+
+For deeper rationale see `../../docs/adr/` (0001~0030+).
