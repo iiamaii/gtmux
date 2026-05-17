@@ -23,8 +23,7 @@ import type {
   LineItem,
   TerminalItem,
 } from '$lib/types/canvas';
-import { mutateLayout } from '$lib/http/sessions';
-import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
+import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
 /** 신규 item 의 기본 좌표 + 크기 default. ADR-0018 D7 의 z 정책은 commit 시점에 결정. */
 const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
@@ -241,16 +240,20 @@ export function createLineItem(
  * 반환: 실제 commit 된 item (z 재계산 반영). active session 없으면 null.
  */
 export async function commitNewItem(item: CanvasItem): Promise<CanvasItem | null> {
-  const active = sessionStore.active;
-  if (active === null) return null;
-  if (!(await ensureMutationOk('Item creation aborted — session reconnect failed.'))) return null;
+  if (sessionStore.active === null) return null;
   let committed: CanvasItem = item;
-  const { layout } = await mutateLayout(active.name, (cur) => {
-    const maxZ = cur.items.reduce((m, it) => (it.z > m ? it.z : m), 0);
-    committed = { ...item, z: maxZ + 1 };
-    return { ...cur, items: [...cur.items, committed] };
-  });
-  sessionStore.loadLayout(layout);
+  const result = await sessionStore.applyMutation(
+    (cur) => {
+      const maxZ = cur.items.reduce((m, it) => (it.z > m ? it.z : m), 0);
+      committed = { ...item, z: maxZ + 1 };
+      return { ...cur, items: [...cur.items, committed] };
+    },
+    {
+      abortMessage: 'Item creation aborted — session reconnect failed.',
+      failMessage: 'Item creation failed',
+    },
+  );
+  if (!result.ok) return null;
   sessionStore.setM([committed.id]);
   return committed;
 }

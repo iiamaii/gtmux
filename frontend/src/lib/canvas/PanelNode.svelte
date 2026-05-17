@@ -24,7 +24,7 @@
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
   import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
-  import { deleteItem, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+  import { deleteItem, UnauthorizedError } from '$lib/http/sessions';
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
@@ -87,10 +87,10 @@
   } = $props();
 
   const isVisible = $derived(data.visibility !== false);
-  // maximized in modal — MaximizedPanelModal 이 XtermHost 를 호스트하므로 in-flow
-  // PanelNode 는 마운트하지 않음 (동일 paneId 의 xterm 가 둘 동시 mount 금지).
-  const isMaximizedInModal = $derived(sessionStore.maximizedItemId === data.id);
-  const isStreaming = $derived(isVisible && data.minimized !== true && !isMaximizedInModal);
+  // Maximize 는 in-flow geom override 패턴 — schema 변경 없이 wrapper 의
+  // position/dimensions 만 override. XtermHost 는 정상 유지 (content/스크롤 보존).
+  // pan/zoom 및 resize 는 Canvas.svelte / NodeResizer.isVisible 에서 disable.
+  const isStreaming = $derived(isVisible && data.minimized !== true);
   // Label source priority (Task 2 fix):
   //   1) terminalPool 의 terminal_meta label (server-wide, PATCH /api/terminals 의
   //      single source of truth — ADR-0021 D7 + terminals.rs:46-48). 빈 문자열은
@@ -118,43 +118,28 @@
   // Resize 도중에는 SvelteFlow 가 controlled width/height 를 자체 업데이트
   // 하므로 본 핸들러는 *최종 값만* store + disk 로 commit (drag 와 동일 패턴).
   function onResizeEnd(_event: unknown, params: ResizeParams) {
-    const active = sessionStore.active;
-    if (active === null) return;
-    const sessionName = active.name;
     const nextW = Math.max(240, params.width);
     const nextH = Math.max(140, params.height);
-    void (async () => {
-      if (!(await ensureMutationOk('Resize aborted — session reconnect failed.'))) return;
-      _commitResize(sessionName, params, nextW, nextH);
-    })();
-  }
-
-  function _commitResize(sessionName: string, params: ResizeParams, nextW: number, nextH: number): void {
-    void mutateLayout(sessionName, (cur) => ({
-      ...cur,
-      items: cur.items.map((it: CanvasItem) =>
-        it.id === data.id && it.type === 'terminal'
-          ? ({
-              ...it,
-              x: params.x,
-              y: params.y,
-              w: nextW,
-              h: nextH,
-            } as TerminalItem)
-          : it,
-      ),
-    }))
-      .then(({ layout }) => sessionStore.loadLayout(layout))
-      .catch((err: unknown) => {
-        if (err instanceof UnauthorizedError) {
-          window.location.href = '/auth';
-          return;
-        }
-        toastStore.show({
-          message: `Resize failed: ${err instanceof Error ? err.message : String(err)}`,
-          tone: 'error',
-        });
-      });
+    void sessionStore.applyMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          it.id === data.id && it.type === 'terminal'
+            ? ({
+                ...it,
+                x: params.x,
+                y: params.y,
+                w: nextW,
+                h: nextH,
+              } as TerminalItem)
+            : it,
+        ),
+      }),
+      {
+        abortMessage: 'Resize aborted — session reconnect failed.',
+        failMessage: 'Resize failed',
+      },
+    );
   }
 
   /**
@@ -300,44 +285,34 @@
   async function onMinimizeClick(e: MouseEvent): Promise<void> {
     e.stopPropagation();
     e.preventDefault();
-    const active = sessionStore.active;
-    if (active === null) return;
+    if (sessionStore.active === null) return;
     const cur = sessionStore.items.get(data.id);
     if (cur === undefined) return;
-    if (!(await ensureMutationOk('Minimize aborted — session reconnect failed.'))) return;
     const wasMinimized = cur.minimized === true;
     const next = !wasMinimized;
     let nextH = cur.h;
     if (next === true) {
-      // → minimize: 옛 geom 백업 + h = 32
       sessionStore.backupItemGeom(data.id, { x: cur.x, y: cur.y, w: cur.w, h: cur.h });
       nextH = MIN_HEADER_H;
     } else {
-      // → restore: 백업 의 h 복원 (없으면 default)
       const backup = sessionStore.getRestoredGeom(data.id);
       nextH = backup !== null ? backup.h : RESTORE_DEFAULT_H;
       sessionStore.clearRestoredGeom(data.id);
     }
-    try {
-      const { layout } = await mutateLayout(active.name, (cur2) => ({
+    await sessionStore.applyMutation(
+      (cur2) => ({
         ...cur2,
         items: cur2.items.map((it) =>
           it.id === data.id
             ? ({ ...it, minimized: next, h: nextH } as typeof it)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Minimize failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'Minimize aborted — session reconnect failed.',
+        failMessage: 'Minimize failed',
+      },
+    );
   }
 
   function onMaximizeClick(e: MouseEvent): void {
@@ -364,7 +339,7 @@
   >
     <NodeResizer
       nodeId={data.id}
-      isVisible={isInM && !isLocked}
+      isVisible={isInM && !isLocked && !isMaximized}
       minWidth={240}
       minHeight={140}
       color="var(--color-accent)"
@@ -770,7 +745,9 @@
     line-height: 1.4;
   }
 
-  /* NodeResizer handle / line styling (Figma white-fill with accent border). */
+  /* NodeResizer handle / line styling (Figma white-fill with accent border).
+     line 은 wrapper selection 의 box-shadow (1.5px accent) 와 시각 중복 — 비활성.
+     edge resize 는 cursor 만 표시되고 line 은 그리지 않음. */
   :global(.panel-resize-handle) {
     background: var(--color-bg) !important;
     border: 1.5px solid var(--color-accent) !important;
@@ -779,6 +756,6 @@
     border-radius: 1px !important;
   }
   :global(.panel-resize-line) {
-    border-color: var(--color-accent) !important;
+    border-color: transparent !important;
   }
 </style>

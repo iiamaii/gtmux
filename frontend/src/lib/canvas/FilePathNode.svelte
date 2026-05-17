@@ -9,9 +9,7 @@
 
   import { NodeResizer } from '@xyflow/svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
-  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
-  import { toastStore } from '$lib/ui/toast-store.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { FilePathItem, CanvasItem } from '$lib/types/canvas';
 
   interface FilePathNodeData {
@@ -101,56 +99,38 @@
       editing = false;
       return;
     }
-    const active = sessionStore.active;
-    if (active === null) return;
-    if (!(await ensureMutationOk('File path edit aborted — session reconnect failed.'))) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    const result = await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'file_path'
             ? ({ ...it, path: next } as FilePathItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-      editing = false;
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Path commit failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'File path edit aborted — session reconnect failed.',
+        failMessage: 'Path commit failed',
+      },
+    );
+    if (result.ok) editing = false;
   }
 
   async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
-    const active = sessionStore.active;
-    if (active === null) return;
-    if (!(await ensureMutationOk('Resize aborted — session reconnect failed.'))) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'file_path'
             ? ({ ...it, x: params.x, y: params.y, w: Math.max(200, params.width), h: Math.max(80, params.height) } as FilePathItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Resize failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'Resize aborted — session reconnect failed.',
+        failMessage: 'Resize failed',
+      },
+    );
   }
 
 </script>

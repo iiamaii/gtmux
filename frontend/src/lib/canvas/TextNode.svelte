@@ -8,9 +8,7 @@
 
   import { NodeResizer } from '@xyflow/svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
-  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
-  import { toastStore } from '$lib/ui/toast-store.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { TextAlign, TextVerticalAlign, TextItem, CanvasItem } from '$lib/types/canvas';
   // 텍스트 정렬 UI 는 ToolbarSubbar (lib/toolbar/ToolbarSubbar.svelte) 로 이전.
   // 본 컴포넌트는 더 이상 alignment toolbar 를 그리지 않는다.
@@ -73,59 +71,42 @@
       editing = false;
       return;
     }
-    const active = sessionStore.active;
-    if (active === null) {
+    if (sessionStore.active === null) {
       editing = false;
       return;
     }
-    if (!(await ensureMutationOk('Text edit aborted — session reconnect failed.'))) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    const result = await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'text'
             ? ({ ...it, text: next } as TextItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-      editing = false;
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Text commit failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'Text edit aborted — session reconnect failed.',
+        failMessage: 'Text commit failed',
+      },
+    );
+    if (result.ok) editing = false;
   }
 
   async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
-    const active = sessionStore.active;
-    if (active === null) return;
-    if (!(await ensureMutationOk('Resize aborted — session reconnect failed.'))) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'text'
             ? ({ ...it, x: params.x, y: params.y, w: Math.max(120, params.width), h: Math.max(minTextHeight, params.height) } as TextItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Resize failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'Resize aborted — session reconnect failed.',
+        failMessage: 'Resize failed',
+      },
+    );
   }
 
 </script>

@@ -17,11 +17,11 @@
 
   import { SvelteSet } from 'svelte/reactivity';
   import { muxStore } from '$lib/stores/mux.svelte';
-  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+  import { UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
-  import type { CanvasItem, CanvasItemType } from '$lib/types/canvas';
+  import type { CanvasItem, CanvasItemType, CanvasLayout } from '$lib/types/canvas';
   import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
   import { zStore } from '$lib/stores/zStore.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
@@ -579,24 +579,12 @@
   }
 
   async function mutateActiveLayout(
-    mutator: Parameters<typeof mutateLayout>[1],
+    mutator: (cur: CanvasLayout) => CanvasLayout,
   ): Promise<void> {
-    const active = sessionStore.active;
-    if (active === null) return;
-    if (!(await ensureMutationOk('Layer mutation aborted — session reconnect failed.'))) return;
-    try {
-      const { layout } = await mutateLayout(active.name, mutator);
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Layout update failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+    await sessionStore.applyMutation(mutator, {
+      abortMessage: 'Layer mutation aborted — session reconnect failed.',
+      failMessage: 'Layout update failed',
+    });
   }
 
   function stopRowAction(e: MouseEvent): void {

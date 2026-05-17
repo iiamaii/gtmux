@@ -12,8 +12,7 @@
   // SVG 좌표 결정.
 
   import { useSvelteFlow } from '@xyflow/svelte';
-  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, LineItem } from '$lib/types/canvas';
   import { LINE_HIT_PADDING, LINE_MIN_LENGTH, lineBoxFromEndpoints } from './itemFactory';
@@ -144,12 +143,7 @@
       pendingCommit = null;
       return;
     }
-    const active = sessionStore.active;
-    if (active === null) {
-      pendingCommit = null;
-      return;
-    }
-    if (!(await ensureMutationOk('Line edit aborted — session reconnect failed.'))) {
+    if (sessionStore.active === null) {
       pendingCommit = null;
       return;
     }
@@ -157,8 +151,8 @@
       { x: next.x, y: next.y },
       { x: next.x2, y: next.y2 },
     );
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'line'
@@ -173,20 +167,13 @@
               } as LineItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-      pendingCommit = null;
-    } catch (err) {
-      pendingCommit = null;
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Line edit failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'Line edit aborted — session reconnect failed.',
+        failMessage: 'Line edit failed',
+      },
+    );
+    pendingCommit = null;
   }
 </script>
 

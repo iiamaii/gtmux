@@ -87,25 +87,13 @@ class SessionStore {
   I = $state<string | null>(null);
 
   /**
-   * FE-only ephemeral. Maximize 된 panel 의 id — Canvas.svelte 의 itemToNode 가
-   * 본 id 의 node 에 한해 in-memory geom override (fullscreen) 를 적용.
-   * schema 영속 X — 사용자의 원본 geom 은 그대로 유지, 시각만 fullscreen.
-   * 한 session 1 panel. attach/switch 시 자동 null 로 reset.
+   * FE-only ephemeral. Maximize 된 item 의 id — MaximizedItemModal 이 본 값
+   * watch 해 workspace 전체를 덮는 modal overlay 렌더링. schema 영속 X.
+   * in-flow PanelNode / NoteNode 는 그대로 마운트 유지 — modal 의 XtermHost 는
+   * dispatcher 의 multi-subscriber (ADR-0021 D1 mirror) 로 동일 paneId fan-out.
+   * 한 session 1 item. attach/switch 시 자동 null 로 reset.
    */
   maximizedItemId = $state<string | null>(null);
-
-  /**
-   * Maximize 진입 시 viewport snapshot — unmaximize 시 복원.
-   * maximize 동안 viewport 를 (0, 0, 1) 으로 lock 해 panel 이 100% scale.
-   */
-  maximizedRestoreViewport = $state<Viewport | null>(null);
-
-  /**
-   * Maximize 진입 시 계산된 fullscreen geom (canvas 의 visible extent 기준,
-   * zoom=1). Canvas 의 itemToNode 가 maximizedItemId 와 match 되는 item 의
-   * position/dimensions 를 본 값으로 override.
-   */
-  maximizedGeom = $state<{ x: number; y: number; w: number; h: number } | null>(null);
 
   /**
    * Focus mode (ADR-0017 §D5). FE-only ephemeral — session 단위.
@@ -195,8 +183,6 @@ class SessionStore {
     this.M.clear();
     this.I = null;
     this.maximizedItemId = null;
-    this.maximizedRestoreViewport = null;
-    this.maximizedGeom = null;
     this.focusMode = { enabled: false, targetPanelId: null };
     // ADR-0028 D4 — per-session history. 이전 session 의 stack 은 drop.
     historyStore.setActive(session.name);
@@ -216,8 +202,6 @@ class SessionStore {
     this.M.clear();
     this.I = null;
     this.maximizedItemId = null;
-    this.maximizedRestoreViewport = null;
-    this.maximizedGeom = null;
     this.focusMode = { enabled: false, targetPanelId: null };
     sessionStorageHint.clear();
     historyStore.setActive(null);
@@ -274,38 +258,16 @@ class SessionStore {
   /* Maximize — FE-only ephemeral, 1-at-a-time (G20)                        */
   /* ────────────────────────────────────────────────────────────────────── */
 
-  /**
-   * Maximize entry — viewport 를 (0, 0, 1) 으로 lock + maximizedGeom 을 canvas
-   * 의 visible extent 로 set. 사용자의 schema geom 은 그대로 유지 — 본 메서드
-   * 는 in-memory override 용 state 만 갱신.
-   */
   maximize(itemId: string): void {
-    const canvas = typeof document !== 'undefined'
-      ? (document.querySelector('.canvas-root') as HTMLElement | null)
-      : null;
-    const vw = canvas?.clientWidth ?? (typeof window !== 'undefined' ? window.innerWidth : 1280);
-    const vh = canvas?.clientHeight ?? (typeof window !== 'undefined' ? window.innerHeight : 720);
-    this.maximizedRestoreViewport = { ...this.viewport };
-    this.maximizedGeom = { x: 0, y: 0, w: vw, h: vh };
     this.maximizedItemId = itemId;
-    this.updateViewport({ x: 0, y: 0, zoom: 1 });
   }
 
   unmaximize(): void {
-    if (this.maximizedRestoreViewport !== null) {
-      this.updateViewport({ ...this.maximizedRestoreViewport });
-      this.maximizedRestoreViewport = null;
-    }
-    this.maximizedGeom = null;
     this.maximizedItemId = null;
   }
 
   toggleMaximize(itemId: string): void {
-    if (this.maximizedItemId === itemId) {
-      this.unmaximize();
-    } else {
-      this.maximize(itemId);
-    }
+    this.maximizedItemId = this.maximizedItemId === itemId ? null : itemId;
   }
 
   /* ────────────────────────────────────────────────────────────────────── */

@@ -10,9 +10,7 @@
   import { NodeResizer } from '@xyflow/svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
-  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
-  import { toastStore } from '$lib/ui/toast-store.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { NoteItem, CanvasItem } from '$lib/types/canvas';
 
   interface NoteNodeData {
@@ -86,68 +84,51 @@
       bodyEditing = false;
       return;
     }
-    const active = sessionStore.active;
-    if (active === null) return;
-    if (!(await ensureMutationOk('Note edit aborted — session reconnect failed.'))) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    if (sessionStore.active === null) return;
+    const result = await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'note'
             ? ({ ...it, [field]: next } as NoteItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
+      }),
+      {
+        abortMessage: 'Note edit aborted — session reconnect failed.',
+        failMessage: 'Note commit failed',
+      },
+    );
+    if (result.ok) {
       if (field === 'title') titleEditing = false;
       else bodyEditing = false;
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Note commit failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
     }
   }
 
   async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
-    const active = sessionStore.active;
-    if (active === null) return;
-    if (!(await ensureMutationOk('Resize aborted — session reconnect failed.'))) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'note'
             ? ({ ...it, x: params.x, y: params.y, w: Math.max(160, params.width), h: Math.max(60, params.height) } as NoteItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Resize failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'Resize aborted — session reconnect failed.',
+        failMessage: 'Resize failed',
+      },
+    );
   }
 
   async function onMinimizeClick(e: MouseEvent): Promise<void> {
     e.stopPropagation();
     e.preventDefault();
     if (isLocked) return;
-    const active = sessionStore.active;
-    if (active === null) return;
+    if (sessionStore.active === null) return;
     const cur = sessionStore.items.get(data.id);
     if (cur === undefined) return;
-    if (!(await ensureMutationOk('Minimize aborted — session reconnect failed.'))) return;
     const wasMinimized = cur.minimized === true;
     const next = !wasMinimized;
     let nextW = cur.w;
@@ -162,26 +143,20 @@
       nextH = backup !== null ? backup.h : RESTORE_DEFAULT_H;
       sessionStore.clearRestoredGeom(data.id);
     }
-    try {
-      const { layout } = await mutateLayout(active.name, (cur2) => ({
+    await sessionStore.applyMutation(
+      (cur2) => ({
         ...cur2,
         items: cur2.items.map((it) =>
           it.id === data.id
             ? ({ ...it, minimized: next, w: nextW, h: nextH } as typeof it)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Minimize failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'Minimize aborted — session reconnect failed.',
+        failMessage: 'Minimize failed',
+      },
+    );
   }
 
   function onChipClick(e: MouseEvent): void {
@@ -216,7 +191,7 @@
   >
     <NodeResizer
       nodeId={data.id}
-      isVisible={isInM && !isLocked && !isMinimized}
+      isVisible={isInM && !isLocked && !isMinimized && !isMaximized}
       minWidth={160}
       minHeight={60}
       color="var(--color-accent)"
@@ -315,7 +290,10 @@
 {/if}
 
 <style>
-  /* ref/frontend-design/components-v2.html §01 — Note */
+  /* ref/frontend-design/components-v2.html §01 — Note.
+     overflow: visible — NodeResizer 의 corner handle 이 .note-node 의 edge 를
+     negative offset 으로 넘어가도 clip 되지 않게. content 의 corner-radius
+     clip 은 .note-card 내부 wrapper 가 책임. */
   .note-node {
     box-sizing: border-box;
     background: var(--color-surface);
@@ -328,7 +306,7 @@
     gap: 6px;
     box-shadow: var(--shadow-sm);
     color: var(--color-fg);
-    overflow: hidden;
+    overflow: visible;
     font-family: var(--font-sans);
     position: relative;
   }

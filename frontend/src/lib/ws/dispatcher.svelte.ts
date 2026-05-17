@@ -30,7 +30,6 @@ import { muxStore } from '$lib/stores/mux.svelte';
 import { reconnectGate } from '$lib/stores/reconnectGate.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { terminalPool } from '$lib/stores/terminalPool.svelte';
-import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
 import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
 import {
   FRAME_TYPE,
@@ -431,39 +430,40 @@ function handleMountCascade(payload: Uint8Array): void {
     // Idempotent — BE may broadcast on a retry.
     return;
   }
-  void mutateLayout(name, (cur) => {
-    if (cur.items.some((it: CanvasItem) => it.id === decoded.terminalId)) {
-      return cur;
-    }
-    const maxZ = cur.items.reduce(
-      (m: number, it: CanvasItem) => (it.z > m ? it.z : m),
-      0,
-    );
-    const item: TerminalItem = {
-      id: decoded.terminalId,
-      type: 'terminal',
-      parent_id: null,
-      x: decoded.x,
-      y: decoded.y,
-      w: decoded.w,
-      h: decoded.h,
-      z: maxZ + 1,
-      visibility: 'visible',
-      locked: false,
-      minimized: false,
-    };
-    return { ...cur, items: [...cur.items, item] };
-  })
-    .then(({ layout }) => {
-      sessionStore.loadLayout(layout);
-      void terminalPool.refresh();
-    })
-    .catch((err: unknown) => {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      console.warn('[ws] MOUNT_CASCADE mutateLayout failed', err);
+  // ADR-0028 D1.1 — WS-driven mutation 은 사용자 액션 이 아니므로 history
+  // capture 제외. captureHistory:false 로 stack 오염 방지.
+  void sessionStore
+    .applyMutation(
+      (cur) => {
+        if (cur.items.some((it: CanvasItem) => it.id === decoded.terminalId)) {
+          return cur;
+        }
+        const maxZ = cur.items.reduce(
+          (m: number, it: CanvasItem) => (it.z > m ? it.z : m),
+          0,
+        );
+        const item: TerminalItem = {
+          id: decoded.terminalId,
+          type: 'terminal',
+          parent_id: null,
+          x: decoded.x,
+          y: decoded.y,
+          w: decoded.w,
+          h: decoded.h,
+          z: maxZ + 1,
+          visibility: 'visible',
+          locked: false,
+          minimized: false,
+        };
+        return { ...cur, items: [...cur.items, item] };
+      },
+      {
+        captureHistory: false,
+        failMessage: 'Terminal mount-cascade failed',
+      },
+    )
+    .then((result) => {
+      if (result.ok) void terminalPool.refresh();
     });
 }
 

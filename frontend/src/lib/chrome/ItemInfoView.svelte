@@ -18,10 +18,8 @@
 
   import { onMount } from 'svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
-  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
-  import { toastStore } from '$lib/ui/toast-store.svelte';
   import {
     alignItems,
     distributeItems,
@@ -199,27 +197,18 @@
     abortMessage: string,
     transform: (it: CanvasItem) => CanvasItem,
   ): Promise<void> {
-    const active = sessionStore.active;
-    if (active === null) return;
     if (selectedItems.length === 0) return;
-    if (!(await ensureMutationOk(abortMessage))) return;
     const ids = new Set(selectedIds);
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it) => (ids.has(it.id) ? transform(it) : it)),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Inspector edit failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage,
+        failMessage: 'Inspector edit failed',
+      },
+    );
   }
 
   async function applyCommonNum(key: CommonNumKey, value: number): Promise<void> {
@@ -324,11 +313,8 @@
     abortMessage: string,
   ): Promise<void> {
     if (moves.size === 0) return;
-    const active = sessionStore.active;
-    if (active === null) return;
-    if (!(await ensureMutationOk(abortMessage))) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it) => {
           const m = moves.get(it.id);
@@ -338,18 +324,9 @@
           }
           return { ...it, x: m.x, y: m.y } as CanvasItem;
         }),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Align failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      { abortMessage, failMessage: 'Align failed' },
+    );
   }
 
   async function onAlign(mode: AlignMode): Promise<void> {
@@ -370,13 +347,10 @@
     field: 'fill' | 'stroke',
     hex: string,
   ): Promise<void> {
-    const active = sessionStore.active;
-    if (active === null) return;
     if (selectedItems.length === 0) return;
-    if (!(await ensureMutationOk('Color change aborted — session reconnect failed.'))) return;
     const ids = new Set(selectedIds);
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
@@ -385,18 +359,12 @@
           if (field === 'fill' && it.type === 'line') return it;
           return { ...it, [field]: hex } as CanvasItem;
         }),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Color change failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      {
+        abortMessage: 'Color change aborted — session reconnect failed.',
+        failMessage: 'Color change failed',
+      },
+    );
   }
 
   /* ── Text alignment — Figma-style segmented control ──────────────
@@ -408,28 +376,17 @@
     next: TextAlign,
   ): Promise<void> {
     if (next === (target.text_align ?? 'center')) return;
-    const active = sessionStore.active;
-    if (active === null) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === target.id && it.type === 'text'
             ? ({ ...it, text_align: next } as TextItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Text align failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      { failMessage: 'Text align failed' },
+    );
   }
 
   async function applyTextVerticalAlign(
@@ -437,28 +394,17 @@
     next: TextVerticalAlign,
   ): Promise<void> {
     if (next === (target.text_vertical_align ?? 'middle')) return;
-    const active = sessionStore.active;
-    if (active === null) return;
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === target.id && it.type === 'text'
             ? ({ ...it, text_vertical_align: next } as TextItem)
             : it,
         ),
-      }));
-      sessionStore.loadLayout(layout);
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Text vertical align failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
+      }),
+      { failMessage: 'Text vertical align failed' },
+    );
   }
 </script>
 

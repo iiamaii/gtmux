@@ -19,9 +19,9 @@
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
   import { debugCount } from '$lib/common/debugCounts';
-  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toolStore } from '$lib/stores/toolStore.svelte';
-  import { attachConfirm, deleteItem, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+  import { attachConfirm, deleteItem, UnauthorizedError } from '$lib/http/sessions';
   import type { CanvasItem } from '$lib/types/canvas';
   import { effectiveLocked, effectiveVisibility } from '$lib/types/group';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -523,22 +523,14 @@
   function itemToNode(item: CanvasItem): Node {
     const visible = effectiveVisibility(item.visibility, item.parent_id, sessionGroupsById);
     const locked = effectiveLocked(item.locked, item.parent_id, sessionGroupsById);
-    // Maximize 인 경우 in-memory geom override — schema item 은 그대로 두고
-    // 렌더링만 fullscreen. content (xterm / inline edit) 는 마운트 유지.
-    const isMax = sessionStore.maximizedItemId === item.id && sessionStore.maximizedGeom !== null;
-    const maxG = sessionStore.maximizedGeom;
-    const ox = isMax && maxG !== null ? maxG.x : item.x;
-    const oy = isMax && maxG !== null ? maxG.y : item.y;
-    const ow = isMax && maxG !== null ? maxG.w : item.w;
-    const oh = isMax && maxG !== null ? maxG.h : item.h;
     const common = {
       id: item.id,
-      position: { x: ox, y: oy },
-      draggable: !locked && !isMax,
+      position: { x: item.x, y: item.y },
+      draggable: !locked,
       selected: sessionStore.M.has(item.id),
-      zIndex: isMax ? 9999 : item.z,
-      width: ow,
-      height: oh,
+      zIndex: item.z,
+      width: item.w,
+      height: item.h,
     };
     if (item.type === 'terminal') {
       return {
@@ -866,28 +858,27 @@
   async function spawnMultiSessionTerminal(coords: { x: number; y: number }): Promise<void> {
     const active = sessionStore.active;
     if (active === null) return;
-    const guard = await sessionStore.guardOutgoingMutation();
-    if (!guard.ok) {
-      toastStore.show({
-        message: 'Session reconnect failed — terminal spawn aborted. Use Switch session…',
-        tone: 'error',
-      });
-      return;
-    }
     const name = active.name;
     const fresh = createTerminalItem(coords);
-    try {
-      // 1+2) Append + commit
-      const { layout } = await mutateLayout(name, (cur) => {
+    // 1+2) Append + commit (ADR-0028 D12 entry — history capture).
+    const result = await sessionStore.applyMutation(
+      (cur) => {
         const maxZ = cur.items.reduce((m, it) => (it.z > m ? it.z : m), 0);
         return {
           ...cur,
           items: [...cur.items, { ...fresh, z: maxZ + 1 }],
         };
-      });
-      sessionStore.loadLayout(layout);
-      sessionStore.setM([fresh.id]);
-      // 3) Spawn the unmatched UUID
+      },
+      {
+        abortMessage: 'Session reconnect failed — terminal spawn aborted.',
+        failMessage: 'Terminal create failed',
+      },
+    );
+    if (!result.ok) return;
+    sessionStore.setM([fresh.id]);
+    // 3) Spawn the unmatched UUID — attachConfirm 은 layout mutation 이 아니므로
+    //    history 무관 (spawn 실패해도 layout 의 panel entry 는 그대로).
+    try {
       const confirmRes = await attachConfirm(name);
       if (confirmRes.failed.length > 0) {
         const failed = confirmRes.failed.find((f) => f.id === fresh.id);
@@ -898,8 +889,6 @@
           });
         }
       }
-      // 4) Pool refresh — 0x88 이 즉시 paneId 바인딩, 본 호출은 attach_count 등의
-      //    metadata 도 즉시 새로고침해 sidebar 가 정합되도록.
       void terminalPool.refresh();
       toolStore.consume();
     } catch (err) {
@@ -908,7 +897,7 @@
         return;
       }
       toastStore.show({
-        message: `Terminal create failed: ${err instanceof Error ? err.message : String(err)}`,
+        message: `Spawn confirm failed: ${err instanceof Error ? err.message : String(err)}`,
         tone: 'error',
       });
     }
@@ -931,9 +920,7 @@
     nodes,
   }: { targetNode: Node | null; nodes: Node[] }) {
     if (nodes.length === 0) return;
-    const active = sessionStore.active;
-    if (active === null) return;
-    const sessionName = active.name;
+    if (sessionStore.active === null) return;
 
     // id → moved item map. 단일 drag 시 nodes.length === 1.
     const movedById = new Map<string, CanvasItem>();
@@ -972,18 +959,16 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
-    void (async () => {
-      if (!(await ensureMutationOk('Drag commit aborted — session reconnect failed.'))) return;
-      try {
-        const { layout } = await mutateLayout(sessionName, (cur) => ({
-          ...cur,
-          items: cur.items.map((it) => movedById.get(it.id) ?? it),
-        }));
-        sessionStore.loadLayout(layout);
-      } catch (e) {
-        console.warn('[gtmux] drag commit failed:', e);
-      }
-    })();
+    void sessionStore.applyMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it) => movedById.get(it.id) ?? it),
+      }),
+      {
+        abortMessage: 'Drag commit aborted — session reconnect failed.',
+        failMessage: 'Drag commit failed',
+      },
+    );
   }
 
   // Right-click handlers — pane area + node. Both prevent the native

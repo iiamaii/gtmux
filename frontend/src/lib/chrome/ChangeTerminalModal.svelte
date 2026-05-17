@@ -23,7 +23,6 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
   import type { TerminalInfo } from '$lib/types/terminals';
@@ -86,17 +85,20 @@
     }
     committing = true;
     try {
-      const { layout } = await mutateLayout(active.name, (curLayout) => {
-        const replaced: TerminalItem = {
-          ...cur,
-          id: nextId,
-        };
-        const items: CanvasItem[] = curLayout.items.map((it) =>
-          it.id === cur.id ? replaced : it,
-        );
-        return { ...curLayout, items };
-      });
-      sessionStore.loadLayout(layout);
+      const result = await sessionStore.applyMutation(
+        (curLayout) => {
+          const replaced: TerminalItem = {
+            ...cur,
+            id: nextId,
+          };
+          const items: CanvasItem[] = curLayout.items.map((it) =>
+            it.id === cur.id ? replaced : it,
+          );
+          return { ...curLayout, items };
+        },
+        { failMessage: 'Rebind failed' },
+      );
+      if (!result.ok) return;
       // M follows the new id so the rebind doesn't leave a phantom selection.
       if (sessionStore.M.has(cur.id)) {
         sessionStore.M.delete(cur.id);
@@ -108,15 +110,6 @@
         tone: 'success',
       });
       changeTerminalDialog.close();
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Rebind failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
     } finally {
       committing = false;
     }

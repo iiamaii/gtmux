@@ -28,7 +28,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+  import { UnauthorizedError } from '$lib/http/sessions';
   import { killTerminal } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem } from '$lib/types/canvas';
@@ -104,30 +104,20 @@
 
   /** Remove the group + descendants from the layout. Returns true on success. */
   async function pruneLayout(): Promise<boolean> {
-    const active = sessionStore.active;
-    if (active === null || groupId === null) return false;
+    if (sessionStore.active === null || groupId === null) return false;
     const gAll = new Set<string>([groupId, ...descendants.groupIds]);
     const itemIds = new Set<string>(descendants.items.map((it) => it.id));
-    try {
-      const { layout } = await mutateLayout(active.name, (cur) => ({
+    const result = await sessionStore.applyMutation(
+      (cur) => ({
         ...cur,
         groups: cur.groups.filter((g) => !gAll.has(g.id)),
         items: cur.items.filter((it) => !itemIds.has(it.id)),
-      }));
-      sessionStore.loadLayout(layout);
-      for (const id of itemIds) sessionStore.M.delete(id);
-      return true;
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return false;
-      }
-      toastStore.show({
-        message: `Group prune failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-      return false;
-    }
+      }),
+      { failMessage: 'Group prune failed' },
+    );
+    if (!result.ok) return false;
+    for (const id of itemIds) sessionStore.M.delete(id);
+    return true;
   }
 
   async function commitPanelsOnly(): Promise<void> {

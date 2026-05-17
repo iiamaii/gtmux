@@ -26,7 +26,7 @@
    */
 
   import { onMount } from 'svelte';
-  import { mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+  import { UnauthorizedError } from '$lib/http/sessions';
   import { killTerminal } from '$lib/http/terminals';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
@@ -108,55 +108,44 @@
       });
       return;
     }
-    const guard = await sessionStore.guardOutgoingMutation();
-    if (!guard.ok) {
-      toastStore.show({
-        message: 'Session reconnect failed — attach aborted.',
-        tone: 'error',
-      });
-      return;
-    }
     const name = activeSessionName;
     attaching.add(uuid);
     attaching = new Set(attaching);
     try {
-      const { layout } = await mutateLayout(name, (cur) => {
-        const n = cur.items.length;
-        const x = n * CASCADE_STEP;
-        const y = n * CASCADE_STEP;
-        const maxZ = cur.items.reduce(
-          (m: number, it: CanvasItem) => (it.z > m ? it.z : m),
-          0,
-        );
-        const item: TerminalItem = {
-          id: uuid,
-          type: 'terminal',
-          parent_id: null,
-          x,
-          y,
-          w: PANEL_DEFAULT_W,
-          h: PANEL_DEFAULT_H,
-          z: maxZ + 1,
-          visibility: 'visible',
-          locked: false,
-          minimized: false,
-        };
-        return { ...cur, items: [...cur.items, item] };
-      });
-      sessionStore.loadLayout(layout);
+      const result = await sessionStore.applyMutation(
+        (cur) => {
+          const n = cur.items.length;
+          const x = n * CASCADE_STEP;
+          const y = n * CASCADE_STEP;
+          const maxZ = cur.items.reduce(
+            (m: number, it: CanvasItem) => (it.z > m ? it.z : m),
+            0,
+          );
+          const item: TerminalItem = {
+            id: uuid,
+            type: 'terminal',
+            parent_id: null,
+            x,
+            y,
+            w: PANEL_DEFAULT_W,
+            h: PANEL_DEFAULT_H,
+            z: maxZ + 1,
+            visibility: 'visible',
+            locked: false,
+            minimized: false,
+          };
+          return { ...cur, items: [...cur.items, item] };
+        },
+        {
+          abortMessage: 'Session reconnect failed — attach aborted.',
+          failMessage: 'Attach failed',
+        },
+      );
+      if (!result.ok) return;
       void terminalPool.refresh();
       toastStore.show({
         message: `Attached terminal to "${name}".`,
         tone: 'success',
-      });
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Attach failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
       });
     } finally {
       attaching.delete(uuid);
