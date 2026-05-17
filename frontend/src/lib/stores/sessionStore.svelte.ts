@@ -29,6 +29,7 @@ import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 import { toastStore } from '$lib/ui/toast-store.svelte';
 import type { CanvasItem, CanvasLayout, Viewport } from '$lib/types/canvas';
 import type { Group } from '$lib/types/group';
+import type { AttachConfirmSummary } from '$lib/types/sessions';
 
 /** Active session 의 식별 정보. attach 성공 시 set, detach 시 null. */
 export interface ActiveSession {
@@ -41,6 +42,11 @@ export interface ActiveSession {
  *
  * - `success`: 200 응답 + layout fetch + sessionStore.setActiveSession/loadLayout
  *              완료. 호출자는 본 화면 mount 진입 가능.
+ * - `confirm_required`: 200 응답이지만 `unmatched.length > 0` — BE 의 terminal
+ *              pool 에 매칭 없는 panel UUID 존재 (= server 재기동 후 모든 terminal
+ *              stale 시 가장 흔히 발생). caller (reconnectGate 등) 가 사용자에게
+ *              AttachConfirmModal 노출 — silent 흐름이 panel 만 남기고 terminal
+ *              respawn 을 건너뛰던 회귀 (2026-05-17 사용자 보고) 의 직접 fix.
  * - `in_use`: 409. 다른 webpage 가 attach 보유.
  * - `not_found`: 404. session 이 BE 에서 사라짐. hint 도 자동 clear 됨.
  * - `unauthorized`: 401. cookie 만료 — caller 가 /auth redirect.
@@ -48,6 +54,7 @@ export interface ActiveSession {
  */
 export type ReattachResult =
   | { kind: 'success' }
+  | { kind: 'confirm_required'; summary: AttachConfirmSummary }
   | { kind: 'in_use'; holderPid?: number }
   | { kind: 'not_found' }
   | { kind: 'unauthorized' }
@@ -363,8 +370,10 @@ class SessionStore {
    *   signal.aborted 로 자체 detect — 본 method 도 `unreachable` 로 반환하나
    *   caller 가 signal 확인 후 무시)
    *
-   * BE 가 200 + `unmatched.length > 0` 응답해도 reattach 흐름에서는 그대로
-   * `success` — confirm dialog 진입 안 함 (plan-0008 §8 risk row).
+   * BE 가 200 + `unmatched.length > 0` 응답 → `confirm_required` 반환 (2026-05-17
+   * 회귀 fix). caller 가 AttachConfirmModal 노출. silent 진입 후 panel 만 남고
+   * terminal respawn 이 누락되던 버그 직접 차단 — WorkspaceSwitcher.tryAttach 의
+   * `confirm_required` 분기와 동일 패턴.
    */
   async attemptReattach(
     name: string,
@@ -421,12 +430,30 @@ class SessionStore {
       };
     }
 
-    // 200 — drain body (lock acquired). matched/unmatched 무시 — confirm dialog
-    // 는 reattach 흐름의 책임 외 (plan-0008 §8).
+    // 200 — drain body (lock acquired). matched/unmatched 검사 → unmatched > 0
+    // 면 confirm_required 반환 (WorkspaceSwitcher.tryAttach 와 정합). caller 가
+    // AttachConfirmModal 노출 책임. 서버 재기동 후 panel 만 남기고 respawn 누락
+    // 회귀 (2026-05-17) 직접 차단.
+    let attachBody: { matched?: string[]; unmatched?: string[] } = {};
     try {
-      await attachRes.json();
+      attachBody = (await attachRes.json()) as {
+        matched?: string[];
+        unmatched?: string[];
+      };
     } catch {
-      /* body 형식 변화 무관 — 다음 layout fetch 가 진실 */
+      /* body 형식 변화 무관 — 아래 layout fetch 가 진실 */
+    }
+    const matched = attachBody.matched ?? [];
+    const unmatched = attachBody.unmatched ?? [];
+    if (unmatched.length > 0) {
+      return {
+        kind: 'confirm_required',
+        summary: {
+          spawn_count: unmatched.length,
+          unmatched_item_ids: unmatched,
+          matched_item_ids: matched,
+        },
+      };
     }
 
     let layoutRes: Response;

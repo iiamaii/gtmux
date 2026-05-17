@@ -21,6 +21,7 @@
 
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
+import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
 
 export type ReconnectState =
   | 'booting'      // auth gate / session hint 검사 중 — 본 화면 mount 금지
@@ -128,7 +129,9 @@ class ReconnectGate {
     this.#controller?.abort();
     this.#controller = new AbortController();
     const signal = this.#controller.signal;
-    // attemptReattach 내부 흐름: POST /attach → (200 시) GET /layout → loadLayout.
+    // attemptReattach 내부 흐름: POST /attach → (200 + unmatched=0 시) GET /layout →
+    // loadLayout. unmatched > 0 면 layout 미 fetch 한 채 `confirm_required` 반환
+    // (2026-05-17 회귀 fix) — 본 wrapper 가 AttachConfirmModal 진입 책임.
     // attaching → hydrating 전이는 attemptReattach 의 attach 200 응답 직후이지만
     // 본 wrapper 가 그 boundary 를 볼 수 없으므로 attaching 단일 phase 로 시작 후,
     // success 시 markReady 로 직접 진입. (5-state 의 hydrating 은 attemptReattach
@@ -140,6 +143,15 @@ class ReconnectGate {
     switch (result.kind) {
       case 'success':
         this.markReady();
+        return;
+      case 'confirm_required':
+        // 서버 재기동 후 hint-based reattach 의 panel UUID 가 stale — WorkspaceSwitcher
+        // 의 tryAttach 와 동일하게 AttachConfirmModal 진입 (2026-05-17 회귀 fix).
+        // sessionStore.active 를 set 해야 AttachConfirmModal 의 confirm 후 layout
+        // load 가 정상 — WorkspaceSwitcher.tryAttach 의 confirm_required 분기 정합.
+        sessionStore.setActiveSession({ name });
+        this.markIdle();
+        workspaceSwitcher.goAttachConfirm(name, result.summary);
         return;
       case 'in_use':
         this.state = 'in_use';

@@ -165,6 +165,14 @@
         window.location.href = '/auth';
         return;
       }
+      if (result.kind === 'confirm_required') {
+        // BE 가 재기동되어 layout 의 terminal UUID 가 stale 한 경우 — silent 흐름이
+        // panel 만 남기고 respawn 을 건너뛰던 회귀 fix (2026-05-17). Case II 라도
+        // respawn 결정은 사용자 몫이므로 AttachConfirmModal 노출.
+        sessionStore.setActiveSession({ name: active.name });
+        workspaceSwitcher.goAttachConfirm(active.name, result.summary);
+        return;
+      }
       const message =
         result.kind === 'in_use'
           ? `Session "${active.name}" is in use by another webpage.`
