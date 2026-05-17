@@ -1,9 +1,10 @@
 <script lang="ts">
   // ADR-0027 D3 — Inspector 의 mixed-aware always-input field (text | number).
   //
-  // 시안: ref/frontend-design/index-v2.html §Right panel `.input` 정합 —
-  // height 28px / surface-2 bg / mono 11px / k-prefix label / hover glass.
-  // wrapper 가 surface 를 그리고 native input 은 transparent.
+  // 디자인: ColorPicker 의 inline-hex / inline-alpha 와 *동일한 box style* 로
+  // 통일 (2026-05-17). h22 / bg = var(--color-bg) / 1px var(--color-border) /
+  // hover border-strong / focus border-accent / mono 11px / k-prefix label.
+  // 옛 시안 (index-v2.html `.input` h28 / bg-2 / transparent border) supersede.
   //
   // Commit semantic (ADR-0027 D3 broadcast):
   // - blur 또는 Enter → oncommit
@@ -101,36 +102,34 @@
 </label>
 
 <style>
-  /* ref/frontend-design/index-v2.html `.input` 정합. */
+  /* ColorPicker inline-hex / inline-alpha 와 동일한 box style — 디자인 통일
+     (2026-05-17). h22 + bg-bg + visible border + hover-strong + focus-accent. */
   .inspector-input {
     display: flex;
     align-items: center;
     gap: 4px;
     width: 100%;
     min-width: 0;
-    height: 28px;
-    padding: 0 8px;
+    height: 22px;
+    padding: 0 6px;
     box-sizing: border-box;
-    background: var(--color-surface-2);
-    border: 1px solid transparent;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
     font-family: var(--font-mono);
     font-size: 11px;
     letter-spacing: 0.2px;
     color: var(--color-fg);
     cursor: text;
-    transition:
-      background var(--motion-fast) var(--motion-easing),
-      border-color var(--motion-fast) var(--motion-easing);
+    transition: border-color var(--motion-fast) var(--motion-easing);
   }
 
   .inspector-input:hover {
-    background: var(--color-glass-1);
+    border-color: var(--color-border-strong);
   }
 
   .inspector-input.editing,
   .inspector-input:focus-within {
-    background: var(--color-surface);
     border-color: var(--color-accent);
   }
 
