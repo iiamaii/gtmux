@@ -7,9 +7,6 @@
 > panel on an infinite canvas, and serves the whole thing from one
 > process behind a per-session token.
 
-The legacy name is *tmux-backed web canvas workspace* — gtmux predates
-ADR-0013 and now drives PTYs directly. No tmux daemon is required.
-
 ---
 
 ## Layout
@@ -39,31 +36,51 @@ codebase/
 | npm | bundled with Node | Or pnpm/yarn — codegen script uses `npm run`. |
 | OS | macOS / Linux | x86_64 + aarch64 supported (see `rust-toolchain.toml` targets). Windows untested. |
 
-No tmux, no system PTY library, no global Node packages required. Make
-sure `cargo` and `npm` are on `$PATH`.
+Make sure `cargo` and `npm` are on `$PATH`. No global Node packages are
+required — Vite + svelte-check are pulled in via `npm install`.
 
 ---
 
-## Quickstart (≈ 5 min)
+## Installation (≈ 5 min, one-time)
 
-From the repo root after `git clone …`:
+From a fresh clone:
 
 ```bash
-cd codebase
+# 1. Clone (this directory is the repo's `codebase/` subtree).
+git clone https://github.com/iiamaii/gtmux.git
+cd gtmux
 
-# 1. Generate the OpenAPI schema and the matching TypeScript types.
-#    Required on the first run so frontend type-checks pass.
+# 2. Generate the OpenAPI schema and matching TypeScript types.
+#    First-run prerequisite — frontend type-checks fail without it.
 make codegen
 
-# 2. Install frontend deps. One-time.
+# 3. Install frontend dependencies (Vite, Svelte, xterm, …).
 cd frontend && npm install && cd ..
 
-# 3. Release build of the CLI + the production frontend bundle.
+# 4. Release build: Rust workspace + production frontend bundle.
+#    Produces ./backend/target/release/gtmux and ./frontend/dist/.
 make build
+```
 
-# 4. Start a server bound to a session name of your choice.
-#    Default port 9001, bind 127.0.0.1.
-./backend/target/release/gtmux start --session demo
+**(Optional) Install the binary system-wide** so you can launch from
+anywhere:
+
+```bash
+sudo install -m 755 backend/target/release/gtmux /usr/local/bin/gtmux
+```
+
+Without this step, invoke the binary from the build output
+(`./backend/target/release/gtmux …`).
+
+---
+
+## Quickstart
+
+Start a server bound to a session name of your choice (default port
+9001, bind 127.0.0.1):
+
+```bash
+gtmux start --session demo
 ```
 
 The startup banner prints a one-time URL on stdout:

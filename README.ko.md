@@ -7,9 +7,6 @@
 > draggable 패널로 펼치고, 모든 것을 한 프로세스 뒤 per-session token
 > 으로 서빙한다.
 
-옛 이름은 *tmux-backed web canvas workspace* — ADR-0013 이전의 명명
-으로, 현재는 PTY 를 직접 다룬다. tmux daemon 불필요.
-
 ---
 
 ## 디렉토리 구조
@@ -39,31 +36,49 @@ codebase/
 | npm | Node 동봉 | pnpm/yarn 도 OK — codegen 스크립트는 `npm run` 사용. |
 | OS | macOS / Linux | x86_64 + aarch64 지원 (`rust-toolchain.toml` targets 참조). Windows 미검증. |
 
-tmux, 시스템 PTY 라이브러리, 글로벌 Node 패키지 *모두 불필요*. `cargo`
-와 `npm` 만 `$PATH` 에 있으면 됨.
+`cargo` 와 `npm` 만 `$PATH` 에 있으면 됨. 글로벌 Node 패키지 불필요 —
+Vite + svelte-check 등은 `npm install` 로 받음.
 
 ---
 
-## Quickstart (≈ 5분)
+## Installation (≈ 5분, 1회)
 
-`git clone …` 후 repo root 에서:
+Fresh clone 에서:
 
 ```bash
-cd codebase
+# 1. Clone (본 디렉토리는 repo 의 codebase/ subtree).
+git clone https://github.com/iiamaii/gtmux.git
+cd gtmux
 
-# 1. OpenAPI 스키마 + 대응 TS 타입 생성.
+# 2. OpenAPI 스키마 + 대응 TS 타입 생성.
 #    첫 실행 시 필수 — 안 하면 frontend 타입체크 실패.
 make codegen
 
-# 2. Frontend 의존성 설치. 1회.
+# 3. Frontend 의존성 설치 (Vite / Svelte / xterm …).
 cd frontend && npm install && cd ..
 
-# 3. CLI 의 release 빌드 + 프로덕션 frontend 번들.
+# 4. Release 빌드: Rust workspace + 프로덕션 frontend 번들.
+#    ./backend/target/release/gtmux + ./frontend/dist/ 생성.
 make build
+```
 
-# 4. 원하는 session 이름으로 server 시작.
-#    기본 port 9001, bind 127.0.0.1.
-./backend/target/release/gtmux start --session demo
+**(선택) Binary 를 system-wide 설치** — 아무 디렉토리에서 실행 가능:
+
+```bash
+sudo install -m 755 backend/target/release/gtmux /usr/local/bin/gtmux
+```
+
+생략 시 빌드 결과물 경로로 직접 실행
+(`./backend/target/release/gtmux …`).
+
+---
+
+## Quickstart
+
+원하는 session 이름으로 server 시작 (기본 port 9001, bind 127.0.0.1):
+
+```bash
+gtmux start --session demo
 ```
 
 기동 시 stdout 에 1회용 URL 출력:

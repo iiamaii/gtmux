@@ -13,7 +13,7 @@ crates/
   http-api       axum router — REST 표면 (sessions, terminals, file_open, …).
   config         figment 기반 로더 (CLI > env > TOML > defaults).
   auth           Token + Argon2id password 모드 (ADR-0003 + ADR-0020).
-  pty-backend    PTY 직접 supervision (ADR-0013, tmux 대체).
+  pty-backend    PTY 직접 supervision (ADR-0013).
 bin/
   gtmux-cli      사용자 facing `gtmux` CLI.
   gen-openapi    utoipa derive 로부터 shared/openapi.yaml 발행.

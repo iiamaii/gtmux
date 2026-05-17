@@ -14,7 +14,7 @@ crates/
   http-api       axum router — REST surface (sessions, terminals, file_open, …).
   config         figment-based loader (CLI > env > TOML > defaults).
   auth           Token + Argon2id password modes (ADR-0003 + ADR-0020).
-  pty-backend    Direct PTY supervision (ADR-0013, replaces tmux).
+  pty-backend    Direct PTY supervision (ADR-0013).
 bin/
   gtmux-cli      The `gtmux` user-facing CLI.
   gen-openapi    Emits shared/openapi.yaml from utoipa derives.
