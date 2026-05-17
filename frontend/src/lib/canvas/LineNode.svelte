@@ -11,6 +11,7 @@
   // 음수 방향 (좌→우, 우→좌, 위→아래, 아래→위) 모두 지원: item.x2-item.x 의 부호로
   // SVG 좌표 결정.
 
+  import { onDestroy } from 'svelte';
   import { useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -133,6 +134,18 @@
     draft = null;
     removeWindowListeners();
   }
+
+  // Drag 중 component unmount (session switch / item delete / layout reload)
+  // 흐름에서 window listener 누수 차단. pointerup/cancel 정상 종료 시는 함수가
+  // 자체적으로 remove 하므로 idempotent.
+  onDestroy(() => {
+    if (activeEndpoint !== null) {
+      removeWindowListeners();
+      activeEndpoint = null;
+      draft = null;
+      pendingCommit = null;
+    }
+  });
 
   async function commitLine(next: DraftLine): Promise<void> {
     if (Math.hypot(next.x2 - next.x, next.y2 - next.y) < LINE_MIN_LENGTH) {
