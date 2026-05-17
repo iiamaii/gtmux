@@ -201,6 +201,7 @@
   onCreate={() => workspaceSwitcher.goCreate()}
   onSelect={() => workspaceSwitcher.goList()}
   onClose={() => workspaceSwitcher.close()}
+  dismissable={sessionStore.active !== null}
 />
 
 <NewSessionModal

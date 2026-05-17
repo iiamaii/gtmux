@@ -33,6 +33,8 @@
     title?: string;
     /** Whether clicks on the backdrop should close. Default true. */
     dismissOnBackdrop?: boolean;
+    /** Whether the Esc key should close. Default true. */
+    dismissOnEsc?: boolean;
     body: Snippet;
     footer?: Snippet;
   }
@@ -42,6 +44,7 @@
     onclose,
     title,
     dismissOnBackdrop = true,
+    dismissOnEsc = true,
     body,
     footer,
   }: Props = $props();
@@ -61,6 +64,7 @@
   function onKeydown(e: KeyboardEvent): void {
     if (!open) return;
     if (e.key === 'Escape') {
+      if (!dismissOnEsc) return;
       e.preventDefault();
       requestClose();
       return;

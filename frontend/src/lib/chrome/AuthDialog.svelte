@@ -7,9 +7,10 @@
    * - plan-0007 §14 FE-NEW-1 + frontend-handover §6 Stage 2
    *
    * 본 dialog 는 *pure switchboard* — 두 버튼만 노출하고 실제 modal (New /
-   * List) 진입은 부모 컴포넌트가 owns 한다. Esc / outside click → 닫힘 없음
-   * (plan-0007 §14.20 의 "modal stack outside click 비활성" — 사용자 의도된
-   * 명시 액션만으로 진행).
+   * List) 진입은 부모 컴포넌트가 owns 한다. backdrop click 은 항상 비활성
+   * (plan-0007 §14.20). Esc/Cancel 닫힘은 `dismissable` prop 으로 제어 —
+   * session 이 없을 때 (active === null) 부모가 false 로 전달해 사용자가
+   * New / Open 둘 중 하나를 *반드시* 선택해야 진행되도록 한다.
    */
 
   import Modal from '$lib/ui/Modal.svelte';
@@ -22,21 +23,38 @@
     /** [기존 session 연동] 클릭 — 부모가 SessionListModal 띄움. */
     onSelect: () => void;
     /**
-     * Esc 또는 backdrop click. 단 plan-0007 §14.20 정합으로 backdrop click
-     * 은 false 처리 — Esc 만 닫음. 본 dialog 가 닫히면 사용자는 *세션 진입
-     * 전* 상태로 — 부모가 자동 reopen 가능.
+     * Esc / Cancel 트리거. dismissable=false 면 호출 경로 자체가 차단되어
+     * 호출되지 않는다.
      */
     onClose?: () => void;
+    /**
+     * 사용자가 modal 을 dismiss 가능한지. false 면 Esc / backdrop / Cancel
+     * 버튼 모두 차단 — 사용자는 New / Open 두 액션 중 하나를 *반드시* 선택
+     * 해야 진행 가능. session 이 없을 때의 정책 (active === null 경로).
+     */
+    dismissable?: boolean;
   }
 
-  const { open, onCreate, onSelect, onClose }: Props = $props();
+  const {
+    open,
+    onCreate,
+    onSelect,
+    onClose,
+    dismissable = true,
+  }: Props = $props();
 </script>
+
+{#snippet cancelFooter()}
+  <Button variant="ghost" onclick={onClose}>Cancel</Button>
+{/snippet}
 
 <Modal
   {open}
-  onclose={onClose}
+  onclose={dismissable ? onClose : undefined}
   title="Choose a workspace session"
   dismissOnBackdrop={false}
+  dismissOnEsc={dismissable}
+  footer={dismissable ? cancelFooter : undefined}
 >
   {#snippet body()}
     <p class="lead">
@@ -67,9 +85,6 @@
         <span class="choice-sub">Pick from saved workspaces.</span>
       </button>
     </div>
-  {/snippet}
-  {#snippet footer()}
-    <Button variant="ghost" onclick={onClose}>Cancel</Button>
   {/snippet}
 </Modal>
 
