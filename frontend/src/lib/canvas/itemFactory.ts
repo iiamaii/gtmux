@@ -24,6 +24,8 @@ import type {
   TerminalItem,
   ImageItem,
   DocumentItem,
+  FreeDrawItem,
+  Point,
 } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
@@ -243,6 +245,45 @@ export function createShapeItem(
     stroke: 'var(--color-fg)',
     fill: 'transparent',
     stroke_width: 2,
+  };
+}
+
+/**
+ * Free draw stroke — drag-to-stroke gesture 의 결과. `points` 는 flow-coord
+ * sequence. bounding box 를 잡고 schema 의 (x, y, w, h) 로 보관.
+ *
+ * Caller (Canvas.svelte 의 onCanvasPointerUp) 책임:
+ *  - `points.length >= 2` 일 때만 호출 (단일 click 은 stroke 의미 없음).
+ *  - point cap (ADR-0018 D4, 5000) 은 수집 단계에서 이미 enforce.
+ */
+const FREE_DRAW_PADDING = 8;
+export function createFreeDrawItem(points: Point[]): FreeDrawItem {
+  const first = points[0];
+  if (first === undefined) {
+    throw new Error('createFreeDrawItem: empty points (caller must guard length >= 1)');
+  }
+  let minX = first.x, minY = first.y, maxX = first.x, maxY = first.y;
+  for (const p of points) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return {
+    id: freshId(),
+    parent_id: null,
+    x: minX - FREE_DRAW_PADDING,
+    y: minY - FREE_DRAW_PADDING,
+    w: Math.max(maxX - minX, 1) + FREE_DRAW_PADDING * 2,
+    h: Math.max(maxY - minY, 1) + FREE_DRAW_PADDING * 2,
+    z: 0,
+    visibility: 'visible',
+    locked: false,
+    minimized: false,
+    type: 'free_draw',
+    stroke: 'var(--color-fg)',
+    stroke_width: 2,
+    points,
   };
 }
 

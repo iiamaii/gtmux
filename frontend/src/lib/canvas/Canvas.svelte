@@ -33,6 +33,7 @@
   import LineNode from './LineNode.svelte';
   import ImageNode from './ImageNode.svelte';
   import DocumentNode from './DocumentNode.svelte';
+  import FreeDrawNode from './FreeDrawNode.svelte';
   import {
     commitNewItem,
     createCanvasItem,
@@ -41,6 +42,7 @@
     createTerminalItem,
     createImageItem,
     createDocumentItem,
+    createFreeDrawItem,
     lineBoxFromEndpoints,
     DEFAULT_TERMINAL_SIZE,
     DEFAULT_NOTE_SIZE,
@@ -69,8 +71,8 @@
   const { screenToFlowPosition, setViewport, getViewport } = useSvelteFlow();
   let applyingStoreViewport = false;
 
-  /** Drag-to-create state — Batch 2 의 rect/ellipse/line gesture. */
-  type DragShape = 'rect' | 'ellipse' | 'line';
+  /** Drag-to-create state — rect/ellipse/line + free_draw. */
+  type DragShape = 'rect' | 'ellipse' | 'line' | 'free_draw';
   interface DragState {
     tool: DragShape;
     /** Flow-coord start point (commit 시 기준). */
@@ -78,8 +80,15 @@
     /** Container-local screen coord — ghost overlay 의 left/top 계산용. */
     startLocal: { x: number; y: number };
     currentLocal: { x: number; y: number };
+    /** free_draw 만 — flow-coord 점들 (commit 용). startFlow 로 시작. */
+    points?: { x: number; y: number }[];
+    /** free_draw 만 — container-local 점들 (ghost preview SVG 용). */
+    pointsLocal?: { x: number; y: number }[];
   }
   let dragState = $state<DragState | null>(null);
+
+  /** ADR-0018 D4 — free_draw point cap. */
+  const FREE_DRAW_MAX_POINTS = 5000;
 
   /**
    * Cursor hover preview — 점-spawn 도구 (terminal/note/file_path/image/
@@ -123,7 +132,8 @@
   const isDragTool = $derived(
     toolStore.current === 'rect' ||
       toolStore.current === 'ellipse' ||
-      toolStore.current === 'line',
+      toolStore.current === 'line' ||
+      toolStore.current === 'free_draw',
   );
 
   /* ── G29: Space-hold pan modifier ────────────────────────────────────
@@ -273,6 +283,35 @@
     const sy = dragState.startLocal.y;
     const cx = dragState.currentLocal.x;
     const cy = dragState.currentLocal.y;
+    if (dragState.tool === 'free_draw') {
+      // Free draw: pointsLocal 의 bounding box + 점 들의 local-coord path.
+      const pts = dragState.pointsLocal ?? [];
+      const first = pts[0];
+      if (first === undefined) return null;
+      let minX = first.x, minY = first.y, maxX = first.x, maxY = first.y;
+      for (const p of pts) {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      }
+      const left = minX - GHOST_LINE_PADDING;
+      const top = minY - GHOST_LINE_PADDING;
+      const width = (maxX - minX) + GHOST_LINE_PADDING * 2;
+      const height = (maxY - minY) + GHOST_LINE_PADDING * 2;
+      const path = pts
+        .map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x - left} ${p.y - top}`)
+        .join(' ');
+      return {
+        tool: dragState.tool,
+        left,
+        top,
+        width: Math.max(width, 1),
+        height: Math.max(height, 1),
+        x1: 0, y1: 0, x2: 0, y2: 0,
+        path,
+      };
+    }
     if (dragState.tool === 'line') {
       const left = Math.min(sx, cx) - GHOST_LINE_PADDING;
       const top = Math.min(sy, cy) - GHOST_LINE_PADDING;
@@ -286,6 +325,7 @@
         y1: sy - top,
         x2: cx - left,
         y2: cy - top,
+        path: '',
       };
     }
     return {
@@ -298,6 +338,7 @@
       y1: 0,
       x2: 0,
       y2: 0,
+      path: '',
     };
   });
 
@@ -323,11 +364,15 @@
     const localY = e.clientY - rect.top;
     const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
 
+    const tool = toolStore.current as DragShape;
     dragState = {
-      tool: toolStore.current as DragShape,
+      tool,
       startFlow: flow,
       startLocal: { x: localX, y: localY },
       currentLocal: { x: localX, y: localY },
+      // Free draw 만 — start 점을 points 의 첫 번째로 set.
+      points: tool === 'free_draw' ? [{ x: flow.x, y: flow.y }] : undefined,
+      pointsLocal: tool === 'free_draw' ? [{ x: localX, y: localY }] : undefined,
     };
 
     root.setPointerCapture(e.pointerId);
@@ -344,12 +389,23 @@
     if (dragState === null) return;
     const root = e.currentTarget as HTMLElement;
     const rect = root.getBoundingClientRect();
+    const nextLocal = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    let nextPoints = dragState.points;
+    let nextPointsLocal = dragState.pointsLocal;
+    if (dragState.tool === 'free_draw' && nextPoints !== undefined && nextPointsLocal !== undefined) {
+      // ADR-0018 D4 — point cap 5000. 도달 시 새 점 skip (드물 — typical
+      // freehand 한 stroke 는 수백 points).
+      if (nextPoints.length < FREE_DRAW_MAX_POINTS) {
+        const flowPt = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+        nextPoints = [...nextPoints, { x: flowPt.x, y: flowPt.y }];
+        nextPointsLocal = [...nextPointsLocal, nextLocal];
+      }
+    }
     dragState = {
       ...dragState,
-      currentLocal: {
-        x: e.clientX - rect.left,
-        y: e.clientY - rect.top,
-      },
+      currentLocal: nextLocal,
+      points: nextPoints,
+      pointsLocal: nextPointsLocal,
     };
   }
 
@@ -365,7 +421,15 @@
     const distance = Math.hypot(dx, dy);
 
     let item;
-    if (state.tool === 'line') {
+    if (state.tool === 'free_draw') {
+      // Free draw: pointer move 로 수집한 points sequence. 점 수 < 2 면
+      // 의미없는 stroke (단순 click) — abort.
+      const pts = state.points ?? [];
+      if (pts.length < 2) {
+        return;
+      }
+      item = createFreeDrawItem(pts);
+    } else if (state.tool === 'line') {
       // Line: endpoint pair 그대로 보존 → 4 방향 (TL→BR, BR→TL, TR→BL, BL→TR).
       // distance < threshold 면 default-size 의 down-right 방향 단일선.
       const p2 =
@@ -429,6 +493,7 @@
     line: LineNode,
     image: ImageNode,
     document: DocumentNode,
+    free_draw: FreeDrawNode,
   };
 
   // M cardinality — PanelNode 가 single/multi 분기를 위해 참조.
@@ -1134,6 +1199,7 @@
       class="drag-ghost"
       class:ghost-ellipse={ghostPreview.tool === 'ellipse'}
       class:ghost-line={ghostPreview.tool === 'line'}
+      class:ghost-free-draw={ghostPreview.tool === 'free_draw'}
       style="left: {ghostPreview.left}px; top: {ghostPreview.top}px; width: {ghostPreview.width}px; height: {ghostPreview.height}px;"
       aria-hidden="true"
     >
@@ -1155,6 +1221,22 @@
           />
           <circle cx={ghostPreview.x1} cy={ghostPreview.y1} r="3.5" />
           <circle cx={ghostPreview.x2} cy={ghostPreview.y2} r="3.5" />
+        </svg>
+      {:else if ghostPreview.tool === 'free_draw'}
+        <svg
+          width={ghostPreview.width}
+          height={ghostPreview.height}
+          viewBox={`0 0 ${ghostPreview.width} ${ghostPreview.height}`}
+          preserveAspectRatio="none"
+        >
+          <path
+            d={ghostPreview.path}
+            fill="none"
+            stroke="var(--color-accent)"
+            stroke-width={2}
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
         </svg>
       {/if}
     </div>
@@ -1271,6 +1353,13 @@
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
     pointer-events: none;
     z-index: 100;
+  }
+
+  /* Free draw 의 stroke preview — bounding-box 강조 안 함 (path 자체가 시각). */
+  .drag-ghost.ghost-free-draw {
+    border: none;
+    background: transparent;
+    box-shadow: none;
   }
 
   .drag-ghost.ghost-ellipse {
