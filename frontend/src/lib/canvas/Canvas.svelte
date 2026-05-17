@@ -1054,6 +1054,19 @@
           w: nextBox.w,
           h: nextBox.h,
         };
+      } else if (cur.type === 'free_draw') {
+        // free_draw 의 points 는 *flow-coord absolute*. wrapper position
+        // 만 갱신하면 path 가 화면 따라가지 못함 + drag stop 시 BE PUT
+        // 응답으로 옛 좌표 복원 → 사용자에게 "원위치 회귀" 시각. line 의
+        // endpoint 평행 이동 패턴 정합 — bbox 의 dx/dy 만큼 모든 점 이동.
+        const dx = pos.x - cur.x;
+        const dy = pos.y - cur.y;
+        next = {
+          ...cur,
+          x: pos.x,
+          y: pos.y,
+          points: cur.points.map((p) => ({ x: p.x + dx, y: p.y + dy })),
+        };
       } else {
         next = { ...cur, x: pos.x, y: pos.y };
       }

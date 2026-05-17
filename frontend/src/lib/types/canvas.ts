@@ -135,12 +135,14 @@ export interface DocumentItem extends ItemCommon {
    * ADR-0018 D4 amend ② (2026-05-17, BE schema.rs ship) — 두 mode 상호
    * 배타. (a) asset-based: `asset_id` set + `mime`/`file_name`/`size_bytes`.
    * (b) inline-stored: `content` set (UTF-8 markdown, cap 64 KB) +
-   * `file_name` (display 용). 두 mode 모두 file_name 은 필요.
+   * `file_name` (display 용). 두 mode 모두 file_name + mime + size_bytes
+   * 는 BE struct 의 required field — inline mode 에서도 placeholder 값
+   * (mime="", size_bytes=content.length) 필요.
    */
   asset_id?: string;
-  mime?: string;
+  mime: string;
   file_name: string;
-  size_bytes?: number;
+  size_bytes: number;
   /** Inline-stored mode 의 UTF-8 markdown content (cap 64 KB). */
   content?: string;
 }
