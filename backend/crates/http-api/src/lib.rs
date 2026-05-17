@@ -82,7 +82,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -548,7 +548,13 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         )
         .route(
             "/api/sessions/import",
-            axum::routing::post(sessions::import_handler),
+            axum::routing::post(sessions::import_handler)
+                // ADR-0029 §6: lift axum's default 2 MB body cap to the
+                // 16 MB ceiling shared with `PUT /api/sessions/:name/layout`
+                // (sessions::SESSION_PUT_MAX_BYTES) — both endpoints write a
+                // v2 layout and reasonable workloads (1000+ items with inline
+                // documents) sit between the two ceilings.
+                .layer(DefaultBodyLimit::max(sessions::SESSION_PUT_MAX_BYTES)),
         )
         .route(
             "/api/sessions/{name}/export",
@@ -1722,6 +1728,74 @@ mod tests {
         assert_eq!(v["error"], "schema_invalid");
         assert!(v["field"].is_string());
         assert!(v["details"].is_string());
+    }
+
+    /// ADR-0029 §6 — import body cap. The route layers
+    /// `DefaultBodyLimit::max(SESSION_PUT_MAX_BYTES)` (16 MiB); axum rejects
+    /// the request with 413 before the handler runs when the body exceeds it.
+    #[tokio::test]
+    async fn sessions_import_413_when_body_exceeds_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        // 17 MiB of JSON-safe padding wrapped in a structurally-valid envelope.
+        // `_bloat` lives outside `viewport`'s known fields — but schema
+        // validation never runs because the body cap layer aborts the read
+        // first. The padding sits as a top-level sibling of `name` / `layout`,
+        // so it doesn't disturb the deserialise target either.
+        let bloat = "a".repeat(17 * 1024 * 1024);
+        let body = format!(
+            r#"{{"name":"x","layout":{{"schema_version":2,"groups":[],"items":[],"viewport":{{"x":0.0,"y":0.0,"zoom":1.0}}}},"_bloat":"{bloat}"}}"#
+        );
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Positive control for ADR-0029 §6 — a sub-cap body (here ~5 MiB of
+    /// padding kept *outside* the schema struct's known fields) is accepted
+    /// past the body-read stage. The handler may still reject it later for
+    /// schema reasons, but never with 413; this guards against accidentally
+    /// re-lowering the cap below the 8–16 MiB band the ADR carved out.
+    #[tokio::test]
+    async fn sessions_import_accepts_body_below_cap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        // 5 MiB of padding — well above the legacy 2 MiB axum default,
+        // well below the 16 MiB ADR cap. The known schema fields stay
+        // valid so the import actually lands.
+        let bloat = "a".repeat(5 * 1024 * 1024);
+        let body = format!(
+            r#"{{"name":"big","layout":{{"schema_version":2,"groups":[],"items":[],"viewport":{{"x":0.0,"y":0.0,"zoom":1.0}}}},"_bloat":"{bloat}"}}"#
+        );
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "5 MiB sub-cap body must not trip the 413 path"
+        );
     }
 
     #[tokio::test]

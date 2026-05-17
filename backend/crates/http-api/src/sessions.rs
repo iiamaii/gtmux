@@ -50,7 +50,12 @@ use crate::workspace::{
 /// cap: 16 MB (P0)" — the existing legacy `/api/layout` cap (256 KiB) is too
 /// tight for the v2 schema once free-draw / images land. We still enforce a
 /// per-field validation (4 KiB label / 64 KiB text) inside `schema::validate`.
-const SESSION_PUT_MAX_BYTES: usize = 16 * 1024 * 1024;
+///
+/// `POST /api/sessions/import` reuses the same cap (ADR-0029 §6) — both are
+/// writing a v2 layout, so the same accept-band applies. `lib.rs` wires
+/// `DefaultBodyLimit::max(SESSION_PUT_MAX_BYTES)` on the import route to lift
+/// axum's default 2 MB ceiling.
+pub(crate) const SESSION_PUT_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SessionLayout — in-memory cache entry
@@ -909,6 +914,10 @@ pub struct ImportSessionBody {
 /// - 400 `schema_invalid` + `field`/`details` — layout failed schema validation.
 /// - 409 `name_conflict`           — a session with this name already
 ///                                   exists; client must rename + retry.
+/// - 413 (axum auto)               — body exceeds [`SESSION_PUT_MAX_BYTES`]
+///                                   (16 MiB, ADR-0029 §6). Enforced by the
+///                                   `DefaultBodyLimit::max(...)` layer on
+///                                   the import route in `lib.rs`.
 /// - 503 `workspace_not_configured` — server started without a workspace.
 /// - 500 `save_failed`             — disk write error.
 ///
