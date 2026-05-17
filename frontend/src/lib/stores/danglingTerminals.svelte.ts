@@ -5,9 +5,10 @@
 // - ADR-0021 D10: dangling recovery via `respawnTerminal`
 //
 // dispatcher 가 0x85 수신 시 `mark(uuid, reason)` 호출. PanelDanglingOverlay
-// 가 자신의 panel terminal_id 가 set 안에 있으면 visual 표시. mount 시 자동
-// `startRespawn(uuid)` lock 확보 후 respawn 호출 — multi-webpage / multi-panel
-// 동시 trigger 의 *client-side single-flight* 보장 (BE 의 idempotent 와 무관).
+// 가 자신의 panel terminal_id 가 set 안에 있으면 visual 표시. `reason:"exit"`
+// 만 자동 respawn 하고, `reason:"killed"` 는 사용자 종료 의도를 보존해 자동
+// respawn 하지 않는다. respawn 호출은 `startRespawn(uuid)` lock 으로 multi-webpage /
+// multi-panel 동시 trigger 의 *client-side single-flight* 를 보장한다.
 //
 // 다른 webpage / 다른 panel 이 이미 respawn 진행 중 (`startRespawn` false) 이면
 // 우리는 spinner 만 보여주고 0x88 도착 후 `handleTerminalSpawned` 가 호출하는

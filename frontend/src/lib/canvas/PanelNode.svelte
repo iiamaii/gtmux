@@ -23,6 +23,7 @@
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
   import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { settingsStore } from '$lib/stores/settings.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
@@ -192,6 +193,13 @@
   function onClose(e: MouseEvent): void {
     e.stopPropagation();
     if (closing) return;
+    // ADR-0021 G25.1.b — auto-kill 설정이 켜져 있으면 modal 우회하고 즉시
+    // [Panel + Terminal] 흐름 실행. 설정 toggle 은 SettingsOverlay 의 Behavior
+    // section. Default false 라 load 전에는 자연스럽게 modal 띄움 (fallback).
+    if (settingsStore.behavior.auto_kill_terminal_on_panel_close) {
+      void performClose(true);
+      return;
+    }
     confirmOpen = true;
   }
 
@@ -252,6 +260,11 @@
   async function performClose(killTerminal: boolean): Promise<void> {
     confirmOpen = false;
     if (sessionStore.active === null) return;
+    // applyDeletion 이 store.items.delete 후 SvelteFlow 가 본 PanelNode 를
+    // unmount → 본 컴포넌트의 derived (otherSessions, attachCount 등) 가 inert
+    // 상태로 진입한다. await 이후 toast 메시지 작성 시 derived read 가 발생하면
+    // `derived_inert` 에러 — await 전에 plain 값으로 snapshot 한다.
+    const mirrorCount = otherSessions.length;
     closing = true;
     try {
       const { ok, fail } = await sessionStore.applyDeletion([data.id], {
@@ -259,10 +272,14 @@
         abortMessage: 'Session reconnect failed — close aborted.',
       });
       if (ok > 0) {
-        void terminalPool.refresh();
+        // kill_terminal=true 경로는 BE 가 terminal_map.unregister + terminal_meta.forget 까지
+        // 동기 수행 — pool 갱신을 toast 전에 await 으로 보장해 sidebar / 다른 mirror
+        // surface 의 stale row 노출을 차단한다. (polling 은 5s 주기라 await 없으면
+        // 사용자가 "kill 안 됨" 으로 인지할 여지가 있음.)
+        await terminalPool.refresh();
         toastStore.show({
           message: killTerminal
-            ? `Panel + terminal closed.${otherSessions.length > 0 ? ` ${otherSessions.length} mirror panel(s) now dangling.` : ''}`
+            ? `Panel + terminal closed.${mirrorCount > 0 ? ` ${mirrorCount} mirror panel(s) now dangling.` : ''}`
             : 'Panel removed. Terminal still in pool.',
           tone: 'success',
         });

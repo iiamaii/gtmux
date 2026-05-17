@@ -18,7 +18,10 @@
 
   import { themeStore, type ThemeMode } from '$lib/stores/theme.svelte';
   import { settingsDialog, type SettingsSection } from '$lib/stores/settingsDialog.svelte';
+  import { settingsStore } from '$lib/stores/settings.svelte';
   import { shortcutRegistry, type ShortcutDescriptor } from '$lib/keyboard/shortcutRegistry.svelte';
+  import { UnauthorizedError } from '$lib/http/sessions';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
 
   const open = $derived(settingsDialog.open);
   const section = $derived(settingsDialog.section);
@@ -30,7 +33,7 @@
     { id: 'shortcuts', label: 'Shortcuts', ready: true },
     { id: 'storage', label: 'Storage', ready: false },
     { id: 'auth', label: 'Auth', ready: false },
-    { id: 'behavior', label: 'Behavior', ready: false },
+    { id: 'behavior', label: 'Behavior', ready: true },
     { id: 'debug', label: 'Debug', ready: false },
   ];
 
@@ -43,6 +46,28 @@
    */
   function setMode(mode: ThemeMode): void {
     themeStore.setMode(mode);
+  }
+
+  /* ── Behavior section ───────────────────────────────────────────── */
+
+  /**
+   * `auto_kill_terminal_on_panel_close` 토글 — ADR-0021 G25.1.b.
+   * PATCH 실패 시 사용자에게 surface — 다음 close 가 default (modal 띄움) 로
+   * fallback 되므로 silent 보다 toast 가 안전.
+   */
+  async function setAutoKill(next: boolean): Promise<void> {
+    try {
+      await settingsStore.setBehavior({ auto_kill_terminal_on_panel_close: next });
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Setting save failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
   }
 
   /* ── Shortcuts section ───────────────────────────────────────────── */
@@ -244,11 +269,24 @@
             </p>
           {:else if section === 'behavior'}
             <h3 class="section-head">Behavior</h3>
-            <p class="placeholder">
-              <code>auto_kill_terminal_on_panel_close</code> toggle (G25).
-              <br />
-              Waiting on BE: <code>PATCH /api/settings</code>.
+            <p class="section-hint">
+              Per-action defaults. Settings persist for the lifetime of the
+              server process.
             </p>
+            <label class="toggle-row">
+              <input
+                type="checkbox"
+                checked={settingsStore.behavior.auto_kill_terminal_on_panel_close}
+                onchange={(e) => void setAutoKill((e.currentTarget as HTMLInputElement).checked)}
+              />
+              <span class="toggle-text">
+                <span class="toggle-title">Auto-kill terminal on panel close</span>
+                <span class="toggle-sub">
+                  Skip the confirm dialog and SIGTERM the terminal whenever a panel
+                  is closed. Mirror panels in other sessions will go dangling.
+                </span>
+              </span>
+            </label>
           {:else if section === 'debug'}
             <h3 class="section-head">Debug</h3>
             <p class="placeholder">
@@ -455,6 +493,44 @@
   .radio-sub {
     color: var(--color-fg-muted);
     font-size: var(--text-base);
+  }
+
+  /* ── Behavior toggle ─────────────────────────────────────────── */
+  .toggle-row {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: var(--space-10);
+    align-items: flex-start;
+    padding: var(--space-10) var(--space-12);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+
+  .toggle-row:hover {
+    background: var(--color-glass-1);
+  }
+
+  .toggle-row input[type='checkbox'] {
+    margin-top: 3px;
+    accent-color: var(--color-accent);
+  }
+
+  .toggle-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .toggle-title {
+    font-weight: var(--weight-medium);
+    color: var(--color-fg);
+  }
+
+  .toggle-sub {
+    color: var(--color-fg-muted);
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
   }
 
   /* ── Shortcuts ───────────────────────────────────────────────── */

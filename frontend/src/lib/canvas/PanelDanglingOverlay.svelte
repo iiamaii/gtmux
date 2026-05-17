@@ -1,9 +1,8 @@
 <script lang="ts">
   // PanelDanglingOverlay — terminal 이 0x85 TERMINAL_DIED 로 dangling 표시되면
-  // visual placeholder. **자동 respawn** (사용자 click 없음) — multi-webpage
-  // 동시 trigger 는 `danglingTerminals.startRespawn` lock 이 client-side
-  // single-flight 로 차단, 0x88 broadcast 가 모든 webpage 의 overlay 를 자연
-  // 해제 (dispatcher.handleTerminalSpawned → clear).
+  // visual placeholder. 정상 exit 는 기존 정책대로 자동 respawn, explicit kill
+  // (Panel+Terminal / SIGTERM) 은 사용자의 종료 의도를 보존하기 위해 자동
+  // respawn 하지 않는다.
   //
   // 정본:
   // - BE Stage 5-B (0034 §3): UUID-carrying terminal-died broadcast
@@ -15,19 +14,20 @@
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { respawnTerminal } from '$lib/http/terminals';
   import { UnauthorizedError } from '$lib/http/sessions';
-  import { toastStore } from '$lib/ui/toast-store.svelte';
 
   const { terminalId }: { terminalId: string } = $props();
 
   const reason = $derived(danglingTerminals.reasonFor(terminalId));
   const visible = $derived(reason !== null);
   const respawning = $derived(danglingTerminals.isRespawning(terminalId));
+  const autoRespawn = $derived(reason === 'exit');
 
   // 자동 respawn — overlay mount 또는 reason 갱신 시 lock 확보 시도. 다른
   // panel / webpage 가 먼저 잡았으면 false (spinner 만 표시). 0x88 도착 시
   // dispatcher 가 clear → overlay 자연 사라짐.
   $effect(() => {
     if (!visible) return;
+    if (!autoRespawn) return;
     void triggerAutoRespawn();
   });
 
@@ -56,7 +56,7 @@
   onMount(() => {
     // mount 직후 한 번 명시 호출 — $effect 가 reason set 보다 먼저 mount 된
     // 경우 대비. visible derived 가 false 면 noop.
-    if (visible) void triggerAutoRespawn();
+    if (visible && autoRespawn) void triggerAutoRespawn();
   });
 </script>
 
@@ -67,9 +67,15 @@
         {reason === 'killed' ? 'Terminal killed' : 'Terminal exited'}
       </div>
       <div class="hint">
-        {respawning ? 'Respawning…' : 'Re-creating terminal…'}
+        {#if reason === 'killed'}
+          Terminal is stopped.
+        {:else}
+          {respawning ? 'Respawning…' : 'Re-creating terminal…'}
+        {/if}
       </div>
-      <div class="spinner" aria-hidden="true"></div>
+      {#if reason !== 'killed'}
+        <div class="spinner" aria-hidden="true"></div>
+      {/if}
     </div>
   </div>
 {/if}

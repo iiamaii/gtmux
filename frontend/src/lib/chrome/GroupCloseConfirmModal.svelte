@@ -122,15 +122,17 @@
 
   async function commitPanelsOnly(): Promise<void> {
     if (committing) return;
+    const itemCount = descendants.items.length;
+    const terminalCount = terminalDescendants.length;
     committing = true;
     try {
       const ok = await pruneLayout();
       if (!ok) return;
-      const n = descendants.items.length;
-      const t = terminalDescendants.length;
       toastStore.show({
-        message: `Removed group + ${n} item${n === 1 ? '' : 's'}${
-          t > 0 ? ` (${t} terminal${t === 1 ? '' : 's'} still alive in pool)` : ''
+        message: `Removed group + ${itemCount} item${itemCount === 1 ? '' : 's'}${
+          terminalCount > 0
+            ? ` (${terminalCount} terminal${terminalCount === 1 ? '' : 's'} still alive in pool)`
+            : ''
         }.`,
         tone: 'success',
       });
@@ -142,11 +144,13 @@
 
   async function commitWithTerminals(): Promise<void> {
     if (committing) return;
+    const killIds = terminalDescendants.map((it) => it.id);
+    const itemCount = descendants.items.length;
+    const mirroredCount = mirroredTerminals.length;
     committing = true;
     try {
       // Kill terminals first — fan out, swallow individual failures so
       // a single 404 (already dead) doesn't block the rest.
-      const killIds = terminalDescendants.map((it) => it.id);
       const results = await Promise.allSettled(killIds.map((id) => killTerminal(id)));
       const rejected = results.filter((r) => r.status === 'rejected');
       if (rejected.length > 0) {
@@ -163,16 +167,17 @@
       const ok = await pruneLayout();
       if (!ok) return;
 
-      void terminalPool.refresh();
-      const mirroredCount = mirroredTerminals.length;
+      // PanelNode.performClose 와 동일 — kill 결과를 toast 전에 await 으로 반영해
+      // sidebar 의 stale row 노출 회피.
+      await terminalPool.refresh();
       const killed = killIds.length - rejected.length;
       const hint =
         mirroredCount > 0
           ? ` — ${mirroredCount} terminal${mirroredCount === 1 ? '' : 's'} mirrored in other session(s); those panels go dangling.`
           : '';
       toastStore.show({
-        message: `Removed group, ${descendants.items.length} item${
-          descendants.items.length === 1 ? '' : 's'
+        message: `Removed group, ${itemCount} item${
+          itemCount === 1 ? '' : 's'
         }, killed ${killed} terminal${killed === 1 ? '' : 's'}${hint}`,
         tone: 'success',
         durationMs: 6_000,

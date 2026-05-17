@@ -14,7 +14,11 @@
    * - 5s 폴링 (mount 동안) — terminalPool.subscribe().
    * - 각 row: alive dot + label/short id + attach count badge + sessions hint.
    * - Attach 버튼 → 현 active session 의 layout 에 추가 (PUT /api/sessions/<name>/layout).
-   * - Kill 버튼 → POST /api/terminals/<id>/kill.
+   * - Attach/Kill 버튼:
+   *   - 현재 session panel 과 연결됨: 액션 숨김.
+   *   - 다른 session panel 과만 연결됨: Attach 만 표시.
+   *   - 어느 panel 과도 연결되지 않음: Attach + Kill 표시.
+   *   Panel 과 연결된 terminal 종료는 panel close 의 [Panel + Terminal] 경로로 수행한다.
    * - 빈 pool → "No terminals" placeholder.
    * - Header 우측 fold 버튼 → chromeStore.toggleTerminals().
    *
@@ -30,6 +34,7 @@
   import { killTerminal } from '$lib/http/terminals';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
+  import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { TerminalInfo } from '$lib/types/terminals';
   import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
@@ -156,6 +161,13 @@
   async function killOne(t: TerminalInfo): Promise<void> {
     const uuid = t.id;
     if (killing.has(uuid)) return;
+    if (t.attach_count > 0) {
+      toastStore.show({
+        message: 'Remove the linked panel with "Panel + Terminal" to stop this terminal.',
+        tone: 'info',
+      });
+      return;
+    }
     const guard = await sessionStore.guardOutgoingMutation();
     if (!guard.ok) {
       toastStore.show({
@@ -168,14 +180,8 @@
     killing = new Set(killing);
     try {
       await killTerminal(uuid);
-      const mirrorHint =
-        t.attach_count > 1
-          ? ` (${t.attach_count - 1} other session(s) affected — dangling)`
-          : t.attach_count === 1
-            ? ' (panel goes dangling — click to respawn)'
-            : '';
       toastStore.show({
-        message: `Killed terminal ${uuid.slice(0, 8)}${mirrorHint}.`,
+        message: `Killed terminal ${uuid.slice(0, 8)}.`,
         tone: 'info',
         durationMs: 5_000,
       });
@@ -233,12 +239,22 @@
         {#each terminals as t (t.id)}
           {@const onCanvas = isOnCurrentCanvas(t.id)}
           {@const busy = attaching.has(t.id)}
+          {@const unplaced = t.attach_count === 0}
           <li
             class="term-row"
             class:on-canvas={onCanvas}
             title={`id: ${t.id}\nattached: ${t.attached_sessions.join(', ') || '(none)'}`}
           >
-            <span class="alive" class:on={t.alive} aria-hidden="true"></span>
+            <!-- alive dot — BE 의 alive 만으로는 현재 사실상 항상 on (dead → unregister
+                 으로 row 자체가 빠짐) 이라 인디케이터 가치가 낮다. 0x85 TERMINAL_DIED
+                 후 같은 id 가 dangling 상태로 잠시 살아있는 window 에서 grey 로 가라
+                 앉히려 dangling 합산. (PanelNode 의 4-state LED 와 달리 sidebar 는
+                 binary 만 유지 — 시급성은 panel header 의 red 가 담당.) -->
+            <span
+              class="alive"
+              class:on={t.alive && !danglingTerminals.has(t.id)}
+              aria-hidden="true"
+            ></span>
             <span class="name">{displayName(t)}</span>
             {#if t.attach_count > 0}
               <span class="badge" title="{t.attach_count} session reference(s)">
@@ -250,49 +266,53 @@
             {#if t.created_at > 0}
               <span class="meta">{ago(t.created_at)}</span>
             {/if}
-            <span class="row-actions">
-              <button
-                type="button"
-                class="attach-btn"
-                disabled={onCanvas || busy || activeSessionName === null}
-                aria-label={onCanvas ? 'Already on canvas' : 'Attach to canvas'}
-                title={onCanvas
-                  ? 'Already on this canvas'
-                  : activeSessionName === null
-                    ? 'Attach a session first'
-                    : `Attach to "${activeSessionName}"`}
-                onclick={() => void attachToCanvas(t.id)}
-              >
-                {#if busy}
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
-                    <circle cx="12" cy="12" r="9" stroke-opacity="0.25" />
-                    <path d="M12 3a9 9 0 0 1 9 9" />
-                  </svg>
-                {:else if onCanvas}
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <polyline points="5 12 10 17 19 7" />
-                  </svg>
-                {:else}
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <line x1="12" y1="5" x2="12" y2="19" />
-                    <line x1="5" y1="12" x2="19" y2="12" />
-                  </svg>
+            {#if !onCanvas}
+              <span class="row-actions">
+                <button
+                  type="button"
+                  class="attach-btn"
+                  disabled={onCanvas || busy || activeSessionName === null}
+                  aria-label={onCanvas ? 'Already on canvas' : 'Attach to canvas'}
+                  title={onCanvas
+                    ? 'Already on this canvas'
+                    : activeSessionName === null
+                      ? 'Attach a session first'
+                      : `Attach to "${activeSessionName}"`}
+                  onclick={() => void attachToCanvas(t.id)}
+                >
+                  {#if busy}
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                      <circle cx="12" cy="12" r="9" stroke-opacity="0.25" />
+                      <path d="M12 3a9 9 0 0 1 9 9" />
+                    </svg>
+                  {:else if onCanvas}
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <polyline points="5 12 10 17 19 7" />
+                    </svg>
+                  {:else}
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <line x1="12" y1="5" x2="12" y2="19" />
+                      <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                  {/if}
+                </button>
+                {#if unplaced}
+                  <button
+                    type="button"
+                    class="kill-btn"
+                    disabled={killing.has(t.id)}
+                    aria-label="Kill terminal"
+                    title="Kill terminal"
+                    onclick={() => void killOne(t)}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <line x1="6" y1="6" x2="18" y2="18" />
+                      <line x1="18" y1="6" x2="6" y2="18" />
+                    </svg>
+                  </button>
                 {/if}
-              </button>
-              <button
-                type="button"
-                class="kill-btn"
-                disabled={killing.has(t.id)}
-                aria-label="Kill terminal"
-                title={`Kill terminal (${t.attach_count > 0 ? `${t.attach_count} session(s) — will dangle` : 'no canvas references'})`}
-                onclick={() => void killOne(t)}
-              >
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <line x1="6" y1="6" x2="18" y2="18" />
-                  <line x1="18" y1="6" x2="6" y2="18" />
-                </svg>
-              </button>
-            </span>
+              </span>
+            {/if}
           </li>
         {/each}
       </ul>

@@ -37,6 +37,7 @@
   import { themeStore } from '$lib/stores/theme.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { settingsStore } from '$lib/stores/settings.svelte';
   import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
   import { reconnectGate } from '$lib/stores/reconnectGate.svelte';
   import type { WsClient } from '$lib/ws/client';
@@ -268,6 +269,12 @@
         if (res.status === 401) {
           window.location.href = '/auth';
           return;
+        }
+        if (res.ok) {
+          // Server-wide behavior settings — PanelNode 의 auto-kill 분기 등
+          // 이 store 값을 읽으므로 첫 panel close 전에 load 가 시작되어야 한다.
+          // 실패는 silent (default false 로 fallback).
+          void settingsStore.load();
         }
         if (res.ok && sessionStore.active === null) {
           // Step 2.5 — sessionStorage hint 검사 (ADR-0019 D5.4, plan-0008 §4.6).
