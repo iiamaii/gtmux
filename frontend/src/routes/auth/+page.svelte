@@ -363,7 +363,7 @@
     text-align: center;
     /* cap-height 의 시각 중심을 brand-mark 의 vertical center 와 맞추기 위한
        미세 nudge — font descent 가 baseline 아래 여백을 만들기 때문. */
-    transform: translateY(-2px);
+    transform: translateY(-4px);
   }
 
   .deck {
