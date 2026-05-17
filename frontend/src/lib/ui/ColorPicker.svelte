@@ -1,22 +1,43 @@
+<script module lang="ts">
+  /**
+   * Module-scope recent-color history — singleton 공유 (모든 picker instance
+   * 가 같은 LRU 본다). Phase 3 의 swatch row "Recent". max 10, FIFO. 새로고침
+   * 시 손실 (clipboard 와 동일 정책 — Figma 도 session-scope).
+   */
+  // svelte module-script 안의 $state — 모든 instance 공유 (proxy).
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _recent: { list: string[] } = $state({ list: [] });
+
+  export function recentColorList(): readonly string[] {
+    return _recent.list;
+  }
+
+  export function pushRecentColor(hex: string): void {
+    const norm = hex.toLowerCase();
+    if (!/^#[0-9a-f]{6}([0-9a-f]{2})?$/.test(norm)) return;
+    const i = _recent.list.indexOf(norm);
+    if (i !== -1) _recent.list.splice(i, 1);
+    _recent.list.unshift(norm);
+    if (_recent.list.length > 10) _recent.list.length = 10;
+  }
+</script>
+
 <script lang="ts">
   /**
    * ColorPicker — Figma-style popover (ref/frontend-design/components-v4.html
    * §.shape-colorpicker spec 정합).
    *
-   * Phase 1 (현재):
-   *   - Visual shell — trigger swatch + popover 의 head/modes/sv-square/sliders/
-   *     value/swatches 의 markup + CSS. 시안 v4 정합.
-   *   - Working interaction: hex input commit / alpha input commit / swatch grid
-   *     클릭 commit / close button / click-outside close.
-   *   - Static visual only (drag 없음): SV-square handle (hex → HSV 위치), hue
-   *     slider handle (hue/360), alpha slider handle (alpha%), modes (Solid 고정),
-   *     format dropdown (HEX 고정).
+   * Phase 1: visual shell — trigger swatch + popover layout (v4 시안).
+   * Phase 2: SV / hue / alpha drag — pointerdown→move→up, draft preview, 1회 commit.
+   * Phase 3 (현 commit):
+   *   - Format toggle (Hex / RGB / HSL) — cp-format pill 클릭 → dropdown.
+   *     cp-input 의 display + parsing 이 format mode 따라.
+   *   - Eyedropper — `window.EyeDropper` 지원 시 button 활성, onclick → pick.
+   *   - Recent swatch history — module-scope LRU, commit 마다 prepend, max 10.
    *
-   * Phase 2 (후속):
-   *   - SV / hue / alpha pointer-down → drag → color update
-   *   - Format toggle (Hex / RGB / HSL cycle)
-   *   - Eyedropper (EyeDropper Web API)
-   *   - Recent swatch history (clipboard 또는 sessionStore)
+   * Phase 4 (후속):
+   *   - OKLCH format 지원 + ADR-0016 amend (token-aware preset palette)
+   *   - localStorage 로 recent 영속화 (option)
    *
    * 입력 (props):
    *   - value: string | null | undefined  — 현재 색 (#rrggbb / #rrggbbaa /
@@ -25,7 +46,7 @@
    *   - disabled / mixed / allowTransparent / allowAlpha — 기존 props 유지.
    *
    * 정본:
-   *   - plan-0010 Task 3 (Q "OKLCH/HSL/hex" — 본 phase 는 hex 만)
+   *   - plan-0010 Task 3 (Q "OKLCH/HSL/hex" — phase 3: HSL 추가, OKLCH P4)
    *   - ADR-0016 (design tokens) amend 후속 (token-aware preset palette 정책)
    */
 
@@ -47,7 +68,7 @@
     allowAlpha = false,
   }: Props = $props();
 
-  // ── 기존 helpers (변경 없음) ─────────────────────────────────────────
+  // ── Helpers (parse / normalize) ─────────────────────────────────
   function isTransparentValue(s: string): boolean {
     const v = s.trim().toLowerCase();
     return v === 'transparent' || v === 'none' || v === '';
@@ -124,7 +145,7 @@
     return `${baseRgb}${a.toString(16).padStart(2, '0')}`;
   }
 
-  // ── 신규: hex ↔ HSV 변환 (SV handle / hue handle 위치 계산용) ────────
+  // ── HSV ↔ hex / hue 색 ──────────────────────────────────────────
   function hexToHsv(hex: string): { h: number; s: number; v: number } {
     const m = hex.match(/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
     if (m === null) return { h: 0, s: 0, v: 0 };
@@ -147,7 +168,6 @@
     return { h, s, v };
   }
 
-  /** Pure hue → hex (saturation=100, value=100). SV-square gradient base. */
   function hueToHex(h: number): string {
     const c = 1;
     const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
@@ -161,7 +181,6 @@
     return '#' + [r, g, b].map((v2) => Math.round(v2 * 255).toString(16).padStart(2, '0')).join('');
   }
 
-  /** Full HSV → hex (sat/val 0~100). */
   function hsvToHex(h: number, s: number, v: number): string {
     const sat = Math.max(0, Math.min(100, s)) / 100;
     const val = Math.max(0, Math.min(100, v)) / 100;
@@ -181,6 +200,79 @@
       .join('');
   }
 
+  // ── Phase 3: hex ↔ RGB string / HSL string ──────────────────────
+  function hexToRgbParts(hex: string): { r: number; g: number; b: number } {
+    const norm = normalizeHex(hex) ?? '#000000';
+    const m = norm.match(/^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i);
+    if (m === null) return { r: 0, g: 0, b: 0 };
+    return {
+      r: Number.parseInt(m[1] ?? '0', 16),
+      g: Number.parseInt(m[2] ?? '0', 16),
+      b: Number.parseInt(m[3] ?? '0', 16),
+    };
+  }
+
+  function hexToRgbString(hex: string): string {
+    const { r, g, b } = hexToRgbParts(hex);
+    return `${r}, ${g}, ${b}`;
+  }
+
+  function parseRgbString(s: string): string | null {
+    const m = s.trim().match(/^(\d+)\s*[,\s]\s*(\d+)\s*[,\s]\s*(\d+)$/);
+    if (m === null) return null;
+    const r = Math.max(0, Math.min(255, Number.parseInt(m[1] ?? '0', 10)));
+    const g = Math.max(0, Math.min(255, Number.parseInt(m[2] ?? '0', 10)));
+    const b = Math.max(0, Math.min(255, Number.parseInt(m[3] ?? '0', 10)));
+    return '#' + [r, g, b].map((n) => n.toString(16).padStart(2, '0')).join('');
+  }
+
+  /** hex → HSL (h:0-360, s:0-100, l:0-100). */
+  function hexToHsl(hex: string): { h: number; s: number; l: number } {
+    const { r, g, b } = hexToRgbParts(hex);
+    const rr = r / 255, gg = g / 255, bb = b / 255;
+    const max = Math.max(rr, gg, bb);
+    const min = Math.min(rr, gg, bb);
+    const l = (max + min) / 2;
+    let h = 0, s = 0;
+    const d = max - min;
+    if (d !== 0) {
+      s = d / (l < 0.5 ? max + min : 2 - max - min);
+      if (max === rr) h = ((gg - bb) / d + (gg < bb ? 6 : 0)) % 6;
+      else if (max === gg) h = (bb - rr) / d + 2;
+      else h = (rr - gg) / d + 4;
+      h = Math.round(h * 60);
+      if (h < 0) h += 360;
+    }
+    return { h, s: Math.round(s * 100), l: Math.round(l * 100) };
+  }
+
+  function hexToHslString(hex: string): string {
+    const { h, s, l } = hexToHsl(hex);
+    return `${h}, ${s}%, ${l}%`;
+  }
+
+  /** HSL string → hex. */
+  function parseHslString(s: string): string | null {
+    const m = s.trim().match(/^(\d+)\s*[,\s]\s*(\d+)%?\s*[,\s]\s*(\d+)%?$/);
+    if (m === null) return null;
+    const h = ((Number.parseInt(m[1] ?? '0', 10) % 360) + 360) % 360;
+    const sat = Math.max(0, Math.min(100, Number.parseInt(m[2] ?? '0', 10))) / 100;
+    const l = Math.max(0, Math.min(100, Number.parseInt(m[3] ?? '0', 10))) / 100;
+    const c = (1 - Math.abs(2 * l - 1)) * sat;
+    const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+    const m2 = l - c / 2;
+    let r = 0, g = 0, b = 0;
+    if (h < 60) { r = c; g = x; }
+    else if (h < 120) { r = x; g = c; }
+    else if (h < 180) { g = c; b = x; }
+    else if (h < 240) { g = x; b = c; }
+    else if (h < 300) { r = x; b = c; }
+    else { r = c; b = x; }
+    return '#' + [r + m2, g + m2, b + m2]
+      .map((v2) => Math.round(v2 * 255).toString(16).padStart(2, '0'))
+      .join('');
+  }
+
   // ── 파생값 ────────────────────────────────────────────────────────
   const resolvedHex = $derived.by(() => {
     if (mixed) return null;
@@ -189,11 +281,6 @@
   });
 
   const isTransparent = $derived(typeof value === 'string' && isTransparentValue(value));
-
-  const displayValue = $derived.by(() => {
-    if (mixed || isTransparent) return '';
-    return resolvedHex ?? '';
-  });
 
   const swatchValue = $derived.by(() => {
     if (resolvedHex === null) return '#000000';
@@ -225,11 +312,11 @@
   let hueEl: HTMLDivElement | undefined = $state();
   let alphaEl: HTMLDivElement | undefined = $state();
 
-  /**
-   * Drag preview — drag 중 picker 내부 visual 만 update (swatch/handles/hex).
-   * drag end (pointerup) 에 1회 commit → ADR-0028 history 1 entry.
-   * null = drag 비활성 (resolvedHex / hsv / alphaPercent 사용).
-   */
+  type FormatMode = 'hex' | 'rgb' | 'hsl';
+  let formatMode = $state<FormatMode>('hex');
+  let formatMenuOpen = $state(false);
+
+  /** Drag preview — drag 중 picker 내부 visual 만 update. drag end 1회 commit. */
   let draftHsv = $state<{ h: number; s: number; v: number } | null>(null);
   let draftAlpha = $state<number | null>(null);
 
@@ -240,14 +327,30 @@
     return hsvToHex(draftHsv.h, draftHsv.s, draftHsv.v);
   });
   const effectiveHueColor = $derived(hueToHex(effectiveHsv.h));
-  /** Popover 위치 — viewport (fixed) 기준 clamp. open 시 measure + scroll/resize 갱신. */
-  let popoverPos = $state<{ top: number; left: number }>({ top: 0, left: 0 });
+
+  /** Display value 의 format 별 정규화 — input 의 표시값. editing 중엔 textInput 그대로. */
+  const displayInFormat = $derived.by(() => {
+    if (mixed) return 'Mixed';
+    if (isTransparent) return 'transparent';
+    const baseHex = hexRgb(effectiveHex);
+    if (formatMode === 'rgb') return hexToRgbString(baseHex);
+    if (formatMode === 'hsl') return hexToHslString(baseHex);
+    return baseHex.replace('#', '').toUpperCase();
+  });
+
+  // ── Browser feature detect — EyeDropper Web API ───────────────
+  const hasEyeDropper = $derived.by(() => {
+    if (typeof window === 'undefined') return false;
+    return typeof (window as unknown as { EyeDropper?: unknown }).EyeDropper === 'function';
+  });
 
   /**
    * Trigger rect + popover rect + viewport 로 위치 계산.
    * 기본 = trigger 아래 + 좌측 정렬. 우측 overflow 시 우측 정렬. 아래 overflow 시
    * trigger 위로 flip. 양쪽 모두 안 들어가면 viewport 안 clamp.
    */
+  let popoverPos = $state<{ top: number; left: number }>({ top: 0, left: 0 });
+
   function updatePopoverPos(): void {
     if (containerEl === undefined || popoverEl === undefined) return;
     const tRect = containerEl.getBoundingClientRect();
@@ -261,7 +364,6 @@
     if (left < margin) left = margin;
     let top = tRect.bottom + gap;
     if (top + pRect.height > vh - margin) {
-      // 아래 overflow — trigger 위로 flip 시도
       const flipped = tRect.top - pRect.height - gap;
       top = flipped >= margin ? flipped : Math.max(margin, vh - pRect.height - margin);
     }
@@ -269,32 +371,28 @@
   }
 
   $effect(() => {
-    if (!editing) textInput = displayValue;
+    if (!editing) textInput = displayInFormat;
   });
   $effect(() => {
-    if (!editingAlpha) alphaInput = String(alphaPercent);
+    if (!editingAlpha) alphaInput = String(Math.round(effectiveAlpha));
   });
 
   // ── Click-outside close + popover position tracking ─────────────
   $effect(() => {
     if (!open) return;
     function onDocPointerDown(e: PointerEvent): void {
-      // trigger 와 popover 둘 다 inside 로 인정 (popover 는 fixed 라
-      // containerEl.contains 가 false — popoverEl 별도 검사).
       const target = e.target as Node;
       if (containerEl?.contains(target)) return;
       if (popoverEl?.contains(target)) return;
+      formatMenuOpen = false;
       open = false;
     }
     const onReflow = () => updatePopoverPos();
     queueMicrotask(() => {
       document.addEventListener('pointerdown', onDocPointerDown, true);
-      // mount 직후 첫 measure — popoverEl 의 rect 가 reliable 한 시점.
       updatePopoverPos();
     });
     window.addEventListener('resize', onReflow);
-    // capture phase scroll — popover 안 element scroll 은 무시 (popover 자체
-    // 가 scroll 안 함 + 외부 scroll 만 reposition trigger).
     window.addEventListener('scroll', onReflow, true);
     return () => {
       document.removeEventListener('pointerdown', onDocPointerDown, true);
@@ -307,6 +405,9 @@
   function commitColor(next: string): void {
     if (next === value) return;
     oncommit(next);
+    // Recent: 6자리 hex 정규화 후 prepend (alpha 8자리 도 OK, single token 으로 기억).
+    const norm = normalizeHex(next);
+    if (norm !== null) pushRecentColor(norm);
   }
 
   function onTextChange(): void {
@@ -316,20 +417,26 @@
       textInput = '';
       return;
     }
-    const norm = normalizeHex(textInput);
-    if (norm === null) {
-      textInput = displayValue;
+    // Format 별 parse.
+    let normRgb: string | null = null;
+    if (formatMode === 'rgb') normRgb = parseRgbString(textInput);
+    else if (formatMode === 'hsl') normRgb = parseHslString(textInput);
+    else normRgb = normalizeHex(textInput);
+
+    if (normRgb === null) {
+      // 잘못된 입력 — revert display.
+      textInput = displayInFormat;
       return;
     }
     if (allowAlpha) {
-      if (/^#[0-9a-f]{8}$/.test(norm)) {
-        commitColor(norm);
+      if (/^#[0-9a-f]{8}$/.test(normRgb)) {
+        commitColor(normRgb);
       } else {
         const a = Math.max(0, Math.min(100, Number.parseInt(alphaInput || '100', 10)));
-        commitColor(combineHexAlpha(norm, Number.isNaN(a) ? 100 : a));
+        commitColor(combineHexAlpha(normRgb, Number.isNaN(a) ? 100 : a));
       }
     } else {
-      commitColor(norm);
+      commitColor(normRgb);
     }
   }
 
@@ -361,16 +468,6 @@
   }
 
   // ── Drag handlers (SV / hue / alpha) ─────────────────────────────
-  /**
-   * Pattern: pointerdown 에서 draft state 초기화 + setPointerCapture 으로 element
-   * 외 drag 도 추적. pointermove 마다 draft 만 update (picker 내부 visual).
-   * pointerup 시 draft 의 최종값을 1회 commit 후 draft = null.
-   *
-   * commit 시점: ADR-0028 정합 — drag 중 매 move commit 하면 history 가 dirty.
-   * drag end 1회 commit 으로 history 1 entry 유지. drag 중 visual preview 는
-   * draftHsv / draftAlpha 가 effective* 파생에 흘러가 swatch / handles / hex
-   * 모두 reactive update.
-   */
   function clamp01(v: number): number {
     return Math.max(0, Math.min(1, v));
   }
@@ -471,12 +568,51 @@
     alphaEl.addEventListener('pointercancel', onUp);
   }
 
-  // ── Preset palette (phase 1 hardcoded; phase 4 token-aware) ──────
+  // ── Phase 3: Format toggle ───────────────────────────────────────
+  function selectFormat(m: FormatMode): void {
+    if (formatMode !== m) {
+      formatMode = m;
+      // editing 중이면 사용자가 본 format 의 새 표시값으로 동기 (editing 종료 후
+      // $effect 의 textInput=displayInFormat 이 처리하지만, 즉시 보이게).
+      if (!editing) textInput = displayInFormat;
+    }
+    formatMenuOpen = false;
+  }
+
+  function toggleFormatMenu(): void {
+    if (disabled) return;
+    formatMenuOpen = !formatMenuOpen;
+  }
+
+  // ── Phase 3: Eyedropper ─────────────────────────────────────────
+  async function pickFromScreen(): Promise<void> {
+    if (disabled || !hasEyeDropper) return;
+    try {
+      const W = window as unknown as {
+        EyeDropper: new () => { open: () => Promise<{ sRGBHex: string }> };
+      };
+      const dropper = new W.EyeDropper();
+      const result = await dropper.open();
+      const norm = normalizeHex(result.sRGBHex);
+      if (norm !== null) {
+        if (allowAlpha) {
+          const a = Math.max(0, Math.min(100, Number.parseInt(alphaInput || '100', 10)));
+          commitColor(combineHexAlpha(norm, Number.isNaN(a) ? 100 : a));
+        } else {
+          commitColor(norm);
+        }
+      }
+    } catch {
+      // 사용자가 Esc 또는 cancel — silent.
+    }
+  }
+
+  // ── Preset palette (Phase 4 에서 token-aware) ────────────────────
   const documentSwatches: readonly string[] = [
     '#0d99ff', '#1abc9c', '#2dc26b', '#ffc857', '#f97316',
     '#e5484d', '#b894ff', '#000000', '#6b6b6b',
   ];
-  const recentSwatches: readonly string[] = []; // phase 2+ wire
+  const recentSwatches = $derived(recentColorList());
 </script>
 
 <div
@@ -515,7 +651,6 @@
   </button>
 
   {#if open}
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       class="shape-colorpicker"
@@ -524,7 +659,7 @@
       role="dialog"
       aria-label="Color picker"
     >
-      <!-- Head — title + close. (Pin button 은 phase 2+ — visible only) -->
+      <!-- Head -->
       <div class="cp-head">
         <span class="cp-title">Color</span>
         <div class="cp-actions">
@@ -542,26 +677,26 @@
         </div>
       </div>
 
-      <!-- Modes — phase 1: Solid 고정, 나머지 disabled (P2). -->
+      <!-- Modes — phase 1: Solid 고정 -->
       <div class="cp-modes">
         <button type="button" class="cp-mode active" title="Solid">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><circle cx="6" cy="6" r="4"/></svg>
         </button>
-        <button type="button" class="cp-mode" title="Linear (P2)" disabled aria-disabled="true">
+        <button type="button" class="cp-mode" title="Linear (P4)" disabled aria-disabled="true">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><rect x="2" y="2" width="8" height="8" rx="1" fill="currentColor" opacity=".3"/></svg>
         </button>
-        <button type="button" class="cp-mode" title="Radial (P2)" disabled aria-disabled="true">
+        <button type="button" class="cp-mode" title="Radial (P4)" disabled aria-disabled="true">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><circle cx="6" cy="6" r="4" fill="currentColor" opacity=".3"/></svg>
         </button>
-        <button type="button" class="cp-mode" title="Angular (P2)" disabled aria-disabled="true">
+        <button type="button" class="cp-mode" title="Angular (P4)" disabled aria-disabled="true">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true"><circle cx="6" cy="6" r="4"/></svg>
         </button>
-        <button type="button" class="cp-mode" title="Image (P2)" disabled aria-disabled="true">
+        <button type="button" class="cp-mode" title="Image (P4)" disabled aria-disabled="true">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true"><rect x="1.5" y="2" width="9" height="8" rx="1"/></svg>
         </button>
       </div>
 
-      <!-- SV square — drag in saturation/value 2D plane. -->
+      <!-- SV square -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         class="cp-sv"
@@ -572,9 +707,17 @@
         <div class="sv-handle" style:left="{effectiveHsv.s}%" style:top="{100 - effectiveHsv.v}%"></div>
       </div>
 
-      <!-- Sliders — hue + alpha. -->
+      <!-- Sliders -->
       <div class="cp-sliders">
-        <button type="button" class="cp-eye" title="Eyedropper (P3+)" disabled aria-disabled="true">
+        <button
+          type="button"
+          class="cp-eye"
+          class:has-feature={hasEyeDropper}
+          title={hasEyeDropper ? 'Pick from screen' : 'Eyedropper (browser unsupported)'}
+          disabled={!hasEyeDropper || disabled}
+          aria-disabled={!hasEyeDropper || disabled}
+          onclick={() => void pickFromScreen()}
+        >
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M9 1.5l3.5 3.5-1.5 1.5L8 4z"/>
             <path d="M8 4 3.2 8.8a1.4 1.4 0 0 0 0 2L4 11.6l-.6.6a.7.7 0 0 1-1-1l.6-.6.8-.8L8.8 4.8"/>
@@ -609,19 +752,33 @@
         </div>
       </div>
 
-      <!-- Value row — format pill + hex input + alpha input. -->
+      <!-- Value row -->
       <div class="cp-value">
-        <div class="cp-input cp-format" title="Format (HEX only — P2)">
-          HEX <span class="caret" aria-hidden="true">▾</span>
+        <div
+          class="cp-input cp-format"
+          class:is-open={formatMenuOpen}
+          title="Color format"
+          role="button"
+          tabindex="0"
+          onclick={toggleFormatMenu}
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              toggleFormatMenu();
+            }
+          }}
+        >
+          {formatMode === 'hex' ? 'HEX' : formatMode === 'rgb' ? 'RGB' : 'HSL'}
+          <span class="caret" aria-hidden="true">▾</span>
         </div>
         <div class="cp-input">
           <input
             type="text"
-            value={editing ? textInput : (draftHsv !== null ? effectiveHex : textInput)}
+            value={editing ? textInput : displayInFormat}
             oninput={(e) => {
               if (editing) textInput = (e.currentTarget as HTMLInputElement).value;
             }}
-            placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : '#000000'}
+            placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : formatMode === 'hex' ? '000000' : formatMode === 'rgb' ? '0, 0, 0' : '0, 0%, 0%'}
             {disabled}
             onfocus={() => (editing = true)}
             onblur={() => {
@@ -633,7 +790,7 @@
             }}
             spellcheck="false"
             autocomplete="off"
-            aria-label="Color hex value"
+            aria-label={`Color ${formatMode.toUpperCase()} value`}
           />
         </div>
         <div class="cp-input cp-alpha">
@@ -663,9 +820,31 @@
           {/if}
           <span class="pct">%</span>
         </div>
+
+        {#if formatMenuOpen}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div class="cp-format-menu is-open" role="menu" aria-label="Color format">
+            {#each ['hex', 'rgb', 'hsl'] as const as m}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <div
+                class="item"
+                class:active={formatMode === m}
+                role="menuitemradio"
+                aria-checked={formatMode === m}
+                tabindex="0"
+                onclick={() => selectFormat(m)}
+              >
+                {m.toUpperCase()}
+                {#if formatMode === m}
+                  <span class="tick" aria-hidden="true">✓</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
       </div>
 
-      <!-- Swatches — Document + Recent. phase 1: hardcoded. P2: token-aware. -->
+      <!-- Swatches: Document + Recent -->
       <div class="cp-swatches">
         <div class="grp">
           <div class="lbl">
@@ -705,12 +884,12 @@
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <span
                   class="sw"
-                  class:selected={resolvedHex !== null && hexRgb(resolvedHex) === sw}
-                  style:--c={sw}
+                  class:selected={resolvedHex !== null && hexRgb(resolvedHex) === hexRgb(sw)}
+                  style:--c={hexRgb(sw)}
                   role="button"
                   tabindex="0"
                   aria-label={`Set color ${sw}`}
-                  onclick={() => onSwatchClick(sw)}
+                  onclick={() => onSwatchClick(hexRgb(sw))}
                 ></span>
               {/each}
             </div>
@@ -722,7 +901,7 @@
 </div>
 
 <style>
-  /* ── Trigger swatch (inspector 안의 색 box) ─────────────────────── */
+  /* ── Trigger swatch ──────────────────────────────────────────── */
   .color-picker {
     position: relative;
     display: inline-flex;
@@ -765,10 +944,8 @@
     background-color: transparent;
   }
 
-  /* ── Popover (v4 §.shape-colorpicker spec) ───────────────────── */
+  /* ── Popover ────────────────────────────────────────────────── */
   .shape-colorpicker {
-    /* fixed — parent overflow 와 무관하게 viewport 기준 위치. open 시 JS 로
-       trigger rect + viewport clamp 으로 top/left inline style 부여. */
     position: fixed;
     z-index: var(--z-popover, 100);
     width: 240px;
@@ -885,10 +1062,16 @@
     display: grid;
     place-items: center;
     color: var(--color-fg);
-    cursor: not-allowed;
+    cursor: pointer;
     padding: 0;
     opacity: 0.4;
+    transition: background var(--motion-fast) var(--motion-easing), opacity var(--motion-fast) var(--motion-easing);
   }
+  .cp-eye.has-feature { opacity: 1; }
+  .cp-eye.has-feature:hover { background: var(--color-glass-1); }
+  .cp-eye:disabled { cursor: not-allowed; }
+  .cp-eye:focus-visible { outline: 1px dashed var(--color-accent); outline-offset: 1px; }
+
   .cp-slider {
     position: relative;
     height: 10px;
@@ -926,6 +1109,7 @@
   }
 
   .cp-value {
+    position: relative; /* format menu absolute anchor */
     display: grid;
     grid-template-columns: 56px 1fr 52px;
     gap: 6px;
@@ -962,11 +1146,14 @@
     font-style: italic;
   }
   .cp-input.cp-format {
-    cursor: not-allowed; /* P2: format toggle */
+    cursor: pointer;
     justify-content: space-between;
     gap: 4px;
     color: var(--color-fg);
+    user-select: none;
   }
+  .cp-input.cp-format:hover { border-color: var(--color-border); }
+  .cp-input.cp-format.is-open { border-color: var(--color-accent); }
   .cp-input.cp-format .caret { opacity: 0.55; }
   .cp-input.cp-alpha {
     justify-content: flex-end;
@@ -986,6 +1173,36 @@
     color: var(--color-fg-muted);
     margin-left: 2px;
   }
+
+  /* Format dropdown — anchored under format pill */
+  .cp-format-menu {
+    position: absolute;
+    top: 44px;
+    left: 12px;
+    width: 96px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    padding: 4px;
+    z-index: 4;
+    display: none;
+  }
+  .cp-format-menu.is-open { display: block; }
+  .cp-format-menu .item {
+    display: flex;
+    align-items: center;
+    height: 24px;
+    padding: 0 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-fg);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .cp-format-menu .item:hover { background: var(--color-surface-2); }
+  .cp-format-menu .item.active { color: var(--color-accent); }
+  .cp-format-menu .item .tick { margin-left: auto; }
 
   .cp-swatches {
     padding: 8px 12px 12px;
