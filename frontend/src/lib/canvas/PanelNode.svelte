@@ -24,6 +24,7 @@
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
   import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
+  import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -148,6 +149,24 @@
    * 정수 → XtermHost mount 가능.
    */
   const terminalPaneId = $derived(terminalPool.paneIdFor(data.id));
+
+  /**
+   * Header LED 의 4-state — terminalPool.alive / paneId binding /
+   * danglingTerminals 결합.
+   *   running    — pool 에 alive + paneId bound. 정상 streaming.
+   *   connecting — pool 에 alive 인데 paneId 미 binding (0x88 대기) — spawn 직후.
+   *   dangling   — danglingTerminals 에 있음 (0x85 terminal-died 수신 / respawn 대기).
+   *   offline    — pool 에 없음 (loading 중 또는 backend 측 unknown).
+   */
+  type StatusKind = 'running' | 'connecting' | 'dangling' | 'offline';
+  const statusKind = $derived.by((): StatusKind => {
+    if (danglingTerminals.has(data.id)) return 'dangling';
+    const t = terminalPool.byId(data.id);
+    if (t === null) return 'offline';
+    if (!t.alive) return 'offline';
+    if (terminalPaneId === undefined) return 'connecting';
+    return 'running';
+  });
 
   // Multi-session terminal kill 은 mirror 보호를 위해 PanelCloseConfirmModal
   // 안에서 사용자 명시 선택. close 버튼 자체는 항상 enabled.
@@ -369,11 +388,15 @@
           role="presentation"
         >{headerLabel}</span>
       {/if}
-      <!-- Status LED — running 고정 (실 source = terminalPool.alive / muxStore 의
-           dead 결합 은 후속 wire). -->
-      <span class="panel-status" aria-label="Panel status">
+      <!-- Status LED — terminalPool.alive + paneId binding + danglingTerminals
+           결합으로 running / connecting / dangling / offline 4-state. -->
+      <span
+        class="panel-status"
+        data-status={statusKind}
+        aria-label={`Panel status: ${statusKind}`}
+      >
         <span class="led" aria-hidden="true"></span>
-        <span class="status-label">running</span>
+        <span class="status-label">{statusKind}</span>
       </span>
       <div class="panel-actions">
         {#if isInI}
@@ -590,7 +613,12 @@
   }
 
   /* Status — LED + uppercase label. margin-left: auto 로 좌측 title 과 우측 actions
-   * 사이의 공간 점유. running 색 고정 (#2dc26b, 시안 정합). */
+   * 사이의 공간 점유. 색은 data-status 분기:
+   *   running    → success (green)
+   *   connecting → warning (amber)
+   *   dangling   → danger (red)
+   *   offline    → fg-muted (grey, default)
+   */
   .panel-status {
     display: inline-flex;
     align-items: center;
@@ -608,8 +636,20 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #2dc26b;
+    background: var(--color-fg-muted);
     flex: 0 0 auto;
+  }
+
+  .panel-status[data-status='running'] .led {
+    background: var(--color-success);
+  }
+
+  .panel-status[data-status='connecting'] .led {
+    background: var(--color-warning);
+  }
+
+  .panel-status[data-status='dangling'] .led {
+    background: var(--color-danger);
   }
 
   .panel-actions {
