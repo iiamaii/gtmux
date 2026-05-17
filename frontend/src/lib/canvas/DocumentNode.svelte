@@ -22,7 +22,13 @@
 
   import { NodeResizer } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import InlineEditField from '$lib/common/InlineEditField.svelte';
+  import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, DocumentItem } from '$lib/types/canvas';
+
+  /** Inline content cap = ADR-0018 D4 amend ② / BE DOCUMENT_INLINE_MAX_BYTES. */
+  const DOCUMENT_INLINE_MAX_BYTES = 64 * 1024;
 
   interface DocumentNodeData {
     id: string;
@@ -105,6 +111,82 @@
   });
   const isEmpty = $derived(isInline && parsed.heading === '' && parsed.paragraphs.length === 0);
 
+  // ─ Inline edit (ADR-0018 D4 amend ② / plan-0011 FE Slice-A2) ─
+  //   - filename: double-click on .doc-head .filename → InlineEditField.
+  //   - content: double-click on .doc-body → InlineEditTextarea. cap 64 KB
+  //     (BE DOCUMENT_INLINE_MAX_BYTES 정합).
+  //   - commit 시 applyMutation 통과 → history capture (Cmd+Z 자연 정합).
+  //   - inline-stored 모드에서만 편집 진입 — asset-based 는 read-only.
+  let nameEditing = $state(false);
+  let contentEditing = $state(false);
+
+  function onNameDblClick(e: MouseEvent): void {
+    if (isLocked || !isInline) return;
+    e.stopPropagation();
+    nameEditing = true;
+  }
+
+  function onBodyDblClick(e: MouseEvent): void {
+    if (isLocked || !isInline) return;
+    e.stopPropagation();
+    contentEditing = true;
+  }
+
+  async function commitName(next: string): Promise<void> {
+    const trimmed = next.trim();
+    if (trimmed === data.file_name || trimmed.length === 0) {
+      nameEditing = false;
+      return;
+    }
+    if (sessionStore.active === null) return;
+    const result = await sessionStore.applyMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          it.id === data.id && it.type === 'document'
+            ? ({ ...it, file_name: trimmed } as DocumentItem)
+            : it,
+        ),
+      }),
+      {
+        abortMessage: 'Document filename edit aborted — session reconnect failed.',
+        failMessage: 'Document rename failed',
+      },
+    );
+    if (result.ok) nameEditing = false;
+  }
+
+  async function commitContent(next: string): Promise<void> {
+    if (next === (data.content ?? '')) {
+      contentEditing = false;
+      return;
+    }
+    if (sessionStore.active === null) return;
+    const byteLength = new TextEncoder().encode(next).length;
+    if (byteLength > DOCUMENT_INLINE_MAX_BYTES) {
+      toastStore.show({
+        message: `Document content too long (${byteLength} / ${DOCUMENT_INLINE_MAX_BYTES} bytes).`,
+        tone: 'error',
+      });
+      return;
+    }
+    const result = await sessionStore.applyMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          it.id === data.id && it.type === 'document'
+            ? ({ ...it, content: next, size_bytes: byteLength } as DocumentItem)
+            : it,
+        ),
+      }),
+      {
+        abortMessage: 'Document edit aborted — session reconnect failed.',
+        failMessage: 'Document commit failed',
+      },
+    );
+    if (result.ok) contentEditing = false;
+  }
+
   type ResizeParams = { x: number; y: number; width: number; height: number };
 
   async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
@@ -157,7 +239,24 @@
         <path d="M3 1.5h4.5L9.5 3.5V10.5H3V1.5z" />
         <path d="M7.5 1.5V3.5h2" />
       </svg>
-      <span class="filename" title={data.file_name}>{data.file_name}</span>
+      {#if nameEditing}
+        <InlineEditField
+          value={data.file_name}
+          editing={true}
+          plain={true}
+          placeholder="filename.md"
+          class="doc-name-edit"
+          onCommit={(next: string) => void commitName(next)}
+          onCancel={() => (nameEditing = false)}
+        />
+      {:else}
+        <span
+          class="filename"
+          title={isInline ? `${data.file_name} — double-click to rename` : data.file_name}
+          ondblclick={onNameDblClick}
+          role="presentation"
+        >{data.file_name}</span>
+      {/if}
       {#if (data.size_bytes ?? 0) > 0}
         <span class="sep">·</span>
         <span>{sizeLabel}</span>
@@ -166,9 +265,25 @@
     </header>
 
     <!-- 2. Doc-body: eyebrow + h2 + p (placeholder 시 empty hint) -->
-    <div class="doc-body">
-      {#if isEmpty}
-        <div class="empty-hint">Empty document — double-click to start writing</div>
+    <div
+      class="doc-body"
+      ondblclick={onBodyDblClick}
+      role="presentation"
+    >
+      {#if contentEditing}
+        <InlineEditTextarea
+          value={data.content ?? ''}
+          editing={true}
+          placeholder={'# Heading\n\nWrite your document — markdown ok.'}
+          rows={8}
+          class="doc-content-edit"
+          onCommit={(next: string) => void commitContent(next)}
+          onCancel={() => (contentEditing = false)}
+        />
+      {:else if isEmpty}
+        <div class="empty-hint">
+          {isInline ? 'Empty document — double-click to start writing' : 'Asset document (read-only placeholder).'}
+        </div>
       {:else}
         <div class="eyebrow">{isInline ? 'Inline document' : 'Asset · ' + (data.mime ?? '')}</div>
         {#if parsed.heading.length > 0}
@@ -305,6 +420,26 @@
     font-family: var(--font-mono);
     font-size: 11px;
     letter-spacing: 0.2px;
+  }
+
+  /* Inline edit chrome — doc-content-edit textarea + doc-name-edit input.
+   * Doc-body 의 padding 을 그대로 따라가도록 width 100% + font 정합. */
+  :global(.doc-content-edit) {
+    width: 100%;
+    min-height: 120px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: var(--color-fg);
+  }
+
+  :global(.doc-name-edit) {
+    flex: 1 1 auto;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 540;
+    color: var(--color-fg);
   }
 
   /* page-dot indicator — 5px circle */
