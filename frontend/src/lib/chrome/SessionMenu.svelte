@@ -15,6 +15,8 @@
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { settingsDialog } from '$lib/stores/settingsDialog.svelte';
   import { shutdownDialog } from '$lib/stores/shutdownDialog.svelte';
+  import { sessionIODialog } from '$lib/stores/sessionIOdialog.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
   import { logout } from '$lib/http/auth';
 
@@ -78,6 +80,37 @@
         <line x1="9" y1="14" x2="15" y2="14"/>
       </svg>
       <span>Switch workspace session…</span>
+    </button>
+    <button
+      type="button"
+      onclick={() => {
+        sessionIODialog.openImport();
+        close();
+      }}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+      <span>Import session…</span>
+    </button>
+    <button
+      type="button"
+      disabled={sessionStore.active === null}
+      title={sessionStore.active === null ? 'No active session to export' : ''}
+      onclick={() => {
+        if (sessionStore.active === null) return;
+        sessionIODialog.openExport();
+        close();
+      }}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/>
+        <line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      <span>Export session…</span>
     </button>
     <button
       type="button"

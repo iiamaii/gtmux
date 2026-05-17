@@ -337,6 +337,137 @@ export async function mutateLayout(
 /* POST /api/sessions/<name>/detach                                           */
 /* ────────────────────────────────────────────────────────────────────────── */
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Import / Export — ADR-0029                                                 */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * ADR-0029 D2 — `gtmux Session Export Envelope v1`. BE 가 export 시 반환,
+ * FE 가 import 시 parse / validate.
+ */
+export interface SessionExportEnvelope {
+  kind: 'gtmux.session.export';
+  export_version: 1;
+  exported_at: string;
+  session_name: string;
+  layout: CanvasLayout;
+  metadata?: { app?: string; app_version?: string | null };
+}
+
+export class EnvelopeParseError extends Error {
+  constructor(public readonly reason: string) {
+    super(`Invalid session export file — ${reason}`);
+  }
+}
+
+/** Type-guard 형 파싱 — JSON.parse 결과를 검증. 실패 시 EnvelopeParseError. */
+export function parseEnvelope(raw: unknown): SessionExportEnvelope {
+  if (typeof raw !== 'object' || raw === null) {
+    throw new EnvelopeParseError('not an object');
+  }
+  const r = raw as Record<string, unknown>;
+  if (r.kind !== 'gtmux.session.export') {
+    throw new EnvelopeParseError('missing or wrong `kind` (expected "gtmux.session.export")');
+  }
+  if (r.export_version !== 1) {
+    throw new EnvelopeParseError(`unsupported export_version (${String(r.export_version)})`);
+  }
+  if (typeof r.session_name !== 'string' || r.session_name.length === 0) {
+    throw new EnvelopeParseError('missing `session_name`');
+  }
+  if (typeof r.layout !== 'object' || r.layout === null) {
+    throw new EnvelopeParseError('missing `layout`');
+  }
+  const l = r.layout as Record<string, unknown>;
+  if (l.schema_version !== 2) {
+    throw new EnvelopeParseError(`unsupported layout.schema_version (${String(l.schema_version)})`);
+  }
+  if (!Array.isArray(l.items) || !Array.isArray(l.groups)) {
+    throw new EnvelopeParseError('layout.items/groups must be arrays');
+  }
+  if (typeof l.viewport !== 'object' || l.viewport === null) {
+    throw new EnvelopeParseError('layout.viewport missing');
+  }
+  return raw as SessionExportEnvelope;
+}
+
+export interface ImportSessionResponse {
+  name: string;
+  created_at: number;
+}
+
+export class ImportNameConflictError extends Error {
+  public override readonly name: string;
+  constructor(name: string) {
+    super(`Session "${name}" already exists`);
+    this.name = name;
+  }
+}
+
+export class ImportSchemaError extends Error {
+  public readonly field: string;
+  public readonly details: string;
+  constructor(field: string, details: string) {
+    super(`Schema invalid (${field}): ${details}`);
+    this.field = field;
+    this.details = details;
+  }
+}
+
+/** `POST /api/sessions/import { name, layout }` — ADR-0029 D3. */
+export async function importSession(
+  name: string,
+  layout: CanvasLayout,
+): Promise<ImportSessionResponse> {
+  const res = await fetch('/api/sessions/import', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, layout }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 409) throw new ImportNameConflictError(name);
+  if (res.status === 400) {
+    const body = (await res.json().catch(() => ({}))) as {
+      field?: string;
+      details?: string;
+    };
+    throw new ImportSchemaError(body.field ?? 'unknown', body.details ?? '');
+  }
+  if (!res.ok) throw new Error(`POST import returned ${res.status}`);
+  return json<ImportSessionResponse>(res);
+}
+
+/**
+ * `GET /api/sessions/{name}/export` — ADR-0029 D4 / BE work package 0052.
+ *
+ * BE ship 전: 503 또는 404 — caller 가 toast 로 안내.
+ * BE ship 후: envelope 본문 + Content-Disposition filename.
+ */
+export interface ExportSessionResult {
+  envelope: SessionExportEnvelope;
+  filename: string;
+  blob: Blob;
+}
+
+export async function exportSession(name: string): Promise<ExportSessionResult> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/export`, {
+    method: 'GET',
+    credentials: 'include',
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 404) throw new Error('Session not found');
+  if (!res.ok) throw new Error(`GET export returned ${res.status}`);
+  const text = await res.text();
+  const blob = new Blob([text], { type: 'application/json' });
+  const envelope = parseEnvelope(JSON.parse(text));
+  // Content-Disposition 의 filename — fallback 은 session_name.
+  const disposition = res.headers.get('content-disposition') ?? '';
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match?.[1] ?? `${name}.gtmux-session.json`;
+  return { envelope, filename, blob };
+}
+
 export async function detachSession(name: string): Promise<DetachResponse> {
   const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/detach`, {
     method: 'POST',

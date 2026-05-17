@@ -22,6 +22,8 @@
   import GroupCloseConfirmModal from '$lib/chrome/GroupCloseConfirmModal.svelte';
   import SettingsOverlay from '$lib/chrome/SettingsOverlay.svelte';
   import WorkspaceSwitcher from '$lib/chrome/WorkspaceSwitcher.svelte';
+  import ImportSessionModal from '$lib/chrome/ImportSessionModal.svelte';
+  import ExportSessionModal from '$lib/chrome/ExportSessionModal.svelte';
   import ReconnectModal from '$lib/chrome/ReconnectModal.svelte';
   import Toolbar2 from '$lib/toolbar/Toolbar2.svelte';
   import ReconnectBanner from '$lib/banner/ReconnectBanner.svelte';
@@ -374,6 +376,8 @@
 <ChangeTerminalModal />
 <GroupCloseConfirmModal />
 <SettingsOverlay />
+<ImportSessionModal />
+<ExportSessionModal />
 {#if reconnectGate.modalState !== null}
   <ReconnectModal
     mode={reconnectGate.modalState}
