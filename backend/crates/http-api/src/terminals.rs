@@ -7,12 +7,16 @@
 //!
 //!   1. `terminal_map`              — UUID ↔ PaneId bridge (alive pool).
 //!   2. `terminal_meta`             — per-UUID label + created_at (this file).
-//!   3. workspace session layouts   — every terminal item across every
+//!   3. `attach_index`              — every terminal item across every
 //!                                    session file (attach_count + names).
 //!
-//! Source (3) is read fresh on every GET. The cost is O(N_sessions) cheap
-//! file reads; the endpoint is called by humans clicking a sidebar, not by
-//! a hot path, so we keep it simple instead of caching a cross-reference.
+//! Source (3) used to be read by scanning every session file on every
+//! `GET /api/terminals` request. ADR-0021 D7 amend ③ (0068 / 0067 Phase 4
+//! / 0066 §BE-2) replaced that with an in-memory reverse index that is
+//! cold-rebuilt at boot and updated by the layout-mutating handlers
+//! (`PUT /layout`, `DELETE /items/:id`, `POST /import`, `DELETE` session).
+//! Per-request cost on the hot path is now O(N_terminals_in_pool), all
+//! in-memory.
 //!
 //! Metadata is *in-memory only* — it is recreated whenever the server boots,
 //! since both the `terminal_map` and the alive PTY pool are themselves
@@ -30,8 +34,6 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::RwLock;
-
-use crate::schema::{Item, Layout};
 
 /// Hard cap on label byte length — matches `ItemCommon.label` (4 KiB,
 /// ADR-0018 D8). Enforced by [`patch_handler`] before the label hits
@@ -146,7 +148,7 @@ pub struct TerminalInfo {
 /// and cross-session attach references. Empty list if no terminals exist.
 /// Returns 503 when no workspace is configured (matches `/api/sessions`).
 pub async fn list_handler(State(state): State<crate::AppState>) -> Response {
-    let Some(wm) = state.workspace.as_ref() else {
+    if state.workspace.is_none() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": "workspace_not_configured" })),
@@ -157,16 +159,10 @@ pub async fn list_handler(State(state): State<crate::AppState>) -> Response {
     let pool = state.terminal_map.snapshot().await;
     let meta = state.terminal_meta.snapshot().await;
 
-    let session_refs = match scan_session_terminal_refs(wm) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "terminals: workspace scan failed; returning pool with empty attach counts"
-            );
-            HashMap::new()
-        }
-    };
+    // ADR-0021 D7 amend ③ (0068) — in-memory reverse index replaces the
+    // per-request workspace scan. Cold-built at boot from disk; kept
+    // fresh by the layout-mutating handlers in `sessions.rs`.
+    let session_refs = state.attach_index.read_all_attach_refs();
 
     let mut rows: Vec<TerminalInfo> = pool
         .into_iter()
@@ -196,42 +192,6 @@ pub async fn list_handler(State(state): State<crate::AppState>) -> Response {
     });
 
     Json(rows).into_response()
-}
-
-/// Walk every session file in the workspace and collect the set of
-/// terminal-item UUIDs referenced, mapped to the session names that
-/// reference them. Sessions whose file is missing / corrupt are silently
-/// skipped — they will show up in the existing `/api/sessions` listing
-/// with their own error surface.
-fn scan_session_terminal_refs(
-    wm: &Arc<crate::WorkspaceManager>,
-) -> Result<HashMap<String, Vec<String>>, crate::WorkspaceError> {
-    let mut by_uuid: HashMap<String, Vec<String>> = HashMap::new();
-    for info in wm.enumerate_sessions()? {
-        let path = match wm.session_path(&info.name) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let layout: Layout = match serde_json::from_slice(&bytes) {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        for item in &layout.items {
-            if let Item::Terminal { common } = item {
-                by_uuid
-                    .entry(common.id.clone())
-                    .or_default()
-                    .push(info.name.clone());
-            }
-        }
-    }
-    // Names within each entry follow workspace enumeration order; do nothing
-    // extra here.
-    Ok(by_uuid)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

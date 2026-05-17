@@ -43,6 +43,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod attach_index;
 mod auth;
 mod file_open;
 mod file_stat;
@@ -197,6 +198,16 @@ pub struct AppState {
             std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>,
         >,
     >,
+    /// Cross-session reverse index `terminal_uuid → BTreeSet<session_name>`
+    /// (ADR-0021 D7 amend ③ / 0066 §BE-2 / 0067 Phase 4 / 0068 work package).
+    /// Powers `GET /api/terminals`'s `attach_count` + `attached_sessions`
+    /// columns without per-request disk scans. Built at boot via
+    /// `with_workspace` → `attach_index.rebuild_from_disk(...)`, then
+    /// kept fresh by the layout-mutating handlers (`PUT
+    /// /api/sessions/:name/layout`, `DELETE
+    /// /api/sessions/:name/items/:id`, `POST /api/sessions/import`,
+    /// `DELETE /api/sessions/:name`).
+    pub attach_index: Arc<attach_index::AttachIndex>,
 }
 
 impl AppState {
@@ -229,6 +240,7 @@ impl AppState {
             respawn_locks: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            attach_index: Arc::new(attach_index::AttachIndex::new()),
         }
     }
 
@@ -403,8 +415,20 @@ impl AppState {
     /// Attach a [`WorkspaceManager`] so the multi-session routes
     /// (`/api/sessions...`) start serving requests. `self` is returned by
     /// value to allow chaining with [`AppState::with_hub`] / [`AppState::with_hub_and_path`].
+    ///
+    /// Side-effect: cold-rebuilds `attach_index` from the workspace's
+    /// session files (ADR-0021 D7 amend ③). A failure here is logged but
+    /// non-fatal — the index simply starts empty and gets refilled as the
+    /// mutation hooks run.
     pub fn with_workspace(mut self, workspace: WorkspaceManager) -> Self {
-        self.workspace = Some(Arc::new(workspace));
+        let wm = Arc::new(workspace);
+        if let Err(e) = self.attach_index.rebuild_from_disk(&wm) {
+            tracing::warn!(
+                error = %e,
+                "attach_index: boot rebuild failed; starting empty (will refill on next mutation)"
+            );
+        }
+        self.workspace = Some(wm);
         self
     }
 
@@ -1486,6 +1510,21 @@ mod tests {
         (app, token, workspace_dir)
     }
 
+    /// Variant of [`make_app_with_workspace`] that *also* returns the
+    /// `AppState` so attach_index assertions (0067 Phase 4 / 0068) can
+    /// peek at the in-memory reverse index after issuing HTTP requests.
+    fn make_app_with_workspace_and_state(
+        dir: &tempfile::TempDir,
+    ) -> (Router, TokenString, std::path::PathBuf, AppState) {
+        let token = issue_token().expect("token");
+        let cfg = test_config();
+        let workspace_dir = dir.path().to_path_buf();
+        let wm = WorkspaceManager::from_path(workspace_dir.clone()).expect("workspace");
+        let state = AppState::new(cfg, token.clone()).with_workspace(wm);
+        let app = router_with_state(state.clone());
+        (app, token, workspace_dir, state)
+    }
+
     #[tokio::test]
     async fn sessions_list_empty_on_fresh_workspace() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2252,6 +2291,265 @@ mod tests {
         );
     }
 
+    // ── ADR-0021 D7 amend ③ (0066 §BE-2 / 0067 Phase 4 / 0068 work package) ──
+    //
+    // attach_index integration tests — confirms each of the four mutation
+    // hooks keeps the in-memory reverse index in lock-step with the
+    // disk-of-truth that powers `GET /api/terminals`'s `attach_count`.
+
+    /// Helper: PUT a layout with `If-Match` = current ETag and a single
+    /// terminal item carrying `uuid`. Returns the new ETag.
+    async fn put_layout_with_terminal(
+        app: &Router,
+        token: &TokenString,
+        session: &str,
+        uuid: &str,
+    ) -> String {
+        // Fetch current ETag.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/sessions/{session}/layout"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        // PUT a layout containing the terminal item.
+        let layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "terminal",
+                "id": uuid,
+                "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0, "z": 0,
+                "visibility": "visible",
+                "locked": false,
+                "label": "", "description": "",
+                "minimized": false,
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        });
+        let put_body = serde_json::to_vec(&layout).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/sessions/{session}/layout"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header(header::IF_MATCH, etag)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(put_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        resp.headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn attach_idx_create_session(app: &Router, token: &TokenString, name: &str) {
+        let create_body = serde_json::to_vec(&json!({ "name": name })).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    const UUID_A: &str = "11111111-2222-4333-8444-aaaaaaaaaaaa";
+    const UUID_B: &str = "11111111-2222-4333-8444-bbbbbbbbbbbb";
+
+    #[tokio::test]
+    async fn attach_index_layout_put_adds_uuid_to_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
+        attach_idx_create_session(&app, &token, "alpha").await;
+        put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
+        let refs = state.attach_index.read_all_attach_refs();
+        assert_eq!(refs.get(UUID_A).unwrap(), &vec!["alpha".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn attach_index_layout_put_remove_terminal_drops_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
+        attach_idx_create_session(&app, &token, "alpha").await;
+        let etag = put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
+        // Now PUT an empty-items layout — should drop UUID_A's entry.
+        let empty_layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri("/api/sessions/alpha/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::IF_MATCH, etag)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&empty_layout).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let refs = state.attach_index.read_all_attach_refs();
+        assert!(
+            !refs.contains_key(UUID_A),
+            "PUT removing terminal must drop its attach_index entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_index_delete_item_removes_terminal_uuid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
+        attach_idx_create_session(&app, &token, "alpha").await;
+        put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
+        // DELETE the item.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/sessions/alpha/items/{UUID_A}"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let refs = state.attach_index.read_all_attach_refs();
+        assert!(
+            !refs.contains_key(UUID_A),
+            "DELETE item must drop its attach_index entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_index_import_seeds_uuid_immediately() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
+        // Build an import body referencing UUID_B.
+        let imported_layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "terminal",
+                "id": UUID_B,
+                "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0, "z": 0,
+                "visibility": "visible",
+                "locked": false,
+                "label": "", "description": "",
+                "minimized": false,
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        });
+        let import_body = serde_json::to_vec(&json!({
+            "name": "from_import",
+            "layout": imported_layout,
+        }))
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(import_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let refs = state.attach_index.read_all_attach_refs();
+        assert_eq!(
+            refs.get(UUID_B).unwrap(),
+            &vec!["from_import".to_string()],
+            "imported session must be visible in attach_index immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_index_session_delete_clears_session_from_entries() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
+        attach_idx_create_session(&app, &token, "alpha").await;
+        attach_idx_create_session(&app, &token, "beta").await;
+        put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
+        put_layout_with_terminal(&app, &token, "beta", UUID_A).await; // mirror
+        // Sanity: both sessions reference UUID_A.
+        let refs_before = state.attach_index.read_all_attach_refs();
+        let mut sessions_before = refs_before.get(UUID_A).unwrap().clone();
+        sessions_before.sort();
+        assert_eq!(
+            sessions_before,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        // DELETE alpha.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/alpha")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        // UUID_A must remain (beta still references it) but only beta.
+        let refs_after = state.attach_index.read_all_attach_refs();
+        assert_eq!(
+            refs_after.get(UUID_A).unwrap(),
+            &vec!["beta".to_string()],
+            "DELETE alpha must remove alpha-membership from UUID_A's set"
+        );
+    }
+
     #[tokio::test]
     async fn sessions_delete_removes_file_and_cache() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2457,6 +2755,13 @@ mod tests {
             serde_json::to_vec(&session_b).unwrap(),
         )
         .unwrap();
+
+        // ADR-0021 D7 amend ③ (0068): `GET /api/terminals` reads from
+        // the in-memory attach_index, not disk. The test seeds the files
+        // *after* AppState boot, so we must replay the boot rebuild
+        // explicitly here to mirror what production does on startup.
+        let wm = state.workspace.as_ref().unwrap().clone();
+        state.attach_index.rebuild_from_disk(&wm).unwrap();
 
         let app = router_with_state(state);
         let resp = app

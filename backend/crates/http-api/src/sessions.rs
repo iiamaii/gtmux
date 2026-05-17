@@ -973,11 +973,21 @@ pub async fn import_handler(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Extract terminal UUIDs *before* the layout is moved into the
+    // SessionLayout cache entry — feeds the attach_index update below.
+    let imported_uuids = crate::attach_index::terminal_uuids_in(&body.layout);
     let cached = SessionLayout::new(body.layout);
     {
         let mut write = state.session_cache.entries.write().await;
         write.insert(body.name.clone(), Arc::new(RwLock::new(cached)));
     }
+    // ADR-0021 D7 amend ③ (0068) — seed the attach_index for this
+    // freshly-imported session. `apply_full_session` because the prior
+    // contribution for this name is by construction empty (the path
+    // existed-check above guarantees a fresh record).
+    state
+        .attach_index
+        .apply_full_session(&body.name, &imported_uuids);
     (
         StatusCode::CREATED,
         Json(json!({ "name": body.name, "created_at": created_at })),
@@ -1184,6 +1194,10 @@ pub async fn delete_handler(
     match std::fs::remove_file(&path) {
         Ok(()) => {
             state.session_cache.evict(&name).await;
+            // ADR-0021 D7 amend ③ (0068) — drop the deleted session's
+            // contribution from the attach_index so its UUIDs no longer
+            // surface as "attached" on `GET /api/terminals`.
+            state.attach_index.forget_session(&name);
             (StatusCode::NO_CONTENT, ()).into_response()
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1264,6 +1278,15 @@ pub async fn delete_item_handler(
         new_etag_quoted = format!("\"{}\"", new_snap.etag_hex);
         *snap = new_snap;
         removed_terminal_id = removed_uuid;
+    }
+
+    // ADR-0021 D7 amend ③ (0068) — attach_index update after disk + snap
+    // swap. Only when the removed item was a Terminal variant (text /
+    // note / image carry no UUID worth tracking here).
+    if let Some(uuid) = removed_terminal_id.as_ref() {
+        state
+            .attach_index
+            .apply_diff(&name, std::slice::from_ref(uuid), &[]);
     }
 
     if q.kill_terminal {
@@ -1518,14 +1541,42 @@ pub async fn layout_put_handler(
             return resp;
         }
     }
+    // ADR-0021 D7 amend ③ (0068 work package) — attach_index update.
+    // Done after the on-disk swap so the index never gets ahead of the
+    // disk-of-truth. Compute the diff while the per-session write lock
+    // is still held so two concurrent PUTs on the same session can't
+    // interleave diffs.
+    let old_uuids = crate::attach_index::terminal_uuids_in(&snap.layout);
+    let new_uuids = crate::attach_index::terminal_uuids_in(&new_snap.layout);
+    let (removed, added) = diff_terminal_uuids(&old_uuids, &new_uuids);
     let new_etag_quoted = format!("\"{}\"", new_snap.etag_hex);
     *snap = new_snap;
     drop(snap);
+    state.attach_index.apply_diff(&name, &removed, &added);
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header(header::ETAG, &new_etag_quoted)
         .body(Body::empty())
         .expect("static headers")
+}
+
+/// Compute `(removed, added)` between two terminal UUID lists drawn from
+/// the prior and new layout of one session. Used by the attach_index
+/// hook in [`layout_put_handler`] to derive the per-session diff.
+fn diff_terminal_uuids(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
+    let old_set: std::collections::HashSet<&String> = old.iter().collect();
+    let new_set: std::collections::HashSet<&String> = new.iter().collect();
+    let removed: Vec<String> = old
+        .iter()
+        .filter(|u| !new_set.contains(u))
+        .cloned()
+        .collect();
+    let added: Vec<String> = new
+        .iter()
+        .filter(|u| !old_set.contains(u))
+        .cloned()
+        .collect();
+    (removed, added)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
