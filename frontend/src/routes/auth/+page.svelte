@@ -304,8 +304,9 @@
 
   .brand-header {
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     align-items: center;
+    justify-content: center;
     gap: var(--space-10);
     margin-bottom: var(--space-6);
   }
