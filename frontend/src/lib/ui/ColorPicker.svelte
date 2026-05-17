@@ -200,6 +200,34 @@
   let editing = $state(false);
   let editingAlpha = $state(false);
   let containerEl: HTMLDivElement | undefined = $state();
+  let popoverEl: HTMLDivElement | undefined = $state();
+  /** Popover 위치 — viewport (fixed) 기준 clamp. open 시 measure + scroll/resize 갱신. */
+  let popoverPos = $state<{ top: number; left: number }>({ top: 0, left: 0 });
+
+  /**
+   * Trigger rect + popover rect + viewport 로 위치 계산.
+   * 기본 = trigger 아래 + 좌측 정렬. 우측 overflow 시 우측 정렬. 아래 overflow 시
+   * trigger 위로 flip. 양쪽 모두 안 들어가면 viewport 안 clamp.
+   */
+  function updatePopoverPos(): void {
+    if (containerEl === undefined || popoverEl === undefined) return;
+    const tRect = containerEl.getBoundingClientRect();
+    const pRect = popoverEl.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const margin = 8;
+    const gap = 6;
+    let left = tRect.left;
+    if (left + pRect.width > vw - margin) left = vw - pRect.width - margin;
+    if (left < margin) left = margin;
+    let top = tRect.bottom + gap;
+    if (top + pRect.height > vh - margin) {
+      // 아래 overflow — trigger 위로 flip 시도
+      const flipped = tRect.top - pRect.height - gap;
+      top = flipped >= margin ? flipped : Math.max(margin, vh - pRect.height - margin);
+    }
+    popoverPos = { top, left };
+  }
 
   $effect(() => {
     if (!editing) textInput = displayValue;
@@ -208,22 +236,31 @@
     if (!editingAlpha) alphaInput = String(alphaPercent);
   });
 
-  // ── Click-outside close ─────────────────────────────────────────
+  // ── Click-outside close + popover position tracking ─────────────
   $effect(() => {
     if (!open) return;
     function onDocPointerDown(e: PointerEvent): void {
-      if (containerEl === undefined) return;
-      if (!containerEl.contains(e.target as Node)) {
-        open = false;
-      }
+      // trigger 와 popover 둘 다 inside 로 인정 (popover 는 fixed 라
+      // containerEl.contains 가 false — popoverEl 별도 검사).
+      const target = e.target as Node;
+      if (containerEl?.contains(target)) return;
+      if (popoverEl?.contains(target)) return;
+      open = false;
     }
-    // 현재 click 의 propagation 끝나기 직전 attach (open=true 만든 click 자체가
-    // outside-click 으로 잡히지 않도록 다음 tick).
+    const onReflow = () => updatePopoverPos();
     queueMicrotask(() => {
       document.addEventListener('pointerdown', onDocPointerDown, true);
+      // mount 직후 첫 measure — popoverEl 의 rect 가 reliable 한 시점.
+      updatePopoverPos();
     });
+    window.addEventListener('resize', onReflow);
+    // capture phase scroll — popover 안 element scroll 은 무시 (popover 자체
+    // 가 scroll 안 함 + 외부 scroll 만 reposition trigger).
+    window.addEventListener('scroll', onReflow, true);
     return () => {
       document.removeEventListener('pointerdown', onDocPointerDown, true);
+      window.removeEventListener('resize', onReflow);
+      window.removeEventListener('scroll', onReflow, true);
     };
   });
 
@@ -332,7 +369,8 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       class="shape-colorpicker"
-      style="--cp-hue: {hueColor}"
+      bind:this={popoverEl}
+      style="--cp-hue: {hueColor}; top: {popoverPos.top}px; left: {popoverPos.left}px;"
       role="dialog"
       aria-label="Color picker"
     >
@@ -546,9 +584,9 @@
 
   /* ── Popover (v4 §.shape-colorpicker spec) ───────────────────── */
   .shape-colorpicker {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
+    /* fixed — parent overflow 와 무관하게 viewport 기준 위치. open 시 JS 로
+       trigger rect + viewport clamp 으로 top/left inline style 부여. */
+    position: fixed;
     z-index: var(--z-popover, 100);
     width: 240px;
     background: var(--color-surface);
