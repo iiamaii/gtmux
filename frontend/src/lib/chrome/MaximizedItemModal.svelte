@@ -56,6 +56,14 @@
   $effect(() => {
     if (portalSlotEl === undefined) return;
     if (!isTerminal || itemId === null) return;
+    // closure capture — Svelte 5 의 `bind:this` 는 element teardown 시점에
+    // outer-scope `portalSlotEl` 을 undefined 로 reset. cleanup 함수가
+    // 호출되는 시점 (modal markup unmount 직전) 에 outer-scope 의 값이
+    // 이미 reset 되었으면 `node.parentNode === portalSlotEl` 체크가 false
+    // 가 되어 inflow 로 복귀 안 됨 → 사용자 시각: terminal 화면 빈 채로
+    // 남고 새로고침 해야 복구. 본 closure 변수 `slot` 은 effect run 시점의
+    // reference 를 capture 하므로 reset 와 무관하게 비교 일관.
+    const slot = portalSlotEl;
     const sel = `[data-portal-id="${itemId}"]`;
     const inflowHost = document.querySelector(sel) as HTMLElement | null;
     if (inflowHost === null) return;
@@ -64,14 +72,14 @@
     const moved: ChildNode[] = [];
     while (inflowHost.firstChild) {
       const child = inflowHost.firstChild;
-      portalSlotEl.appendChild(child);
+      slot.appendChild(child);
       moved.push(child);
     }
     return () => {
       const home = document.querySelector(sel) as HTMLElement | null;
       if (home === null) return;
       for (const node of moved) {
-        if (node.parentNode === portalSlotEl) {
+        if (node.parentNode === slot) {
           home.appendChild(node);
         }
       }
