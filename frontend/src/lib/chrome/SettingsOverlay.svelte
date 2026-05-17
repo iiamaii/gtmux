@@ -38,10 +38,8 @@
 
   /**
    * ADR-0017 amend ④ D2 의 Auto-save 정책 정합 — change 즉시 persist + modal
-   * 유지. chrome theme (token swap) 은 setMode 한 번에 즉시 반영. xterm 의
-   * cell DOM stale 색 (v6 의 known issue) 의 hot reload 는 ADR-0017 D5 의
-   * "다음 amend" 영역 — 본 컴포넌트 scope 외. 사용자가 stale 색 본 경우엔
-   * page reload manual 권장 (section-hint 안내).
+   * 유지. chrome theme (token swap) 은 setMode 한 번에 즉시 반영. xterm 은
+   * XtermHost 의 live theme effect 가 repaint 하며 terminal buffer 를 보존한다.
    */
   function setMode(mode: ThemeMode): void {
     themeStore.setMode(mode);
@@ -179,8 +177,7 @@
             <h3 class="section-head">Theme</h3>
             <p class="section-hint">
               Choose the appearance — <em>System</em> follows your OS preference.
-              Changes apply immediately. If terminal cell colors look stale
-              after switching, reload the page.
+              Changes apply immediately.
             </p>
             <div class="radio-group" role="radiogroup" aria-label="Theme mode">
               {#each ['system', 'light', 'dark'] as mode (mode)}

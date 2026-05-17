@@ -25,7 +25,7 @@
   // 인스턴스를 등록. 본 컴포넌트는 `getContext` 로 꺼내 사용 — PanelNode 가 prop 으로
   // threading 하지 않아 sub-tree 깊이와 무관하게 동작.
 
-  import { getContext } from 'svelte';
+  import { getContext, untrack } from 'svelte';
   import { Terminal } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import { Unicode11Addon } from '@xterm/addon-unicode11';
@@ -88,7 +88,7 @@
 
     const term = new Terminal({
       ...SECURE_XTERM_OPTIONS,
-      theme: xtermTheme(themeStore.resolved),
+      theme: { ...xtermTheme(untrack(() => themeStore.resolved)) },
     });
     termRef = term;
     const fitAddon = new FitAddon();
@@ -222,17 +222,13 @@
    * SECURE_XTERM_OPTIONS 의 theme 은 mount 시 1회 — 이후 themeStore.resolved
    * (system mode 의 OS preference 변경 포함) 가 바뀌면 본 effect 가 live
    * Terminal 의 `options.theme` 를 교체. xterm v6 의 `options` setter 는
-   * shallow merge + 즉시 repaint. */
+   * object reference 비교를 하므로 새 object 를 전달해야 한다. */
   $effect(() => {
     const term = termRef;
     const resolved = themeStore.resolved;
     if (term === null) return;
-    term.options.theme = xtermTheme(resolved);
-    // 옛 in-place refresh 시도 (A/B/C) 모두 v6 의 cached cell DOM stale 색
-    // 회수 불가능. PanelNode 가 `#key themeStore.resolved` 로 XtermHost
-    // 자체를 force remount — 본 effect 는 *같은 mount 안 system theme
-    // OS preference 변경* 의 단발 swap 만 cover. cell repaint 까지는
-    // PanelNode 의 remount 에 의존.
+    term.options.theme = { ...xtermTheme(resolved) };
+    term.refresh(0, Math.max(0, term.rows - 1));
   });
 </script>
 
