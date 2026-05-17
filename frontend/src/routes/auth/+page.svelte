@@ -358,9 +358,12 @@
     font-size: 40px;
     font-weight: var(--weight-semibold);
     letter-spacing: -0.8px;
-    line-height: 1.1;
+    line-height: 1;
     margin: 0;
     text-align: center;
+    /* cap-height 의 시각 중심을 brand-mark 의 vertical center 와 맞추기 위한
+       미세 nudge — font ascent 가 cap-top 위에 여백을 만들기 때문. */
+    transform: translateY(2px);
   }
 
   .deck {
