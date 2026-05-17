@@ -5,7 +5,7 @@
    * Layout (3-col grid):
    *   - left   : SessionMenu (kebab) + brand-mark + "gtmux"
    *   - center : host info — "<bind>:<port> · <mode>"
-   *   - right  : ThemeToggle + FocusToggle
+   *   - right  : ThemeToggle
    *
    * Stage C scope: chrome shell + actions only. ViewportCtrl / HelpBar /
    * Sidebar floating refactor land in Stage E / F.
@@ -13,7 +13,6 @@
 
   import SessionMenu from './SessionMenu.svelte';
   import ThemeToggle from '$lib/ui/ThemeToggle.svelte';
-  import FocusToggle from './FocusToggle.svelte';
   import brandLogoUrl from '$lib/assets/brand.png';
 
   const TOKEN_STORAGE_KEY = 'gtmux_token';
@@ -65,7 +64,6 @@
 
   <div class="titlebar-right">
     <ThemeToggle />
-    <FocusToggle />
   </div>
 </header>
 
