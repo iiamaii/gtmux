@@ -2157,6 +2157,101 @@ mod tests {
         assert!(resp.headers().contains_key(header::ETAG));
     }
 
+    /// ADR-0006 D13 amend ③ (0066 §BE-4 / 0067 Phase 3) — verify that the
+    /// PUT path's `spawn_blocking` disk write produces bytes that, when
+    /// hashed, recompose into the same ETag the response header returned.
+    /// If `spawn_blocking` truncates, writes the wrong buffer, or races
+    /// the in-memory snapshot swap, this round-trip detects it.
+    #[tokio::test]
+    async fn sessions_layout_put_disk_bytes_match_response_etag() {
+        use ring::digest::{digest, SHA256};
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, workspace_dir) = make_app_with_workspace(&dir);
+        let create_body = serde_json::to_vec(&json!({ "name": "be4" })).unwrap();
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // GET to fetch current ETag.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions/be4/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // PUT a non-trivial layout so the byte payload differs from the
+        // initial empty state — exercises the spawn_blocking write path
+        // with real content rather than the no-change shortcut.
+        let put_layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [],
+            "viewport": { "x": 12.5, "y": -7.25, "zoom": 1.5 },
+        });
+        let put_body = serde_json::to_vec(&put_layout).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri("/api/sessions/be4/layout")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::IF_MATCH, etag)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(put_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let new_etag_quoted = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Read the file the spawn_blocking write produced.
+        let disk_bytes = std::fs::read(workspace_dir.join("be4.json")).unwrap();
+        // Hash → first 16 bytes → 32-hex → quote.
+        let d = digest(&SHA256, &disk_bytes);
+        let mut hex = String::with_capacity(32);
+        for b in &d.as_ref()[..16] {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        let from_disk = format!("\"{hex}\"");
+        assert_eq!(
+            new_etag_quoted, from_disk,
+            "response ETag must equal SHA256-128 of disk bytes after spawn_blocking write"
+        );
+    }
+
     #[tokio::test]
     async fn sessions_delete_removes_file_and_cache() {
         let dir = tempfile::TempDir::new().unwrap();

@@ -72,7 +72,14 @@ pub struct SessionLayout {
 impl SessionLayout {
     pub fn new(layout: Layout) -> Self {
         let bytes = canonical_bytes(&layout);
-        let (etag, etag_hex) = sha256_128(&bytes);
+        Self::new_with_bytes(layout, &bytes)
+    }
+
+    /// Build a SessionLayout when the caller has already canonicalised the
+    /// layout into `bytes`. Avoids the double-serialize in
+    /// `layout_put_handler` (0066 §BE-4 / 0067 Phase 3 / ADR-0006 D13 amend ③).
+    pub fn new_with_bytes(layout: Layout, bytes: &[u8]) -> Self {
+        let (etag, etag_hex) = sha256_128(bytes);
         Self {
             etag,
             etag_hex,
@@ -1331,20 +1338,30 @@ pub async fn layout_get_handler(
         Ok(a) => a,
         Err(e) => return e.into_response(),
     };
-    let snap = arc.read().await;
-    let etag_quoted = format!("\"{}\"", snap.etag_hex);
-    if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
-        if let Ok(v) = if_none_match.to_str() {
-            if parse_etag_header(v).is_some_and(|h| h == snap.etag_hex) {
-                return Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, &etag_quoted)
-                    .body(Body::empty())
-                    .expect("static headers");
+    // ADR-0006 D13 amend ③ (0067 Phase 3 / 0066 §BE-4): clone the layout
+    // out from under the read lock and serialise *outside* the lock so
+    // a concurrent PUT or another GET on the same session is not
+    // blocked by this caller's serialise cost (which can reach ms-range
+    // for large layouts). The 304 short-circuit stays inside the lock
+    // — it only reads the cheap `etag_hex`.
+    let (etag_quoted, layout_clone) = {
+        let snap = arc.read().await;
+        let etag_quoted = format!("\"{}\"", snap.etag_hex);
+        if let Some(if_none_match) = req.headers().get(header::IF_NONE_MATCH) {
+            if let Ok(v) = if_none_match.to_str() {
+                if parse_etag_header(v).is_some_and(|h| h == snap.etag_hex) {
+                    return Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header(header::ETAG, &etag_quoted)
+                        .body(Body::empty())
+                        .expect("static headers");
+                }
             }
         }
-    }
-    let body = canonical_bytes(&snap.layout);
+        (etag_quoted, snap.layout.clone())
+        // snap (read guard) drops here.
+    };
+    let body = canonical_bytes(&layout_clone);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
@@ -1391,6 +1408,26 @@ pub async fn layout_put_handler(
     }
 
     // 4. CAS under the per-session write lock. Disk-first.
+    //
+    // ADR-0006 D13 amend ③ (0067 Phase 3 / 0066 §BE-4):
+    //   * Serialise the new bytes *before* taking the write lock so the
+    //     serialise cost (1–3 ms for typical layouts, more for large
+    //     free-draw/image metadata) doesn't extend the lock window.
+    //   * Build `new_snap` with `new_with_bytes(&bytes)` to avoid the
+    //     double-serialize the old code did (once inside `SessionLayout::new`,
+    //     once at the `canonical_bytes` call site).
+    //   * Move the sync `atomic_write_session` disk write into
+    //     `tokio::task::spawn_blocking` so the tokio worker thread is freed
+    //     during the fsync/rename round-trip. The write lock is held across
+    //     the spawn_blocking await — disk-first invariant (D13.c → D13.d)
+    //     and CAS atomicity are unchanged.
+    let bytes = canonical_bytes(&layout);
+    let new_snap = SessionLayout::new_with_bytes(layout, &bytes);
+    let path = match wm.session_path(&name) {
+        Ok(p) => p,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+
     let arc = match state.session_cache.get_or_load(wm, &name).await {
         Ok(a) => a,
         Err(e) => return e.into_response(),
@@ -1404,19 +1441,39 @@ pub async fn layout_put_handler(
         }
         return resp;
     }
-    let new_snap = SessionLayout::new(layout);
-    let path = match wm.session_path(&name) {
-        Ok(p) => p,
-        Err(e) => return SessionError::Workspace(e).into_response(),
-    };
-    let bytes = canonical_bytes(&new_snap.layout);
-    if let Err(e) = atomic_write_session(&path, &bytes) {
-        let current_etag = format!("\"{}\"", snap.etag_hex);
-        let mut resp = SessionError::Workspace(e).into_response();
-        if let Ok(val) = HeaderValue::from_str(&current_etag) {
-            resp.headers_mut().insert(header::ETAG, val);
+    // Disk write off the async worker. Lock stays held — disk-first
+    // invariant.
+    let write_path = path.clone();
+    let write_bytes = bytes;
+    let write_result =
+        tokio::task::spawn_blocking(move || atomic_write_session(&write_path, &write_bytes)).await;
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            let current_etag = format!("\"{}\"", snap.etag_hex);
+            let mut resp = SessionError::Workspace(e).into_response();
+            if let Ok(val) = HeaderValue::from_str(&current_etag) {
+                resp.headers_mut().insert(header::ETAG, val);
+            }
+            return resp;
         }
-        return resp;
+        Err(join_err) => {
+            // spawn_blocking task panicked — treat as I/O error so the
+            // client retries instead of seeing a confusing 200.
+            tracing::error!(
+                error = %join_err,
+                "layout_put: atomic_write_session spawn_blocking panicked"
+            );
+            let current_etag = format!("\"{}\"", snap.etag_hex);
+            let mut resp = SessionError::Workspace(WorkspaceError::Io(
+                std::io::Error::other("atomic_write_session task panicked"),
+            ))
+            .into_response();
+            if let Ok(val) = HeaderValue::from_str(&current_etag) {
+                resp.headers_mut().insert(header::ETAG, val);
+            }
+            return resp;
+        }
     }
     let new_etag_quoted = format!("\"{}\"", new_snap.etag_hex);
     *snap = new_snap;
@@ -1539,5 +1596,32 @@ mod tests {
         assert!(matches!(err, SessionError::Corrupt(_)));
         // Original moved aside.
         assert!(!dir.path().join("rotten.json").exists());
+    }
+
+    // ── ADR-0006 D13 amend ③ (0066 §BE-4 / 0067 Phase 3) ──────────────────
+
+    #[tokio::test]
+    async fn new_with_bytes_produces_same_etag_as_new() {
+        // The `SessionLayout::new_with_bytes` helper exists so the PUT
+        // handler can serialise the layout *once* and reuse the bytes
+        // for both the disk write and the ETag computation. The contract
+        // is that, given canonical bytes, it produces the same etag as
+        // `new()` (which serialises internally). Drift here would silently
+        // diverge the response ETag from the disk content.
+        let layout = crate::schema::Layout {
+            schema_version: crate::schema::SCHEMA_VERSION,
+            groups: vec![],
+            items: vec![],
+            viewport: crate::schema::Viewport {
+                x: 0.0,
+                y: 0.0,
+                zoom: 1.0,
+            },
+        };
+        let bytes = canonical_bytes(&layout);
+        let via_new = SessionLayout::new(layout.clone());
+        let via_with_bytes = SessionLayout::new_with_bytes(layout, &bytes);
+        assert_eq!(via_new.etag, via_with_bytes.etag);
+        assert_eq!(via_new.etag_hex, via_with_bytes.etag_hex);
     }
 }
