@@ -496,6 +496,11 @@ function handleTerminalSpawned(payload: Uint8Array): void {
     return;
   }
   terminalPool.bindPaneId(decoded.terminalId, decoded.paneId);
+  // multi-webpage / multi-panel 의 무한 respawn loop 차단 — 한 webpage 가
+  // respawn 트리거 → 0x88 broadcast → 모든 webpage 의 dangling overlay 자동
+  // 해제. clear 호출 누락 시 다른 webpage 의 overlay 가 stale 한 채 남아
+  // 사용자가 click → 또 spawn → infinite loop 발생.
+  danglingTerminals.clear(decoded.terminalId);
 }
 
 function handleFocusModeChanged(payload: Uint8Array): void {

@@ -1,13 +1,16 @@
 <script lang="ts">
-  // PanelDanglingOverlay — overlay rendered when this panel's terminal has been
-  // marked dead via BE 0x85 TERMINAL_DIED (0034 §3) but the layout item still
-  // exists. Click → respawn the same UUID (ADR-0021 D10 dangling recovery).
+  // PanelDanglingOverlay — terminal 이 0x85 TERMINAL_DIED 로 dangling 표시되면
+  // visual placeholder. **자동 respawn** (사용자 click 없음) — multi-webpage
+  // 동시 trigger 는 `danglingTerminals.startRespawn` lock 이 client-side
+  // single-flight 로 차단, 0x88 broadcast 가 모든 webpage 의 overlay 를 자연
+  // 해제 (dispatcher.handleTerminalSpawned → clear).
   //
   // 정본:
   // - BE Stage 5-B (0034 §3): UUID-carrying terminal-died broadcast
-  // - 0033 §8.1: "terminal_died 수신 → 그 UUID 의 모든 panel 에 overlay → click → respawnTerminal(id)"
   // - ADR-0021 D10: respawn preserves UUID, fresh PaneId
+  // - 사용자 요구 (2026-05-17): "session 간 동일 terminal auto respawn 으로 전환"
 
+  import { onMount } from 'svelte';
   import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { respawnTerminal } from '$lib/http/terminals';
@@ -18,31 +21,43 @@
 
   const reason = $derived(danglingTerminals.reasonFor(terminalId));
   const visible = $derived(reason !== null);
+  const respawning = $derived(danglingTerminals.isRespawning(terminalId));
 
-  let respawning = $state(false);
+  // 자동 respawn — overlay mount 또는 reason 갱신 시 lock 확보 시도. 다른
+  // panel / webpage 가 먼저 잡았으면 false (spinner 만 표시). 0x88 도착 시
+  // dispatcher 가 clear → overlay 자연 사라짐.
+  $effect(() => {
+    if (!visible) return;
+    void triggerAutoRespawn();
+  });
 
-  async function onRespawn(e: MouseEvent): Promise<void> {
-    e.stopPropagation();
-    if (respawning) return;
-    respawning = true;
+  async function triggerAutoRespawn(): Promise<void> {
+    if (!danglingTerminals.startRespawn(terminalId)) return;
     try {
       await respawnTerminal(terminalId);
+      // 명시 clear — 0x88 broadcast 가 dispatcher 로도 도착하지만 visual 즉시
+      // 정합 위해 caller 도 clear (idempotent).
       danglingTerminals.clear(terminalId);
       void terminalPool.refresh();
-      toastStore.show({ message: 'Terminal respawned.', tone: 'success' });
     } catch (err) {
+      // Lock 해제 — mark 는 유지. 사용자가 회복 시도 트리거 (mount remount 등).
+      danglingTerminals.releaseRespawn(terminalId);
       if (err instanceof UnauthorizedError) {
         window.location.href = '/auth';
         return;
       }
-      toastStore.show({
-        message: `Respawn failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    } finally {
-      respawning = false;
+      // multi-webpage race: 다른 webpage 가 먼저 respawn 했고 BE 가 conflict
+      // 응답한 경우 noisy toast 회피 — 0x88 가 곧 도착 (또는 이미 도착) 하면
+      // overlay 자연 해제. error message 만 console.
+      console.debug('[gtmux] auto-respawn failed (likely race)', err);
     }
   }
+
+  onMount(() => {
+    // mount 직후 한 번 명시 호출 — $effect 가 reason set 보다 먼저 mount 된
+    // 경우 대비. visible derived 가 false 면 noop.
+    if (visible) void triggerAutoRespawn();
+  });
 </script>
 
 {#if visible}
@@ -51,16 +66,10 @@
       <div class="title">
         {reason === 'killed' ? 'Terminal killed' : 'Terminal exited'}
       </div>
-      <div class="hint">Restart the same terminal — UUID is preserved.</div>
-      <button
-        type="button"
-        class="respawn"
-        disabled={respawning}
-        onclick={onRespawn}
-        onmousedown={(e: MouseEvent) => e.stopPropagation()}
-      >
-        {respawning ? 'Respawning…' : 'Respawn'}
-      </button>
+      <div class="hint">
+        {respawning ? 'Respawning…' : 'Re-creating terminal…'}
+      </div>
+      <div class="spinner" aria-hidden="true"></div>
     </div>
   </div>
 {/if}
@@ -75,7 +84,7 @@
     background: color-mix(in srgb, var(--color-bg) 78%, transparent);
     backdrop-filter: blur(2px);
     z-index: 5;
-    pointer-events: auto;
+    pointer-events: none;
   }
 
   .card {
@@ -103,25 +112,18 @@
     color: var(--color-fg-muted);
   }
 
-  .respawn {
-    margin-top: var(--space-4);
-    padding: var(--space-4) var(--space-12);
-    background: var(--color-accent);
-    color: var(--color-bg);
-    border: 0;
-    border-radius: var(--radius-sm);
-    font-size: var(--text-md);
-    font-weight: var(--weight-medium);
-    cursor: pointer;
-    transition: opacity var(--motion-fast) var(--motion-easing);
+  .spinner {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 2px solid var(--color-border);
+    border-top-color: var(--color-accent);
+    animation: spin 0.8s linear infinite;
   }
 
-  .respawn:hover:not(:disabled) {
-    opacity: 0.9;
-  }
-
-  .respawn:disabled {
-    opacity: 0.55;
-    cursor: not-allowed;
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>
