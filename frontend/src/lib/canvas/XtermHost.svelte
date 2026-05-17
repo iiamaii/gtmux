@@ -245,7 +245,9 @@
       // silent.
     }
     if (containerEl !== undefined) {
-      const cells = containerEl.querySelectorAll<HTMLElement>('.xterm-rows span');
+      // NOTE: querySelectorAll<HTMLElement>(...) generic 표기는 svelte parser
+      // 가 HTML tag 로 오인 → script unclosed. cast 패턴으로 우회.
+      const cells = containerEl.querySelectorAll('.xterm-rows span') as NodeListOf<HTMLElement>;
       cells.forEach((span) => {
         // color / background-color 만 reset, 다른 inline style (font-weight,
         // text-decoration 등) 은 보존.
