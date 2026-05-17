@@ -50,11 +50,11 @@
 
 <header class="titlebar" aria-label="gtmux titlebar">
   <div class="titlebar-left">
-    <SessionMenu {sessionName} />
     <div class="brand" aria-label="gtmux">
       <img class="brand-mark" src={brandLogoUrl} alt="" aria-hidden="true" />
       <span class="brand-name">gtmux</span>
     </div>
+    <SessionMenu {sessionName} />
   </div>
 
   <div class="titlebar-center">
@@ -87,7 +87,7 @@
   .titlebar-left {
     display: inline-flex;
     align-items: center;
-    gap: var(--space-6);
+    gap: var(--space-10);
   }
 
   .titlebar-right {
@@ -108,22 +108,21 @@
     white-space: nowrap;
   }
 
-  /* Brand — auth page (routes/auth/+page.svelte) 의 .brand / .brand-mark 정합.
-     22px conic-gradient logo + sans 15px 'gtmux'. */
+  /* Brand — titlebar 좌측 identity. brand-mark + "gtmux" 가로 배치. */
   .brand {
     display: inline-flex;
     align-items: center;
     gap: var(--space-8);
     font-weight: var(--weight-semibold);
-    font-size: 15px;
-    letter-spacing: -0.2px;
+    font-size: 18px;
+    letter-spacing: -0.3px;
     color: var(--color-fg);
     user-select: none;
   }
 
   .brand-mark {
-    width: 22px;
-    height: 22px;
+    width: 30px;
+    height: 30px;
     border-radius: var(--radius-md);
     object-fit: cover;
     flex-shrink: 0;
@@ -132,6 +131,9 @@
 
   .brand-name {
     line-height: 1;
+    /* cap-height 시각 중심을 brand-mark vertical center 와 정합. auth page
+       의 동일 nudge 패턴 — 폰트 ascent 여백 보정. */
+    transform: translateY(-1px);
   }
 
   .sep {
