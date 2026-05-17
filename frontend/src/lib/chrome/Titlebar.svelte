@@ -114,15 +114,15 @@
     align-items: center;
     gap: var(--space-8);
     font-weight: var(--weight-semibold);
-    font-size: 18px;
-    letter-spacing: -0.3px;
+    font-size: 16px;
+    letter-spacing: -0.25px;
     color: var(--color-fg);
     user-select: none;
   }
 
   .brand-mark {
-    width: 30px;
-    height: 30px;
+    width: 27px;
+    height: 27px;
     border-radius: var(--radius-md);
     object-fit: cover;
     flex-shrink: 0;
