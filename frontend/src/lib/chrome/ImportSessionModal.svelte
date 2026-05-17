@@ -34,6 +34,11 @@
 
   const open = $derived(sessionIODialog.mode === 'import');
 
+  // Client-side body cap — BE `sessions::SESSION_PUT_MAX_BYTES` 와 동일 16 MiB.
+  // 초과 시 friendly toast/inline error (네트워크 안 타고 차단), 동일 값을 BE 가
+  // 413 으로 보장 (ADR-0029 §6 / amend ②).
+  const IMPORT_MAX_BYTES = 16 * 1024 * 1024;
+
   // Stage 머신:
   //   pick      → file picker 노출
   //   preview   → envelope OK, target name confirm
@@ -106,11 +111,21 @@
     return 'imported-session';
   }
 
+  function formatMB(bytes: number): string {
+    const mb = bytes / (1024 * 1024);
+    return mb >= 10 ? `${Math.round(mb)} MB` : `${mb.toFixed(1)} MB`;
+  }
+
   async function onFileChange(e: Event): Promise<void> {
     const input = e.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
     if (file === undefined) return;
     parseError = null;
+    if (file.size > IMPORT_MAX_BYTES) {
+      parseError = `Session file too large (${formatMB(file.size)}). Maximum is ${formatMB(IMPORT_MAX_BYTES)}.`;
+      input.value = '';
+      return;
+    }
     try {
       const text = await file.text();
       const parsed = parseEnvelope(JSON.parse(text));
@@ -264,6 +279,7 @@
       <div class="hint">
         Imports are side-effect-free — only a new session file is created.
         Terminal panels start fresh when first attached.
+        Max file size: 16 MB.
       </div>
     {:else if stage === 'preview' || stage === 'importing'}
       {#if envelope !== null && preview !== null}
