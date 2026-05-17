@@ -30,6 +30,8 @@
   import { toolStore, type ToolId } from '$lib/stores/toolStore.svelte';
   import ActiveSessionDropdown from '$lib/chrome/ActiveSessionDropdown.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
+  import { historyStore } from '$lib/stores/historyStore.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
   interface ToolDef {
     id: ToolId;
@@ -209,6 +211,36 @@
     {#if locked}
       <span class="lock-indicator" title="Tool locked (Q to release)">Q</span>
     {/if}
+    <!-- ADR-0028 D8 — Undo / Redo. canUndo / canRedo 가 historyStore 의
+         derived. Active session 없거나 stack 빈 경우 disabled. -->
+    <div class="group history-group" aria-label="History">
+      <button
+        type="button"
+        class="tool"
+        title="Undo (⌘Z)"
+        aria-label="Undo"
+        disabled={!historyStore.canUndo}
+        onclick={() => void sessionStore.undo()}
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 7v6h6"/>
+          <path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>
+        </svg>
+      </button>
+      <button
+        type="button"
+        class="tool"
+        title="Redo (⇧⌘Z)"
+        aria-label="Redo"
+        disabled={!historyStore.canRedo}
+        onclick={() => void sessionStore.redo()}
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 7v6h-6"/>
+          <path d="M3 17a9 9 0 0 1 15-6.7L21 13"/>
+        </svg>
+      </button>
+    </div>
   </div>
 </nav>
 
@@ -283,9 +315,21 @@
     cursor: pointer;
   }
 
-  .tool:hover {
+  .tool:hover:not(:disabled) {
     background: var(--color-glass-1);
     color: var(--color-fg);
+  }
+
+  .tool:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* History group — toolbar 우측 끝, divider 시각 분리. */
+  .history-group {
+    margin-left: var(--space-6);
+    padding-left: var(--space-6);
+    border-left: 1px solid var(--color-border);
   }
 
   .tool:focus-visible {
