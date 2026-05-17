@@ -446,6 +446,16 @@
    */
   let popoverPos = $state<{ top: number; left: number }>({ top: 0, left: 0 });
 
+  /**
+   * 위치 정책 (사용자 요구):
+   * - Horizontal: RightPanel 의 *좌측 가장자리* anchor — popover 가 panel
+   *   영역을 가리지 않도록 panel.left - popover.width - gap. RightPanel 가
+   *   없는 경우 trigger.left - popover.width - gap (좌측 mount).
+   * - Vertical: trigger 의 top 근처. popover.height 가 viewport 보다 크면
+   *   viewport [margin, vh-margin] 안 clamp.
+   * - Horizontal clamp: 좌측 < margin 이면 margin, 우측 > vw-margin 이면
+   *   안쪽으로 밀어 넣음.
+   */
   function updatePopoverPos(): void {
     if (containerEl === undefined || popoverEl === undefined) return;
     const tRect = containerEl.getBoundingClientRect();
@@ -453,15 +463,23 @@
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     const margin = 8;
-    const gap = 6;
-    let left = tRect.left;
-    if (left + pRect.width > vw - margin) left = vw - pRect.width - margin;
-    if (left < margin) left = margin;
-    let top = tRect.bottom + gap;
-    if (top + pRect.height > vh - margin) {
-      const flipped = tRect.top - pRect.height - gap;
-      top = flipped >= margin ? flipped : Math.max(margin, vh - pRect.height - margin);
+    const gap = 8;
+
+    const rightPanel = document.querySelector('.right-panel') as HTMLElement | null;
+    let left: number;
+    if (rightPanel !== null) {
+      const rRect = rightPanel.getBoundingClientRect();
+      left = rRect.left - pRect.width - gap;
+    } else {
+      left = tRect.left - pRect.width - gap;
     }
+    if (left < margin) left = margin;
+    if (left + pRect.width > vw - margin) left = vw - pRect.width - margin;
+
+    let top = tRect.top;
+    if (top + pRect.height > vh - margin) top = vh - pRect.height - margin;
+    if (top < margin) top = margin;
+
     popoverPos = { top, left };
   }
 
@@ -793,25 +811,6 @@
         </div>
       </div>
 
-      <!-- Modes — phase 1: Solid 고정 -->
-      <div class="cp-modes">
-        <button type="button" class="cp-mode active" title="Solid">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><circle cx="6" cy="6" r="4"/></svg>
-        </button>
-        <button type="button" class="cp-mode" title="Linear (P4)" disabled aria-disabled="true">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><rect x="2" y="2" width="8" height="8" rx="1" fill="currentColor" opacity=".3"/></svg>
-        </button>
-        <button type="button" class="cp-mode" title="Radial (P4)" disabled aria-disabled="true">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><circle cx="6" cy="6" r="4" fill="currentColor" opacity=".3"/></svg>
-        </button>
-        <button type="button" class="cp-mode" title="Angular (P4)" disabled aria-disabled="true">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true"><circle cx="6" cy="6" r="4"/></svg>
-        </button>
-        <button type="button" class="cp-mode" title="Image (P4)" disabled aria-disabled="true">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true"><rect x="1.5" y="2" width="9" height="8" rx="1"/></svg>
-        </button>
-      </div>
-
       <!-- SV square -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
@@ -1108,37 +1107,6 @@
   }
   .cp-btn:hover { background: var(--color-glass-2); color: var(--color-fg); }
   .cp-btn:focus-visible { outline: 1px dashed var(--color-accent); outline-offset: 1px; }
-
-  .cp-modes {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 2px;
-    padding: 4px;
-    background: var(--color-surface-2);
-    border-bottom: 1px solid var(--color-border);
-  }
-  .cp-mode {
-    height: 22px;
-    display: grid;
-    place-items: center;
-    border: none;
-    background: transparent;
-    border-radius: var(--radius-sm);
-    color: var(--color-fg-muted);
-    cursor: pointer;
-    padding: 0;
-    transition: background var(--motion-fast) var(--motion-easing), color var(--motion-fast) var(--motion-easing);
-  }
-  .cp-mode:hover:not(:disabled) { color: var(--color-fg); }
-  .cp-mode:disabled { cursor: not-allowed; opacity: 0.4; }
-  .cp-mode.active {
-    background: var(--color-surface);
-    color: var(--color-fg);
-    box-shadow: 0 1px 2px rgba(0,0,0,.08), 0 0 0 0.5px rgba(0,0,0,.06);
-  }
-  :global(:root.dark) .cp-mode.active {
-    box-shadow: 0 1px 2px rgba(0,0,0,.5), 0 0 0 0.5px rgba(255,255,255,.08);
-  }
 
   .cp-sv {
     position: relative;
