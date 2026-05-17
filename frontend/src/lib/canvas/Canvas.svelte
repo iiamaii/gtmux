@@ -136,6 +136,9 @@
       toolStore.current === 'free_draw',
   );
 
+  // Text tool 은 drag-to-create 아닌 click-to-create — cursor 만 text I-beam.
+  const isTextTool = $derived(toolStore.current === 'text');
+
   /* ── G29: Space-hold pan modifier ────────────────────────────────────
    * Figma convention — Space 를 누르면 cursor=grab, 그 상태에서 left-drag =
    * viewport pan. 평소 left-drag 은 selection box / node move 용이라
@@ -1164,6 +1167,7 @@
   class="canvas-root"
   role="presentation"
   class:drag-cursor={isDragTool && !isSpacePressed && !isHandTool}
+  class:text-cursor={isTextTool && !isSpacePressed && !isHandTool}
   class:pan-cursor={isSpacePressed || isHandTool}
   onpointerdowncapture={onCanvasPointerDown}
   onpointermovecapture={onCanvasPointerMove}
@@ -1327,6 +1331,12 @@
   .canvas-root.drag-cursor,
   .canvas-root.drag-cursor :global(.svelte-flow__pane) {
     cursor: crosshair;
+  }
+
+  /* Text tool — I-beam cursor (입력 텍스트 위 cursor 정합). */
+  .canvas-root.text-cursor,
+  .canvas-root.text-cursor :global(.svelte-flow__pane) {
+    cursor: text;
   }
 
   /* G29: Space-hold pan modifier — grab while Space is held, grabbing

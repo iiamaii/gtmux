@@ -91,6 +91,15 @@ class EscRouter {
     }
   };
 
+  /**
+   * Eager attach — explicit handler 등록 없이도 default fallback chain
+   * (unmaximize / tool 취소 / selection clear) 이 동작하도록. module load
+   * 시 호출 권장.
+   */
+  attach(): void {
+    this.#ensureAttached();
+  }
+
   /** Test/dev only — handler 모두 제거. */
   _reset(): void {
     this.#handlers.clear();
@@ -98,3 +107,10 @@ class EscRouter {
 }
 
 export const escRouter = new EscRouter();
+
+// Eager attach — handler register 없어도 fallback chain (unmaximize / tool
+// 취소 / selection clear) 이 동작하도록 module load 시 listener 부착. SSR
+// 안전 (typeof window 가드).
+if (typeof window !== 'undefined') {
+  escRouter.attach();
+}
