@@ -228,27 +228,35 @@
     const resolved = themeStore.resolved;
     if (term === null) return;
     term.options.theme = xtermTheme(resolved);
-    // theme options swap 만으로는 cell texture cache + cell DOM 의 inline
-    // style 이 stale — 빈 영역 / 옛 색 그대로 남는 회귀 (사용자 보고
-    // 2026-05-17 2회). 두 단계 강제 redraw:
-    //   1. clearTextureAtlas + refresh(0, rows-1) — xterm 의 cell-buffer 재 paint
-    //   2. .xterm root 의 display 토글 → 강제 reflow — 모든 child renderer
-    //      (canvas / dom) 의 inline color 가 새 theme 으로 재 commit.
+    // theme options swap 만으로는 v6 DOM renderer 의 cell DOM (.xterm-rows
+    // > div > span) 의 inline color / background-color 가 stale — 새로고침
+    // 외 복구 X. 가설: cell span 의 inline style.color / backgroundColor 가
+    // *cell write 시점에 commit* 된 옛 theme 의 sRGB. theme swap 후
+    // refresh(0, rows-1) 가 cached span fragment 를 *recycle* 못 함.
+    //
+    // 시도 C: cell span 의 inline color reset (= 옛 stale 색 제거) → refresh
+    // 가 새 theme 으로 재 paint. ANSI class (.xterm-fg-N, .xterm-bg-N) 는
+    // class 인데, *.xterm 의 inline <style>* 의 token 이 theme swap 시 자동
+    // 변경 — 그러나 cell 의 *inline color* 가 더 우선 (specificity) → inline
+    // 제거 후에야 class 의 새 색 falls through.
     try {
       term.clearTextureAtlas?.();
-      term.refresh(0, term.rows - 1);
     } catch {
-      // alt-screen 등 edge — silent.
+      // silent.
     }
     if (containerEl !== undefined) {
-      const xtermRoot = containerEl.querySelector('.xterm') as HTMLElement | null;
-      if (xtermRoot !== null) {
-        const prev = xtermRoot.style.display;
-        xtermRoot.style.display = 'none';
-        // 강제 reflow — getBoundingClientRect / offsetHeight 가 layout flush.
-        void xtermRoot.offsetHeight;
-        xtermRoot.style.display = prev;
-      }
+      const cells = containerEl.querySelectorAll<HTMLElement>('.xterm-rows span');
+      cells.forEach((span) => {
+        // color / background-color 만 reset, 다른 inline style (font-weight,
+        // text-decoration 등) 은 보존.
+        span.style.color = '';
+        span.style.backgroundColor = '';
+      });
+    }
+    try {
+      term.refresh(0, term.rows - 1);
+    } catch {
+      // silent.
     }
   });
 </script>
