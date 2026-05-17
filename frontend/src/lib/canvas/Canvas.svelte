@@ -1394,7 +1394,7 @@
   .point-spawn-ghost {
     position: absolute;
     box-sizing: border-box;
-    border: 1.5px dashed var(--color-accent);
+    border: 1px dashed var(--color-accent);
     background: color-mix(in srgb, var(--color-accent) 6%, transparent);
     pointer-events: none;
     /* canvas-overlay (18) — side-panel (20) 보다 아래라 LeftPanel/RightPanel
@@ -1407,7 +1407,7 @@
   .drag-ghost {
     position: absolute;
     box-sizing: border-box;
-    border: 2px solid var(--color-accent);
+    border: 1px solid var(--color-accent);
     background: color-mix(in srgb, var(--color-accent) 10%, transparent);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
     pointer-events: none;

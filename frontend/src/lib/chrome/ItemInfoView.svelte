@@ -529,33 +529,33 @@
           <div class="align-row" role="group" aria-label="Alignment">
             <div class="align-group" aria-label="Align horizontal">
               <button type="button" class="align-btn" title="Align left" aria-label="Align left" onclick={() => onAlign('left')}>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="2" x2="2" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="3.5" y="9" width="5" height="3"/></svg>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="2" x2="2" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="3.5" y="9" width="5" height="3"/></svg>
               </button>
               <button type="button" class="align-btn" title="Align center horizontally" aria-label="Align center horizontally" onclick={() => onAlign('center-x')}>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="8" y1="2" x2="8" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="5.5" y="9" width="5" height="3"/></svg>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><line x1="8" y1="2" x2="8" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="5.5" y="9" width="5" height="3"/></svg>
               </button>
               <button type="button" class="align-btn" title="Align right" aria-label="Align right" onclick={() => onAlign('right')}>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="14" y1="2" x2="14" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="7.5" y="9" width="5" height="3"/></svg>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><line x1="14" y1="2" x2="14" y2="14"/><rect x="3.5" y="4" width="9" height="3"/><rect x="7.5" y="9" width="5" height="3"/></svg>
               </button>
             </div>
             <div class="align-group" aria-label="Align vertical">
               <button type="button" class="align-btn" title="Align top" aria-label="Align top" onclick={() => onAlign('top')}>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="2" x2="14" y2="2"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="3.5" width="3" height="5"/></svg>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="2" x2="14" y2="2"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="3.5" width="3" height="5"/></svg>
               </button>
               <button type="button" class="align-btn" title="Align center vertically" aria-label="Align center vertically" onclick={() => onAlign('center-y')}>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="8" x2="14" y2="8"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="5.5" width="3" height="5"/></svg>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="8" x2="14" y2="8"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="5.5" width="3" height="5"/></svg>
               </button>
               <button type="button" class="align-btn" title="Align bottom" aria-label="Align bottom" onclick={() => onAlign('bottom')}>
-                <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="14" x2="14" y2="14"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="7.5" width="3" height="5"/></svg>
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><line x1="2" y1="14" x2="14" y2="14"/><rect x="4" y="3.5" width="3" height="9"/><rect x="9" y="7.5" width="3" height="5"/></svg>
               </button>
             </div>
             {#if selectionCount >= 3}
               <div class="align-group" aria-label="Distribute">
                 <button type="button" class="align-btn" title="Distribute horizontally" aria-label="Distribute horizontally" onclick={() => onDistribute('horizontal')}>
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="1" y="4" width="3" height="8"/><rect x="6.5" y="4" width="3" height="8"/><rect x="12" y="4" width="3" height="8"/></svg>
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><rect x="1" y="4" width="3" height="8"/><rect x="6.5" y="4" width="3" height="8"/><rect x="12" y="4" width="3" height="8"/></svg>
                 </button>
                 <button type="button" class="align-btn" title="Distribute vertically" aria-label="Distribute vertically" onclick={() => onDistribute('vertical')}>
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="4" y="1" width="8" height="3"/><rect x="4" y="6.5" width="8" height="3"/><rect x="4" y="12" width="8" height="3"/></svg>
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true"><rect x="4" y="1" width="8" height="3"/><rect x="4" y="6.5" width="8" height="3"/><rect x="4" y="12" width="8" height="3"/></svg>
                 </button>
               </div>
             {/if}
