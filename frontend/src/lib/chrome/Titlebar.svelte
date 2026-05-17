@@ -50,11 +50,11 @@
 
 <header class="titlebar" aria-label="gtmux titlebar">
   <div class="titlebar-left">
+    <SessionMenu {sessionName} />
     <div class="brand" aria-label="gtmux">
       <img class="brand-mark" src={brandLogoUrl} alt="" aria-hidden="true" />
       <span class="brand-name">gtmux</span>
     </div>
-    <SessionMenu {sessionName} />
   </div>
 
   <div class="titlebar-center">
