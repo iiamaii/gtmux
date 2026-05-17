@@ -188,12 +188,19 @@
         {/if}
       </div>
     </div>
-    <!-- Foot row — badge (per-lang) + future meta (lines / KB / branch — placeholder
-         until BE-side stat 추가, ADR amend 후). 시안 §03 fp-foot. -->
-    {#if !editing && data.path.length > 0 && langBadge !== null}
+    <!-- Foot row — badge (per-lang) + placeholder meta (lines / size /
+         branch). 실 데이터 wire 는 BE file-stat endpoint 의존 (별 ADR /
+         work-package). 현재는 시안 §03 의 visual frame 만 — 모든 meta 는
+         dim em-dash placeholder. 시안 v3 의 .sep / .right 정합. -->
+    {#if !editing && data.path.length > 0}
       <div class="fp-foot">
-        <span class="fp-badge {langBadge.cls}">{langBadge.label}</span>
-        <span class="fp-foot-spacer"></span>
+        {#if langBadge !== null}
+          <span class="fp-badge {langBadge.cls}">{langBadge.label}</span>
+        {/if}
+        <span class="fp-meta-dim">— lines</span>
+        <span class="sep">·</span>
+        <span class="fp-meta-dim">— KB</span>
+        <span class="right fp-meta-dim">—</span>
       </div>
     {/if}
   </div>
@@ -294,8 +301,19 @@
     flex: 1 1 auto;
   }
 
-  /* v3 시안의 .sep / .right 도 사용 가능 — 향후 lines / size / branch
-   * meta wire 시 적용 (현재는 placeholder 라 spacer 만 사용). */
+  /* v3 시안 §03 — .sep / .right 의 visual 정합. 실 데이터 wire 전까지
+   * placeholder em-dash 들을 그대로 보여 frame 만 갖추는 패턴. */
+  .fp-foot .sep {
+    opacity: 0.5;
+  }
+
+  .fp-foot .right {
+    margin-left: auto;
+  }
+
+  .fp-foot .fp-meta-dim {
+    color: var(--color-fg-subtle);
+  }
 
   /* Lang badge — per-lang background color (시안 §03 palette). */
   .fp-badge {
