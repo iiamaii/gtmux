@@ -38,6 +38,11 @@
     createLineItem,
     createTerminalItem,
     lineBoxFromEndpoints,
+    DEFAULT_TERMINAL_SIZE,
+    DEFAULT_NOTE_SIZE,
+    DEFAULT_FILE_PATH_SIZE,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_DOCUMENT_SIZE,
   } from './itemFactory';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
 
@@ -73,21 +78,41 @@
   let dragState = $state<DragState | null>(null);
 
   /**
-   * Cursor hover preview — terminal 도구가 active 일 때 cursor 위치에 새
-   * panel 의 *default 크기 (480×320 flow units)* 윤곽선을 미리보기. zoom 에
-   * 따라 screen px 크기가 비례 (`size_screen = size_flow * zoom`).
-   * cursor 가 .canvas-root 밖이거나 노드 위면 null 로 hide.
+   * Cursor hover preview — 점-spawn 도구 (terminal/note/file_path/image/
+   * document) 가 active 일 때 cursor 위치에 새 item 의 *default 크기* 의
+   * 윤곽선을 center-aligned 로 미리보기. zoom 에 따라 screen px 비례
+   * (`size_screen = size_flow * zoom`). cursor 가 .canvas-root 밖이거나
+   * 노드 위면 null 로 hide. text 는 작아서 (160×56) ghost 의미 약함 — 제외.
    */
   let hoverScreen = $state<{ x: number; y: number } | null>(null);
 
-  const isPanelTool = $derived(toolStore.current === 'terminal');
-  const terminalGhost = $derived.by(() => {
-    if (!isPanelTool || hoverScreen === null) return null;
+  /** 점-spawn 도구 중 ghost 표시 + cursor=center spawn 적용 대상. */
+  const POINT_SPAWN_DEFAULTS = {
+    terminal: DEFAULT_TERMINAL_SIZE,
+    note: DEFAULT_NOTE_SIZE,
+    file_path: DEFAULT_FILE_PATH_SIZE,
+    image: DEFAULT_IMAGE_SIZE,
+    document: DEFAULT_DOCUMENT_SIZE,
+  } as const;
+  type GhostTool = keyof typeof POINT_SPAWN_DEFAULTS;
+  const isGhostTool = $derived.by((): GhostTool | null => {
+    const t = toolStore.current;
+    return t in POINT_SPAWN_DEFAULTS ? (t as GhostTool) : null;
+  });
+  const pointSpawnGhost = $derived.by(() => {
+    const t = isGhostTool;
+    if (t === null || hoverScreen === null) return null;
+    const size = POINT_SPAWN_DEFAULTS[t];
+    const zoom = sessionStore.viewport.zoom;
+    const w = size.w * zoom;
+    const h = size.h * zoom;
+    // cursor=center — ghost 의 좌상단 = cursor - (w/2, h/2).
     return {
-      x: hoverScreen.x,
-      y: hoverScreen.y,
-      w: 480 * sessionStore.viewport.zoom,
-      h: 320 * sessionStore.viewport.zoom,
+      tool: t,
+      x: hoverScreen.x - w / 2,
+      y: hoverScreen.y - h / 2,
+      w,
+      h,
     };
   });
 
@@ -779,6 +804,17 @@
     }
   }
 
+  function onSpawnError(err: unknown): void {
+    if (err instanceof UnauthorizedError) {
+      window.location.href = '/auth';
+      return;
+    }
+    toastStore.show({
+      message: `Create failed: ${err instanceof Error ? err.message : String(err)}`,
+      tone: 'error',
+    });
+  }
+
   function onpaneclick({ event }: { event: MouseEvent | TouchEvent }) {
     // Hand tool — exploration only, click no-op (Figma).
     if (isHandTool) return;
@@ -792,26 +828,29 @@
       const tool = toolStore.current;
       const flow = screenToFlowPosition({ x: event.clientX, y: event.clientY });
 
+      // cursor=center 보정 — POINT_SPAWN_DEFAULTS 의 5 type 만. text 는 cursor
+      // 가 좌상단 그대로 (작은 박스 + 더블 클릭 inline edit 진입 시 자연 정합).
+      function centered(t: GhostTool): { x: number; y: number } {
+        const s = POINT_SPAWN_DEFAULTS[t];
+        return { x: flow.x - s.w / 2, y: flow.y - s.h / 2 };
+      }
+
       if (tool === 'terminal') {
-        void spawnMultiSessionTerminal(flow);
+        void spawnMultiSessionTerminal(centered('terminal'));
         return;
       }
-      if (tool === 'text' || tool === 'note' || tool === 'file_path') {
-        const item = createCanvasItem(tool, { x: flow.x, y: flow.y });
+      if (tool === 'text') {
+        const item = createCanvasItem('text', { x: flow.x, y: flow.y });
         void commitNewItem(item)
-          .then(() => {
-            toolStore.consume();
-          })
-          .catch((err: unknown) => {
-            if (err instanceof UnauthorizedError) {
-              window.location.href = '/auth';
-              return;
-            }
-            toastStore.show({
-              message: `Create failed: ${err instanceof Error ? err.message : String(err)}`,
-              tone: 'error',
-            });
-          });
+          .then(() => toolStore.consume())
+          .catch(onSpawnError);
+        return;
+      }
+      if (tool === 'note' || tool === 'file_path') {
+        const item = createCanvasItem(tool, centered(tool));
+        void commitNewItem(item)
+          .then(() => toolStore.consume())
+          .catch(onSpawnError);
         return;
       }
     }
@@ -1096,10 +1135,11 @@
     </div>
   {/if}
 
-  {#if terminalGhost !== null && dragState === null}
+  {#if pointSpawnGhost !== null && dragState === null}
     <div
-      class="terminal-ghost"
-      style="left: {terminalGhost.x}px; top: {terminalGhost.y}px; width: {terminalGhost.w}px; height: {terminalGhost.h}px;"
+      class="point-spawn-ghost"
+      data-tool={pointSpawnGhost.tool}
+      style="left: {pointSpawnGhost.x}px; top: {pointSpawnGhost.y}px; width: {pointSpawnGhost.w}px; height: {pointSpawnGhost.h}px;"
       aria-hidden="true"
     ></div>
   {/if}
@@ -1184,9 +1224,10 @@
     cursor: grabbing;
   }
 
-  /* Terminal tool — cursor hover preview of the panel-to-be-spawned.
-     Dashed accent outline, no fill — purely guide, no interactivity. */
-  .terminal-ghost {
+  /* Point-spawn tool ghost — cursor hover 시 새 item 의 default 크기로
+   * outline 미리보기 (cursor=center 정렬). 5 type: terminal/note/file_path/
+   * image/document. Dashed accent, no fill — purely guide, no interactivity. */
+  .point-spawn-ghost {
     position: absolute;
     box-sizing: border-box;
     border: 1.5px dashed var(--color-accent);

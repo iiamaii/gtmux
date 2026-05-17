@@ -26,20 +26,24 @@ import type {
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
 /** 신규 item 의 기본 좌표 + 크기 default. ADR-0018 D7 의 z 정책은 commit 시점에 결정. */
-const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
+export const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
 // Text default — font 16 × line-height 1.4 ≈ 22.4 line-box. h 56 이면 inner
 // content 영역 48px 안에서 line-box 가 약 47% 차지 → vertical align 의 top /
 // middle / bottom 차이가 ±12.5px 만큼 가시. 너무 작으면 (예 h<40) 정렬 차이가
 // 거의 안 보여 fit-perception 가짐.
 const DEFAULT_TEXT_SIZE = { w: 160, h: 56 } as const;
-const DEFAULT_NOTE_SIZE = { w: 300, h: 96 } as const;
+export const DEFAULT_NOTE_SIZE = { w: 300, h: 96 } as const;
 // 시안 §03 — fp-main(icon 24 + padding 11+10 = 45) + fp-foot(content 14 +
 // padding 6+7 = 27) + border 2 = ~74. NodeResizer minHeight 와 정합 — 셋
 // (factory default / NodeResizer minHeight / onResizeEnd clamp) 가 동일해야
 // resize 시 layout shift 없음.
-const DEFAULT_FILE_PATH_SIZE = { w: 320, h: 80 } as const;
+export const DEFAULT_FILE_PATH_SIZE = { w: 320, h: 80 } as const;
 const DEFAULT_SHAPE_SIZE = { w: 200, h: 140 } as const;
 const DEFAULT_LINE_SIZE = { w: 240, h: 80 } as const;
+/** ImageNode placeholder (BE asset endpoint 미land — ADR-0018 D4 의 P2+). */
+export const DEFAULT_IMAGE_SIZE = { w: 320, h: 240 } as const;
+/** DocumentNode — 시안 §02 inline-stored mode (ADR-0018 D4 amend ②). */
+export const DEFAULT_DOCUMENT_SIZE = { w: 360, h: 280 } as const;
 export const LINE_MIN_LENGTH = 5;
 export const LINE_HIT_PADDING = 8;
 
