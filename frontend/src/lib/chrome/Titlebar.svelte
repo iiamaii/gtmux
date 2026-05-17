@@ -5,14 +5,14 @@
    * Layout (3-col grid):
    *   - left   : SessionMenu (kebab) + brand-mark + "gtmux"
    *   - center : host info — "<bind>:<port> · <mode>"
-   *   - right  : ThemeToggle
+   *   - right  : (theme toggle 은 SettingsOverlay 안에서만 — 잦은 toggle 시
+   *     xterm cell stale 색 회귀 회피 + Settings 변경 마다 자동 reload)
    *
    * Stage C scope: chrome shell + actions only. ViewportCtrl / HelpBar /
    * Sidebar floating refactor land in Stage E / F.
    */
 
   import SessionMenu from './SessionMenu.svelte';
-  import ThemeToggle from '$lib/ui/ThemeToggle.svelte';
   import brandLogoUrl from '$lib/assets/brand.png';
 
   const TOKEN_STORAGE_KEY = 'gtmux_token';
@@ -62,9 +62,7 @@
     <span class="muted">{mode}</span>
   </div>
 
-  <div class="titlebar-right">
-    <ThemeToggle />
-  </div>
+  <div class="titlebar-right"></div>
 </header>
 
 <style>
