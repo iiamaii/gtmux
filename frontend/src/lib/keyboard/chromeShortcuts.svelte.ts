@@ -14,6 +14,7 @@
 //   Cmd+,        → Settings overlay  (Slice C)
 
 import { chromeStore } from '$lib/stores/chrome.svelte';
+import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { settingsDialog } from '$lib/stores/settingsDialog.svelte';
 import { shutdownDialog } from '$lib/stores/shutdownDialog.svelte';
 import { toolStore } from '$lib/stores/toolStore.svelte';
@@ -33,6 +34,10 @@ export function bindChromeShortcuts(): () => void {
       description: 'New terminal (click canvas to place)',
       category: 'Canvas',
       handler: () => {
+        // Toolbar2 의 12 도구가 no-session 시 disabled — keyboard 도 같은
+        // 정책으로 일관성 유지 (canvas 가 자체적으로 active===null 시 spawn
+        // 무시하지만, 도구 highlight 만 켜진 confusing UX 차단).
+        if (sessionStore.active === null) return true;
         toolStore.set('terminal');
         return true;
       },
@@ -45,6 +50,7 @@ export function bindChromeShortcuts(): () => void {
       description: 'New terminal (Win/Linux)',
       category: 'Canvas',
       handler: () => {
+        if (sessionStore.active === null) return true;
         toolStore.set('terminal');
         return true;
       },
@@ -60,6 +66,9 @@ export function bindChromeShortcuts(): () => void {
       description: 'Session shutdown…',
       category: 'Chrome',
       handler: () => {
+        // SessionMenu 의 Session shutdown 항목이 no-session 시 disabled —
+        // keyboard 도 같은 정책.
+        if (sessionStore.active === null) return true;
         shutdownDialog.show();
         return true;
       },
@@ -73,6 +82,7 @@ export function bindChromeShortcuts(): () => void {
       description: 'Session shutdown (Win/Linux)',
       category: 'Chrome',
       handler: () => {
+        if (sessionStore.active === null) return true;
         shutdownDialog.show();
         return true;
       },

@@ -196,7 +196,10 @@
     <button
       type="button"
       class="danger"
+      disabled={sessionStore.active === null}
+      title={sessionStore.active === null ? 'No active session to shutdown' : ''}
       onclick={() => {
+        if (sessionStore.active === null) return;
         shutdownDialog.show();
         close();
       }}

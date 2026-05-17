@@ -19,6 +19,7 @@
 
   import { onDestroy } from 'svelte';
   import { chromeStore, type LeftPanelTab } from '$lib/stores/chrome.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import LayerTreeView from './LayerTreeView.svelte';
   import TerminalListView from './TerminalListView.svelte';
   import PanelFoldButton from '$lib/chrome/PanelFoldButton.svelte';
@@ -26,6 +27,9 @@
   const collapsed = $derived(chromeStore.state.sidebarCollapsed);
   const activeTab = $derived(chromeStore.state.leftPanelTab);
   const panelWidth = $derived(chromeStore.state.leftPanelWidth);
+  // No active session 시 tabs + body 는 의미 없음. fold/expand 만 유지해
+  // 사용자가 chrome 정리는 계속 가능.
+  const noActiveSession = $derived(sessionStore.active === null);
 
   let panelEl = $state<HTMLElement | null>(null);
   let resizing = $state(false);
@@ -85,8 +89,9 @@
       type="button"
       class="rail-btn"
       class:active={activeTab === 'layers'}
-      title="Layers"
+      title={noActiveSession ? 'Connect a session to view layers' : 'Layers'}
       aria-label="Open Layers tab"
+      disabled={noActiveSession}
       onclick={() => expandAndSelect('layers')}
     >
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -99,8 +104,9 @@
       type="button"
       class="rail-btn"
       class:active={activeTab === 'terminals'}
-      title="Terminals"
+      title={noActiveSession ? 'Connect a session to view terminals' : 'Terminals'}
       aria-label="Open Terminals tab"
+      disabled={noActiveSession}
       onclick={() => expandAndSelect('terminals')}
     >
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -125,6 +131,8 @@
           class="panel-tab"
           class:active={activeTab === 'layers'}
           aria-selected={activeTab === 'layers'}
+          disabled={noActiveSession}
+          title={noActiveSession ? 'Connect a session to view layers' : ''}
           onclick={() => selectTab('layers')}
         >Layers</button>
         <button
@@ -133,6 +141,8 @@
           class="panel-tab"
           class:active={activeTab === 'terminals'}
           aria-selected={activeTab === 'terminals'}
+          disabled={noActiveSession}
+          title={noActiveSession ? 'Connect a session to view terminals' : ''}
           onclick={() => selectTab('terminals')}
         >Terminals</button>
       </div>
@@ -144,7 +154,7 @@
       />
     </header>
 
-    <div class="left-panel-body">
+    <div class="left-panel-body" class:no-session={noActiveSession} inert={noActiveSession}>
       {#if activeTab === 'layers'}
         <LayerTreeView />
       {:else}
@@ -272,6 +282,20 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+  }
+
+  /* No active session — body 는 visible 하되 inert + dimmed (사용자에게
+   * "여기 보일 거다" 힌트 + 상호작용 차단). inert attribute 가 click/key/
+   * focus 차단, opacity 가 visual 차단. */
+  .left-panel-body.no-session {
+    opacity: 0.4;
+    pointer-events: none;
+  }
+
+  .panel-tab:disabled,
+  .rail-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   /* Collapsed rail — 28px wide vertical bar, same vertical span. */

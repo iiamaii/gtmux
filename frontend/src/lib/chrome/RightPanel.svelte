@@ -17,12 +17,15 @@
 
   import { onDestroy } from 'svelte';
   import { chromeStore, type RightPanelTab } from '$lib/stores/chrome.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import ItemInfoView from './ItemInfoView.svelte';
   import PanelFoldButton from './PanelFoldButton.svelte';
 
   const collapsed = $derived(chromeStore.state.paneInfoCollapsed);
   const activeTab = $derived(chromeStore.state.rightPanelTab);
   const panelWidth = $derived(chromeStore.state.rightPanelWidth);
+  // No active session 시 inspect tab + body 는 의미 없음. fold/expand 만 유지.
+  const noActiveSession = $derived(sessionStore.active === null);
 
   let panelEl = $state<HTMLElement | null>(null);
   let resizing = $state(false);
@@ -82,8 +85,9 @@
       type="button"
       class="rail-btn"
       class:active={activeTab === 'inspect'}
-      title="Inspect"
+      title={noActiveSession ? 'Connect a session to inspect items' : 'Inspect'}
       aria-label="Open Inspect tab"
+      disabled={noActiveSession}
       onclick={() => expandAndSelect('inspect')}
     >
       <!-- info circle -->
@@ -117,6 +121,8 @@
           class="panel-tab"
           class:active={activeTab === 'inspect'}
           aria-selected={activeTab === 'inspect'}
+          disabled={noActiveSession}
+          title={noActiveSession ? 'Connect a session to inspect items' : ''}
           onclick={() => selectTab('inspect')}
         >Inspect</button>
       </div>
@@ -128,7 +134,7 @@
       />
     </header>
 
-    <div class="right-panel-body">
+    <div class="right-panel-body" class:no-session={noActiveSession} inert={noActiveSession}>
       {#if activeTab === 'inspect'}
         <ItemInfoView />
       {/if}
@@ -247,6 +253,19 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+  }
+
+  /* No active session — body 는 visible 하되 inert + dimmed (LeftPanel
+   * 과 동일 패턴). */
+  .right-panel-body.no-session {
+    opacity: 0.4;
+    pointer-events: none;
+  }
+
+  .panel-tab:disabled,
+  .rail-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
   }
 
   /* Collapsed rail — 28px wide vertical bar on the right edge. Mirror

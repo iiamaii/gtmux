@@ -137,6 +137,9 @@
 
   const current = $derived(toolStore.current);
   const locked = $derived(toolStore.locked);
+  // No active session 시 12 도구는 의미 없음 (canvas mutation 무효). 사용자
+  // 가 ActiveSessionDropdown 으로 session 을 먼저 연결하도록 유도.
+  const noActiveSession = $derived(sessionStore.active === null);
 
   function onkeydown(e: KeyboardEvent): void {
     // Q toggles lock (only if a non-mode tool is active).
@@ -181,9 +184,12 @@
             class="tool"
             class:active={current === tool.id}
             class:locked={current === tool.id && locked}
-            title={tool.name + (tool.hint ? ` — ${tool.hint}` : '')}
+            title={noActiveSession
+              ? 'Connect a session to use canvas tools'
+              : tool.name + (tool.hint ? ` — ${tool.hint}` : '')}
             aria-label={tool.name}
             aria-pressed={current === tool.id}
+            disabled={noActiveSession}
             data-tool-id={tool.id}
             onclick={(e) => {
               toolStore.set(tool.id);
