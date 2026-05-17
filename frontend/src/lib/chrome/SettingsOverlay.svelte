@@ -37,19 +37,14 @@
   /* ── Theme section ───────────────────────────────────────────────── */
 
   /**
-   * Theme 변경 시 자동 새로고침 — xterm v6 의 cell DOM stale 색 회귀 회피.
-   * 새로고침 chain (full page reload → WS 재 connect → BE ring buffer replay
-   * → 새 Terminal 의 cell paint 새 theme) 이 *유일한 robust path*. theme
-   * 변경 자체는 *드문 이벤트* — Titlebar toggle 제거 + Settings 안으로 격리
-   * 라 reload 부담 acceptable. sessionStorage hint 가 reload 후 자동 reattach.
+   * ADR-0017 amend ④ D2 의 Auto-save 정책 정합 — change 즉시 persist + modal
+   * 유지. chrome theme (token swap) 은 setMode 한 번에 즉시 반영. xterm 의
+   * cell DOM stale 색 (v6 의 known issue) 의 hot reload 는 ADR-0017 D5 의
+   * "다음 amend" 영역 — 본 컴포넌트 scope 외. 사용자가 stale 색 본 경우엔
+   * page reload manual 권장 (section-hint 안내).
    */
   function setMode(mode: ThemeMode): void {
     themeStore.setMode(mode);
-    if (typeof window !== 'undefined') {
-      // setMode 의 storage write 와 apply() 가 동기 완료 — 다음 tick 에 reload.
-      // 즉시 reload 도 OK 이지만 한 micro-task 의 여유로 store flush 안전망.
-      queueMicrotask(() => window.location.reload());
-    }
   }
 
   /* ── Shortcuts section ───────────────────────────────────────────── */
@@ -184,7 +179,8 @@
             <h3 class="section-head">Theme</h3>
             <p class="section-hint">
               Choose the appearance — <em>System</em> follows your OS preference.
-              Changes apply immediately.
+              Changes apply immediately. If terminal cell colors look stale
+              after switching, reload the page.
             </p>
             <div class="radio-group" role="radiogroup" aria-label="Theme mode">
               {#each ['system', 'light', 'dark'] as mode (mode)}
