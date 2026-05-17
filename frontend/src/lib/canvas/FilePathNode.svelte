@@ -4,12 +4,13 @@
   // 사용자 입력 path 의 visual reference. 실제 OS-level open 은 ADR-0023 의
   // confirm + allowlist 흐름 (FileOpenConfirmModal — BE-NEW-12 의존, P2).
   //
-  // 현재: path 표시 + 더블 클릭 인라인 편집만. open icon 은 placeholder
-  // (ADR-0023 ship 시 wire).
+  // ADR-0035 D1 (2026-05-17 amend) — path 의 *직접 입력 제거*. 더블 클릭 →
+  // 전역 filePicker 으로 picker modal 진입 → 선택 시 applyMutation.
+  // InlineEdit 패턴 폐기 (path 의 free-form typing 은 traversal / typo risk).
 
   import { NodeResizer } from '@xyflow/svelte';
-  import InlineEditField from '$lib/common/InlineEditField.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { filePicker } from '$lib/stores/filePicker.svelte';
   import type { FilePathItem, CanvasItem } from '$lib/types/canvas';
 
   interface FilePathNodeData {
@@ -47,7 +48,6 @@
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(selected || sessionStore.M.has(data.id));
 
-  let editing = $state(false);
   type ResizeParams = { x: number; y: number; width: number; height: number };
 
   // ref/frontend-design/components.html §03 — display 시 path/name 분리:
@@ -88,18 +88,28 @@
     }
   });
 
+  /** parent dir of current path (picker 의 initialDir). path 가 비어 있으면
+   *  workspace root (filePicker store 의 '' default). */
+  function parentDirOf(path: string): string {
+    if (path.length === 0) return '';
+    const lastSlash = path.replace(/\/+$/, '').lastIndexOf('/');
+    if (lastSlash <= 0) return '';
+    return path.slice(0, lastSlash);
+  }
+
   function onDblClick(e: MouseEvent): void {
     if (isLocked) return;
     e.stopPropagation();
-    editing = true;
+    // ADR-0035 D1 amend (2026-05-17) — 더블 클릭 → picker modal. path 의
+    // free-form typing 폐기 (traversal / typo risk + picker 가 정확).
+    filePicker.openFor(parentDirOf(data.path), (absolutePath: string) => {
+      void onCommit(absolutePath);
+    });
   }
 
   async function onCommit(next: string): Promise<void> {
-    if (next === data.path) {
-      editing = false;
-      return;
-    }
-    const result = await sessionStore.applyMutation(
+    if (next === data.path) return;
+    await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
@@ -113,7 +123,6 @@
         failMessage: 'Path commit failed',
       },
     );
-    if (result.ok) editing = false;
   }
 
   async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
@@ -167,19 +176,8 @@
         </svg>
       </div>
       <div class="fp-meta">
-        {#if editing}
-          <InlineEditField
-            value={data.path}
-            editing={true}
-            allowEmpty={true}
-            plain={true}
-            placeholder="/path/to/file"
-            class="path-edit"
-            onCommit={(next: string) => void onCommit(next)}
-            onCancel={() => (editing = false)}
-          />
-        {:else if data.path.length === 0}
-          <span class="path-placeholder">Double-click to set path</span>
+        {#if data.path.length === 0}
+          <span class="path-placeholder">Double-click to pick a file…</span>
         {:else}
           {#if splitPath.dir.length > 0}
             <div class="fp-path" title={data.path}>{splitPath.dir}</div>
@@ -189,22 +187,18 @@
       </div>
     </div>
     <!-- Foot row — badge (per-lang) + placeholder meta (lines / size /
-         branch). 실 데이터 wire 는 BE file-stat endpoint 의존
-         (ADR-0034 / 0060 work-package). 현 placeholder = v3 시안 §03 의
-         visual frame — em-dash dim. *항상 표시* (path 빈 상태도) —
-         사용자가 visual frame 으로 file_path 임을 인지. editing 중에만
-         hide (InlineEdit 의 chrome 와 시각 충돌 방지). -->
-    {#if !editing}
-      <div class="fp-foot">
-        {#if langBadge !== null}
-          <span class="fp-badge {langBadge.cls}">{langBadge.label}</span>
-        {/if}
-        <span class="fp-meta-dim">— lines</span>
-        <span class="sep">·</span>
-        <span class="fp-meta-dim">— KB</span>
-        <span class="right fp-meta-dim">—</span>
-      </div>
-    {/if}
+         branch). 실 데이터 wire 는 BE file-stat endpoint (ADR-0034 의
+         별 fp-foot wire 가 다른 worker 의 62fc743 에 ship). placeholder
+         em-dash 는 *항상 표시* — visual frame 으로 file_path 즉시 인지. -->
+    <div class="fp-foot">
+      {#if langBadge !== null}
+        <span class="fp-badge {langBadge.cls}">{langBadge.label}</span>
+      {/if}
+      <span class="fp-meta-dim">— lines</span>
+      <span class="sep">·</span>
+      <span class="fp-meta-dim">— KB</span>
+      <span class="right fp-meta-dim">—</span>
+    </div>
   </div>
 {/if}
 

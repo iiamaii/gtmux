@@ -34,9 +34,18 @@ export class DirNotFoundError extends Error {
   }
 }
 
+export interface ListDirOptions {
+  /** ADR-0035 D7 — per-request override of `Settings.picker_show_hidden`.
+   * `undefined` → use Settings default; `true`/`false` → override. */
+  showHidden?: boolean;
+}
+
 /** `GET /api/fs/list?dir=<percent-encoded>`. Empty `dir` = workspace root. */
-export async function listDir(dir: string): Promise<FsListResponse> {
+export async function listDir(dir: string, options: ListDirOptions = {}): Promise<FsListResponse> {
   const qs = new URLSearchParams({ dir });
+  if (options.showHidden !== undefined) {
+    qs.set('show_hidden', String(options.showHidden));
+  }
   const res = await fetch(`/api/fs/list?${qs}`, {
     method: 'GET',
     headers: { Accept: 'application/json' },

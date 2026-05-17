@@ -37,16 +37,17 @@ use serde_json::{json, Value};
 
 use crate::AppState;
 
-/// Mutable behavior settings. The only toggle for Stage 7 minimal is
-/// ADR-0021 G25.1.b's `auto_kill_terminal_on_panel_close` — when `true`,
-/// the FE skips the per-panel close dialog and SIGTERMs the matching
-/// terminal directly. Default = `false` (safer — confirm dialog default).
+/// Mutable behavior settings.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BehaviorSettings {
     /// ADR-0021 G25.1.b: when true, panel close = panel + terminal SIGTERM
     /// with no per-action dialog. Default `false` per `bool::default()`.
     pub auto_kill_terminal_on_panel_close: bool,
+    /// ADR-0035 D7: when true, FilePicker shows dot-prefixed entries
+    /// (e.g. `.git`, `.env`, `.config`). Default `false` — hidden entries
+    /// are skipped (typical UX). Toggleable from Settings UI.
+    pub picker_show_hidden: bool,
 }
 
 /// Compile-time build metadata. Sourced from `Cargo.toml` + optional
@@ -275,6 +276,20 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
                         .into_response();
                 };
                 next.auto_kill_terminal_on_panel_close = b;
+            }
+            "picker_show_hidden" => {
+                let Some(b) = value.as_bool() else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "type_mismatch",
+                            "field": "behavior.picker_show_hidden",
+                            "expected": "bool",
+                        })),
+                    )
+                        .into_response();
+                };
+                next.picker_show_hidden = b;
             }
             other => {
                 return (

@@ -26,6 +26,7 @@
   import { effectiveLocked, effectiveVisibility } from '$lib/types/group';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import FilePickerModal from '$lib/chrome/FilePickerModal.svelte';
+  import { filePicker } from '$lib/stores/filePicker.svelte';
   import PanelNode from './PanelNode.svelte';
   import TextNode from './TextNode.svelte';
   import NoteNode from './NoteNode.svelte';
@@ -879,32 +880,14 @@
     }
   }
 
-  /** ADR-0035 D1 — file_path 도구의 picker modal state.
-   *   - filePickerOpen: modal visibility
-   *   - pendingFilePathSpawn: cursor center coords at picker open. cancel
-   *     시 item spawn 안 함, select 시 createCanvasItem('file_path', ...) +
-   *     commit + toolStore.consume(). */
-  let filePickerOpen = $state(false);
-  let pendingFilePathSpawn = $state<{ x: number; y: number } | null>(null);
-
-  function onFilePickerCancel(): void {
-    filePickerOpen = false;
-    pendingFilePathSpawn = null;
-    // Cancel = item spawn 안 함. tool 은 그대로 유지 (사용자가 다시 시도 가능).
-  }
-
-  function onFilePickerSelect(absolutePath: string): void {
-    filePickerOpen = false;
-    const pos = pendingFilePathSpawn;
-    pendingFilePathSpawn = null;
-    if (pos === null) return;
-    const item = createCanvasItem('file_path', pos);
-    // createCanvasItem 의 default 는 path = ''. 선택한 path 로 override.
-    const withPath = { ...item, path: absolutePath };
-    void commitNewItem(withPath)
-      .then(() => toolStore.consume())
-      .catch(onSpawnError);
-  }
+  // ADR-0035 D1 — file_path 도구 의 picker. 전역 `filePicker` store 가 modal
+  // visibility + caller callback 을 관리. spawn flow / 수정 flow 둘 다
+  // 같은 modal instance 사용 (Canvas mount 의 단일 FilePickerModal).
+  //
+  // Caller 1 (spawn): file_path 도구 click → canvas click → filePicker.openFor
+  //   (workspace='', select → createCanvasItem('file_path', pos) + path 갱신).
+  // Caller 2 (rename): FilePathNode 의 onDblClick → filePicker.openFor(parent,
+  //   select → applyMutation(path)).
 
   function onSpawnError(err: unknown): void {
     if (err instanceof UnauthorizedError) {
@@ -958,9 +941,15 @@
       if (tool === 'file_path') {
         // ADR-0035 D1 — file_path 도구 spawn 직후 자동 picker modal.
         // 사용자가 path 선택 → file_path item spawn (실 path 로). cancel →
-        // item 생성 안 함. spawn 좌표는 picker open 시점의 cursor center.
-        pendingFilePathSpawn = centered('file_path');
-        filePickerOpen = true;
+        // item 생성 안 함.
+        const pos = centered('file_path');
+        filePicker.openFor('', (absolutePath: string) => {
+          const item = createCanvasItem('file_path', pos);
+          const withPath = { ...item, path: absolutePath };
+          void commitNewItem(withPath)
+            .then(() => toolStore.consume())
+            .catch(onSpawnError);
+        });
         return;
       }
       if (tool === 'image') {
@@ -1305,12 +1294,13 @@
   {/if}
 </div>
 
-<!-- ADR-0035 D1 — file_path 도구 spawn 직후 자동 picker modal. canvas-root
-     밖에 mount — modal stack 의 z-index 정합. -->
+<!-- ADR-0035 D1 — single picker modal instance. 전역 filePicker store 가
+     visibility + caller callback 관리 (spawn / rename 두 caller 공유). -->
 <FilePickerModal
-  open={filePickerOpen}
-  onCancel={onFilePickerCancel}
-  onSelect={onFilePickerSelect}
+  open={filePicker.open}
+  initialDir={filePicker.initialDir}
+  onCancel={() => filePicker.cancel()}
+  onSelect={(abs) => filePicker.select(abs)}
   onUnauthorized={() => { window.location.href = '/auth'; }}
 />
 

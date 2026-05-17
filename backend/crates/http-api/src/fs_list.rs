@@ -33,6 +33,12 @@ pub struct FsListQuery {
     /// Absolute path of the directory to list. Empty string = workspace root
     /// (convenience — the picker modal opens here by default).
     pub dir: String,
+    /// Per-request override of `BehaviorSettings.picker_show_hidden`. When
+    /// `Some`, the request value wins; when `None`, the Settings value is
+    /// used. Lets the FE picker modal toggle hidden entries without
+    /// touching the persistent Settings.
+    #[serde(default)]
+    pub show_hidden: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,13 +123,24 @@ pub async fn fs_list_handler(
             .into_response();
     }
 
-    // Read entries. Skip dot-prefixed (D7) and any IO-flaky stragglers.
+    // ADR-0035 D7 — Settings.picker_show_hidden default 또는 query param
+    // 의 per-request override. true → dot-prefixed (`.git`, `.env`) 도 표시.
+    let show_hidden = match q.show_hidden {
+        Some(v) => v,
+        None => state.behavior_settings.read().await.picker_show_hidden,
+    };
+
+    // Read entries. Skip dot-prefixed by default (Settings 의 toggle) and
+    // any IO-flaky stragglers.
     let mut entries: Vec<FsEntry> = match std::fs::read_dir(&canonical) {
         Ok(it) => it,
         Err(_) => return internal_500("read_dir_failed"),
     }
     .filter_map(|res| res.ok())
     .filter(|e| {
+        if show_hidden {
+            return true;
+        }
         e.file_name()
             .to_str()
             .map(|n| !n.starts_with('.'))

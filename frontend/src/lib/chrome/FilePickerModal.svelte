@@ -43,6 +43,10 @@
   let errorMessage = $state<string | null>(null);
   let selectedName = $state<string | null>(null);
   let filter = $state('');
+  /** Per-session override of Settings.picker_show_hidden (ADR-0035 D7).
+   * undefined → BE Settings 값 사용 (default false). true/false → override.
+   * checkbox toggle 으로 변경. */
+  let showHidden = $state<boolean | undefined>(undefined);
 
   const filteredEntries = $derived.by((): FsEntry[] => {
     if (filter.length === 0) return entries;
@@ -73,7 +77,7 @@
     errorMessage = null;
     selectedName = null;
     try {
-      const res = await listDir(dir);
+      const res = await listDir(dir, { showHidden });
       currentDir = res.dir;
       parentDir = res.parent;
       entries = res.entries;
@@ -142,6 +146,12 @@
     void navigate(parentDir);
   }
 
+  function onToggleHidden(e: Event): void {
+    const checked = (e.currentTarget as HTMLInputElement).checked;
+    showHidden = checked;
+    void navigate(currentDir);
+  }
+
   function fmtSize(bytes: number | null): string {
     if (bytes === null) return '';
     if (bytes < 1024) return `${bytes} B`;
@@ -173,7 +183,7 @@
       <span class="crumb crumb-cur" title={currentDir}>{currentDir}</span>
     </div>
 
-    <!-- Filter -->
+    <!-- Filter + Show-hidden toggle (ADR-0035 D7) -->
     <div class="picker-filter">
       <input
         type="text"
@@ -183,6 +193,14 @@
         oninput={(e) => (filter = (e.currentTarget as HTMLInputElement).value)}
         autocomplete="off"
       />
+      <label class="hidden-toggle mono" title="Show files / dirs starting with a dot (e.g. .git, .env). Server default = off.">
+        <input
+          type="checkbox"
+          checked={showHidden === true}
+          onchange={onToggleHidden}
+        />
+        <span>Show hidden</span>
+      </label>
     </div>
 
     <!-- Entries -->
@@ -295,7 +313,31 @@
   }
 
   .picker-filter {
+    display: flex;
+    align-items: center;
+    gap: var(--space-8);
     margin-bottom: var(--space-8);
+  }
+
+  .picker-filter .text-input {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .hidden-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    font-size: var(--text-sm);
+    color: var(--color-fg-muted);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .hidden-toggle input[type='checkbox'] {
+    accent-color: var(--color-accent);
+    cursor: pointer;
   }
 
   .text-input {
