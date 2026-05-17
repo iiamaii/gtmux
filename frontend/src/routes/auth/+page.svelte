@@ -146,10 +146,6 @@
 </script>
 
 <header class="topbar">
-  <div class="brand">
-    <img class="brand-mark" src={brandLogoUrl} alt="" aria-hidden="true" />
-    <span>gtmux</span>
-  </div>
   <div class="topbar-actions">
     <button
       class="icon-btn"
@@ -167,7 +163,10 @@
 
 <main>
   <section class="card" aria-labelledby="auth-title">
-    <h1 class="heading" id="auth-title">Enter gtmux</h1>
+    <div class="brand-header">
+      <img class="brand-mark" src={brandLogoUrl} alt="" aria-hidden="true" />
+      <h1 class="heading" id="auth-title">gtmux</h1>
+    </div>
     <p class="deck">
       Authenticate with a token or password. Your session persists on this device.
     </p>
@@ -292,32 +291,31 @@
     height: 56px;
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    justify-content: flex-end;
     padding: 0 var(--space-24);
     z-index: 10;
-  }
-
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: var(--space-10);
-    font-weight: var(--weight-semibold);
-    font-size: 15px;
-    letter-spacing: -0.2px;
-  }
-
-  .brand-mark {
-    width: 22px;
-    height: 22px;
-    border-radius: var(--radius-md);
-    object-fit: cover;
-    display: block;
   }
 
   .topbar-actions {
     display: flex;
     align-items: center;
     gap: var(--space-4);
+  }
+
+  .brand-header {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-10);
+    margin-bottom: var(--space-6);
+  }
+
+  .brand-mark {
+    width: 56px;
+    height: 56px;
+    border-radius: var(--radius-md);
+    object-fit: cover;
+    display: block;
   }
 
   .icon-btn {
@@ -360,7 +358,8 @@
     font-weight: var(--weight-semibold);
     letter-spacing: -0.6px;
     line-height: 1.15;
-    margin: 0 0 6px;
+    margin: 0;
+    text-align: center;
   }
 
   .deck {
@@ -370,6 +369,7 @@
     letter-spacing: -0.1px;
     margin: 0 0 28px;
     line-height: 1.45;
+    text-align: center;
   }
 
   .tabs {
