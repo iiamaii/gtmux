@@ -84,20 +84,34 @@ const paneOutHandlers = new Map<string, Set<PaneOutHandler>>();
  * a typical shell-prompt redraw (a few hundred bytes including SGR).
  */
 const PANE_LATE_BUFFER_CAP = 256 * 1024;
-const paneOutLateBuffers = new Map<string, Uint8Array[]>();
+
+/**
+ * Hot-path debug log gate. Vite 가 production build 시 `import.meta.env.DEV`
+ * 를 `false` literal 로 inline → `if (false) console.debug(...)` 가 dead-code
+ * elimination 되어 PANE_OUT 마다의 console call 비용 0. Dev 에서는 그대로
+ * 동작.
+ */
+const DEBUG_PANE_OUT = import.meta.env.DEV;
+
+/** Per-pane late buffer + running total (length recompute 비용 제거). */
+type LateBufferEntry = { chunks: Uint8Array[]; total: number };
+const paneOutLateBuffers = new Map<string, LateBufferEntry>();
 
 function appendLateBuffer(paneKey: string, bytes: Uint8Array): void {
-  const queued = paneOutLateBuffers.get(paneKey) ?? [];
-  const totalSoFar = queued.reduce((acc, b) => acc + b.length, 0);
-  if (totalSoFar >= PANE_LATE_BUFFER_CAP) {
-    // Drop oldest until the new chunk fits. (FIFO — keep the *most recent*
-    // bytes, which are usually the most relevant for visual catch-up.)
-    while (queued.length > 0 && queued.reduce((a, b) => a + b.length, 0) + bytes.length > PANE_LATE_BUFFER_CAP) {
-      queued.shift();
-    }
+  let entry = paneOutLateBuffers.get(paneKey);
+  if (!entry) {
+    entry = { chunks: [], total: 0 };
+    paneOutLateBuffers.set(paneKey, entry);
   }
-  queued.push(bytes);
-  paneOutLateBuffers.set(paneKey, queued);
+  // Drop oldest until the new chunk fits. (FIFO — keep the *most recent*
+  // bytes, which are usually the most relevant for visual catch-up.)
+  // running `total` 로 O(k) 처리 — 직전 구현의 reduce-in-while 가 O(k²) 였음.
+  while (entry.chunks.length > 0 && entry.total + bytes.length > PANE_LATE_BUFFER_CAP) {
+    const dropped = entry.chunks.shift();
+    if (dropped !== undefined) entry.total -= dropped.length;
+  }
+  entry.chunks.push(bytes);
+  entry.total += bytes.length;
 }
 
 export function registerPaneOut(paneId: string, handler: PaneOutHandler): void {
@@ -112,16 +126,18 @@ export function registerPaneOut(paneId: string, handler: PaneOutHandler): void {
   // mirror subscribers join the live stream from here on (no historical replay;
   // that's ADR-0021 D6 catch-up territory, out of scope for the dispatcher).
   if (wasEmpty) {
-    const queued = paneOutLateBuffers.get(paneId);
-    if (queued && queued.length > 0) {
-      console.debug('[ws] registerPaneOut pane=%s flushing %d buffered chunk(s)',
-        paneId, queued.length);
-      for (const bytes of queued) handler(bytes, noop);
+    const entry = paneOutLateBuffers.get(paneId);
+    if (entry && entry.chunks.length > 0) {
+      if (DEBUG_PANE_OUT) {
+        console.debug('[ws] registerPaneOut pane=%s flushing %d buffered chunk(s)',
+          paneId, entry.chunks.length);
+      }
+      for (const bytes of entry.chunks) handler(bytes, noop);
       paneOutLateBuffers.delete(paneId);
-    } else {
+    } else if (DEBUG_PANE_OUT) {
       console.debug('[ws] registerPaneOut pane=%s (no buffered bytes)', paneId);
     }
-  } else {
+  } else if (DEBUG_PANE_OUT) {
     console.debug('[ws] registerPaneOut pane=%s subscriber=%d (mirror)', paneId, set.size);
   }
 }
@@ -228,8 +244,10 @@ function handlePaneOut(payload: Uint8Array): void {
   const key = String(decoded.paneId);
   const handlers = paneOutHandlers.get(key);
   if (!handlers || handlers.size === 0) {
-    console.debug('[ws] PANE_OUT pane=%s len=%d → late-buffer (no subscribers)',
-      key, decoded.bytes.length);
+    if (DEBUG_PANE_OUT) {
+      console.debug('[ws] PANE_OUT pane=%s len=%d → late-buffer (no subscribers)',
+        key, decoded.bytes.length);
+    }
     appendLateBuffer(key, decoded.bytes);
     return;
   }
@@ -238,8 +256,10 @@ function handlePaneOut(payload: Uint8Array): void {
   // local cursor / scrollback). Snapshot the set so a subscriber unregistering
   // mid-iteration (e.g. via term.write triggering an unmount) doesn't skip
   // siblings.
-  console.debug('[ws] PANE_OUT pane=%s len=%d → %d subscriber(s)',
-    key, decoded.bytes.length, handlers.size);
+  if (DEBUG_PANE_OUT) {
+    console.debug('[ws] PANE_OUT pane=%s len=%d → %d subscriber(s)',
+      key, decoded.bytes.length, handlers.size);
+  }
   for (const handler of [...handlers]) {
     handler(decoded.bytes, noop);
   }
