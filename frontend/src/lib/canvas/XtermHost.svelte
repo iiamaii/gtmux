@@ -245,9 +245,9 @@
       // silent.
     }
     if (containerEl !== undefined) {
-      // NOTE: TS generic `<HTMLElement>` 표기는 어디서든 svelte parser 가
-      // HTML tag 로 오인 → script unclosed. `as HTMLElement` 도 동일.
-      // runtime `instanceof` narrow 가 generic-free + TS-safe.
+      // NOTE: TS generic 표기 (kkwaeshhi 안 HTMLElement) 는 svelte parser
+      // 가 HTML tag 로 오인 → script unclosed. comment 안 raw text 도 동일
+      // — 꺾쇠 자체를 쓰지 말 것. runtime instanceof narrow 만 안전.
       const cells = containerEl.querySelectorAll('.xterm-rows span');
       cells.forEach((span) => {
         if (span instanceof HTMLElement) {
