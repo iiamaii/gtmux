@@ -13,7 +13,6 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
-  import XtermHost from '$lib/canvas/XtermHost.svelte';
   import PanelDanglingOverlay from '$lib/canvas/PanelDanglingOverlay.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
@@ -44,6 +43,40 @@
 
   let titleEditing = $state(false);
   let bodyEditing = $state(false);
+
+  // ── xterm DOM portal ────────────────────────────────────────────────────
+  // Maximize 시 in-flow PanelNode 의 `[data-portal-id={itemId}]` 컨테이너 안의
+  // XtermHost DOM (xterm 인스턴스 의 containerEl 트리) 을 modal 의 slot 으로
+  // reparent. XtermHost 컴포넌트 자체는 PanelNode 가 계속 mount 유지 → xterm
+  // 인스턴스, ResizeObserver, dispatcher 등록 그대로 보존. cleanup 시 inflow
+  // 로 다시 reparent. inflow 가 사라진 edge case (session switch 등) 는 child
+  // 가 modal 과 함께 GC 되도록 noop.
+  let portalSlotEl: HTMLDivElement | undefined = $state(undefined);
+
+  $effect(() => {
+    if (portalSlotEl === undefined) return;
+    if (!isTerminal || itemId === null) return;
+    const sel = `[data-portal-id="${itemId}"]`;
+    const inflowHost = document.querySelector(sel) as HTMLElement | null;
+    if (inflowHost === null) return;
+    // inflow 의 first child (XtermHost containerEl) 만 portalSlot 으로 이동.
+    // 다중 child 가능성 (예: pending placeholder) 대비해 looper.
+    const moved: ChildNode[] = [];
+    while (inflowHost.firstChild) {
+      const child = inflowHost.firstChild;
+      portalSlotEl.appendChild(child);
+      moved.push(child);
+    }
+    return () => {
+      const home = document.querySelector(sel) as HTMLElement | null;
+      if (home === null) return;
+      for (const node of moved) {
+        if (node.parentNode === portalSlotEl) {
+          home.appendChild(node);
+        }
+      }
+    };
+  });
 
   function onRestoreClick(e: MouseEvent): void {
     e.stopPropagation();
@@ -170,7 +203,11 @@
       <div class="max-body">
         {#if isTerminal}
           {#if terminalPaneId !== undefined}
-            <XtermHost paneId={String(terminalPaneId)} />
+            <!-- xterm DOM portal target — in-flow PanelNode 의 xterm 컨테이너
+                 DOM 이 maximize 동안 본 div 로 reparent (JS appendChild).
+                 단일 xterm 인스턴스 가 in-flow ↔ modal 사이를 이동 — state /
+                 scroll buffer / dispatcher 등록 모두 보존. -->
+            <div class="xterm-portal-slot" bind:this={portalSlotEl}></div>
           {:else}
             <div class="max-pending" role="status" aria-live="polite">
               <div class="pending-title">Terminal stream connecting…</div>
@@ -330,6 +367,21 @@
     background: var(--color-bg);
     overflow: hidden;
     position: relative;
+    min-height: 0;
+  }
+
+  /* xterm DOM portal target — in-flow PanelNode 의 xterm 컨테이너 가 본 div
+     안으로 이동. flex 로 width/height 100% 채움 (xterm 의 ResizeObserver 가
+     fit() 자동 호출 → cell 크기 재계산). */
+  .xterm-portal-slot {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: var(--xterm-bg);
+  }
+  :global(.xterm-portal-slot > :first-child) {
+    flex: 1 1 auto;
     min-height: 0;
   }
 

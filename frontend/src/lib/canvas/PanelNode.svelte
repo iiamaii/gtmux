@@ -463,15 +463,14 @@
     <div class="panel-body">
       {#if isStreaming}
         {#if terminalPaneId !== undefined}
-          <!-- 0039 §3 Option C1 — terminalPool 의 UUID→PaneId binding (0x88
-               TERMINAL_SPAWNED) 이 도착했으므로 numeric PaneId 로 XtermHost mount.
-               같은 paneId 에 multiple panel 가 subscribe 하면 dispatcher 의
-               multi-subscriber 패턴 (ADR-0021 D1 mirror) 으로 모두에게 fan-out. -->
-          <XtermHost paneId={String(terminalPaneId)} />
+          <!-- xterm-portal-host: MaximizedItemModal 이 maximize 시 본 div 의
+               XtermHost DOM (containerEl) 을 modal 의 slot 으로 reparent.
+               XtermHost 인스턴스는 PanelNode 가 계속 마운트 유지 — 단일 xterm
+               인스턴스 가 in-flow ↔ modal 로 DOM 만 이동, state/scroll 보존. -->
+          <div class="xterm-portal-host" data-portal-id={data.id}>
+            <XtermHost paneId={String(terminalPaneId)} />
+          </div>
         {:else}
-          <!-- binding 미도착 — `[New Terminal]` spawn race 의 짧은 구간 또는 page
-               reload 후 첫 0x88 도착 전. terminal_died 상태는 PanelDanglingOverlay
-               가 우선. -->
           <div class="panel-pending" role="status" aria-live="polite">
             <div class="pending-title">Terminal stream connecting…</div>
             <div class="pending-hint">Waiting for spawn handshake.</div>
@@ -700,6 +699,20 @@
      * height 와 컨테이너 사이 잔여 영역이 같은 색이라 resize 중에도
      * 검은색 갭이 노출되지 않음. */
     background: var(--xterm-bg);
+  }
+
+  /* xterm DOM portal — XtermHost 의 containerEl 가 본 div 의 직접 child.
+     Modal 이 active 시 본 div 가 비어있고, 내부 child 는 modal 의 slot 으로
+     reparent (JS appendChild). flex/size 는 maximized 시에도 동일하게 활용. */
+  .xterm-portal-host {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+  :global(.xterm-portal-host > :first-child) {
+    flex: 1 1 auto;
+    min-height: 0;
   }
 
   /* Minimized — header only, body hide, header bottom border 제거 (시안 §04). */

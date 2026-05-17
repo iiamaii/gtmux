@@ -17,6 +17,7 @@
   import RightPanel from '$lib/chrome/RightPanel.svelte';
   import ViewportCtrl from '$lib/chrome/ViewportCtrl.svelte';
   import ContextMenu from '$lib/chrome/ContextMenu.svelte';
+  import MaximizedItemModal from '$lib/chrome/MaximizedItemModal.svelte';
   import ChangeTerminalModal from '$lib/chrome/ChangeTerminalModal.svelte';
   import GroupCloseConfirmModal from '$lib/chrome/GroupCloseConfirmModal.svelte';
   import SettingsOverlay from '$lib/chrome/SettingsOverlay.svelte';
@@ -352,6 +353,7 @@
         <RightPanel />
         <ViewportCtrl />
         <ContextMenu bind:this={contextMenuRef} />
+        <MaximizedItemModal />
         {#if sessionStore.active === null && workspaceSwitcher.stage === 'closed'}
           <!-- Modal cancel / 첫 진입 시 사용자가 빈 canvas 만 보고 혼란스럽지
                않도록 — centered placeholder 가 New / Open 진입점 단독 제공. -->
