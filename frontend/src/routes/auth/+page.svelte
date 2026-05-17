@@ -355,10 +355,10 @@
   }
 
   .heading {
-    font-size: 28px;
+    font-size: 40px;
     font-weight: var(--weight-semibold);
-    letter-spacing: -0.6px;
-    line-height: 1.15;
+    letter-spacing: -0.8px;
+    line-height: 1.1;
     margin: 0;
     text-align: center;
   }
