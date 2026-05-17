@@ -227,12 +227,12 @@
       style:background={mixed || isTransparent ? undefined : (allowAlpha && resolvedHex !== null && alphaPercent < 100 ? resolvedHex : swatchValue)}
     >
       {#if mixed}
-        <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
-          <line x1="3" y1="25" x2="25" y2="3" stroke="var(--color-fg-subtle)" stroke-width="1" />
+        <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+          <line x1="3" y1="23" x2="23" y2="3" stroke="var(--color-fg-subtle)" stroke-width="1" />
         </svg>
       {:else if isTransparent}
-        <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
-          <line x1="3" y1="25" x2="25" y2="3" stroke="var(--color-danger)" stroke-width="1.2" />
+        <svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true">
+          <line x1="3" y1="23" x2="23" y2="3" stroke="var(--color-danger)" stroke-width="1.2" />
         </svg>
       {/if}
     </span>
@@ -318,16 +318,16 @@
 
   .swatch-wrap {
     position: relative;
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     display: inline-block;
     cursor: pointer;
   }
 
   .swatch {
     display: block;
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--color-border);
     background-clip: padding-box;
@@ -356,8 +356,8 @@
     inset: 0;
     opacity: 0;
     cursor: pointer;
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     padding: 0;
     border: 0;
     background: transparent;
@@ -420,8 +420,8 @@
   }
 
   .transparent-btn {
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
