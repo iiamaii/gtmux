@@ -227,12 +227,12 @@
       style:background={mixed || isTransparent ? undefined : (allowAlpha && resolvedHex !== null && alphaPercent < 100 ? resolvedHex : swatchValue)}
     >
       {#if mixed}
-        <svg width="24" height="22" viewBox="0 0 24 22" aria-hidden="true">
-          <line x1="2" y1="20" x2="22" y2="2" stroke="var(--color-fg-subtle)" stroke-width="1" />
+        <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+          <line x1="3" y1="25" x2="25" y2="3" stroke="var(--color-fg-subtle)" stroke-width="1" />
         </svg>
       {:else if isTransparent}
-        <svg width="24" height="22" viewBox="0 0 24 22" aria-hidden="true">
-          <line x1="2" y1="20" x2="22" y2="2" stroke="var(--color-danger)" stroke-width="1.2" />
+        <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+          <line x1="3" y1="25" x2="25" y2="3" stroke="var(--color-danger)" stroke-width="1.2" />
         </svg>
       {/if}
     </span>
@@ -309,7 +309,7 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-4);
-    height: 22px;
+    height: 28px;
   }
 
   .color-picker.disabled {
@@ -318,16 +318,16 @@
 
   .swatch-wrap {
     position: relative;
-    width: 24px;
-    height: 22px;
+    width: 28px;
+    height: 28px;
     display: inline-block;
     cursor: pointer;
   }
 
   .swatch {
     display: block;
-    width: 24px;
-    height: 22px;
+    width: 28px;
+    height: 28px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--color-border);
     background-clip: padding-box;
@@ -356,8 +356,8 @@
     inset: 0;
     opacity: 0;
     cursor: pointer;
-    width: 24px;
-    height: 22px;
+    width: 28px;
+    height: 28px;
     padding: 0;
     border: 0;
     background: transparent;
@@ -367,7 +367,7 @@
     flex: 1 1 auto;
     min-width: 0;
     width: 76px;
-    height: 22px;
+    height: 28px;
     padding: 0 6px;
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
@@ -394,7 +394,7 @@
 
   .alpha-input {
     width: 44px;
-    height: 22px;
+    height: 28px;
     padding: 0 4px;
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
@@ -420,8 +420,8 @@
   }
 
   .transparent-btn {
-    width: 22px;
-    height: 22px;
+    width: 28px;
+    height: 28px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
