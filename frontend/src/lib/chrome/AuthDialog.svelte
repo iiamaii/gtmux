@@ -130,8 +130,11 @@
   }
 
   .choice:focus-visible {
-    outline: 2px dashed var(--color-accent);
-    outline-offset: 1px;
+    /* Modal auto-focus 가 first focusable (New Session) 에 즉시 focus →
+       dashed outline 이 사용자 첫 화면에 노출되며 거슬림. outline 제거 +
+       border-color 만 강화로 인디케이터 유지. */
+    outline: none;
+    border-color: var(--color-accent);
   }
 
   .choice-icon {

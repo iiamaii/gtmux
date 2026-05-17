@@ -274,6 +274,7 @@
         <InlineEditTextarea
           value={data.content ?? ''}
           editing={true}
+          plain={true}
           placeholder={'# Heading\n\nWrite your document — markdown ok.'}
           rows={8}
           class="doc-content-edit"

@@ -515,7 +515,10 @@
     border: 1px solid var(--color-border);
     border-radius: var(--radius-md);
     box-shadow: var(--shadow-md);
-    overflow: hidden;
+    /* NoteNode 의 §6 fix 와 동일 패턴 — corner resize handle 의 negative
+       offset 이 panel 의 edge 밖으로 나가도 clip 되지 않게. inner content
+       (xterm) 의 overflow 는 .panel-body 의 overflow:hidden 으로 격리. */
+    overflow: visible;
     box-sizing: border-box;
     font-family: var(--font-mono);
     font-size: var(--text-lg);

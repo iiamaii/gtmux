@@ -1397,7 +1397,9 @@
     border: 1.5px dashed var(--color-accent);
     background: color-mix(in srgb, var(--color-accent) 6%, transparent);
     pointer-events: none;
-    z-index: 99;
+    /* canvas-overlay (18) — side-panel (20) 보다 아래라 LeftPanel/RightPanel
+       위로 ghost 가 표시되지 않음. */
+    z-index: var(--z-canvas-overlay);
     border-radius: var(--radius-sm);
   }
 
@@ -1409,7 +1411,7 @@
     background: color-mix(in srgb, var(--color-accent) 10%, transparent);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
     pointer-events: none;
-    z-index: 100;
+    z-index: var(--z-canvas-overlay);
   }
 
   /* Free draw 의 stroke preview — bounding-box 강조 안 함 (path 자체가 시각). */

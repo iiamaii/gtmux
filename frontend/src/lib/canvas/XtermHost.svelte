@@ -228,6 +228,15 @@
     const resolved = themeStore.resolved;
     if (term === null) return;
     term.options.theme = xtermTheme(resolved);
+    // theme options swap 만으로는 cell texture cache 가 stale — 빈 영역 / 옛
+    // 색 그대로 남는 회귀 (사용자 보고 2026-05-17). 강제 redraw 로 모든 row
+    // 의 cell 을 새 theme 으로 다시 그림.
+    try {
+      term.clearTextureAtlas?.();
+      term.refresh(0, term.rows - 1);
+    } catch {
+      // refresh 가 인식 안 되는 alt-screen 등의 edge case — silent.
+    }
   });
 </script>
 
