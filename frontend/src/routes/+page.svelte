@@ -40,6 +40,7 @@
   import { settingsStore } from '$lib/stores/settings.svelte';
   import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
   import { reconnectGate } from '$lib/stores/reconnectGate.svelte';
+  import * as leaveBeacon from '$lib/lifecycle/leaveBeacon';
   import type { WsClient } from '$lib/ws/client';
 
   const TOKEN_STORAGE_KEY = 'gtmux_token';
@@ -200,6 +201,12 @@
     unbindSystemTheme = themeStore.bindSystemListener();
     heartbeatStore.start();
 
+    // Page-unload best-effort attach lock release — ADR-0021 D6 amend ②,
+    // 0071 §D-5. `beforeunload` + `pagehide` 둘 다 listen 해 정상 close /
+    // BFCache / iOS Safari 케이스를 모두 cover. BE `POST /api/leave` 가
+    // owner-scoped 으로 lock release.
+    leaveBeacon.bind();
+
     // Phase 2 (plan-0008 §6) — visibility transition listener.
     const onVisibility = () => maybeSilentReattach();
     document.addEventListener('visibilitychange', onVisibility);
@@ -325,6 +332,7 @@
 
   onDestroy(() => {
     heartbeatStore.stop();
+    leaveBeacon.unbind();
     if (unbindVisibility !== null) {
       unbindVisibility();
       unbindVisibility = null;
