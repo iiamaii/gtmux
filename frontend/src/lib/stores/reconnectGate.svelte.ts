@@ -19,6 +19,7 @@
 // - cancel() 안에서 sessionStorageHint.clear() 호출 — 다음 reload 도 dialog 흐름.
 // - attemptReattach 의 404 분기는 자체 clear 처리 → reconnectGate 중복 clear 무해.
 
+import { detachSession } from '$lib/http/sessions';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
@@ -107,12 +108,27 @@ class ReconnectGate {
    * - state = 'idle' 로 reset — 본 화면 mount 게이트는 통과하지만, AppPage
    *   에서 그 직후 `workspaceSwitcher.open()` 을 호출하므로 사용자가 본
    *   화면 빈 상태를 흘끗 보더라도 즉시 modal 이 덮음.
+   * - **Tentative attach lock release** (ADR-0019 D5.4 amend ②, 0071 §B-1):
+   *   `state === 'attaching' && attemptName !== null` 분기는 BE 가 lock 을
+   *   잡았을 가능성이 있는 구간. fire-and-forget `detachSession` 으로 즉시
+   *   해제 — `WorkspaceSwitcher.cancelAttachConfirm` 의 step 1 (D5.5.1) 과
+   *   동형 패턴. 실패는 silent (console.debug). BE 의 30s heartbeat fallback
+   *   (ADR-0021 D6.2) 이 안전망이므로 lock leak 영구화 위험 0. 사용자 UI
+   *   는 `markIdle()` + `workspaceSwitcher.open()` 으로 즉시 전환되어야 하
+   *   므로 await 하지 않음 (Q1: fire-and-forget).
    */
   cancel(): void {
     this.#controller?.abort();
     this.#controller = null;
+    const wasAttaching = this.state === 'attaching' && this.attemptName !== null;
+    const tentativeName = this.attemptName;
     this.markIdle();
     sessionStorageHint.clear();
+    if (wasAttaching && tentativeName !== null) {
+      void detachSession(tentativeName).catch((err) => {
+        console.debug('[gtmux] reconnectGate.cancel: tentative detach failed', err);
+      });
+    }
   }
 
   /** attemptReattach 200 + loadLayout 완료 후 호출 — sessionStore active/layout set. */
