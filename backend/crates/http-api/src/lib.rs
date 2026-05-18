@@ -624,6 +624,14 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             axum::routing::post(sessions::attach_handler)
                 .delete(sessions::detach_handler),
         )
+        // ADR-0021 D6 amend ② / 0071 §D-5: sendBeacon-friendly best-effort
+        // release. The matching reliable channel is
+        // `DELETE /api/sessions/{name}/attach`; this one accepts URL-query
+        // `webpage_id` because `navigator.sendBeacon` can't set headers.
+        .route(
+            "/api/leave",
+            axum::routing::post(sessions::leave_handler),
+        )
         .route(
             "/api/sessions/{name}/attach/confirm",
             axum::routing::post(sessions::attach_confirm_handler),
@@ -3663,6 +3671,161 @@ mod tests {
             alpha_for_other["active"],
             json!(true),
             "a different webpage must still see the row as in-use"
+        );
+    }
+
+    // ── ADR-0021 D6 amend ② / 0071 §D-5 — POST /api/leave (sendBeacon) ─
+
+    async fn leave_with_webpage_id(
+        app: &Router,
+        token: &TokenString,
+        webpage_id: &str,
+        cookie: Option<&str>,
+    ) -> StatusCode {
+        let mut req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri(format!("/api/leave?webpage_id={webpage_id}"))
+            .header(header::HOST, TEST_HOST)
+            .header(header::AUTHORIZATION, bearer(token));
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, format!("gtmux_auth={c}"));
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    /// Happy path: a Webpage that holds an attach calls `/api/leave` →
+    /// 204, and a subsequent GET /sessions shows the row as no longer
+    /// active.
+    #[tokio::test]
+    async fn leave_releases_lock_for_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "alpha").await;
+
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-a").await,
+            StatusCode::OK
+        );
+        // Sanity: list shows alpha as active for the same Webpage (D5.6 —
+        // any open Webpage sees the row as in-use).
+        let before = list_as_webpage(&app, &token, "page-a").await;
+        let alpha_before = before
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "alpha")
+            .unwrap();
+        assert_eq!(alpha_before["active"], json!(true));
+
+        assert_eq!(
+            leave_with_webpage_id(&app, &token, "page-a", None).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let after = list_as_webpage(&app, &token, "page-b").await;
+        let alpha_after = after
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "alpha")
+            .unwrap();
+        assert_eq!(
+            alpha_after["active"],
+            json!(false),
+            "after /api/leave the session must be selectable again from any Webpage"
+        );
+    }
+
+    /// Idempotency: calling `/api/leave` without any prior attach is a
+    /// silent no-op + 204. sendBeacon fires `beforeunload` even when the
+    /// page never attached (rare but possible — e.g. the user closed the
+    /// tab right after the AuthDialog), so the handler must not 4xx.
+    #[tokio::test]
+    async fn leave_idempotent_when_no_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        assert_eq!(
+            leave_with_webpage_id(&app, &token, "page-ghost", None).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    /// `/api/leave` rides the same `/api/*` middleware as the other
+    /// session endpoints — bearer / cookie missing → 401 before the
+    /// handler runs.
+    #[tokio::test]
+    async fn leave_requires_auth() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, _token, _) = make_app_with_workspace(&dir);
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/leave?webpage_id=page-a")
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `/api/leave` is owner-scoped, exactly like `DELETE /attach`. A
+    /// Webpage releasing its own attach must not collateral-release a
+    /// *sibling tab*'s attach to a different session.
+    #[tokio::test]
+    async fn leave_releases_only_matching_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "alpha").await;
+        create_session(&app, &token, "beta").await;
+
+        // Two Webpages on the *same* (bearer-only) auth context, distinct
+        // tab identities — each takes its own session.
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-1").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            attach_as_webpage(&app, &token, "beta", "page-2").await,
+            StatusCode::OK
+        );
+
+        // Leave from page-1: only alpha should release.
+        assert_eq!(
+            leave_with_webpage_id(&app, &token, "page-1", None).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let listing = list_as_webpage(&app, &token, "page-3").await;
+        let alpha = listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "alpha")
+            .unwrap();
+        let beta = listing
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "beta")
+            .unwrap();
+        assert_eq!(
+            alpha["active"],
+            json!(false),
+            "page-1's /api/leave must drop alpha's lock"
+        );
+        assert_eq!(
+            beta["active"],
+            json!(true),
+            "page-2's attach must survive page-1's /api/leave"
         );
     }
 

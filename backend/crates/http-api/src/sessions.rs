@@ -65,6 +65,23 @@ fn session_cookie(headers: &HeaderMap) -> String {
 
 fn webpage_id_from_headers(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(WEBPAGE_ID_HEADER)?.to_str().ok()?.trim();
+    sanitize_webpage_id(raw)
+}
+
+/// Parse `webpage_id=<value>` from a URL query string. Used by
+/// `POST /api/leave` because `navigator.sendBeacon` cannot set custom
+/// headers — the per-tab identity has to ride the URL instead. The
+/// allowed alphabet matches `webpage_id_from_headers` so server-side
+/// owner_key formation is identical regardless of channel.
+fn webpage_id_from_query(query: Option<&str>) -> Option<String> {
+    let raw = query?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "webpage_id").then_some(value)
+    })?;
+    sanitize_webpage_id(raw)
+}
+
+fn sanitize_webpage_id(raw: &str) -> Option<String> {
     if raw.is_empty() || raw.len() > 128 {
         return None;
     }
@@ -885,6 +902,37 @@ pub async fn detach_handler(
         hub.clear_session_for_owner(&owner_key);
     }
     (StatusCode::OK, Json(json!({ "name": name, "released": true }))).into_response()
+}
+
+/// `POST /api/leave?webpage_id=<id>` — best-effort attach release fired
+/// from `beforeunload` via `navigator.sendBeacon` (ADR-0021 D6 amend ②).
+///
+/// `sendBeacon` cannot set custom headers, so the per-tab identity rides
+/// the URL query. The owner_key is formed exactly as for any other
+/// HTTP path (`auth_cookie + 0x1f + webpage_id`, ADR-0019 D5.6) and
+/// then handed to [`crate::AppState::release_lock_for_owner`].
+///
+/// Idempotent: an owner that holds no lock is a no-op. Returns 204 so
+/// the response body is empty — `sendBeacon` never reads it anyway, and
+/// any extra bytes are pure bandwidth loss.
+///
+/// Distinct from `DELETE /api/sessions/{name}/attach`: that endpoint is
+/// the *reliable* user-action channel (path carries the session name).
+/// `/api/leave` is the *page-unload best-effort* channel — same
+/// underlying release, different ingress contract.
+pub async fn leave_handler(
+    State(state): State<crate::AppState>,
+    req: Request<Body>,
+) -> Response {
+    let auth_cookie = crate::auth::extract_session_cookie(req.headers())
+        .unwrap_or_else(|| "_unknown".to_string());
+    let webpage_id = webpage_id_from_query(req.uri().query());
+    let owner_key = match webpage_id {
+        Some(id) => format!("{auth_cookie}\x1f{id}"),
+        None => auth_cookie,
+    };
+    state.release_lock_for_owner(&owner_key).await;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn lock_conflict_response(
