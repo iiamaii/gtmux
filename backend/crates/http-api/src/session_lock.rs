@@ -314,6 +314,59 @@ pub fn unlink_stale(locks_dir: &Path, name: &str) -> std::io::Result<()> {
     }
 }
 
+/// Boot-time housekeeping: walk every session record in `wm` and peek its
+/// `.lock` file. When a peek returns [`LockState::Stale`] — the body
+/// survived but the kernel-level flock is gone (typical SIGKILL trail) —
+/// remove the file so the directory does not grow unboundedly across many
+/// abrupt restarts.
+///
+/// **Non-functional**: peek already recognises `Stale` and the next
+/// [`acquire`] would overwrite the body anyway (`set_len(0)` in §acquire);
+/// this helper exists only for `.locks/` hygiene. It is therefore
+/// `warn`-on-error rather than fail-fast — a single unreadable entry
+/// must never block boot (0072 handover Q6).
+///
+/// **`InUse` is never touched** — that would silently break a live
+/// Webpage. Only entries the kernel has already released get pruned.
+///
+/// Returns the number of stale files unlinked (boot log uses this to
+/// emit a single info-level line; zero is silent).
+pub fn scan_and_cleanup_stale_locks(wm: &crate::workspace::WorkspaceManager) -> u32 {
+    let infos = match wm.enumerate_sessions() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "session_lock: stale scan enumerate failed; skipping cleanup"
+            );
+            return 0;
+        }
+    };
+    let locks_dir = wm.locks_dir();
+    let mut cleaned = 0u32;
+    for info in &infos {
+        if !matches!(peek(&locks_dir, &info.name), LockState::Stale) {
+            continue;
+        }
+        match unlink_stale(&locks_dir, &info.name) {
+            Ok(()) => {
+                cleaned += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session = %info.name,
+                    error = %e,
+                    "session_lock: stale unlink failed; continuing"
+                );
+            }
+        }
+    }
+    if cleaned > 0 {
+        tracing::info!(count = cleaned, "session_lock: boot-time stale cleanup");
+    }
+    cleaned
+}
+
 // Suppress dead_code on the unused-after-Drop sentinel field on platforms
 // that elide the trait dispatch.
 const _: fn(&LockGuard) = |_| {};
@@ -425,4 +478,79 @@ mod tests {
 
     // Quiet unused import on builds where Duration is constants-only.
     const _: Duration = Duration::from_secs(0);
+
+    /// Build a `WorkspaceManager` whose workspace dir contains the named
+    /// session files plus the matching stale `.lock` body for each.
+    /// Used by the `scan_and_cleanup_stale_locks` tests to set up a
+    /// SIGKILL-aftermath scenario without an actual server crash.
+    fn workspace_with_stale_locks(names: &[&str]) -> (TempDir, crate::workspace::WorkspaceManager) {
+        let dir = TempDir::new().unwrap();
+        let wm =
+            crate::workspace::WorkspaceManager::from_path(dir.path().to_path_buf()).unwrap();
+        std::fs::create_dir_all(wm.locks_dir()).unwrap();
+        for name in names {
+            // empty v2 layout JSON — enumerate_sessions just needs the file.
+            std::fs::write(
+                dir.path().join(format!("{name}.json")),
+                br#"{"schema_version":2,"groups":[],"items":[],"viewport":{"x":0,"y":0,"zoom":1}}"#,
+            )
+            .unwrap();
+            // stale lock body — same shape acquire writes, but no live flock.
+            std::fs::write(
+                wm.locks_dir().join(format!("{name}.lock")),
+                format!(
+                    r#"{{"server_id":"x","pid":1,"ws_conn_id":"y","lease_until_unix":0,"_for":"{name}"}}"#
+                ),
+            )
+            .unwrap();
+        }
+        (dir, wm)
+    }
+
+    /// 0071 §D-1 / 0072 BE-C happy path: a workspace inherited from a
+    /// SIGKILL'd run has stale `.lock` bodies for every session. The
+    /// boot sweep must unlink each one.
+    #[test]
+    fn stale_lock_scan_unlinks_stale_files() {
+        let (_dir, wm) = workspace_with_stale_locks(&["alpha", "beta"]);
+        assert!(wm.locks_dir().join("alpha.lock").exists());
+        assert!(wm.locks_dir().join("beta.lock").exists());
+        let cleaned = scan_and_cleanup_stale_locks(&wm);
+        assert_eq!(cleaned, 2, "both stale files must be unlinked");
+        assert!(!wm.locks_dir().join("alpha.lock").exists());
+        assert!(!wm.locks_dir().join("beta.lock").exists());
+    }
+
+    /// A lock that is **actively held** by another acquirer (e.g. a
+    /// surviving Webpage on a previous server reboot path) must survive
+    /// the sweep — `LockState::InUse` is never unlinked. The held flock
+    /// also remains valid after the sweep returns.
+    #[test]
+    fn stale_lock_scan_preserves_held_locks() {
+        let dir = TempDir::new().unwrap();
+        let wm =
+            crate::workspace::WorkspaceManager::from_path(dir.path().to_path_buf()).unwrap();
+        std::fs::create_dir_all(wm.locks_dir()).unwrap();
+        // Session record for "alpha" plus a real, held flock.
+        std::fs::write(
+            dir.path().join("alpha.json"),
+            br#"{"schema_version":2,"groups":[],"items":[],"viewport":{"x":0,"y":0,"zoom":1}}"#,
+        )
+        .unwrap();
+        let server_id: Arc<str> = fresh_server_id().into();
+        let mut guard = acquire(&wm.locks_dir(), "alpha", server_id, "conn-live").unwrap();
+        assert!(matches!(
+            peek(&wm.locks_dir(), "alpha"),
+            LockState::InUse(_)
+        ));
+        let cleaned = scan_and_cleanup_stale_locks(&wm);
+        assert_eq!(cleaned, 0, "InUse must never be unlinked");
+        assert!(
+            wm.locks_dir().join("alpha.lock").exists(),
+            "held lock file must survive the sweep"
+        );
+        // Guard is still valid — release explicitly to verify.
+        guard.release();
+        assert!(!wm.locks_dir().join("alpha.lock").exists());
+    }
 }

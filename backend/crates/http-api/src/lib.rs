@@ -420,10 +420,15 @@ impl AppState {
     /// (`/api/sessions...`) start serving requests. `self` is returned by
     /// value to allow chaining with [`AppState::with_hub`] / [`AppState::with_hub_and_path`].
     ///
-    /// Side-effect: cold-rebuilds `attach_index` from the workspace's
-    /// session files (ADR-0021 D7 amend ③). A failure here is logged but
-    /// non-fatal — the index simply starts empty and gets refilled as the
-    /// mutation hooks run.
+    /// Side-effects:
+    /// 1. cold-rebuilds `attach_index` from the workspace's session files
+    ///    (ADR-0021 D7 amend ③). Failure here is logged but non-fatal —
+    ///    the index simply starts empty and gets refilled as the mutation
+    ///    hooks run.
+    /// 2. sweeps `.locks/` for stale entries left by a prior SIGKILL /
+    ///    panic (0071 §D-1, ADR-0019 D6). Strictly housekeeping — peek
+    ///    already recognises Stale at runtime, so a failed sweep does not
+    ///    affect functionality.
     pub fn with_workspace(mut self, workspace: WorkspaceManager) -> Self {
         let wm = Arc::new(workspace);
         if let Err(e) = self.attach_index.rebuild_from_disk(&wm) {
@@ -432,6 +437,7 @@ impl AppState {
                 "attach_index: boot rebuild failed; starting empty (will refill on next mutation)"
             );
         }
+        crate::session_lock::scan_and_cleanup_stale_locks(&wm);
         self.workspace = Some(wm);
         self
     }
