@@ -117,7 +117,7 @@ export interface AttachConfirmResponse {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* POST /api/sessions/<name>/detach                                           */
+/* DELETE /api/sessions/<name>/attach                                         */
 /* ────────────────────────────────────────────────────────────────────────── */
 
 export type DetachResponse = { kind: 'ok' } | { kind: 'not_attached' };

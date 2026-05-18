@@ -29,6 +29,7 @@
     SESSION_NAME_REGEX,
     type SessionExportEnvelope,
   } from '$lib/http/sessions';
+  import { getWebpageId } from '$lib/session/webpageId';
   import type { CanvasItem } from '$lib/types/canvas';
   import { toastStore } from '$lib/ui/toast-store.svelte';
 
@@ -204,7 +205,7 @@
           // silent
         }
       }
-      const wsConnId = `webpage-${Math.random().toString(36).slice(2, 10)}`;
+      const wsConnId = getWebpageId();
       const res = await attachSession(importedName, { ws_conn_id: wsConnId });
       if (res.kind === 'ok') {
         sessionStore.setActiveSession({ name: importedName });

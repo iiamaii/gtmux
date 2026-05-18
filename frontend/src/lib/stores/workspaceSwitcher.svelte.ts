@@ -46,6 +46,8 @@ class WorkspaceSwitcherStore {
   }
 
   goList(closeTarget: ListCloseTarget = this.listCloseTarget): void {
+    this.pendingSession = null;
+    this.pendingSummary = null;
     this.listCloseTarget = closeTarget;
     this.stage = 'list';
   }

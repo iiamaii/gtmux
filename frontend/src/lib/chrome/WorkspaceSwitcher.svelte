@@ -30,6 +30,7 @@
   import {
     attachConfirm,
     attachSession,
+    detachSession,
     getLayout,
     listSessions,
     UnauthorizedError,
@@ -39,6 +40,7 @@
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import { getWebpageId } from '$lib/session/webpageId';
   import type {
     AttachResponse,
     SessionInfo,
@@ -47,6 +49,8 @@
   // 기존 session 이름 list (NewSessionModal 의 duplicate pre-check 용).
   // list stage 진입 시점 또는 create stage 진입 시점에 lazy fetch.
   let existingNames = $state<readonly string[]>([]);
+  let pendingAttachPreviousSession: string | null = null;
+  let pendingAttachHasTentativeLock = false;
 
   $effect(() => {
     if (
@@ -77,10 +81,11 @@
 
   /** WS conn id stub — Stage 3 BE-NEW-4 의 WS routing 정합 전까지 placeholder. */
   function makeWsConnId(): string {
-    return `webpage-${Math.random().toString(36).slice(2, 10)}`;
+    return getWebpageId();
   }
 
   async function tryAttach(name: string): Promise<void> {
+    const previousSession = sessionStore.active?.name ?? null;
     let res: AttachResponse;
     try {
       res = await attachSession(name, { ws_conn_id: makeWsConnId() });
@@ -108,6 +113,8 @@
       sessionStore.setActiveSession({ name });
       sessionStore.loadLayout(res.layout);
       reconnectGate.markSuccess();
+      pendingAttachPreviousSession = null;
+      pendingAttachHasTentativeLock = false;
       toastStore.show({
         message: `Attached to session "${name}".`,
         tone: 'success',
@@ -119,7 +126,11 @@
     if (res.kind === 'confirm_required') {
       // BE Stage 4-C: attach 가 lock 은 잡았지만 unmatched UUID 존재.
       // 사용자가 confirm 누르면 attach/confirm 호출 → spawn → layout fetch.
-      sessionStore.setActiveSession({ name });
+      // 아직 layout 이 load 된 workspace 가 아니므로 active session 으로 올리지 않는다.
+      // Cancel 시에는 이 tentative lock 을 release 하고, 이전 session 이 있었다면
+      // 다시 attach 해 "switch 취소 = 이전 workspace 유지" 의미를 복원한다.
+      pendingAttachPreviousSession = previousSession;
+      pendingAttachHasTentativeLock = true;
       workspaceSwitcher.goAttachConfirm(name, res.summary);
       return;
     }
@@ -161,9 +172,12 @@
       }
       // Layout fetch — confirm 후엔 모두 match-able 상태.
       const { layout } = await getLayout(name);
+      sessionStore.setActiveSession({ name });
       sessionStore.loadLayout(layout);
       reconnectGate.markSuccess();
       void terminalPool.refresh();
+      pendingAttachPreviousSession = null;
+      pendingAttachHasTentativeLock = false;
       workspaceSwitcher.close();
     } catch (err) {
       if (err instanceof UnauthorizedError) {
@@ -175,6 +189,65 @@
         tone: 'error',
       });
     }
+  }
+
+  async function restorePreviousSession(name: string): Promise<void> {
+    const res = await attachSession(name, { ws_conn_id: makeWsConnId() });
+    if (res.kind === 'ok') {
+      sessionStore.setActiveSession({ name });
+      sessionStore.loadLayout(res.layout);
+      reconnectGate.markSuccess();
+      void terminalPool.refresh();
+      return;
+    }
+    if (res.kind === 'confirm_required') {
+      pendingAttachPreviousSession = null;
+      pendingAttachHasTentativeLock = true;
+      workspaceSwitcher.goAttachConfirm(name, res.summary);
+      return;
+    }
+    const pidHint =
+      res.active_server_pid !== undefined
+        ? ` (server-pid ${res.active_server_pid})`
+        : '';
+    throw new Error(`previous session is already attached elsewhere${pidHint}`);
+  }
+
+  async function cancelAttachConfirm(): Promise<void> {
+    const pending = workspaceSwitcher.pendingSession;
+    const previous = pendingAttachPreviousSession;
+    const shouldReleasePending =
+      pendingAttachHasTentativeLock &&
+      pending !== null &&
+      sessionStore.active?.name !== pending;
+
+    pendingAttachPreviousSession = null;
+    pendingAttachHasTentativeLock = false;
+
+    try {
+      if (shouldReleasePending) {
+        await detachSession(pending);
+      }
+      if (previous !== null && previous !== pending) {
+        await restorePreviousSession(previous);
+        if (workspaceSwitcher.stage === 'attach_confirm') return;
+      } else if (sessionStore.active === null) {
+        sessionStore.clear();
+      }
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        redirectToAuth();
+        return;
+      }
+      sessionStore.clear();
+      toastStore.show({
+        message: `Attach cancelled, but previous session could not be restored: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'warning',
+        durationMs: 8_000,
+      });
+    }
+
+    workspaceSwitcher.goList();
   }
 
   function onSessionCreated(session: SessionInfo): void {
@@ -222,6 +295,6 @@
   open={workspaceSwitcher.stage === 'attach_confirm'}
   sessionName={workspaceSwitcher.pendingSession ?? ''}
   summary={workspaceSwitcher.pendingSummary}
-  onCancel={() => workspaceSwitcher.goList()}
+  onCancel={() => void cancelAttachConfirm()}
   onConfirm={onConfirmAttach}
 />

@@ -27,11 +27,17 @@ import type {
   SessionInfo,
   SessionListResponse,
 } from '$lib/types/sessions';
+import { getWebpageId, webpageHeaders } from '$lib/session/webpageId';
 
 const JSON_HEADERS: Record<string, string> = {
   Accept: 'application/json',
   'Content-Type': 'application/json',
 };
+
+const JSON_WEBPAGE_HEADERS = (): Record<string, string> => ({
+  ...JSON_HEADERS,
+  ...webpageHeaders(),
+});
 
 /** Thrown when the server responds with an HTTP status that the caller is
  *  expected to redirect on (currently 401). */
@@ -57,7 +63,7 @@ async function json<T>(res: Response): Promise<T> {
 export async function listSessions(): Promise<SessionListResponse> {
   const res = await fetch('/api/sessions', {
     method: 'GET',
-    headers: { Accept: 'application/json' },
+    headers: { Accept: 'application/json', ...webpageHeaders() },
     credentials: 'include',
   });
   if (res.status === 401) throw new UnauthorizedError();
@@ -144,9 +150,9 @@ export async function attachSession(
 ): Promise<AttachResponse> {
   const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/attach`, {
     method: 'POST',
-    headers: JSON_HEADERS,
+    headers: JSON_WEBPAGE_HEADERS(),
     credentials: 'include',
-    body: JSON.stringify(req),
+    body: JSON.stringify({ ...req, ws_conn_id: req.ws_conn_id || getWebpageId() }),
   });
   if (res.status === 401) throw new UnauthorizedError();
   if (res.status === 409) {
@@ -200,7 +206,7 @@ export async function attachConfirm(
     `/api/sessions/${encodeURIComponent(name)}/attach/confirm`,
     {
       method: 'POST',
-      headers: JSON_HEADERS,
+      headers: JSON_WEBPAGE_HEADERS(),
       credentials: 'include',
       body: JSON.stringify({}),
     },
@@ -233,6 +239,7 @@ export async function deleteItem(
     `/api/sessions/${encodeURIComponent(sessionName)}/items/${encodeURIComponent(itemId)}${qs}`,
     {
       method: 'DELETE',
+      headers: webpageHeaders(),
       credentials: 'include',
     },
   );
@@ -284,6 +291,7 @@ export async function putLayout(
       method: 'PUT',
       headers: {
         ...JSON_HEADERS,
+        ...webpageHeaders(),
         'If-Match': `"${etag}"`,
       },
       credentials: 'include',
@@ -332,10 +340,6 @@ export async function mutateLayout(
     throw err;
   }
 }
-
-/* ────────────────────────────────────────────────────────────────────────── */
-/* POST /api/sessions/<name>/detach                                           */
-/* ────────────────────────────────────────────────────────────────────────── */
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Import / Export — ADR-0029                                                 */
@@ -468,13 +472,18 @@ export async function exportSession(name: string): Promise<ExportSessionResult> 
   return { envelope, filename, blob };
 }
 
+/* ────────────────────────────────────────────────────────────────────────── */
+/* DELETE /api/sessions/<name>/attach                                         */
+/* ────────────────────────────────────────────────────────────────────────── */
+
 export async function detachSession(name: string): Promise<DetachResponse> {
-  const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/detach`, {
-    method: 'POST',
+  const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/attach`, {
+    method: 'DELETE',
+    headers: webpageHeaders(),
     credentials: 'include',
   });
   if (res.status === 401) throw new UnauthorizedError();
   if (res.status === 404) return { kind: 'not_attached' };
-  if (!res.ok) throw new Error(`POST detach returned ${res.status}`);
-  return json<DetachResponse>(res);
+  if (!res.ok) throw new Error(`DELETE attach returned ${res.status}`);
+  return { kind: 'ok' };
 }

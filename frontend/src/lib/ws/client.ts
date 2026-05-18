@@ -11,6 +11,7 @@
 // 본 모듈은 *transport-only*. envelope 의 의미적 처리 (store fan-out) 는 dispatcher.
 
 import { decodeEnvelope, encodeEnvelope, type Envelope, type FrameTypeCode } from './decode';
+import { getWebpageId } from '$lib/session/webpageId';
 
 // ── 공개 타입 ──────────────────────────────────────────────────────────────
 
@@ -316,5 +317,6 @@ export function computeWsUrl(): string {
   }
   const loc = window.location;
   const scheme = loc.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${scheme}//${loc.host}/ws`;
+  const webpageId = encodeURIComponent(getWebpageId());
+  return `${scheme}//${loc.host}/ws?webpage_id=${webpageId}`;
 }

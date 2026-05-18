@@ -27,6 +27,7 @@ import { deleteItem, EtagMismatchError, mutateLayout, UnauthorizedError } from '
 import { historyStore } from '$lib/stores/historyStore.svelte';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 import { toastStore } from '$lib/ui/toast-store.svelte';
+import { getWebpageId, webpageHeaders } from '$lib/session/webpageId';
 import type { CanvasItem, CanvasLayout, Viewport } from '$lib/types/canvas';
 import type { Group } from '$lib/types/group';
 import type { AttachConfirmSummary } from '$lib/types/sessions';
@@ -65,7 +66,7 @@ const DEFAULT_VIEWPORT: Viewport = { x: 0, y: 0, zoom: 1 };
 
 /** `attemptReattach` 의 WS conn id stub — `WorkspaceSwitcher` 와 동일 패턴. */
 function makeWsConnId(): string {
-  return `webpage-${Math.random().toString(36).slice(2, 10)}`;
+  return getWebpageId();
 }
 
 class SessionStore {
@@ -398,6 +399,7 @@ class SessionStore {
           headers: {
             Accept: 'application/json',
             'Content-Type': 'application/json',
+            ...webpageHeaders(),
           },
           credentials: 'include',
           body: JSON.stringify({ ws_conn_id: makeWsConnId() }),
