@@ -15,8 +15,8 @@
    *    - unmatched_item_ids: layout 의 terminal 중 pool 에 없는 것 (= fresh spawn)
    *    - unmatched_terminal_ids: pool 의 terminal 중 layout 에 없는 것 (= 다른
    *      session 의 alive terminal — 그대로 두고 본 session 은 touch 안 함)
-   * 3. [Confirm] → 부모가 `attachSession(..., { confirmed: true })` 재호출.
-   *    [Cancel] → 부모가 SessionListModal 로 회귀.
+   * 3. [Confirm] → 부모가 `attachConfirm()` 호출 후 layout fetch.
+   *    [Cancel] → 부모가 tentative attach 를 정리하고 SessionListModal 로 회귀.
    */
 
   import Modal from '$lib/ui/Modal.svelte';
@@ -61,6 +61,12 @@
               <strong>{summary.spawn_count}</strong>
               new terminal{summary.spawn_count === 1 ? '' : 's'} will be
               started for missing panels.
+            </span>
+          </li>
+          <li class="note-row">
+            <span class="badge note">note</span>
+            <span class="text">
+              New terminals start fresh — previous output cannot be restored.
             </span>
           </li>
         {/if}
@@ -148,6 +154,17 @@
     background: var(--color-surface);
     color: var(--color-fg-muted);
     border: 1px solid var(--color-border);
+  }
+
+  .badge.note {
+    background: transparent;
+    color: var(--color-fg-muted);
+    border: 1px dashed var(--color-border);
+  }
+
+  .note-row .text {
+    color: var(--color-fg-muted);
+    font-style: italic;
   }
 
   .text {
