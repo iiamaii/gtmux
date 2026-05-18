@@ -190,16 +190,20 @@ pub struct TerminalSpawnedEvent {
 }
 
 /// Payload of a `SessionChange` broadcast (Slice next-2, ADR-0025 D4).
-/// Published by [`Hub::set_session_for_cookie`] /
-/// [`Hub::clear_session_for_cookie`] whenever a cookie's attached
-/// session changes. WS handlers filter by their own cookie and
+/// Published by [`Hub::set_session_for_owner`] /
+/// [`Hub::clear_session_for_owner`] whenever a Webpage's attached
+/// session changes. WS handlers filter by their own owner key and
 /// recompute the `pane_output` filter set.
 ///
-/// `new_session` is `None` when the cookie was detached (the cookie
-/// is now in the *legacy demo path* — no filter, server-wide pass).
+/// `owner_key` carries the per-Webpage identity `auth_cookie + 0x1f +
+/// webpage_id` (ADR-0019 D5.6), not just the auth cookie — distinct tabs
+/// sharing one cookie own distinct attach state.
+///
+/// `new_session` is `None` when the Webpage detached (it is now in the
+/// *legacy demo path* — no filter, server-wide pass).
 #[derive(Clone, Debug)]
 pub struct SessionChangeEvent {
-    pub cookie: Arc<str>,
+    pub owner_key: Arc<str>,
     pub new_session: Option<Arc<str>>,
 }
 
@@ -316,13 +320,15 @@ pub struct Hub {
     /// timeout path. Snapshotted at WS upgrade time so a runtime change only
     /// affects subsequent connections.
     heartbeat_timings: Arc<std::sync::RwLock<HeartbeatTimings>>,
-    /// Cookie → session_name registry (Stage 5-A / ADR-0021 D5). The
-    /// http-api `attach_handler` writes here after a successful flock + cookie
+    /// Owner key → session_name registry (Stage 5-A / ADR-0021 D5,
+    /// ADR-0019 D5.6). The owner key is `auth_cookie + 0x1f + webpage_id`
+    /// so each browser tab keeps a distinct binding. The http-api
+    /// `attach_handler` writes here after a successful flock + owner
     /// reverse-map insert; `detach_handler` (and the WS-disconnect-driven
-    /// `release_lock_for_cookie`) clears the entry. The WS handler consults
-    /// this map when routing session-scoped envelopes (5-C) so a frame
-    /// emitted on session A is never delivered to a subscriber whose cookie
-    /// is attached to session B.
+    /// `release_lock_for_owner`) clears the entry. The WS handler
+    /// consults this map when routing session-scoped envelopes (5-C) so
+    /// a frame emitted on session A is never delivered to a subscriber
+    /// whose owner is attached to session B.
     ///
     /// `std::sync::RwLock` over `tokio::sync::RwLock`: every operation here
     /// is a sub-microsecond hash-table touch with no `.await` point inside
@@ -352,7 +358,7 @@ pub struct Hub {
     /// `POST /api/sessions/:name/terminals` to direct the trigger
     /// session's webpage to append a fresh `TerminalItem` at the
     /// server-provided coordinates. Subscribers filter by
-    /// `hub.session_for_cookie(my_cookie) == event.trigger_session`.
+    /// `hub.session_for_owner(my_cookie) == event.trigger_session`.
     mount_cascade_events: broadcast::Sender<MountCascadeEvent>,
     /// Manipulation broadcast (Stage 5-C, ADR-0021 D5). Published by the
     /// inbound 0x81..=0x84 dispatch path once it knows the sender's
@@ -381,7 +387,7 @@ pub struct Hub {
     /// the close frame (1000 normal) arrives.
     server_shutdown_events: broadcast::Sender<ServerShutdownEvent>,
     /// Session-change broadcast (Slice next-2, ADR-0025 D4). Emitted
-    /// by `set_session_for_cookie` / `clear_session_for_cookie` so WS
+    /// by `set_session_for_owner` / `clear_session_for_owner` so WS
     /// handlers can refresh their per-connection PaneId filter set
     /// when the cookie's attached session changes (workspace switch,
     /// implicit detach-on-reattach).
@@ -498,85 +504,88 @@ impl Hub {
             .unwrap_or_default()
     }
 
-    /// Record that `cookie` is currently attached to `session_name`
-    /// (Stage 5-A / ADR-0021 D5). Called by the http-api `attach_handler`
-    /// after a successful flock + cookie reverse-map insert. Idempotent:
-    /// re-attaching the same cookie to a different session replaces the
-    /// entry; re-attaching to the same session is a no-op write.
+    /// Record that the Webpage identified by `owner_key`
+    /// (= `auth_cookie + 0x1f + webpage_id`, ADR-0019 D5.6) is currently
+    /// attached to `session_name` (Stage 5-A / ADR-0021 D5). Called by the
+    /// http-api `attach_handler` after a successful flock + owner
+    /// reverse-map insert. Idempotent: re-attaching the same owner to a
+    /// different session replaces the entry; re-attaching to the same
+    /// session is a no-op write.
     ///
     /// A poisoned [`std::sync::RwLock`] is treated as a soft failure: the
     /// update is dropped and a warn-level trace fires. The kernel-level
     /// session lock is the source of truth — this table only steers WS
     /// frame routing, so a missed update degrades to "session-scoped frame
     /// behaves like server-wide" until the next attach refreshes it.
-    pub fn set_session_for_cookie(&self, cookie: &str, session_name: &str) {
+    pub fn set_session_for_owner(&self, owner_key: &str, session_name: &str) {
         let changed = match self.session_table.write() {
             Ok(mut t) => {
-                let prev = t.insert(cookie.to_string(), session_name.to_string());
+                let prev = t.insert(owner_key.to_string(), session_name.to_string());
                 prev.as_deref() != Some(session_name)
             }
             Err(_) => {
                 tracing::warn!(
-                    cookie_len = cookie.len(),
-                    "hub session_table: write poisoned; skipping set_session_for_cookie"
+                    owner_len = owner_key.len(),
+                    "hub session_table: write poisoned; skipping set_session_for_owner"
                 );
                 false
             }
         };
         if changed {
             // Slice next-2 (ADR-0025 D4): notify the WS handler that
-            // owns this cookie so it can recompute its filter set.
+            // owns this Webpage so it can recompute its filter set.
             let _ = self.session_change_events.send(SessionChangeEvent {
-                cookie: Arc::from(cookie),
+                owner_key: Arc::from(owner_key),
                 new_session: Some(Arc::from(session_name)),
             });
         }
     }
 
-    /// Drop the cookie → session_name binding for `cookie`. Called by the
-    /// http-api `detach_handler` and by the WS-disconnect-driven
-    /// `release_lock_for_cookie`. Idempotent: a missing entry is a no-op.
-    pub fn clear_session_for_cookie(&self, cookie: &str) {
+    /// Drop the owner → session_name binding for `owner_key`. Called by
+    /// the http-api `detach_handler` and by the WS-disconnect-driven
+    /// `release_lock_for_owner`. Idempotent: a missing entry is a no-op.
+    pub fn clear_session_for_owner(&self, owner_key: &str) {
         let removed = match self.session_table.write() {
-            Ok(mut t) => t.remove(cookie).is_some(),
+            Ok(mut t) => t.remove(owner_key).is_some(),
             Err(_) => {
                 tracing::warn!(
-                    cookie_len = cookie.len(),
-                    "hub session_table: write poisoned; skipping clear_session_for_cookie"
+                    owner_len = owner_key.len(),
+                    "hub session_table: write poisoned; skipping clear_session_for_owner"
                 );
                 false
             }
         };
         if removed {
-            // ADR-0025 D5: cookie reverts to the legacy demo path
+            // ADR-0025 D5: owner reverts to the legacy demo path
             // (no filter, server-wide pass). WS handler will rebuild
             // its filter set to `None`.
             let _ = self.session_change_events.send(SessionChangeEvent {
-                cookie: Arc::from(cookie),
+                owner_key: Arc::from(owner_key),
                 new_session: None,
             });
         }
     }
 
-    /// Look up the session that `cookie` is currently attached to.
-    /// Returns `None` when the cookie has no active attach or the table is
-    /// poisoned. Used by the WS dispatcher (Stage 5-C) to decide whether
-    /// a session-scoped envelope is in-scope for a given connection.
-    pub fn session_for_cookie(&self, cookie: &str) -> Option<String> {
+    /// Look up the session that the Webpage identified by `owner_key` is
+    /// currently attached to. Returns `None` when the owner has no active
+    /// attach or the table is poisoned. Used by the WS dispatcher (Stage
+    /// 5-C) to decide whether a session-scoped envelope is in-scope for
+    /// a given connection.
+    pub fn session_for_owner(&self, owner_key: &str) -> Option<String> {
         self.session_table
             .read()
             .ok()
-            .and_then(|t| t.get(cookie).cloned())
+            .and_then(|t| t.get(owner_key).cloned())
     }
 
-    /// Remove every cookie entry currently pointing at `session_name`.
-    /// Called by the http-api `detach_handler`, which mirrors the same
-    /// `retain(|_, v| v != name)` behaviour on `session_locks_by_cookie` —
-    /// the two maps must stay in lock-step or the WS dispatcher would
-    /// surface stale "still attached" routing for cookies that just
-    /// detached.
+    /// Remove every owner entry currently pointing at `session_name`.
+    /// Used for session-wide teardown (e.g. `DELETE /api/sessions/:name`)
+    /// where every Webpage that thought it owned this session must drop
+    /// its routing entry. The two maps (`session_locks_by_owner` on the
+    /// http-api side, this `session_table`) must stay in lock-step or the
+    /// WS dispatcher would surface stale "still attached" routing.
     pub fn clear_sessions_by_name(&self, session_name: &str) {
-        let removed_cookies: Vec<String> = match self.session_table.write() {
+        let removed_owners: Vec<String> = match self.session_table.write() {
             Ok(mut t) => {
                 let to_remove: Vec<String> = t
                     .iter()
@@ -596,9 +605,9 @@ impl Hub {
                 Vec::new()
             }
         };
-        for cookie in &removed_cookies {
+        for owner in &removed_owners {
             let _ = self.session_change_events.send(SessionChangeEvent {
-                cookie: Arc::from(cookie.as_str()),
+                owner_key: Arc::from(owner.as_str()),
                 new_session: None,
             });
         }
@@ -690,7 +699,7 @@ impl Hub {
     }
 
     /// Subscribe to terminal-list change deltas. Each WS connection pulls
-    /// from this channel and filters via [`Hub::session_for_cookie`] —
+    /// from this channel and filters via [`Hub::session_for_owner`] —
     /// see WS handler's `terminal_list_change_rx` select arm.
     pub fn subscribe_terminal_list_change(
         &self,
@@ -763,7 +772,7 @@ impl Hub {
 
     /// Broadcast a manipulation event (Stage 5-C). Called by the WS
     /// dispatcher after it receives an inbound `0x81..=0x84` frame and
-    /// resolves the sender's session via [`Hub::session_for_cookie`].
+    /// resolves the sender's session via [`Hub::session_for_owner`].
     /// Subscribers (including the sender's own connection) all see the
     /// event; per-subscriber filtering happens in the dispatcher loop.
     pub fn publish_manipulation(&self, event: ManipulationEvent) {
@@ -1109,48 +1118,48 @@ mod tests {
     #[tokio::test]
     async fn session_table_empty_by_default() {
         let hub = Hub::new(PtyBackend::new());
-        assert_eq!(hub.session_for_cookie("anybody"), None);
+        assert_eq!(hub.session_for_owner("anybody"), None);
     }
 
     #[tokio::test]
     async fn session_table_set_then_lookup() {
         let hub = Hub::new(PtyBackend::new());
-        hub.set_session_for_cookie("c1", "demo");
-        assert_eq!(hub.session_for_cookie("c1"), Some("demo".to_string()));
-        assert_eq!(hub.session_for_cookie("c2"), None);
+        hub.set_session_for_owner("c1", "demo");
+        assert_eq!(hub.session_for_owner("c1"), Some("demo".to_string()));
+        assert_eq!(hub.session_for_owner("c2"), None);
     }
 
     #[tokio::test]
     async fn session_table_set_replaces_existing() {
         let hub = Hub::new(PtyBackend::new());
-        hub.set_session_for_cookie("c1", "demo");
-        hub.set_session_for_cookie("c1", "other");
-        assert_eq!(hub.session_for_cookie("c1"), Some("other".to_string()));
+        hub.set_session_for_owner("c1", "demo");
+        hub.set_session_for_owner("c1", "other");
+        assert_eq!(hub.session_for_owner("c1"), Some("other".to_string()));
     }
 
     #[tokio::test]
     async fn session_table_clear_is_idempotent() {
         let hub = Hub::new(PtyBackend::new());
         // Clearing a non-existent entry must not panic / error.
-        hub.clear_session_for_cookie("nobody");
-        hub.set_session_for_cookie("c1", "demo");
-        hub.clear_session_for_cookie("c1");
-        assert_eq!(hub.session_for_cookie("c1"), None);
+        hub.clear_session_for_owner("nobody");
+        hub.set_session_for_owner("c1", "demo");
+        hub.clear_session_for_owner("c1");
+        assert_eq!(hub.session_for_owner("c1"), None);
         // Second clear is still a no-op.
-        hub.clear_session_for_cookie("c1");
-        assert_eq!(hub.session_for_cookie("c1"), None);
+        hub.clear_session_for_owner("c1");
+        assert_eq!(hub.session_for_owner("c1"), None);
     }
 
     #[tokio::test]
     async fn session_table_clear_by_name_drops_matching_cookies() {
         let hub = Hub::new(PtyBackend::new());
-        hub.set_session_for_cookie("c1", "demo");
-        hub.set_session_for_cookie("c2", "demo");
-        hub.set_session_for_cookie("c3", "other");
+        hub.set_session_for_owner("c1", "demo");
+        hub.set_session_for_owner("c2", "demo");
+        hub.set_session_for_owner("c3", "other");
         hub.clear_sessions_by_name("demo");
-        assert_eq!(hub.session_for_cookie("c1"), None);
-        assert_eq!(hub.session_for_cookie("c2"), None);
-        assert_eq!(hub.session_for_cookie("c3"), Some("other".to_string()));
+        assert_eq!(hub.session_for_owner("c1"), None);
+        assert_eq!(hub.session_for_owner("c2"), None);
+        assert_eq!(hub.session_for_owner("c3"), Some("other".to_string()));
     }
 
     #[tokio::test]
@@ -1160,10 +1169,10 @@ mod tests {
         // by the http-api handler clone.
         let h1 = Hub::new(PtyBackend::new());
         let h2 = h1.clone();
-        h1.set_session_for_cookie("c1", "demo");
-        assert_eq!(h2.session_for_cookie("c1"), Some("demo".to_string()));
-        h2.clear_session_for_cookie("c1");
-        assert_eq!(h1.session_for_cookie("c1"), None);
+        h1.set_session_for_owner("c1", "demo");
+        assert_eq!(h2.session_for_owner("c1"), Some("demo".to_string()));
+        h2.clear_session_for_owner("c1");
+        assert_eq!(h1.session_for_owner("c1"), None);
     }
 
     // ── TerminalUuidProvider (0040 §5 option A) ──────────────────────────

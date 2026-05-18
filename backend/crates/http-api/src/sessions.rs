@@ -46,6 +46,8 @@ use crate::workspace::{
     atomic_write_session, validate_session_name, WorkspaceError, WorkspaceManager,
 };
 
+const WEBPAGE_ID_HEADER: &str = "x-gtmux-webpage-id";
+
 /// Soft cap on session-record PUT bodies. Matches ADR-0018 D8 §"전체 file size
 /// cap: 16 MB (P0)" — the existing legacy `/api/layout` cap (256 KiB) is too
 /// tight for the v2 schema once free-draw / images land. We still enforce a
@@ -56,6 +58,49 @@ use crate::workspace::{
 /// `DefaultBodyLimit::max(SESSION_PUT_MAX_BYTES)` on the import route to lift
 /// axum's default 2 MB ceiling.
 pub(crate) const SESSION_PUT_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn session_cookie(headers: &HeaderMap) -> String {
+    crate::auth::extract_session_cookie(headers).unwrap_or_else(|| "_unknown".to_string())
+}
+
+fn webpage_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(WEBPAGE_ID_HEADER)?.to_str().ok()?.trim();
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    if raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
+fn attach_owner_key(headers: &HeaderMap) -> String {
+    let cookie = session_cookie(headers);
+    match webpage_id_from_headers(headers) {
+        Some(webpage_id) => format!("{cookie}\x1f{webpage_id}"),
+        None => cookie,
+    }
+}
+
+async fn owner_holds_session(state: &crate::AppState, owner_key: &str, name: &str) -> bool {
+    let by_owner = state.session_locks_by_owner.lock().await;
+    matches!(by_owner.get(owner_key), Some(n) if n == name)
+}
+
+fn not_attached_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "not_attached",
+            "message": "webpage does not hold an attach for this session",
+        })),
+    )
+        .into_response()
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SessionLayout — in-memory cache entry
@@ -361,11 +406,11 @@ pub async fn attach_handler(
         return SessionError::NotFound(name).into_response();
     }
 
-    // Tie the lock to the caller's cookie so a subsequent /detach from the
-    // same browser tab can release exactly this lock without ambient
-    // ambiguity.
-    let cookie = crate::auth::extract_session_cookie(req.headers())
-        .unwrap_or_else(|| "_unknown".to_string());
+    // Tie the lock to the caller's webpage identity, not just the auth
+    // cookie. Multiple tabs share the cookie but must remain separate
+    // Webpages for ADR-0019 D3 single-attach.
+    let owner_key = attach_owner_key(req.headers());
+    let ws_conn_id = webpage_id_from_headers(req.headers()).unwrap_or_else(|| owner_key.clone());
 
     // ADR-0019 D3 single-attach invariant — implicit detach-on-reattach.
     // If this cookie already holds a *different* session's lock (e.g. user
@@ -379,44 +424,44 @@ pub async fn attach_handler(
     // skipped and the rest of this handler short-circuits via the
     // `holders.contains_key(&name)` check immediately below.
     let previous_session: Option<String> = {
-        let by_cookie = state.session_locks_by_cookie.lock().await;
-        by_cookie
-            .get(&cookie)
+        let by_owner = state.session_locks_by_owner.lock().await;
+        by_owner
+            .get(&owner_key)
             .filter(|prev| prev.as_str() != name)
             .cloned()
     };
     if let Some(prev_name) = previous_session {
-        let mut by_cookie = state.session_locks_by_cookie.lock().await;
-        by_cookie.remove(&cookie);
-        drop(by_cookie);
+        let mut by_owner = state.session_locks_by_owner.lock().await;
+        by_owner.remove(&owner_key);
+        drop(by_owner);
         let mut holders = state.session_locks.lock().await;
         if let Some(mut guard) = holders.remove(&prev_name) {
             tracing::info!(
-                cookie_len = cookie.len(),
+                owner_len = owner_key.len(),
                 prev_session = %prev_name,
                 next_session = %name,
-                "session_lock: implicit detach on cookie switch"
+                "session_lock: implicit detach on webpage switch"
             );
             guard.release();
         }
         drop(holders);
         if let Some(hub) = state.hub.as_ref() {
-            hub.clear_session_for_cookie(&cookie);
+            hub.clear_session_for_owner(&owner_key);
         }
     }
 
     // ADR-0019 D3 — same-cookie same-session reattach is an idempotent
     // 200 (not a 409). Surfaces when:
     //   * refresh races where the SPA's reattach POST overtakes the WS
-    //     close → release_lock_for_cookie pipeline; and
+    //     close → release_lock_for_owner pipeline; and
     //   * plan-0008 Phase 2 silent reattach (WS reconnecting→open or
     //     visibility-change while still holding the lock).
     // In both cases the *same* cookie already owns this session's lock,
     // so no acquire runs — just re-classify the layout and reply OK.
     {
-        let by_cookie = state.session_locks_by_cookie.lock().await;
-        if by_cookie.get(&cookie).map(|s| s == &name).unwrap_or(false) {
-            drop(by_cookie);
+        let by_owner = state.session_locks_by_owner.lock().await;
+        if by_owner.get(&owner_key).map(|s| s == &name).unwrap_or(false) {
+            drop(by_owner);
             return reuse_existing_attach_response(&state, wm, &name).await;
         }
     }
@@ -431,7 +476,6 @@ pub async fn attach_handler(
 
     let locks_dir = wm.locks_dir();
     let server_id = state.server_id.clone();
-    let ws_conn_id = cookie.clone();
     let name_for_block = name.clone();
     let acquired = tokio::task::spawn_blocking(move || {
         crate::session_lock::acquire(&locks_dir, &name_for_block, server_id, &ws_conn_id)
@@ -467,19 +511,19 @@ pub async fn attach_handler(
     // simply won't be auto-released since the WS will not present the
     // missing cookie.
     {
-        let mut by_cookie = state.session_locks_by_cookie.lock().await;
+        let mut by_owner = state.session_locks_by_owner.lock().await;
         // If the same cookie had a stale entry for a previous attach (e.g.
         // the FE retried after a transient error), the prior session lock
         // would have been released already by the path that took it out
         // of `session_locks` — but the reverse map could lag. Overwriting
         // here is the safer choice.
-        by_cookie.insert(cookie.clone(), name.clone());
+        by_owner.insert(owner_key.clone(), name.clone());
     }
     // Stage 5-A: mirror the cookie ↔ session binding into the WS hub so the
     // dispatcher (5-C) can route session-scoped envelopes only to the
     // matching webpage. Skip when no hub is wired (unit-test paths).
     if let Some(hub) = state.hub.as_ref() {
-        hub.set_session_for_cookie(&cookie, &name);
+        hub.set_session_for_owner(&owner_key, &name);
     }
     // Drop the same-server serialisation lock before doing layout I/O — the
     // attach itself is committed by the flock acquire above; further work
@@ -495,7 +539,7 @@ pub async fn attach_handler(
         Err(e) => {
             // The flock is already held — release it so the user can retry
             // after fixing the underlying corrupt/missing file.
-            release_attach(&state, &name, &cookie).await;
+            release_attach(&state, &name, &owner_key).await;
             return e.into_response();
         }
     };
@@ -534,22 +578,9 @@ pub async fn attach_confirm_handler(
         return service_unavailable("hub_not_configured");
     }
 
-    let cookie = crate::auth::extract_session_cookie(req.headers())
-        .unwrap_or_else(|| "_unknown".to_string());
-
-    {
-        let by_cookie = state.session_locks_by_cookie.lock().await;
-        let owns = matches!(by_cookie.get(&cookie), Some(n) if n == &name);
-        if !owns {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": "not_attached",
-                    "message": "cookie does not hold an attach for this session",
-                })),
-            )
-                .into_response();
-        }
+    let owner_key = attach_owner_key(req.headers());
+    if !owner_holds_session(&state, &owner_key, &name).await {
+        return not_attached_response();
     }
 
     let uuids = match load_terminal_uuids(&state, wm, &name).await {
@@ -641,21 +672,9 @@ pub async fn create_terminal_handler(
         return service_unavailable("hub_not_configured");
     }
 
-    let cookie = crate::auth::extract_session_cookie(req.headers())
-        .unwrap_or_else(|| "_unknown".to_string());
-    {
-        let by_cookie = state.session_locks_by_cookie.lock().await;
-        let owns = matches!(by_cookie.get(&cookie), Some(n) if n == &name);
-        if !owns {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": "not_attached",
-                    "message": "cookie does not hold an attach for this session",
-                })),
-            )
-                .into_response();
-        }
+    let owner_key = attach_owner_key(req.headers());
+    if !owner_holds_session(&state, &owner_key, &name).await {
+        return not_attached_response();
     }
 
     let (x, y, w, h) = match next_mount_cascade_coords(&state, wm, &name).await {
@@ -793,7 +812,7 @@ async fn load_terminal_uuids(
 }
 
 /// ADR-0019 D3 idempotent re-attach response. The caller has already
-/// confirmed (via `session_locks_by_cookie`) that the current cookie
+/// confirmed (via `session_locks_by_owner`) that the current cookie
 /// owns the existing lock for `name`, so no flock acquire runs — we
 /// just re-run match-or-spawn classification (ADR-0018 D6) to mirror
 /// the body shape of the first-attach success path.
@@ -819,21 +838,21 @@ async fn reuse_existing_attach_response(
         .into_response()
 }
 
-async fn release_attach(state: &crate::AppState, name: &str, cookie: &str) {
+async fn release_attach(state: &crate::AppState, name: &str, owner_key: &str) {
     let mut holders = state.session_locks.lock().await;
     if let Some(mut guard) = holders.remove(name) {
         guard.release();
     }
-    let mut by_cookie = state.session_locks_by_cookie.lock().await;
-    if matches!(by_cookie.get(cookie), Some(v) if v == name) {
-        by_cookie.remove(cookie);
+    let mut by_owner = state.session_locks_by_owner.lock().await;
+    if matches!(by_owner.get(owner_key), Some(v) if v == name) {
+        by_owner.remove(owner_key);
     }
-    // Stage 5-A: keep the WS hub's cookie ↔ session_name map in lock-step
+    // Stage 5-A: keep the WS hub's owner ↔ session_name map in lock-step
     // with the http-api reverse-index. The hub method is a no-op on missing
     // entries, so a failed-attach cleanup path that never wrote anything
     // here is still safe.
     if let Some(hub) = state.hub.as_ref() {
-        hub.clear_session_for_cookie(cookie);
+        hub.clear_session_for_owner(owner_key);
     }
 }
 
@@ -842,26 +861,28 @@ async fn release_attach(state: &crate::AppState, name: &str, cookie: &str) {
 pub async fn detach_handler(
     State(state): State<crate::AppState>,
     AxumPath(name): AxumPath<String>,
+    req: Request<Body>,
 ) -> Response {
+    let owner_key = attach_owner_key(req.headers());
     {
-        let mut holders = state.session_locks.lock().await;
-        if let Some(mut guard) = holders.remove(&name) {
-            guard.release();
+        let mut by_owner = state.session_locks_by_owner.lock().await;
+        let owns = matches!(by_owner.get(&owner_key), Some(v) if v == &name);
+        if owns {
+            by_owner.remove(&owner_key);
+            drop(by_owner);
+            let mut holders = state.session_locks.lock().await;
+            if let Some(mut guard) = holders.remove(&name) {
+                guard.release();
+            }
+        } else {
+            drop(by_owner);
         }
     }
-    // Prune the reverse map so a later WS-close for the same cookie
-    // doesn't try to re-release. The cookie key may map to a stale name
-    // if the FE re-attached to a different session between detach and
-    // close — in that case we leave the new mapping alone.
-    {
-        let mut by_cookie = state.session_locks_by_cookie.lock().await;
-        by_cookie.retain(|_, v| v != &name);
-    }
-    // Stage 5-A: mirror the prune into the WS hub so the dispatcher does
-    // not keep routing session-scoped envelopes to cookies that just
-    // detached from this session.
+    // Stage 5-A: mirror the owner-specific prune into the WS hub so the
+    // dispatcher does not keep routing session-scoped envelopes to this
+    // webpage after detach.
     if let Some(hub) = state.hub.as_ref() {
-        hub.clear_sessions_by_name(&name);
+        hub.clear_session_for_owner(&owner_key);
     }
     (StatusCode::OK, Json(json!({ "name": name, "released": true }))).into_response()
 }
@@ -1228,12 +1249,17 @@ pub async fn delete_item_handler(
     State(state): State<crate::AppState>,
     AxumPath((name, id)): AxumPath<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<DeleteItemQuery>,
+    req: Request<Body>,
 ) -> Response {
     let Some(wm) = state.workspace.as_ref() else {
         return service_unavailable("workspace_not_configured");
     };
     if let Err(e) = validate_session_name(&name) {
         return SessionError::Workspace(e).into_response();
+    }
+    let owner_key = attach_owner_key(req.headers());
+    if !owner_holds_session(&state, &owner_key, &name).await {
+        return not_attached_response();
     }
     let arc = match state.session_cache.get_or_load(wm, &name).await {
         Ok(a) => a,
@@ -1445,6 +1471,13 @@ pub async fn layout_put_handler(
     let Some(wm) = state.workspace.as_ref() else {
         return service_unavailable("workspace_not_configured");
     };
+    if let Err(e) = validate_session_name(&name) {
+        return SessionError::Workspace(e).into_response();
+    }
+    let owner_key = attach_owner_key(req.headers());
+    if !owner_holds_session(&state, &owner_key, &name).await {
+        return not_attached_response();
+    }
     // 1. If-Match — required (ADR-0006 D5).
     let if_match = match req.headers().get(header::IF_MATCH) {
         Some(v) => match v.to_str() {

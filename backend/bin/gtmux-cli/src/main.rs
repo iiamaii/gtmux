@@ -464,14 +464,14 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
 
     let state_for_disconnect = app_state.clone();
     let _disconnect_task = tokio::spawn(async move {
-        while let Some(cookie) = disconnect_rx.recv().await {
-            state_for_disconnect.release_lock_for_cookie(&cookie).await;
+        while let Some(owner_key) = disconnect_rx.recv().await {
+            state_for_disconnect.release_lock_for_owner(&owner_key).await;
         }
     });
     let state_for_heartbeat = app_state.clone();
     let _heartbeat_task = tokio::spawn(async move {
-        while let Some(cookie) = heartbeat_rx.recv().await {
-            state_for_heartbeat.refresh_lease_for_cookie(&cookie).await;
+        while let Some(owner_key) = heartbeat_rx.recv().await {
+            state_for_heartbeat.refresh_lease_for_owner(&owner_key).await;
         }
     });
 

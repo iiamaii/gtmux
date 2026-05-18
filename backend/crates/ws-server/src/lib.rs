@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -147,7 +147,7 @@ pub enum FrameType {
     /// **outside** the triggering session sees `{ added: [...], removed: [] }`
     /// so its Terminal-list sidebar refreshes ahead of the 5-s polling
     /// loop. WS dispatcher filters per-connection via
-    /// [`Hub::session_for_cookie`]: the trigger session itself does not
+    /// [`Hub::session_for_owner`]: the trigger session itself does not
     /// receive this frame (its layout already reflects the spawn). Inner
     /// payload: `varint 0 + UTF-8 JSON {"added":["<uuid>",…],"removed":[…]}`.
     TerminalListUpdate = 0x87,
@@ -389,6 +389,7 @@ pub fn router(_config: &Config, token: &TokenString, hub: Hub) -> Router {
 async fn ws_handler(
     State(state): State<WsState>,
     ws: WebSocketUpgrade,
+    uri: Uri,
     headers: HeaderMap,
 ) -> Response {
     let Some(raw) = headers
@@ -411,7 +412,7 @@ async fn ws_handler(
     // disconnect-notification key; with D10 α it can also satisfy the
     // upgrade authentication when the http-api layer registered a
     // [`hub::CookieValidator`] on the hub.
-    let cookie_value = headers
+    let auth_cookie = headers
         .get("cookie")
         .and_then(|v| v.to_str().ok())
         .and_then(|raw| {
@@ -422,6 +423,17 @@ async fn ws_handler(
                     .map(|v| v.to_string())
             })
         });
+    // ADR-0019 D5.6: pair the auth cookie with the per-tab `webpage_id` query
+    // to form the *owner key*. Two tabs sharing one cookie become two distinct
+    // Webpages and therefore distinct attach owners. When `webpage_id` is
+    // absent the owner key falls back to the cookie verbatim — legacy clients
+    // and unit tests keep working unchanged.
+    let owner_key = auth_cookie.as_ref().map(|cookie| {
+        match webpage_id_from_query(uri.query()) {
+            Some(webpage_id) => format!("{cookie}\x1f{webpage_id}"),
+            None => cookie.clone(),
+        }
+    });
 
     // D10 α additive auth: accept the upgrade when **either** the cookie
     // validates **or** the subprotocol bearer matches the canonical
@@ -431,7 +443,7 @@ async fn ws_handler(
     // accept, reply with the most informative 401 message — bearer
     // mismatch is the high-signal case for an attacker probe; missing
     // bearer is the most common path for an unsigned client.
-    let cookie_ok = if let Some(c) = cookie_value.as_deref() {
+    let cookie_ok = if let Some(c) = auth_cookie.as_deref() {
         if let Some(validator) = state.hub.cookie_validator() {
             validator.validate(c).await
         } else {
@@ -451,7 +463,7 @@ async fn ws_handler(
             warn!("ws upgrade rejected: bearer + cookie both invalid");
             return (StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
-        if cookie_value.is_some() {
+        if auth_cookie.is_some() {
             // Cookie-only browser sessions are stored in-memory by the
             // http-api layer. After a server restart, an existing browser tab
             // can still hold the old HttpOnly cookie and auto-reconnect once
@@ -474,15 +486,15 @@ async fn ws_handler(
     let mut response = ws
         .protocols(["gtmux.v1"])
         .on_upgrade(move |socket| async move {
-            handle_socket(socket, hub.clone(), cookie_value.clone(), connection_id.clone()).await;
-            if let Some(cookie) = cookie_value {
+            handle_socket(socket, hub.clone(), owner_key.clone(), connection_id.clone()).await;
+            if let Some(owner) = owner_key {
                 if let Some(sink) = hub.disconnect_sink() {
                     // Errors here only mean "no consumer registered" —
                     // the http-api layer hasn't wired its receiver yet
                     // (boot ordering) or has already shut down. Either
                     // way the session lock will be released by the
                     // server-shutdown path; warn for visibility only.
-                    if sink.send(cookie).is_err() {
+                    if sink.send(owner).is_err() {
                         tracing::debug!(
                             "ws disconnect sink closed; auto-release skipped"
                         );
@@ -496,6 +508,24 @@ async fn ws_handler(
     response
 }
 
+fn webpage_id_from_query(query: Option<&str>) -> Option<String> {
+    let raw = query?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "webpage_id").then_some(value)
+    })?;
+    if raw.is_empty() || raw.len() > 128 {
+        return None;
+    }
+    if raw
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
 /// Per-connection loop. Performs catch-up replay on attach (every alive
 /// pane's ring buffer is flushed as a 0x02 PANE_OUT envelope, followed
 /// by the matching `pane-spawned` NOTIFY so the frontend knows the id
@@ -504,7 +534,7 @@ async fn ws_handler(
 async fn handle_socket(
     socket: WebSocket,
     hub: Hub,
-    cookie_value: Option<String>,
+    owner_key: Option<String>,
     connection_id: Arc<str>,
 ) {
     let (mut sink, mut stream) = socket.split();
@@ -546,10 +576,10 @@ async fn handle_socket(
     // terminal_spawned_events / session_change_events) under the
     // false-negative-safe invariant.
     let mut session_pane_set: Option<std::collections::HashSet<u64>> =
-        if let (Some(provider), Some(cookie)) =
-            (hub.session_pane_set_provider(), cookie_value.as_deref())
+        if let (Some(provider), Some(owner)) =
+            (hub.session_pane_set_provider(), owner_key.as_deref())
         {
-            match hub.session_for_cookie(cookie) {
+            match hub.session_for_owner(owner) {
                 Some(session_name) => Some(provider.pane_ids_for_session(&session_name).await),
                 None => None,
             }
@@ -696,7 +726,7 @@ async fn handle_socket(
                             &mut last_pause_event,
                             &mut sink,
                             &hub,
-                            cookie_value.as_deref(),
+                            owner_key.as_deref(),
                             &connection_id,
                             session_pane_set.as_ref(),
                         ).await;
@@ -713,11 +743,11 @@ async fn handle_socket(
                     }
                     Ok(Message::Pong(_)) => {
                         last_pong = Instant::now();
-                        emit_heartbeat(&heartbeat_sink, cookie_value.as_deref());
+                        emit_heartbeat(&heartbeat_sink, owner_key.as_deref());
                     }
                     Ok(Message::Ping(p)) => {
                         let _ = sink.send(Message::Pong(p)).await;
-                        emit_heartbeat(&heartbeat_sink, cookie_value.as_deref());
+                        emit_heartbeat(&heartbeat_sink, owner_key.as_deref());
                     }
                     Ok(Message::Close(_)) => {
                         let _ = sink.send(close_frame(
@@ -802,11 +832,11 @@ async fn handle_socket(
                         // alone, so re-query when this connection has
                         // an attached session. False positives are
                         // cheap (rare PUT × in-memory join).
-                        if let (Some(provider), Some(cookie)) = (
+                        if let (Some(provider), Some(owner)) = (
                             hub.session_pane_set_provider(),
-                            cookie_value.as_deref(),
+                            owner_key.as_deref(),
                         ) {
-                            if let Some(my_session) = hub.session_for_cookie(cookie) {
+                            if let Some(my_session) = hub.session_for_owner(owner) {
                                 let fresh = provider
                                     .pane_ids_for_session(&my_session)
                                     .await;
@@ -876,10 +906,10 @@ async fn handle_socket(
                         if event.sender_conn_id.as_ref() == connection_id.as_ref() {
                             continue;
                         }
-                        let Some(cookie) = cookie_value.as_deref() else {
+                        let Some(owner) = owner_key.as_deref() else {
                             continue;
                         };
-                        let Some(my_session) = hub.session_for_cookie(cookie) else {
+                        let Some(my_session) = hub.session_for_owner(owner) else {
                             continue;
                         };
                         if my_session.as_str() != event.session_id.as_ref() {
@@ -917,14 +947,14 @@ async fn handle_socket(
                 match cascade {
                     Ok(event) => {
                         // Stage 5-D P2: trigger-only delivery. Subscribers
-                        // whose cookie maps to the trigger session emit the
-                        // 0x86 envelope; all others drop. Cookies with no
+                        // whose owner key maps to the trigger session emit the
+                        // 0x86 envelope; all others drop. Owners with no
                         // session attach also drop (race window: WS open
                         // before /attach).
-                        let Some(cookie) = cookie_value.as_deref() else {
+                        let Some(owner) = owner_key.as_deref() else {
                             continue;
                         };
-                        let Some(my_session) = hub.session_for_cookie(cookie) else {
+                        let Some(my_session) = hub.session_for_owner(owner) else {
                             continue;
                         };
                         if my_session.as_str() != event.trigger_session.as_ref() {
@@ -967,11 +997,11 @@ async fn handle_socket(
                         // require a UUID→session reverse index in the
                         // hub, but the work-package payload (~1 spawn
                         // per user click) doesn't justify it.
-                        if let (Some(provider), Some(cookie)) = (
+                        if let (Some(provider), Some(owner)) = (
                             hub.session_pane_set_provider(),
-                            cookie_value.as_deref(),
+                            owner_key.as_deref(),
                         ) {
-                            if let Some(my_session) = hub.session_for_cookie(cookie) {
+                            if let Some(my_session) = hub.session_for_owner(owner) {
                                 let fresh = provider
                                     .pane_ids_for_session(&my_session)
                                     .await;
@@ -1011,14 +1041,14 @@ async fn handle_socket(
             change = session_change_rx.recv() => {
                 match change {
                     Ok(event) => {
-                        // Slice next-2 (ADR-0025 D4): cookie session
-                        // change. Only matter when this connection's
-                        // cookie matches.
-                        let my_cookie = match cookie_value.as_deref() {
+                        // Slice next-2 (ADR-0025 D4): owner session change.
+                        // Only matter when this connection's owner key
+                        // matches.
+                        let my_owner = match owner_key.as_deref() {
                             Some(c) => c,
                             None => continue,
                         };
-                        if event.cookie.as_ref() != my_cookie {
+                        if event.owner_key.as_ref() != my_owner {
                             continue;
                         }
                         match (event.new_session.as_deref(), hub.session_pane_set_provider()) {
@@ -1027,7 +1057,7 @@ async fn handle_socket(
                                 session_pane_set = Some(fresh);
                             }
                             (None, _) => {
-                                // D5: cookie detached → legacy path.
+                                // D5: owner detached → legacy path.
                                 session_pane_set = None;
                             }
                             (Some(_), None) => {
@@ -1041,11 +1071,11 @@ async fn handle_socket(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Lagged on a low-freq channel implies many
                         // workspace switches; recompute defensively.
-                        if let (Some(provider), Some(cookie)) = (
+                        if let (Some(provider), Some(owner)) = (
                             hub.session_pane_set_provider(),
-                            cookie_value.as_deref(),
+                            owner_key.as_deref(),
                         ) {
-                            if let Some(my_session) = hub.session_for_cookie(cookie) {
+                            if let Some(my_session) = hub.session_for_owner(owner) {
                                 let fresh = provider
                                     .pane_ids_for_session(&my_session)
                                     .await;
@@ -1105,14 +1135,14 @@ async fn handle_socket(
                     Ok(event) => {
                         // Stage 5-D P1 routing: skip when this connection has
                         // no cookie at all, when the cookie has not yet
-                        // attached to any session, or when the cookie is
+                        // attached to any session, or when the owner is
                         // attached to the trigger session itself (its layout
                         // already reflects the spawn — emitting here would
                         // be redundant noise).
-                        let Some(cookie) = cookie_value.as_deref() else {
+                        let Some(owner) = owner_key.as_deref() else {
                             continue;
                         };
-                        let Some(my_session) = hub.session_for_cookie(cookie) else {
+                        let Some(my_session) = hub.session_for_owner(owner) else {
                             continue;
                         };
                         if my_session.as_str() == event.trigger_session.as_ref() {
@@ -1210,7 +1240,7 @@ async fn handle_client_envelope(
     last_pause_event: &mut HashMap<PaneId, Instant>,
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     hub: &Hub,
-    cookie_value: Option<&str>,
+    owner_key: Option<&str>,
     connection_id: &Arc<str>,
     session_pane_set: Option<&std::collections::HashSet<u64>>,
 ) -> bool {
@@ -1429,24 +1459,24 @@ async fn handle_client_envelope(
         | FrameType::ViewportChanged
         | FrameType::FocusMode => {
             // Stage 5-C: server-side echo-minus-sender. The originating
-            // connection's session_for_cookie binding determines the
+            // connection's session_for_owner binding determines the
             // routing scope; we enrich the inbound payload with a trailing
             // varint-len + UTF-8 `session_id` so subscribers can surface
             // the value to the FE without an extra HTTP roundtrip. Drop
-            // silently when the connection has no cookie or the cookie
+            // silently when the connection has no owner or the owner
             // has not yet attached — those clients are not addressable
             // for session-scoped delivery.
-            let Some(cookie) = cookie_value else {
+            let Some(owner) = owner_key else {
                 debug!(
                     kind = ?env.kind,
-                    "ws manipulation dropped: no cookie on connection"
+                    "ws manipulation dropped: no owner key on connection"
                 );
                 return false;
             };
-            let Some(session_name) = hub.session_for_cookie(cookie) else {
+            let Some(session_name) = hub.session_for_owner(owner) else {
                 debug!(
                     kind = ?env.kind,
-                    "ws manipulation dropped: cookie has no session attach"
+                    "ws manipulation dropped: owner has no session attach"
                 );
                 return false;
             };
@@ -1503,13 +1533,17 @@ fn debounce_pause(state: &mut HashMap<PaneId, Instant>, pane_id: PaneId) -> bool
 /// Forward a heartbeat signal to the registered sink, if any. Send errors
 /// (sink closed) are silently absorbed — they signify "the consumer task
 /// exited", which can happen during graceful shutdown and isn't a fault.
+///
+/// `owner_key` carries the per-Webpage identity `auth_cookie + 0x1f +
+/// webpage_id` (ADR-0019 D5.6) so the http-api side can refresh the
+/// matching `session_locks_by_owner` lease body.
 fn emit_heartbeat(
     sink: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
-    cookie: Option<&str>,
+    owner_key: Option<&str>,
 ) {
-    let Some(cookie) = cookie else { return };
+    let Some(owner_key) = owner_key else { return };
     let Some(tx) = sink else { return };
-    let _ = tx.send(cookie.to_string());
+    let _ = tx.send(owner_key.to_string());
 }
 
 fn close_frame(code: u16, reason: &'static str) -> Message {
@@ -1943,8 +1977,8 @@ bind = "127.0.0.1"
 
         // Two cookies, bound to different sessions before the WS upgrade so
         // the dispatcher arm has a stable lookup when the publish lands.
-        hub.set_session_for_cookie("cookie-A", "alpha");
-        hub.set_session_for_cookie("cookie-B", "beta");
+        hub.set_session_for_owner("cookie-A", "alpha");
+        hub.set_session_for_owner("cookie-B", "beta");
 
         let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
         let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
@@ -1984,7 +2018,7 @@ bind = "127.0.0.1"
         let (addr, hub) = spawn_test_server(token.clone()).await;
 
         // Bind only cookie-B; ws_no_cookie connects without any cookie at all.
-        hub.set_session_for_cookie("cookie-B", "beta");
+        hub.set_session_for_owner("cookie-B", "beta");
 
         let url = format!("ws://{addr}/ws");
         let mut req = url.into_client_request().unwrap();
@@ -2022,7 +2056,7 @@ bind = "127.0.0.1"
                 .await;
         assert!(
             echo.is_none(),
-            "cookie with no session_for_cookie binding must not receive 0x87"
+            "owner with no session_for_owner binding must not receive 0x87"
         );
     }
 
@@ -2417,7 +2451,7 @@ bind = "127.0.0.1"
         let mut set = std::collections::HashSet::new();
         set.insert(id_a);
         hub.set_session_pane_set_provider(std::sync::Arc::new(PaneSetStubProvider(set)));
-        hub.set_session_for_cookie("c1", "sess-a");
+        hub.set_session_for_owner("c1", "sess-a");
 
         let mut ws = connect_authed_with_cookie(addr, &token, "c1").await;
         let spawned =
@@ -2472,7 +2506,7 @@ bind = "127.0.0.1"
         // Cookie bound to a session but no SessionPaneSetProvider —
         // matches bootstrap / migration windows where the http-api
         // wiring hasn't installed the provider yet.
-        hub.set_session_for_cookie("c1", "sess-a");
+        hub.set_session_for_owner("c1", "sess-a");
 
         let mut ws = connect_authed_with_cookie(addr, &token, "c1").await;
         let spawned =
@@ -2491,8 +2525,8 @@ bind = "127.0.0.1"
     async fn mount_cascade_delivered_to_trigger_session_only() {
         let token = gtmux_auth::issue_token().unwrap();
         let (addr, hub) = spawn_test_server(token.clone()).await;
-        hub.set_session_for_cookie("cookie-A", "alpha");
-        hub.set_session_for_cookie("cookie-B", "beta");
+        hub.set_session_for_owner("cookie-A", "alpha");
+        hub.set_session_for_owner("cookie-B", "beta");
 
         let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
         let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
@@ -2596,7 +2630,7 @@ bind = "127.0.0.1"
 
         let mut probe = hub.subscribe_manipulation();
         // Client sends a viewport-changed (0x83) but its cookie has no
-        // hub.session_for_cookie binding — dispatcher drops without publish.
+        // hub.session_for_owner binding — dispatcher drops without publish.
         let frame = Envelope::new(
             FrameType::ViewportChanged,
             Bytes::from(payload::encode_viewport_marker_only()),
@@ -2618,8 +2652,8 @@ bind = "127.0.0.1"
         // (with session_id trailer), A does NOT receive its own echo.
         let token = gtmux_auth::issue_token().unwrap();
         let (addr, hub) = spawn_test_server(token.clone()).await;
-        hub.set_session_for_cookie("cookie-A", "alpha");
-        hub.set_session_for_cookie("cookie-B", "alpha");
+        hub.set_session_for_owner("cookie-A", "alpha");
+        hub.set_session_for_owner("cookie-B", "alpha");
 
         let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
         let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
@@ -2660,8 +2694,8 @@ bind = "127.0.0.1"
         // A→alpha, C→beta. A sends 0x83. C must NOT receive it.
         let token = gtmux_auth::issue_token().unwrap();
         let (addr, hub) = spawn_test_server(token.clone()).await;
-        hub.set_session_for_cookie("cookie-A", "alpha");
-        hub.set_session_for_cookie("cookie-C", "beta");
+        hub.set_session_for_owner("cookie-A", "alpha");
+        hub.set_session_for_owner("cookie-C", "beta");
 
         let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
         let mut ws_c = connect_authed_with_cookie(addr, &token, "cookie-C").await;
@@ -2689,8 +2723,8 @@ bind = "127.0.0.1"
         // can't silently drift away from `read_trailing_session_id`.
         let token = gtmux_auth::issue_token().unwrap();
         let (addr, hub) = spawn_test_server(token.clone()).await;
-        hub.set_session_for_cookie("cookie-A", "session-with-dashes");
-        hub.set_session_for_cookie("cookie-B", "session-with-dashes");
+        hub.set_session_for_owner("cookie-A", "session-with-dashes");
+        hub.set_session_for_owner("cookie-B", "session-with-dashes");
 
         let mut ws_a = connect_authed_with_cookie(addr, &token, "cookie-A").await;
         let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
@@ -2722,7 +2756,7 @@ bind = "127.0.0.1"
         // a similar event). The decoder must surface both fields.
         let token = gtmux_auth::issue_token().unwrap();
         let (addr, hub) = spawn_test_server(token.clone()).await;
-        hub.set_session_for_cookie("cookie-B", "beta");
+        hub.set_session_for_owner("cookie-B", "beta");
 
         let mut ws_b = connect_authed_with_cookie(addr, &token, "cookie-B").await;
         drain_initial(&mut ws_b, std::time::Duration::from_millis(50)).await;
@@ -2970,7 +3004,7 @@ bind = "127.0.0.1"
     /// **Contract under test**:
     ///   * *strict* — once the timeout fires, the connection's cookie is
     ///     emitted onto the disconnect sink (this is the production
-    ///     `release_lock_for_cookie` trigger).
+    ///     `release_lock_for_owner` trigger).
     ///   * *best-effort* — the server attempts a graceful
     ///     `Close(1011 INTERNAL)` frame, but on a `cargo test --workspace`
     ///     run the tokio runtime is shared with N other tests; under that
@@ -3045,7 +3079,7 @@ bind = "127.0.0.1"
         );
 
         // The handle_socket return path also fires `disconnect_sink` with
-        // the cookie value, which is how `release_lock_for_cookie` runs
+        // the owner key, which is how `release_lock_for_owner` runs
         // in production. *This* assertion is the load-bearing one.
         let received =
             tokio::time::timeout(std::time::Duration::from_secs(2), disc_rx.recv())
@@ -3057,7 +3091,7 @@ bind = "127.0.0.1"
 
     /// ADR-0021 D6.2 — a live PONG reply keeps the connection alive and
     /// fires the heartbeat sink (which the http-api layer wires to
-    /// `refresh_lease_for_cookie`). Pairs with the timeout test above to
+    /// `refresh_lease_for_owner`). Pairs with the timeout test above to
     /// cover both arms of the heartbeat state machine.
     #[tokio::test]
     async fn heartbeat_pong_reply_emits_heartbeat_sink() {

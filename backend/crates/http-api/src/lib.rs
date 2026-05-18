@@ -157,12 +157,14 @@ pub struct AppState {
     /// the OS-level flock. Serialises same-server attach attempts on the
     /// same session name (D6.6).
     pub session_locks: Arc<tokio::sync::Mutex<std::collections::HashMap<String, LockGuard>>>,
-    /// Reverse index: cookie value → session name. Populated when an attach
-    /// succeeds against a known cookie; consulted on WS-close to find the
-    /// matching `session_locks` entry to release (ADR-0019 D6 §heartbeat).
+    /// Reverse index: owner key → session name. The owner key is
+    /// `auth_cookie + 0x1f + webpage_id` (ADR-0019 D5.6) so two tabs sharing
+    /// the auth cookie keep distinct attach lifetimes. Populated when an
+    /// attach succeeds; consulted on WS-close to find the matching
+    /// `session_locks` entry to release (ADR-0019 D6 §heartbeat).
     /// Manipulated *only* while `session_locks` is held to keep the two
     /// maps consistent — never under contention from a different path.
-    pub session_locks_by_cookie: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
+    pub session_locks_by_owner: Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// UUID ↔ PaneId bridge for the schema v2 terminal-item model (ADR-0018
     /// D2). Every spawn that surfaces through the HTTP API registers here;
     /// every detected death unregisters. The `pty-backend` / `ws-server`
@@ -224,7 +226,7 @@ impl AppState {
             session_locks: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            session_locks_by_cookie: Arc::new(tokio::sync::Mutex::new(
+            session_locks_by_owner: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             terminal_map: Arc::new(TerminalMap::new()),
@@ -262,22 +264,23 @@ impl AppState {
         self
     }
 
-    /// Refresh the lease body of the session lock currently held by
-    /// `cookie` (ADR-0019 D6.2). Called from the WS heartbeat consumer task
-    /// on every Ping/Pong. Bumps the `lease_until_unix` field so a peeking
-    /// modal sees a fresh expected expiry. The kernel flock is unaffected
-    /// — this is purely a diagnostic refresh.
+    /// Refresh the lease body of the session lock currently held by the
+    /// Webpage identified by `owner_key` (= `auth_cookie + 0x1f + webpage_id`,
+    /// ADR-0019 D5.6 / ADR-0019 D6.2). Called from the WS heartbeat consumer
+    /// task on every Ping/Pong. Bumps the `lease_until_unix` field so a
+    /// peeking modal sees a fresh expected expiry. The kernel flock is
+    /// unaffected — this is purely a diagnostic refresh.
     ///
-    /// Idempotent. A cookie that holds no lock is a no-op.
-    pub async fn refresh_lease_for_cookie(&self, cookie: &str) {
-        let by_cookie = self.session_locks_by_cookie.lock().await;
-        let Some(name) = by_cookie.get(cookie).cloned() else {
+    /// Idempotent. An owner that holds no lock is a no-op.
+    pub async fn refresh_lease_for_owner(&self, owner_key: &str) {
+        let by_owner = self.session_locks_by_owner.lock().await;
+        let Some(name) = by_owner.get(owner_key).cloned() else {
             return;
         };
-        drop(by_cookie);
+        drop(by_owner);
         let mut holders = self.session_locks.lock().await;
         if let Some(guard) = holders.get_mut(&name) {
-            if let Err(e) = guard.refresh_lease(cookie) {
+            if let Err(e) = guard.refresh_lease(owner_key) {
                 tracing::warn!(
                     session = %name,
                     error = %e,
@@ -320,15 +323,16 @@ impl AppState {
         }
     }
 
-    /// Release any cross-server session lock currently held by `cookie`
-    /// (ADR-0019 D6). Called from the WS disconnect consumer task on close.
-    /// Idempotent — a cookie that never attached is a no-op.
-    pub async fn release_lock_for_cookie(&self, cookie: &str) {
-        // Locks are taken in a fixed order (locks_by_cookie → session_locks)
-        // anywhere two maps are touched together, so a same-cookie attach
+    /// Release any cross-server session lock currently held by the Webpage
+    /// identified by `owner_key` (= `auth_cookie + 0x1f + webpage_id`,
+    /// ADR-0019 D5.6 / ADR-0019 D6). Called from the WS disconnect consumer
+    /// task on close. Idempotent — an owner that never attached is a no-op.
+    pub async fn release_lock_for_owner(&self, owner_key: &str) {
+        // Locks are taken in a fixed order (locks_by_owner → session_locks)
+        // anywhere two maps are touched together, so a same-owner attach
         // racing with a disconnect cannot deadlock.
-        let mut by_cookie = self.session_locks_by_cookie.lock().await;
-        let Some(name) = by_cookie.remove(cookie) else {
+        let mut by_owner = self.session_locks_by_owner.lock().await;
+        let Some(name) = by_owner.remove(owner_key) else {
             return;
         };
         let mut holders = self.session_locks.lock().await;
@@ -339,11 +343,11 @@ impl AppState {
             );
             guard.release();
         }
-        // Stage 5-A: mirror the auto-release into the hub's cookie ↔
-        // session table so a fresh WS reconnect doesn't see this cookie
+        // Stage 5-A: mirror the auto-release into the hub's owner ↔
+        // session table so a fresh WS reconnect doesn't see this Webpage
         // as still session-attached.
         if let Some(hub) = self.hub.as_ref() {
-            hub.clear_session_for_cookie(cookie);
+            hub.clear_session_for_owner(owner_key);
         }
     }
 
@@ -2128,6 +2132,10 @@ mod tests {
             )
             .await
             .unwrap();
+        // ADR-0019 D5.6: PUT /layout demands an owner-scoped attach. Bearer-
+        // only auth → owner_key falls back to "_unknown" in both attach +
+        // PUT, so the guard passes once we run the attach handler.
+        assert_eq!(attach(&app, &token, "demo").await, StatusCode::OK);
 
         // GET to fetch current ETag.
         let resp = app
@@ -2220,6 +2228,8 @@ mod tests {
             )
             .await
             .unwrap();
+        // ADR-0019 D5.6 owner-attach guard.
+        assert_eq!(attach(&app, &token, "be4").await, StatusCode::OK);
 
         // GET to fetch current ETag.
         let resp = app
@@ -2325,7 +2335,10 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        // PUT a layout containing the terminal item.
+        // PUT a layout containing the terminal item. The `x-gtmux-webpage-id`
+        // header carries the same value the matching `attach_idx_create_session`
+        // call used, so `attach_owner_key(headers)` reproduces the same
+        // owner_key and clears the ADR-0019 D5.6 attach-guard on PUT.
         let layout = json!({
             "schema_version": 2,
             "groups": [],
@@ -2350,6 +2363,7 @@ mod tests {
                     .uri(format!("/api/sessions/{session}/layout"))
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(token))
+                    .header("x-gtmux-webpage-id", session)
                     .header(header::IF_MATCH, etag)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(put_body))
@@ -2383,6 +2397,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+        // ADR-0019 D5.6: PUT /layout + DELETE /items require an owner-scoped
+        // attach. Each session attaches as its own Webpage (`webpage_id` ==
+        // session name) so multi-session tests get distinct owner keys —
+        // attaching session B does not implicitly detach session A.
+        assert_eq!(
+            attach_as_webpage(app, token, name, name).await,
+            StatusCode::OK
+        );
+    }
+
+    /// Test helper: seed `session_locks_by_owner` so handlers protected by
+    /// the ADR-0019 D5.6 owner-attach guard (`PUT /layout`,
+    /// `DELETE /items`) treat a bearer-only request as already attached.
+    /// Bypasses the real flock — pure in-memory poke. The owner_key key
+    /// matches what `attach_owner_key(headers)` returns for a request with
+    /// no `Cookie` and no `x-gtmux-webpage-id` header.
+    async fn seed_owner_attached(state: &AppState, name: &str) {
+        state
+            .session_locks_by_owner
+            .lock()
+            .await
+            .insert("_unknown".to_string(), name.to_string());
     }
 
     const UUID_A: &str = "11111111-2222-4333-8444-aaaaaaaaaaaa";
@@ -2404,7 +2440,9 @@ mod tests {
         let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
         attach_idx_create_session(&app, &token, "alpha").await;
         let etag = put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
-        // Now PUT an empty-items layout — should drop UUID_A's entry.
+        // Now PUT an empty-items layout — should drop UUID_A's entry. The
+        // `x-gtmux-webpage-id: alpha` header matches the attach owner_key
+        // seeded by `attach_idx_create_session("alpha")`.
         let empty_layout = json!({
             "schema_version": 2,
             "groups": [],
@@ -2419,6 +2457,7 @@ mod tests {
                     .uri("/api/sessions/alpha/layout")
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(&token))
+                    .header("x-gtmux-webpage-id", "alpha")
                     .header(header::IF_MATCH, etag)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(serde_json::to_vec(&empty_layout).unwrap()))
@@ -2440,7 +2479,9 @@ mod tests {
         let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
         attach_idx_create_session(&app, &token, "alpha").await;
         put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
-        // DELETE the item.
+        // DELETE the item. `x-gtmux-webpage-id: alpha` so the ADR-0019 D5.6
+        // owner-attach guard sees the same owner_key the attach handler
+        // recorded.
         let resp = app
             .clone()
             .oneshot(
@@ -2449,6 +2490,7 @@ mod tests {
                     .uri(format!("/api/sessions/alpha/items/{UUID_A}"))
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(&token))
+                    .header("x-gtmux-webpage-id", "alpha")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3234,6 +3276,9 @@ mod tests {
             serde_json::to_vec(&make_layout_with_one_terminal(uuid)).unwrap(),
         )
         .unwrap();
+        // ADR-0019 D5.6 owner-attach guard: synthesise the same owner_key
+        // (`"_unknown"`) that the bearer-only DELETE below produces.
+        seed_owner_attached(&state, "demo").await;
 
         let app = router_with_state(state.clone());
         let resp = app
@@ -3283,6 +3328,7 @@ mod tests {
             serde_json::to_vec(&make_layout_with_one_terminal(uuid)).unwrap(),
         )
         .unwrap();
+        seed_owner_attached(&state, "demo").await;
 
         let app = router_with_state(state.clone());
         let resp = app
@@ -3314,6 +3360,7 @@ mod tests {
             serde_json::to_vec(&layout).unwrap(),
         )
         .unwrap();
+        seed_owner_attached(&state, "demo").await;
         let app = router_with_state(state);
         let resp = app
             .oneshot(
@@ -3427,6 +3474,29 @@ mod tests {
         resp.status()
     }
 
+    async fn attach_as_webpage(
+        app: &Router,
+        token: &TokenString,
+        name: &str,
+        webpage_id: &str,
+    ) -> StatusCode {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/sessions/{name}/attach"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header("x-gtmux-webpage-id", webpage_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    }
+
     async fn detach(app: &Router, token: &TokenString, name: &str) -> StatusCode {
         let resp = app
             .clone()
@@ -3442,6 +3512,49 @@ mod tests {
             .await
             .unwrap();
         resp.status()
+    }
+
+    async fn detach_as_webpage(
+        app: &Router,
+        token: &TokenString,
+        name: &str,
+        webpage_id: &str,
+    ) -> StatusCode {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/api/sessions/{name}/attach"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header("x-gtmux-webpage-id", webpage_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    async fn list_as_webpage(app: &Router, token: &TokenString, webpage_id: &str) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header("x-gtmux-webpage-id", webpage_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     #[tokio::test]
@@ -3461,6 +3574,96 @@ mod tests {
         assert_eq!(detach(&app, &token, "alpha").await, StatusCode::OK);
         // Second detach is still 200 (idempotent).
         assert_eq!(detach(&app, &token, "alpha").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn same_cookie_different_webpage_cannot_attach_same_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "alpha").await;
+
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-a").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-a").await,
+            StatusCode::OK,
+            "same webpage reattach remains idempotent"
+        );
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-b").await,
+            StatusCode::CONFLICT,
+            "same auth cookie in a different tab must still be a different Webpage"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_is_webpage_scoped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "alpha").await;
+
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-a").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            detach_as_webpage(&app, &token, "alpha", "page-b").await,
+            StatusCode::OK,
+            "detach is idempotent but must not release another webpage"
+        );
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-c").await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            detach_as_webpage(&app, &token, "alpha", "page-a").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-c").await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn session_list_disables_any_open_webpage_session() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "alpha").await;
+        create_session(&app, &token, "beta").await;
+
+        assert_eq!(
+            attach_as_webpage(&app, &token, "alpha", "page-a").await,
+            StatusCode::OK
+        );
+
+        let as_owner = list_as_webpage(&app, &token, "page-a").await;
+        let alpha_for_owner = as_owner
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "alpha")
+            .unwrap();
+        assert_eq!(
+            alpha_for_owner["active"],
+            json!(true),
+            "an already-open session is not selectable, even for the owning webpage"
+        );
+
+        let as_other = list_as_webpage(&app, &token, "page-b").await;
+        let alpha_for_other = as_other
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "alpha")
+            .unwrap();
+        assert_eq!(
+            alpha_for_other["active"],
+            json!(true),
+            "a different webpage must still see the row as in-use"
+        );
     }
 
     #[tokio::test]
@@ -3615,7 +3818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_lock_for_cookie_drops_the_attach() {
+    async fn release_lock_for_owner_drops_the_attach() {
         // ADR-0019 D6 + ADR-0021 D6: a WS-close event must auto-release the
         // session lock the cookie still holds, with no need for an explicit
         // DELETE.
@@ -3645,7 +3848,7 @@ mod tests {
         // Reach into the AppState behind the router to invoke the release
         // path. We can't easily get the AppState back from `router_with_state`
         // so we reconstruct one against the same workspace dir + simulate.
-        // The unit-level coverage of release_lock_for_cookie is via the
+        // The unit-level coverage of release_lock_for_owner is via the
         // standalone test below; here we verify the *integration* surface.
         // A second attach from a *different* cookie must 409 because takeover
         // is forbidden (ADR-0019 D4) — the auto-release path is the only way
@@ -3671,7 +3874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_lease_for_cookie_bumps_lease_until() {
+    async fn refresh_lease_for_owner_bumps_lease_until() {
         // ADR-0019 D6.2: each Ping/Pong drives a lease refresh so peeking
         // modals don't see a stale "expected expiry" hint.
         let dir = tempfile::TempDir::new().unwrap();
@@ -3697,7 +3900,7 @@ mod tests {
             .await
             .insert("refresh".to_string(), guard);
         state
-            .session_locks_by_cookie
+            .session_locks_by_owner
             .lock()
             .await
             .insert(cookie_value.to_string(), "refresh".to_string());
@@ -3710,7 +3913,7 @@ mod tests {
         // Sleep past the 1s resolution of unix-seconds so the new lease
         // can demonstrably differ.
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        state.refresh_lease_for_cookie(cookie_value).await;
+        state.refresh_lease_for_owner(cookie_value).await;
 
         let lease_after: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -3721,12 +3924,12 @@ mod tests {
         );
 
         // Idempotent — refresh for a cookie with no lock is a no-op.
-        state.refresh_lease_for_cookie("absent-cookie").await;
+        state.refresh_lease_for_owner("absent-cookie").await;
     }
 
     #[tokio::test]
-    async fn release_lock_for_cookie_directly_on_appstate() {
-        // Direct unit test of `AppState::release_lock_for_cookie` (the
+    async fn release_lock_for_owner_directly_on_appstate() {
+        // Direct unit test of `AppState::release_lock_for_owner` (the
         // method the WS-close consumer task calls).
         let dir = tempfile::TempDir::new().unwrap();
         let token = issue_token().expect("token");
@@ -3753,7 +3956,7 @@ mod tests {
                 .await
                 .insert("manual".to_string(), guard);
             state
-                .session_locks_by_cookie
+                .session_locks_by_owner
                 .lock()
                 .await
                 .insert(cookie_value.to_string(), "manual".to_string());
@@ -3761,13 +3964,13 @@ mod tests {
         assert!(dir.path().join(".locks/manual.lock").exists());
 
         // Release-by-cookie must drop both maps and the lock file.
-        state.release_lock_for_cookie(cookie_value).await;
+        state.release_lock_for_owner(cookie_value).await;
         assert!(state.session_locks.lock().await.is_empty());
-        assert!(state.session_locks_by_cookie.lock().await.is_empty());
+        assert!(state.session_locks_by_owner.lock().await.is_empty());
         assert!(!dir.path().join(".locks/manual.lock").exists());
 
         // Idempotent — second call on an absent cookie is a no-op.
-        state.release_lock_for_cookie(cookie_value).await;
+        state.release_lock_for_owner(cookie_value).await;
     }
 
     #[tokio::test]
@@ -4240,7 +4443,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_mirrors_cookie_to_hub_session_table() {
-        // attach_handler must update hub.session_for_cookie so the WS
+        // attach_handler must update hub.session_for_owner so the WS
         // dispatcher (5-C) can route session-scoped envelopes. Verifies
         // both the success-path write and that detach/cleanup later
         // unwinds it.
@@ -4263,7 +4466,7 @@ mod tests {
         let app = router_with_state(state);
         let cookie_value = "mirror-cookie-aaa";
         // Pre-condition: hub knows nothing about this cookie.
-        assert_eq!(hub.session_for_cookie(cookie_value), None);
+        assert_eq!(hub.session_for_owner(cookie_value), None);
 
         let resp = app
             .clone()
@@ -4282,7 +4485,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // attach must have mirrored the cookie binding into the hub.
         assert_eq!(
-            hub.session_for_cookie(cookie_value),
+            hub.session_for_owner(cookie_value),
             Some("mirror".to_string())
         );
 
@@ -4301,11 +4504,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(detach.status(), StatusCode::OK);
-        assert_eq!(hub.session_for_cookie(cookie_value), None);
+        assert_eq!(hub.session_for_owner(cookie_value), None);
     }
 
     #[tokio::test]
-    async fn release_lock_for_cookie_clears_hub_session() {
+    async fn release_lock_for_owner_clears_hub_session() {
         // The WS-disconnect-driven release path must also clear the hub
         // mirror, otherwise a fresh WS reconnect for the same cookie
         // would see itself as still session-attached.
@@ -4342,21 +4545,21 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            hub.session_for_cookie(cookie_value),
+            hub.session_for_owner(cookie_value),
             Some("auto".to_string())
         );
 
         // Drive the WS-disconnect path directly.
-        state_clone.release_lock_for_cookie(cookie_value).await;
-        assert_eq!(hub.session_for_cookie(cookie_value), None);
+        state_clone.release_lock_for_owner(cookie_value).await;
+        assert_eq!(hub.session_for_owner(cookie_value), None);
     }
 
     #[tokio::test]
-    async fn detach_clears_all_cookies_for_session_in_hub() {
-        // detach_handler clears `session_locks_by_cookie` by *name* — the
-        // hub mirror must follow the same semantics so multiple webpages
-        // sharing a session (a configuration ADR-0019 D3 forbids today
-        // but the table tolerates) all drop their bindings together.
+    async fn detach_is_owner_scoped_in_hub() {
+        // ADR-0019 D5.6: detach_handler releases the lock only for the
+        // calling Webpage's owner_key. Phantom hub entries from other
+        // Webpages (or stale bindings from an old code path) must
+        // survive — only the matching owner is cleared.
         let dir = tempfile::TempDir::new().unwrap();
         let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
         let hub = state.hub.as_ref().expect("hub wired").clone();
@@ -4372,19 +4575,16 @@ mod tests {
         )
         .unwrap();
 
-        // Seed two cookies pointing at "multi" directly on the hub side
-        // (the same-server flock guard forbids two cookies actually
-        // attaching at once; we still want the clear-by-name semantic
-        // to be unambiguous).
-        hub.set_session_for_cookie("cookie-A", "multi");
-        hub.set_session_for_cookie("cookie-B", "multi");
-        hub.set_session_for_cookie("cookie-C", "other");
+        // Seed three owner bindings directly on the hub. Only "cookie-A"
+        // will actually go through the attach handler below; the others
+        // are *phantom* mappings (e.g. from a stale prior code path or
+        // a different Webpage). D5.6 detach must not touch them.
+        hub.set_session_for_owner("cookie-A", "multi");
+        hub.set_session_for_owner("cookie-B", "multi");
+        hub.set_session_for_owner("cookie-C", "other");
 
         let app = router_with_state(state);
-        // Real attach to acquire the flock under cookie-A so DELETE can
-        // succeed against `session_locks`. The set_session_for_cookie
-        // above for cookie-A gets overwritten with the same value by the
-        // attach handler — still "multi".
+        // Real attach to acquire the flock under cookie-A.
         let resp = app
             .clone()
             .oneshot(
@@ -4401,6 +4601,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        // Detach as cookie-A: owner-scoped, so only cookie-A's hub
+        // binding goes; cookie-B / cookie-C survive untouched.
         let detach = app
             .oneshot(
                 HttpRequest::builder()
@@ -4408,16 +4610,20 @@ mod tests {
                     .uri("/api/sessions/multi/attach")
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::COOKIE, "gtmux_auth=cookie-A")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(detach.status(), StatusCode::OK);
-        assert_eq!(hub.session_for_cookie("cookie-A"), None);
-        assert_eq!(hub.session_for_cookie("cookie-B"), None);
-        // Cookie-C pointed at a different session; must survive.
-        assert_eq!(hub.session_for_cookie("cookie-C"), Some("other".into()));
+        assert_eq!(hub.session_for_owner("cookie-A"), None);
+        assert_eq!(
+            hub.session_for_owner("cookie-B"),
+            Some("multi".into()),
+            "D5.6: detach is owner-scoped — sibling Webpage bindings must survive"
+        );
+        assert_eq!(hub.session_for_owner("cookie-C"), Some("other".into()));
     }
 
     // ── Implicit detach-on-reattach (session switch UX) ──────────────────
@@ -4464,7 +4670,7 @@ mod tests {
             .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
         assert!(workspace_dir.join(".locks/one.lock").exists());
-        assert_eq!(hub.session_for_cookie(cookie_value), Some("one".into()));
+        assert_eq!(hub.session_for_owner(cookie_value), Some("one".into()));
 
         // 2) attach 'two' with the SAME cookie — must implicitly release 'one'.
         let r2 = app
@@ -4486,7 +4692,7 @@ mod tests {
         assert!(!workspace_dir.join(".locks/one.lock").exists());
         assert!(workspace_dir.join(".locks/two.lock").exists());
         // hub mirror must now point at 'two'.
-        assert_eq!(hub.session_for_cookie(cookie_value), Some("two".into()));
+        assert_eq!(hub.session_for_owner(cookie_value), Some("two".into()));
 
         // 3) Listing — 'one' active=false, 'two' active=true.
         let list = app
@@ -4548,7 +4754,7 @@ mod tests {
         };
         assert_eq!(app.clone().oneshot(make_req()).await.unwrap().status(), StatusCode::OK);
         assert!(workspace_dir.join(".locks/solo.lock").exists());
-        assert_eq!(hub.session_for_cookie(cookie_value), Some("solo".into()));
+        assert_eq!(hub.session_for_owner(cookie_value), Some("solo".into()));
         // Second attach (same cookie, same name) — 200 idempotent. Lock
         // file stays put (no implicit release fired) and the hub mirror
         // is unchanged.
@@ -4559,6 +4765,6 @@ mod tests {
         assert_eq!(v["attached"], json!(true));
         assert_eq!(v["name"], json!("solo"));
         assert!(workspace_dir.join(".locks/solo.lock").exists());
-        assert_eq!(hub.session_for_cookie(cookie_value), Some("solo".into()));
+        assert_eq!(hub.session_for_owner(cookie_value), Some("solo".into()));
     }
 }
