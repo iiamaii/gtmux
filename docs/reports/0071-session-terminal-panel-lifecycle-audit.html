@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>0071 — Session·Terminal·Panel·History 라이프사이클 정합 감사</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --bg-soft: #1a1f29;
+    --bg-card: #1f2530;
+    --border: #2d3441;
+    --border-soft: #232934;
+    --text: #d4d8df;
+    --text-dim: #8a93a3;
+    --text-strong: #f0f3f8;
+    --accent: #7ab8ff;
+    --p0: #ff6b6b;
+    --p0-bg: rgba(255, 107, 107, 0.08);
+    --p1: #ffa94d;
+    --p1-bg: rgba(255, 169, 77, 0.08);
+    --p2: #6cc985;
+    --p2-bg: rgba(108, 201, 133, 0.08);
+    --invariant: #5ec3e0;
+    --invariant-bg: rgba(94, 195, 224, 0.06);
+    --reject: #b96eff;
+    --reject-bg: rgba(185, 110, 255, 0.08);
+    --code-bg: #11151c;
+    --code-text: #c0d3ee;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.7 -apple-system, BlinkMacSystemFont, "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .container {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 32px 24px 80px;
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 36px;
+  }
+  @media (max-width: 920px) {
+    .container { grid-template-columns: 1fr; }
+    nav.toc { position: static !important; max-height: none !important; }
+  }
+  nav.toc {
+    position: sticky;
+    top: 24px;
+    align-self: start;
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
+    font-size: 13px;
+  }
+  nav.toc h3 {
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 11px;
+    margin: 0 0 12px;
+  }
+  nav.toc a {
+    display: block;
+    color: var(--text-dim);
+    text-decoration: none;
+    padding: 5px 10px;
+    border-left: 2px solid var(--border-soft);
+    margin-bottom: 2px;
+    border-radius: 0 4px 4px 0;
+    transition: color .15s, border-color .15s, background .15s;
+  }
+  nav.toc a:hover {
+    color: var(--text-strong);
+    background: var(--bg-soft);
+    border-left-color: var(--accent);
+  }
+  nav.toc a.section { font-weight: 600; color: var(--text); margin-top: 8px; }
+  nav.toc a.sub { padding-left: 22px; font-size: 12px; }
+
+  main { min-width: 0; }
+
+  header.doc-header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 20px;
+    margin-bottom: 28px;
+  }
+  header.doc-header h1 {
+    font-size: 26px;
+    margin: 0 0 10px;
+    color: var(--text-strong);
+    letter-spacing: -0.01em;
+  }
+  header.doc-header .subtitle {
+    color: var(--text-dim);
+    font-size: 14px;
+  }
+  .meta-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 6px 18px;
+    margin-top: 16px;
+    font-size: 13px;
+  }
+  .meta-grid dt { color: var(--text-dim); }
+  .meta-grid dd { margin: 0; color: var(--text); }
+  .meta-grid a { color: var(--accent); text-decoration: none; }
+  .meta-grid a:hover { text-decoration: underline; }
+
+  h2.section {
+    font-size: 21px;
+    margin: 44px 0 18px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-strong);
+    scroll-margin-top: 16px;
+  }
+  h3 {
+    font-size: 17px;
+    margin: 28px 0 12px;
+    color: var(--text-strong);
+    scroll-margin-top: 16px;
+  }
+  h4 {
+    font-size: 15px;
+    margin: 20px 0 8px;
+    color: var(--text-strong);
+  }
+  p { margin: 0 0 14px; }
+  ul, ol { margin: 0 0 14px; padding-left: 22px; }
+  li { margin-bottom: 4px; }
+  strong { color: var(--text-strong); }
+  em { color: var(--text); font-style: italic; }
+  a { color: var(--accent); }
+
+  code {
+    font-family: "JetBrains Mono", "SF Mono", "Menlo", monospace;
+    font-size: 13px;
+    background: var(--code-bg);
+    color: var(--code-text);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border-soft);
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-text);
+    padding: 14px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border-soft);
+    overflow-x: auto;
+    font-size: 12.5px;
+    line-height: 1.55;
+    margin: 12px 0 16px;
+  }
+  pre code {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: inherit;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 14px 0 20px;
+    font-size: 13.5px;
+  }
+  th, td {
+    border: 1px solid var(--border);
+    padding: 9px 12px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--bg-soft);
+    color: var(--text-strong);
+    font-weight: 600;
+    font-size: 13px;
+  }
+  tr:nth-child(even) td { background: var(--bg-soft); }
+  td code { font-size: 12px; }
+
+  /* Severity badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .badge.p0 { background: var(--p0-bg); color: var(--p0); border: 1px solid var(--p0); }
+  .badge.p1 { background: var(--p1-bg); color: var(--p1); border: 1px solid var(--p1); }
+  .badge.p2 { background: var(--p2-bg); color: var(--p2); border: 1px solid var(--p2); }
+  .badge.invariant { background: var(--invariant-bg); color: var(--invariant); border: 1px solid var(--invariant); }
+  .badge.reject { background: var(--reject-bg); color: var(--reject); border: 1px solid var(--reject); }
+  .badge.real { background: rgba(255, 107, 107, 0.18); color: #ff8a8a; border: 1px solid var(--p0); }
+  .badge.naming { background: rgba(255, 169, 77, 0.18); color: #ffc283; border: 1px solid var(--p1); }
+
+  /* Finding cards */
+  .finding {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--border);
+    border-radius: 8px;
+    padding: 18px 22px;
+    margin: 16px 0 22px;
+  }
+  .finding.p0 { border-left-color: var(--p0); }
+  .finding.p1 { border-left-color: var(--p1); }
+  .finding.p2 { border-left-color: var(--p2); }
+  .finding.invariant { border-left-color: var(--invariant); }
+  .finding h3 { margin-top: 0; }
+  .finding .why-text {
+    background: rgba(122, 184, 255, 0.06);
+    border-left: 3px solid var(--accent);
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin: 10px 0;
+    font-size: 13.5px;
+  }
+  .finding .file-ref {
+    display: inline-block;
+    background: var(--bg-soft);
+    border: 1px solid var(--border-soft);
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 12px;
+    color: var(--accent);
+    margin: 2px 0;
+  }
+
+  /* Summary stat boxes */
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+    margin: 18px 0 26px;
+  }
+  .stat {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    text-align: left;
+  }
+  .stat .num {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--text-strong);
+    line-height: 1;
+    margin-bottom: 4px;
+  }
+  .stat .label {
+    font-size: 12px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .stat.p0 { border-left: 3px solid var(--p0); }
+  .stat.p1 { border-left: 3px solid var(--p1); }
+  .stat.p2 { border-left: 3px solid var(--p2); }
+  .stat.invariant { border-left: 3px solid var(--invariant); }
+  .stat.reject { border-left: 3px solid var(--reject); }
+
+  /* Callout */
+  .callout {
+    background: rgba(122, 184, 255, 0.06);
+    border: 1px solid rgba(122, 184, 255, 0.2);
+    border-left: 4px solid var(--accent);
+    padding: 14px 18px;
+    border-radius: 6px;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  .callout.warn {
+    background: var(--p1-bg);
+    border-color: rgba(255, 169, 77, 0.3);
+    border-left-color: var(--p1);
+  }
+  .callout strong { color: var(--text-strong); }
+
+  /* Scenario step list */
+  ol.scenario {
+    counter-reset: step;
+    list-style: none;
+    padding-left: 0;
+  }
+  ol.scenario li {
+    counter-increment: step;
+    position: relative;
+    padding: 8px 12px 8px 42px;
+    background: var(--bg-soft);
+    margin-bottom: 6px;
+    border-radius: 6px;
+    border: 1px solid var(--border-soft);
+  }
+  ol.scenario li::before {
+    content: counter(step);
+    position: absolute;
+    left: 10px;
+    top: 7px;
+    width: 24px;
+    height: 24px;
+    background: var(--accent);
+    color: var(--bg);
+    border-radius: 50%;
+    text-align: center;
+    line-height: 24px;
+    font-weight: 700;
+    font-size: 12px;
+  }
+  ol.scenario li.problem { border-left: 3px solid var(--p0); }
+  ol.scenario li.problem::before { background: var(--p0); color: white; }
+
+  /* Tags row */
+  .tags { margin: 8px 0 12px; }
+  .tag {
+    display: inline-block;
+    background: var(--bg-soft);
+    color: var(--text-dim);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    margin-right: 5px;
+    border: 1px solid var(--border-soft);
+  }
+
+  /* Footer */
+  footer.doc-footer {
+    margin-top: 60px;
+    padding-top: 20px;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+  }
+
+  /* Print */
+  @media print {
+    body { background: white; color: black; }
+    nav.toc { display: none; }
+    .container { grid-template-columns: 1fr; padding: 0; max-width: none; }
+    .finding, .stat, table, pre { page-break-inside: avoid; }
+    a { color: black; text-decoration: none; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Sticky TOC -->
+  <nav class="toc">
+    <h3>목차</h3>
+    <a href="#summary" class="section">0. 요약</a>
+    <a href="#section-a" class="section">§A. False-positive 정리</a>
+    <a href="#section-b" class="section">§B. 실제 결함 (P0)</a>
+    <a href="#b-1" class="sub">B-1. reconnectGate.cancel</a>
+    <a href="#b-2" class="sub">B-2. terminal history</a>
+    <a href="#section-c" class="section">§C. Naming debt</a>
+    <a href="#section-d" class="section">§D. P1·P2 후속</a>
+    <a href="#section-e" class="section">§E. Land 순서</a>
+    <a href="#section-f" class="section">§F. 검증된 invariants</a>
+    <a href="#appendix" class="section">Appendix</a>
+  </nav>
+
+  <main>
+
+    <!-- Header -->
+    <header class="doc-header">
+      <h1>0071 — Session·Terminal·Panel·History 라이프사이클 정합 감사</h1>
+      <p class="subtitle">
+        ADR (0019/0020/0021/0025) ↔ SSoT (<code>state-machines.md</code>) ↔ 코드 정합 감사 보고
+      </p>
+      <dl class="meta-grid">
+        <dt>작성일</dt><dd>2026-05-18</dd>
+        <dt>작성 주체</dt><dd>agent (system-architect role, root-cause-analyst pass)</dd>
+        <dt>트리거</dt><dd>사용자 보고 — “session 관리, terminal, panel, history 가 꼬여있다. ghost 시나리오에 영향받지 않도록 설계 필요”</dd>
+        <dt>범위</dt><dd>BE (Rust http-api + ws-server + auth + pty-backend) ↔ FE (Svelte chrome + stores + ws + http)</dd>
+        <dt>정본 cross-link</dt>
+        <dd>
+          <a href="../ssot/state-machines.md">state-machines.md</a> ·
+          <a href="../adr/0019-session-and-workspace-model.md">ADR-0019</a> ·
+          <a href="../adr/0020-auth-lifecycle.md">ADR-0020</a> ·
+          <a href="../adr/0021-terminal-pool-and-mirror.md">ADR-0021</a> ·
+          <a href="../adr/0025-session-scoped-pane-output-filter.md">ADR-0025</a>
+        </dd>
+        <dt>직전 관련 보고</dt>
+        <dd>
+          <a href="0069-session-attach-confirm-cancel-recovery.md">0069</a> (D5.5 land) ·
+          <a href="0070-webpage-owner-session-list-regression.md">0070</a> (D5.6 보완)
+        </dd>
+      </dl>
+    </header>
+
+    <!-- §0 Summary -->
+    <h2 class="section" id="summary">0. Executive Summary</h2>
+
+    <div class="summary-grid">
+      <div class="stat p0">
+        <div class="num">2</div>
+        <div class="label">실제 결함 (P0)</div>
+      </div>
+      <div class="stat p1">
+        <div class="num">1</div>
+        <div class="label">Naming debt (P0 maintenance)</div>
+      </div>
+      <div class="stat p2">
+        <div class="num">6</div>
+        <div class="label">P1·P2 후속</div>
+      </div>
+      <div class="stat invariant">
+        <div class="num">8</div>
+        <div class="label">검증된 invariants</div>
+      </div>
+      <div class="stat reject">
+        <div class="num">6</div>
+        <div class="label">Reject 된 false-positive</div>
+      </div>
+    </div>
+
+    <div class="callout">
+      <strong>핵심 메시지:</strong>
+      코드 자체의 라이프사이클 정합은 ADR 의도와 <em>대체로</em> 일치한다. 사용자가 체감한 “꼬임” 의 주된 원인은 다음 3 축이 동시에 작용했을 가능성이 가장 크다:
+      <ol style="margin-top: 8px; margin-bottom: 0;">
+        <li><strong>“fresh-spawn 후 history 없음”</strong> 이라는 by-design fact 가 UX 에 노출 안 됨 (B-2)</li>
+        <li><strong><code>reconnectGate.cancel()</code> 의 lock 누락</strong> 으로 인한 30s 회수 지연 (B-1)</li>
+        <li><strong>BE naming debt</strong> 가 정합 인지를 방해 — 본 감사 자체도 6 개의 false-positive 를 유발 (C-1)</li>
+      </ol>
+    </div>
+
+    <!-- §A False positives -->
+    <h2 class="section" id="section-a">§A. Agent 1차 보고 — verification 후 reject 된 항목</h2>
+
+    <p>본 감사에서 두 Explore agent (BE + FE) 가 1차 보고한 항목 중, <strong>코드 직접 검증으로 false-positive 판명된 항목들</strong>. 다음 감사·점검에서 같은 오인을 피하기 위해 명시 기록.</p>
+
+    <table>
+      <thead>
+        <tr><th style="width: 38%;">Agent claim</th><th style="width: 18%;">결과</th><th>검증 근거</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>BE: <code>attach_index</code> 의 mutation hook 4 개 중 3 개 누락</td>
+          <td><span class="badge reject">false</span></td>
+          <td><code>grep "apply_diff\|apply_full_session\|forget_session" sessions.rs</code> → 4 hook 모두 wire 확인: 1006 (import), 1221 (delete-session), 1315 (delete-item), 1588 (PUT)</td>
+        </tr>
+        <tr>
+          <td>BE: WS handler 가 <code>hub.session_for_cookie(cookie-only)</code> 호출 → multi-tab 격리 깨짐</td>
+          <td><span class="badge reject">false</span></td>
+          <td><code>ws-server/lib.rs:484</code> 가 closure 에 <code>owner_key</code> 를 넘기지만 <code>handle_socket</code> param 이름이 <code>cookie_value</code> 라 오인. line 577 의 arg 는 실제로 owner_key. <code>session_locks_by_cookie</code> 의 key 도 owner_key (<code>attach_handler:520</code>) 라 정합</td>
+        </tr>
+        <tr>
+          <td>BE: heartbeat 가 cookie-only 로 lookup → multi-webpage collision</td>
+          <td><span class="badge reject">false</span></td>
+          <td><code>ws-server/lib.rs:741/745 emit_heartbeat(&heartbeat_sink, cookie_value.as_deref())</code> → <code>bin/gtmux-cli/src/main.rs:474 refresh_lease_for_cookie(&cookie)</code> 의 모든 <code>cookie</code> 가 사실은 owner_key</td>
+        </tr>
+        <tr>
+          <td>FE: <code>getWebpageId()</code> 가 매 호출 새 UUID return → 불안정</td>
+          <td><span class="badge reject">false</span></td>
+          <td><code>webpageId.ts:14-15</code> 가 <code>sessionStorage.getItem</code> 이 있으면 existing 반환. 첫 호출만 mint+set, 이후 stable. <code>mintWebpageId()</code> 의 매번 호출은 비효율이지만 결과는 stable</td>
+        </tr>
+        <tr>
+          <td>FE: <code>listCloseTarget</code> 분기 미구현</td>
+          <td><span class="badge reject">false</span></td>
+          <td><code>workspaceSwitcher.svelte.ts:30,48,55-56</code> 완전 구현. <code>closeList()</code> 가 <code>'closed'</code> 면 close, 그 외 choice 회귀</td>
+        </tr>
+        <tr>
+          <td>FE: <code>confirmAttach</code> 의 setActiveSession 이 layout fetch 전에 호출 → race</td>
+          <td><span class="badge reject">false</span></td>
+          <td><code>WorkspaceSwitcher.svelte:174-176</code> 순서 정상: <code>await getLayout</code> → setActiveSession → loadLayout. throw 시 setActiveSession 미호출</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <p style="color: var(--p1);"><strong>→ 6 건 중 5 건이 naming debt 의 부산물.</strong> §C-1 의 refactor 가 미래 점검의 false-positive 율을 결정적으로 낮춤.</p>
+
+    <!-- §B Real findings -->
+    <h2 class="section" id="section-b">§B. 실제 결함 (P0)</h2>
+
+    <!-- B-1 -->
+    <div class="finding p0" id="b-1">
+      <h3><span class="badge p0">P0</span><span class="badge real">실제 결함</span>B-1. <code>reconnectGate.cancel()</code> 가 tentative attach 의 BE lock 을 release 안 함</h3>
+
+      <h4>📍 위치</h4>
+      <p><span class="file-ref">codebase/frontend/src/lib/stores/reconnectGate.svelte.ts:111-116</span></p>
+
+<pre><code>cancel(): void {
+  this.#controller?.abort();
+  this.#controller = null;
+  this.markIdle();
+  sessionStorageHint.clear();
+  // ❌ DELETE /api/sessions/&lt;attemptName&gt;/attach 호출 없음
+}</code></pre>
+
+      <h4>🔁 재현 시나리오</h4>
+      <ol class="scenario">
+        <li>브라우저: <code>sessionStorage.gtmux-last-active-session = "alpha"</code></li>
+        <li>페이지 reload → <code>AppPage.onMount</code> 가 hint 발견 → <code>reconnectGate.start("alpha")</code> → <code>POST /api/sessions/alpha/attach</code></li>
+        <li>BE <code>attach_handler</code> 가 flock 잡고 lease body 쓰는 도중 또는 200 응답 직전</li>
+        <li>사용자가 ReconnectModal 의 [Switch session…] 클릭</li>
+        <li><code>cancel()</code> 호출 → AbortController.abort() → in-flight fetch 취소</li>
+        <li class="problem">BE 는 이미 200 응답 직전이거나 응답을 보냈는데 FE 가 못 받은 상태 — 서버 측 flock + reverse-map 잡혀있음</li>
+        <li>FE 는 SessionListModal 로 이동 (state-machines.md §3.3 의 <code>'choice'</code> routing)</li>
+      </ol>
+
+      <h4>📊 영향</h4>
+      <ul>
+        <li><strong>자가 회복 케이스 (다행)</strong>: 같은 owner_key 로 <code>"alpha"</code> 재시도 → idempotent 200 (<code>sessions.rs:461-466</code>)</li>
+        <li><strong>회복 안 되는 케이스 (문제)</strong>: 다른 webpage_id 의 새 탭으로 <code>"alpha"</code> 진입 → 409 + “in use” badge → 30s heartbeat timeout 까지 lock 잔존. 사용자 perception: “내가 cancel 했는데도 session 이 잡혀있다”</li>
+        <li><strong>회복 안 되는 케이스 (보안)</strong>: cookie 만료 직전 cancel → 30s 보다 더 오래 lock 잔존 가능 (작은 race)</li>
+      </ul>
+
+      <h4>🔄 대비 사례</h4>
+      <p><code>WorkspaceSwitcher.svelte:215-250</code> 의 <code>cancelAttachConfirm</code> 은 명시적으로 <code>detachSession(pending)</code> 호출 (state-machines.md §3.2.1 의 step 1, ADR-0019 D5.5.1). <strong>reconnectGate 만 이 패턴에서 누락.</strong></p>
+
+      <h4>📜 ADR 정합성</h4>
+      <p>ADR-0019 D5.4 본문 + state-machines.md §3.3 의 “ReconnectModal [Switch session…]” 행은 명시 cancel = lock release 의도가 <strong>직접 명시되어 있지 않음</strong>. → 이 비-amend 가 결함의 근원.</p>
+
+      <h4>✅ 권장 fix</h4>
+      <ol>
+        <li><strong>(즉시 land, FE-only)</strong> <code>reconnectGate.cancel()</code> 에 <code>state === 'attaching' && attemptName !== null</code> 분기에 best-effort <code>detachSession(attemptName)</code> 호출. 실패는 silent — 30s heartbeat fallback. 비동기 fire-and-forget OK</li>
+        <li><strong>(짝 commit, ADR amend)</strong> ADR-0019 D5.4 amend ② — “사용자 명시 cancel = tentative lock release. detach 실패는 30s heartbeat 가 fallback” 명시</li>
+      </ol>
+    </div>
+
+    <!-- B-2 -->
+    <div class="finding p0" id="b-2">
+      <h3><span class="badge p0">P0</span><span class="badge real">실제 결함</span>B-2. “terminal history 미표시” — by-design 함정 + UX 미고지</h3>
+
+      <h4>🎯 근본 원인</h4>
+      <div class="why-text">
+        <strong>PaneId 는 process-bound.</strong> 서버 재시작 시 모든 PaneId 가 fresh, 옛 process 의 ring buffer 가 OS-level 로 사라짐. terminal_map 의 UUID↔PaneId binding 도 in-memory 라 사라짐. AttachConfirm 흐름이 새 UUID→PaneId 를 새 process 로 binding 하지만 <strong>새 process 의 ring buffer 는 0 bytes.</strong>
+      </div>
+
+      <h4>🔍 현 동작 (verified)</h4>
+      <p><span class="file-ref">ws-server/lib.rs:613-686</span> 의 catch-up replay 흐름:</p>
+
+<pre><code>1. TerminalSpawned 0x88 burst — 모든 alive (PaneId, UUID) pair. FILTER 없음
+2. session_pane_set 가 cookie-attached 면 cold-load (lib.rs:573-583)
+3. for each id in backend.pane_ids():
+     if !session_pane_set.contains(id.0) { continue; }    ← amend ③ filter
+     send NOTIFY pane-spawned
+     send PANE_OUT (ring buffer replay, backend.subscribe_output(id).0)</code></pre>
+
+      <ul>
+        <li>서버 재기동 직후: <code>backend.pane_ids()</code> 가 empty → catch-up replay 가 <strong>단 1 byte 도 안 보냄</strong></li>
+        <li>AttachConfirm 후 respawn 시점: live broadcast <code>terminal_spawned_events</code> 가 새 binding emit → FE terminalPool 가 binding 추가 → panel xterm mount → <strong>새 process 의 fresh shell</strong></li>
+      </ul>
+
+      <h4>🧠 왜 “꼬여보이는가” (사용자 mental model)</h4>
+      <ul>
+        <li>사용자: “session 은 file 영속이니 history 도 영속이어야지” — ADR-0019 D5 의 <em>session file 영속</em> 과 <em>terminal process 영속</em> 의 분리를 인지 못 함</li>
+        <li>ADR-0021 D10 (lifecycle) 은 process die = history die 를 명시. <strong>그러나 UX layer 에서 이 사실이 노출 안 됨</strong></li>
+        <li>AttachConfirmModal 의 현 copy: “Will spawn N new terminal(s). Continue?” — <em>이전 출력은 복원 불가</em> 라는 경고 없음</li>
+      </ul>
+
+      <h4>⚠️ 잠재적 부가 원인 (verification 필요)</h4>
+      <p>ADR-0021 D8 의 [Attach existing terminal] (Terminal list → 현 session 으로 mount):</p>
+      <ul>
+        <li>이 경우 PaneId 는 alive — ring buffer 가 BE 메모리에 있음</li>
+        <li>FE PUT /layout 로 새 panel item 추가</li>
+        <li>BE 가 layout_events broadcast → WS의 <code>session_pane_set</code> hot-update 가 PaneId 추가</li>
+        <li class="problem"><strong>그러나 <code>backend.subscribe_output()</code> 의 replay tuple 은 catch-up 시점에만 보내짐 — hot-update path 에는 ring buffer 의 그 시점 replay 가 포함 안 됨</strong></li>
+        <li>사용자 perception: “이 terminal 에 분명 history 가 있는데 attach 후 빈 화면이다”</li>
+      </ul>
+
+      <div class="callout warn">
+        <strong>verify 필요</strong>: 이게 verify 되면 두 번째 P0 — 코드 fix 가 필요한 진짜 결함. 본 감사에서 코드 경로만 식별, 재현 시연 안 함. 다음 manual E2E 에서 확인.
+      </div>
+
+      <h4>✅ 권장 fix — 3 옵션</h4>
+      <ol>
+        <li><strong>(a) UX-only (저비용)</strong>: AttachConfirmModal 의 copy 에 명시 경고 — <em>“기존 terminal 들은 새 process 로 spawn 됩니다 — 이전 output 은 복원되지 않습니다.”</em> + ADR-0018 D6, ADR-0021 D10 본문 amend</li>
+        <li><strong>(b) Attach-time ring replay</strong>: ADR-0021 D8 amend — [Attach existing terminal] 흐름에 그 시점의 ring buffer 1회 replay. 새 endpoint <code>POST /api/terminals/&lt;uuid&gt;/replay</code> 또는 PUT 응답 envelope 동봉</li>
+        <li><strong>(c) Auto-replay on layout PUT</strong>: <code>put_layout_handler</code> 의 <code>added</code> UUIDs 의 ring buffer 를 그 session 의 WS 로 emit. 첫 추가만 dedup 필요</li>
+      </ol>
+      <p><strong>권장: (a) 즉시 land + (b) ADR amend draft → 사용자 결정 후 구현.</strong></p>
+    </div>
+
+    <!-- §C Naming debt -->
+    <h2 class="section" id="section-c">§C. Naming debt — P0 maintenance 안정성</h2>
+
+    <div class="finding p1">
+      <h3><span class="badge p0">P0</span><span class="badge naming">Naming debt</span>C-1. BE 전역 변수/함수명이 owner_key 를 <code>cookie</code> 라 부름</h3>
+
+      <p>§A 의 false-positive 6 건 중 <strong>5 건이 본 naming debt 에 기인</strong>. 6 개월 후 reviewer 가 “왜 cookie 단위로 lookup 해? multi-tab 깨질 텐데” 라며 <strong>불필요한 fix 시도하다 실제 정합을 깰 위험</strong>이 매우 높다.</p>
+
+      <h4>영향 받는 정의 (BE)</h4>
+      <table>
+        <thead><tr><th>위치</th><th>변수/함수</th><th>실제 의미</th></tr></thead>
+        <tbody>
+          <tr><td><code>http-api/lib.rs:164</code></td><td><code>session_locks_by_cookie: Mutex&lt;HashMap&lt;String, String&gt;&gt;</code></td><td>key 는 owner_key</td></tr>
+          <tr><td><code>http-api/lib.rs:272</code></td><td><code>refresh_lease_for_cookie(cookie: &str)</code></td><td>param 은 owner_key</td></tr>
+          <tr><td><code>http-api/lib.rs:326</code></td><td><code>release_lock_for_cookie(cookie: &str)</code></td><td>같음</td></tr>
+          <tr><td><code>ws-server/lib.rs:415-425</code></td><td>let cookie_value = ... gtmux_auth 추출</td><td>여기까지는 진짜 cookie</td></tr>
+          <tr><td><code>ws-server/lib.rs:426-431</code></td><td>let owner_key = ...</td><td>여기서 owner_key 형성</td></tr>
+          <tr><td><code>ws-server/lib.rs:484</code></td><td><code>if let Some(cookie) = owner_key</code></td><td>shadowing — cookie 가 owner_key</td></tr>
+          <tr><td><code>ws-server/lib.rs:532</code></td><td><code>handle_socket(..., cookie_value: Option&lt;String&gt;, ...)</code></td><td>param 은 owner_key (호출 site 가 owner_key 전달)</td></tr>
+          <tr><td><code>ws-server/lib.rs:577</code></td><td><code>hub.session_for_cookie(cookie)</code></td><td>arg = owner_key</td></tr>
+          <tr><td><code>bin/gtmux-cli/src/main.rs:468</code></td><td><code>release_lock_for_cookie(&cookie)</code></td><td><code>cookie</code> 변수 = owner_key</td></tr>
+        </tbody>
+      </table>
+
+      <h4>✅ 권장 refactor</h4>
+      <p>별 1 commit, mechanical, behavior change 0:</p>
+      <table>
+        <thead><tr><th>옛 이름</th><th>새 이름</th></tr></thead>
+        <tbody>
+          <tr><td><code>session_locks_by_cookie</code></td><td><code>session_locks_by_owner</code></td></tr>
+          <tr><td><code>release_lock_for_cookie</code></td><td><code>release_lock_for_owner</code></td></tr>
+          <tr><td><code>refresh_lease_for_cookie</code></td><td><code>refresh_lease_for_owner</code></td></tr>
+          <tr><td><code>handle_socket(..., cookie_value, ...)</code></td><td><code>handle_socket(..., owner_key, ...)</code></td></tr>
+          <tr><td>WS 의 <code>cookie</code> shadow</td><td><code>owner</code></td></tr>
+          <tr><td><code>Hub::session_for_cookie</code></td><td><code>Hub::session_for_owner</code> (또는 docstring 만 보강)</td></tr>
+          <tr><td><code>Hub::set_session_for_cookie</code></td><td><code>Hub::set_session_for_owner</code></td></tr>
+          <tr><td><code>Hub::clear_session_for_cookie</code></td><td><code>Hub::clear_session_for_owner</code></td></tr>
+        </tbody>
+      </table>
+
+      <p><strong>가장 가벼운 옵션</strong>: 변수명만 refactor + public API 는 유지 + docstring 에 <code>"@param cookie: 실제로는 cookie + 0x1f + webpage_id 형태의 owner_key. ADR-0019 D5.6 참조."</code> 한 줄씩 보강.</p>
+    </div>
+
+    <!-- §D P1·P2 -->
+    <h2 class="section" id="section-d">§D. P1·P2 후속</h2>
+
+    <table>
+      <thead>
+        <tr><th>#</th><th>항목</th><th>영역</th><th>심각도</th><th>권장</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>D-1</strong></td>
+          <td>boot-time stale <code>.lock</code> 파일 scan 없음</td>
+          <td>BE</td>
+          <td><span class="badge p2">P2</span></td>
+          <td>functional 0 (peek 정상). 시간 누적 시 <code>.locks/</code> dirty. <code>with_workspace()</code> 안에 stale 자동 cleanup 추가</td>
+        </tr>
+        <tr>
+          <td><strong>D-2</strong></td>
+          <td>ADR-0025 amend ③ 의 race-1/race-2 잔여</td>
+          <td>BE</td>
+          <td><span class="badge p2">P2</span></td>
+          <td>amend 본문의 risk 평가표가 이미 명시. 추가 fix 불요</td>
+        </tr>
+        <tr>
+          <td><strong>D-3</strong></td>
+          <td>WS handshake 가 <code>webpage_id</code> query 만 인식</td>
+          <td>BE</td>
+          <td><span class="badge p2">P2</span></td>
+          <td>현 OK. HTTP 는 header, WS 는 query 의 분리가 자연. amend 불요</td>
+        </tr>
+        <tr>
+          <td><strong>D-4</strong></td>
+          <td>AttachConfirmModal cancel chain 의 toast 실 출력 verification</td>
+          <td>FE</td>
+          <td><span class="badge p1">P1</span></td>
+          <td>0069 가 8s warning toast 명시. 다음 manual E2E 에서 verify</td>
+        </tr>
+        <tr>
+          <td><strong>D-5</strong></td>
+          <td><code>POST /api/leave</code> sendBeacon endpoint 부재</td>
+          <td>BE+FE</td>
+          <td><span class="badge p1">P1</span></td>
+          <td>ADR-0021 D6 가 명시한 sendBeacon 미구현. <code>/api/leave</code> endpoint + FE <code>beforeunload</code> 추가. 정상 탭 close 의 즉시 회수</td>
+        </tr>
+        <tr>
+          <td><strong>D-6</strong></td>
+          <td>multi-webpage rebind 의 history replay 부재 (B-2.4 부가 원인)</td>
+          <td>BE+FE</td>
+          <td><span class="badge p1">P1</span></td>
+          <td>ADR-0021 D8 amend 필요. 재현 verify 후 P1 또는 P0 결정</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- §E Land order -->
+    <h2 class="section" id="section-e">§E. 권장 Land 순서</h2>
+
+    <ol class="scenario">
+      <li><strong>C-1 naming refactor</strong> (BE-only, mechanical, 1 commit + ADR-0019 D5.6 amend ②) — 점검·리뷰의 false-positive 감소가 다른 모든 land 의 토대</li>
+      <li><strong>B-1 reconnectGate.cancel detach</strong> (FE-only, 1 commit + ADR-0019 D5.4 amend ②) — orphan lock 회피</li>
+      <li><strong>B-2 옵션 (a) AttachConfirmModal copy</strong> (FE-only, 1 commit + ADR-0018 D6 / ADR-0021 D10 amend) — history 손실 UX 함정 해소</li>
+      <li><strong>D-4 manual E2E</strong> — cancel chain toast 실 출력 verify</li>
+      <li><strong>B-2 옵션 (b) ADR amend draft</strong> → 사용자 결정 → 구현</li>
+      <li><strong>D-5 <code>/api/leave</code> sendBeacon</strong> (BE+FE pair commit, ADR-0021 D6 amend) — 정상 탭 close 의 즉시 회수</li>
+      <li><strong>D-1 boot-time stale lock scan</strong> (BE only, 1 commit) — housekeeping</li>
+    </ol>
+
+    <!-- §F Invariants -->
+    <h2 class="section" id="section-f">§F. 검증된 invariants — 변경 불요</h2>
+
+    <div class="callout">
+      <strong>다음 8 개는 ADR 의도대로 코드에 정합되어 있음.</strong> 향후 검토 시 “이거 깨진 거 아닐까?” 라는 의심이 들면, 본 항목을 먼저 본 보고서 §F 로 확인 → 이미 검증 완료.
+    </div>
+
+    <ol>
+      <li><span class="badge invariant">OK</span><strong>ADR-0019 D3 single-attach</strong>: <code>attach_handler</code> 의 idempotent 분기 (sessions.rs:461-466) + 409 분기 (472-475) 정합</li>
+      <li><span class="badge invariant">OK</span><strong>ADR-0019 D5.5 tentative lock</strong>: <code>confirm_required</code> 응답 시 BE flock 잡힌 상태, <code>attach_confirm_handler</code> 가 owner-scope 검증 (sessions.rs:566+)</li>
+      <li><span class="badge invariant">OK</span><strong>ADR-0019 D5.6 webpage owner</strong>: HTTP <code>X-Gtmux-Webpage-Id</code> header / WS <code>?webpage_id=</code> query — <code>attach_owner_key</code> / <code>webpage_id_from_query</code> 일관 적용</li>
+      <li><span class="badge invariant">OK</span><strong>ADR-0021 D7 amend ③ attach_index</strong>: boot rebuild + 4 mutation hook 완비 (lib.rs:425, sessions.rs:1006/1221/1315/1588)</li>
+      <li><span class="badge invariant">OK</span><strong>ADR-0021 D10.3 respawn per-UUID Mutex</strong>: <code>AppState.respawn_locks</code> + <code>reused</code> flag (terminals.rs:283+)</li>
+      <li><span class="badge invariant">OK</span><strong>ADR-0025 amend ③ session-scoped PANE_OUT filter</strong>: cold-load + catch-up + 4 hot-update channels (ws-server/lib.rs:573-583, 641-647)</li>
+      <li><span class="badge invariant">OK</span><strong>ADR-0028 D11.1 applyMutation priorSnapshot rollback</strong>: sessionStore.ts:619-678</li>
+      <li><span class="badge invariant">OK</span><strong>Session lock acquire 의 stale body overwrite</strong>: session_lock.rs:200 <code>file.set_len(0)</code> — SIGKILL 후 재기동의 자가 회복</li>
+    </ol>
+
+    <!-- Appendix -->
+    <h2 class="section" id="appendix">Appendix</h2>
+
+    <h3>A. 본 감사의 조사 방법론</h3>
+    <ol>
+      <li><strong>Phase 1 — ADR/SSoT 정독</strong>: state-machines.md → ADR-0019 → ADR-0020 → ADR-0021 → ADR-0025. 합성 SoT 우선, 정본 ADR cross-check</li>
+      <li><strong>Phase 2 — BE/FE 병렬 정찰</strong>: Explore agent 2 개 spawn, ADR ↔ 코드 정합 1차 보고</li>
+      <li><strong>Phase 3 — Verification</strong>: agent 의 고심각도 claim 마다 <code>grep</code> + <code>Read</code> 로 직접 검증. False-positive 6 건 reject</li>
+      <li><strong>Phase 4 — Synthesis</strong>: 실 결함 / naming debt / by-design 함정 분류, ADR amend 후보 짝</li>
+    </ol>
+
+    <h3>B. 본 감사가 <em>완전 검증</em> 안 한 영역</h3>
+    <ul>
+      <li><strong>D-4 cancel chain toast</strong>: 0069 가 명시한 8s warning toast 의 실제 출력 trace 안 함</li>
+      <li><strong>B-2.4 rebind history replay</strong>: 코드 경로만 식별, 재현 시연 안 함. 다음 manual E2E 에서 확인</li>
+      <li><strong>WS subprotocol 의 webpage_id 누락 영향</strong>: HTTP 만 header, WS 는 query — 의도된 분리 같으나 invariant ADR 명시 없음</li>
+      <li><strong>multi-cookie scenario</strong>: 같은 호스트의 multi-user 가 아닌 multi-tab 만 검토. ADR scope 가 single-user 라 자연 OK</li>
+      <li><strong><code>/api/shutdown</code> 의 정상 종료 vs SIGKILL 차이</strong>: 두 path 의 boot 회복 검증 안 함</li>
+    </ul>
+
+    <footer class="doc-footer">
+      생성: 2026-05-18 · 본 HTML 은 <code>0071-session-terminal-panel-lifecycle-audit.md</code> 의 사용자 review 용 시각화 · 정본은 markdown
+    </footer>
+
+  </main>
+</div>
+
+<script>
+  // Smooth scroll for TOC
+  document.querySelectorAll('nav.toc a').forEach(a => {
+    a.addEventListener('click', e => {
+      const id = a.getAttribute('href').slice(1);
+      const target = document.getElementById(id);
+      if (target) {
+        e.preventDefault();
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        history.replaceState(null, '', '#' + id);
+      }
+    });
+  });
+</script>
+</body>
+</html>
