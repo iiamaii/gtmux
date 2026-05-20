@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/ws-server",
+  "crates/http-api",
+  "crates/config",
+  "crates/auth",
+  "crates/pty-backend",
+  "bin/gtmux-cli",
+  "bin/gen-openapi",
+]
+
+# 워크스페이스 공통 패키지 메타데이터 (R7 §8 inheritance).
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/gtmux/gtmux"
+
+# R7 §주요 crate version 표를 정본으로 사용 — 본 섹션에서만 버전을 잠그고,
+# 개별 crate Cargo.toml은 `workspace = true`로 inherit한다.
+# 참조: docs/reports/0007-backend-runtime.md §2·§8 표.
+[workspace.dependencies]
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-util", "process", "signal", "sync", "fs", "time", "net"] }
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
+tokio-tungstenite = { version = "0.29", features = ["handshake"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "set-header", "validate-request", "fs"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bytes = "1.11"
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter"] }
+ring = "0.17"
+figment = { version = "0.10", features = ["toml", "env"] }
+winnow = "0.6"
+utoipa = { version = "5", features = ["axum_extras"] }
+anyhow = "1.0"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+base64 = "0.22"
+dashmap = "6"
+atomic-write-file = "0.3"
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+argon2 = "0.5"
+rpassword = "=7.3.1"
+fs2 = "0.4"
+
+# Release profile (R7 §8) — 단일 정적 바이너리 최적화.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

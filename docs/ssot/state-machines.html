@@ -1,0 +1,934 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>gtmux state machines — Auth · Session · Terminal</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.min.js"></script>
+  <style>
+    :root {
+      --bg: #fafafa;
+      --fg: #1a1a1a;
+      --muted: #6b6b73;
+      --accent: #7b45b1;
+      --accent-soft: #ede4f7;
+      --code-bg: #f1f1f3;
+      --border: #e1e1e3;
+      --note-bg: #fff8e6;
+      --note-border: #f5a623;
+      --table-stripe: #f7f7f9;
+      --graph-bg: #ffffff;
+      --node-normal-bg: #f4f0fa;
+      --node-normal-border: #7b45b1;
+      --node-start-bg: #d4f1d4;
+      --node-start-border: #3a8a3a;
+      --node-end-bg: #e8e8eb;
+      --node-end-border: #6b6b73;
+      --node-ready-bg: #d4e8f7;
+      --node-ready-border: #2a6db5;
+      --node-error-bg: #fae0d4;
+      --node-error-border: #c25a2c;
+      --node-decision-bg: #faf3d4;
+      --node-decision-border: #c2a02c;
+      --edge-color: #888;
+      --edge-label-bg: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+        Roboto, "Helvetica Neue", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+      line-height: 1.6; -webkit-font-smoothing: antialiased; }
+    .layout { display: grid; grid-template-columns: 280px 1fr; min-height: 100vh; }
+    @media (max-width: 960px) {
+      .layout { grid-template-columns: 1fr; }
+      nav.toc { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+    }
+    nav.toc {
+      position: sticky; top: 0; height: 100vh; overflow-y: auto;
+      padding: 28px 20px; border-right: 1px solid var(--border); background: var(--bg);
+    }
+    nav.toc .brand { font-weight: 700; font-size: 16px; color: var(--accent); margin-bottom: 4px; }
+    nav.toc .sub { font-size: 12px; color: var(--muted); margin-bottom: 24px; }
+    nav.toc h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--muted); margin: 20px 0 8px; }
+    nav.toc ul { list-style: none; padding: 0; margin: 0; }
+    nav.toc a { display: block; padding: 5px 10px; color: var(--fg);
+      text-decoration: none; font-size: 13.5px; border-radius: 5px; }
+    nav.toc a:hover { background: var(--accent-soft); color: var(--accent); }
+    main { padding: 32px 48px; max-width: 1300px; }
+    @media (max-width: 960px) { main { padding: 20px 24px; } }
+    h1 { margin: 0 0 6px; font-size: 30px; }
+    .doc-meta { color: var(--muted); font-size: 14px; margin-bottom: 28px;
+      padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+    h2 { margin: 48px 0 12px; padding-bottom: 10px;
+      border-bottom: 2px solid var(--accent-soft); font-size: 23px; }
+    h3 { margin: 28px 0 10px; font-size: 17px; }
+    .adr { color: var(--accent); font-size: 14px; font-weight: 500; margin-left: 8px; }
+    p { margin: 8px 0 12px; }
+    p.lead { font-size: 14.5px; color: var(--muted); }
+    code { background: var(--code-bg); padding: 2px 6px; border-radius: 3px;
+      font-size: 13px; font-family: "SF Mono", Menlo, Consolas, monospace; }
+    pre.code { background: var(--code-bg); padding: 12px 16px; border-radius: 6px;
+      overflow-x: auto; font-size: 13px; font-family: "SF Mono", Menlo, Consolas, monospace; }
+
+    /* Graph container — responsive: 70vh, clamp 360~720 */
+    .graph-wrap {
+      position: relative; background: var(--graph-bg); border: 1px solid var(--border);
+      border-radius: 10px; margin: 16px 0 24px; overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .graph { width: 100%; height: clamp(360px, 70vh, 640px); touch-action: none; }
+    .graph.tall { height: clamp(420px, 80vh, 720px); }
+    @media (max-width: 600px) {
+      .graph { height: clamp(320px, 60vh, 480px); }
+      .graph.tall { height: clamp(380px, 70vh, 560px); }
+    }
+    /* Table overflow on mobile */
+    .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    @media (max-width: 600px) {
+      table { font-size: 12.5px; }
+      th, td { padding: 8px 10px; }
+    }
+    .graph-controls {
+      position: absolute; top: 12px; right: 12px; display: flex; gap: 6px; z-index: 10;
+    }
+    .graph-controls button {
+      background: white; border: 1px solid var(--border); border-radius: 5px;
+      padding: 4px 10px; font-size: 12px; cursor: pointer; color: var(--muted);
+      font-family: inherit;
+    }
+    .graph-controls button:hover { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+    .graph-legend {
+      padding: 10px 16px; border-top: 1px solid var(--border); background: var(--bg);
+      font-size: 12px; color: var(--muted); display: flex; gap: 16px; flex-wrap: wrap;
+    }
+    .graph-legend .item { display: inline-flex; align-items: center; gap: 6px; }
+    .graph-legend .dot {
+      display: inline-block; width: 12px; height: 12px; border-radius: 3px;
+      border: 1.5px solid;
+    }
+    .graph-legend .dot.start { background: var(--node-start-bg); border-color: var(--node-start-border); }
+    .graph-legend .dot.normal { background: var(--node-normal-bg); border-color: var(--node-normal-border); }
+    .graph-legend .dot.ready { background: var(--node-ready-bg); border-color: var(--node-ready-border); }
+    .graph-legend .dot.error { background: var(--node-error-bg); border-color: var(--node-error-border); }
+    .graph-legend .dot.decision {
+      background: var(--node-decision-bg); border-color: var(--node-decision-border);
+      transform: rotate(45deg); border-radius: 2px;
+    }
+    .graph-legend .dot.end { background: var(--node-end-bg); border-color: var(--node-end-border); }
+
+    .note { background: var(--note-bg); border-left: 3px solid var(--note-border);
+      padding: 12px 16px; margin: 12px 0; font-size: 14px; border-radius: 0 6px 6px 0; }
+    table { width: 100%; border-collapse: collapse; margin: 12px 0 24px; font-size: 13.5px; }
+    th, td { padding: 10px 14px; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    th { background: var(--code-bg); font-weight: 600; }
+    tbody tr:nth-child(odd) { background: var(--table-stripe); }
+    .toc-pill { display: inline-block; background: var(--accent-soft); color: var(--accent);
+      padding: 1px 8px; border-radius: 10px; font-size: 11px; margin-left: 6px; font-weight: 600; }
+
+    /* Sequence diagram (multi-webpage respawn) */
+    .seq-wrap {
+      background: var(--graph-bg); border: 1px solid var(--border); border-radius: 10px;
+      padding: 24px; margin: 16px 0 24px; overflow-x: auto;
+    }
+    .seq-svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+
+    footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border);
+      color: var(--muted); font-size: 13px; }
+    .anchor-target { scroll-margin-top: 12px; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <nav class="toc">
+    <div class="brand">gtmux state machines</div>
+    <div class="sub">Auth · Session · Terminal — 3 layer</div>
+
+    <h3>1. 개요</h3>
+    <ul><li><a href="#vocab">어휘 + 3 layer 직교</a></li></ul>
+
+    <h3>2. Auth</h3>
+    <ul>
+      <li><a href="#g-auth">2.1 Auth lifecycle <span class="toc-pill">graph</span></a></li>
+      <li><a href="#auth-states">2.2 State 정의</a></li>
+    </ul>
+
+    <h3>3. Session attach</h3>
+    <ul>
+      <li><a href="#g-reconnect">3.1 reconnectGate <span class="toc-pill">graph</span></a></li>
+      <li><a href="#g-switcher">3.2 workspaceSwitcher <span class="toc-pill">graph</span></a></li>
+      <li><a href="#g-cancel">3.2.1 cancelAttachConfirm <span class="toc-pill">graph</span></a></li>
+      <li><a href="#list-close-target">3.3 listCloseTarget</a></li>
+      <li><a href="#g-silent">3.4 silentReattach <span class="toc-pill">graph</span></a></li>
+      <li><a href="#precondition">3.4.1 6 precondition</a></li>
+    </ul>
+
+    <h3>4. Terminal</h3>
+    <ul>
+      <li><a href="#g-terminal">4.1 Terminal 6-state <span class="toc-pill">graph</span></a></li>
+      <li><a href="#g-panel-close">4.2 Panel close <span class="toc-pill">graph</span></a></li>
+      <li><a href="#g-respawn">4.3 multi-webpage respawn <span class="toc-pill">sequence</span></a></li>
+    </ul>
+
+    <h3>5. UI 분기 / 예외</h3>
+    <ul>
+      <li><a href="#ui-modal-policy">dismissOnBackdrop 정책</a></li>
+      <li><a href="#exception-browser">Browser 예외 8</a></li>
+      <li><a href="#exception-ui">UI 차단 8</a></li>
+    </ul>
+  </nav>
+
+  <main>
+    <h1>gtmux state machines</h1>
+    <p class="doc-meta">
+      Auth · Session attach · Terminal connection 3-layer 합성 SoT 의 <strong>interactive graph viewer</strong>.<br>
+      엔진: Cytoscape.js 3.30 + dagre layout (auto top-down DAG).
+      각 graph 는 drag (node 이동) / scroll (zoom) / drag-pan (배경 drag) 인터랙티브.
+      원본: <code>docs/ssot/state-machines.md</code>. ADR: 0017 D6 · 0019 · 0020 · 0021 · 0028 · 0030.
+    </p>
+
+    <!-- 1. 어휘 -->
+    <h2 id="vocab" class="anchor-target">1. 어휘 + 3 layer</h2>
+    <table>
+      <thead><tr><th>어휘</th><th>정의</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Server</strong></td><td>1 process · 1 port · 1 workspace 바인딩</td></tr>
+        <tr><td><strong>Workspace</strong></td><td>server 와 1:1, storage dir</td></tr>
+        <tr><td><strong>Session</strong></td><td>workspace 안 named file record</td></tr>
+        <tr><td><strong>Webpage</strong></td><td>WS 연결, session 의 편집 채널 (Webpage : Session = 1:1)</td></tr>
+        <tr><td><strong>Terminal</strong></td><td>server-pool, multi-session 공유 가능 (Terminal : Panel = 1:N)</td></tr>
+        <tr><td><strong>Cookie</strong></td><td>HttpOnly auth 토큰. WS handshake 의 단일 인증 채널</td></tr>
+        <tr><td><strong>flock + lease</strong></td><td>session 단위 cross-server / cross-webpage lock</td></tr>
+      </tbody>
+    </table>
+
+    <!-- 2. Auth -->
+    <h2 id="g-auth" class="anchor-target">2.1 Auth lifecycle <span class="adr">(ADR-0020)</span></h2>
+    <p class="lead">Page 진입 ~ logout — cookie 차원의 9 state.</p>
+    <div class="graph-wrap">
+      <div class="graph-controls">
+        <button onclick="cyAuth.fit(undefined, 40)">Fit</button>
+        <button onclick="cyAuth.zoom(cyAuth.zoom() * 1.2)">+</button>
+        <button onclick="cyAuth.zoom(cyAuth.zoom() / 1.2)">−</button>
+      </div>
+      <div id="g-auth-c" class="graph"></div>
+      <div class="graph-legend">
+        <span class="item"><span class="dot start"></span> start (entry)</span>
+        <span class="item"><span class="dot normal"></span> 일반 state</span>
+        <span class="item"><span class="dot ready"></span> Authenticated / CookieValid</span>
+        <span class="item"><span class="dot error"></span> AuthFailed</span>
+      </div>
+    </div>
+
+    <h3 id="auth-states" class="anchor-target">2.2 State 정의</h3>
+    <table>
+      <thead><tr><th>State</th><th>의미</th><th>주 transition</th></tr></thead>
+      <tbody>
+        <tr><td><code>NoCookie</code></td><td>인증 cookie 없음 / 만료 / clear</td><td>→ AuthPage</td></tr>
+        <tr><td><code>AuthPage</code></td><td><code>/auth</code> SPA 렌더링 (D13)</td><td>→ TokenInput / PasswordInput</td></tr>
+        <tr><td><code>TokenInput</code> / <code>PasswordInput</code></td><td>입력 form 표시 (D4 / D5)</td><td>→ ServerVerify</td></tr>
+        <tr><td><code>ServerVerify</code></td><td>BE <code>/auth/login</code> 처리</td><td>200 → Authenticated / 401 → AuthFailed</td></tr>
+        <tr><td><code>Authenticated</code></td><td>cookie 발행 직후</td><td>→ CookieValid</td></tr>
+        <tr><td><code>CookieValid</code></td><td>cookie 유효 — 본 app 사용 중</td><td>→ WSHandshake / Logout / Rotation</td></tr>
+        <tr><td><code>WSHandshake</code></td><td>WS upgrade 진행 중</td><td>open / 1008 close</td></tr>
+        <tr><td><code>Logout</code></td><td>3-step: hint.clear → POST /logout → window.location</td><td>→ NoCookie</td></tr>
+        <tr><td><code>Rotation</code></td><td>cookie 회전 (D14)</td><td>→ NoCookie or Authenticated</td></tr>
+      </tbody>
+    </table>
+
+    <!-- 3.1 reconnectGate -->
+    <h2 id="g-reconnect" class="anchor-target">3.1 reconnectGate 8-state <span class="adr">(ADR-0019 D5.4)</span></h2>
+    <p class="lead">Page entry blocking gate — <code>canMountApp</code> 게이트로 본 화면 mount 차단/허용 결정.</p>
+    <div class="graph-wrap">
+      <div class="graph-controls">
+        <button onclick="cyRG.fit(undefined, 40)">Fit</button>
+        <button onclick="cyRG.zoom(cyRG.zoom() * 1.2)">+</button>
+        <button onclick="cyRG.zoom(cyRG.zoom() / 1.2)">−</button>
+      </div>
+      <div id="g-reconnect-c" class="graph tall"></div>
+      <div class="graph-legend">
+        <span class="item"><span class="dot start"></span> booting (entry)</span>
+        <span class="item"><span class="dot normal"></span> attaching / hydrating</span>
+        <span class="item"><span class="dot ready"></span> ready (canMountApp)</span>
+        <span class="item"><span class="dot error"></span> in_use / not_found / unreachable</span>
+      </div>
+    </div>
+    <div class="note">
+      <strong>canMountApp = (state === 'ready') ∨ (state === 'idle')</strong> —
+      <code>booting</code> / <code>attaching</code> / <code>hydrating</code> /
+      실패 분기 동안 본 화면 mount 차단. 빈 canvas flash 0.
+    </div>
+
+    <!-- 3.2 workspaceSwitcher -->
+    <h2 id="g-switcher" class="anchor-target">3.2 workspaceSwitcher 5-stage</h2>
+    <p class="lead">Modal stack state machine — AuthDialog/SessionMenu/Toolbar 등에서 진입, attach_confirm 까지.</p>
+    <div class="graph-wrap">
+      <div class="graph-controls">
+        <button onclick="cySW.fit(undefined, 40)">Fit</button>
+        <button onclick="cySW.zoom(cySW.zoom() * 1.2)">+</button>
+        <button onclick="cySW.zoom(cySW.zoom() / 1.2)">−</button>
+      </div>
+      <div id="g-switcher-c" class="graph"></div>
+      <div class="graph-legend">
+        <span class="item"><span class="dot start"></span> closed (entry)</span>
+        <span class="item"><span class="dot normal"></span> modal stage</span>
+        <span class="item"><span class="dot ready"></span> ready (canvas mount)</span>
+      </div>
+    </div>
+    <div class="note">
+      <strong>SessionListModal 의 <code>dismissOnBackdrop=false</code></strong> — backdrop
+      클릭으로 cancel 불가. [Cancel] 버튼만 routing (→ list 의 <code>listCloseTarget</code>
+      분기 가 결정 — §3.3).
+    </div>
+
+    <!-- 3.2.1 cancelAttachConfirm -->
+    <h2 id="g-cancel" class="anchor-target">3.2.1 cancelAttachConfirm 5-step fallback chain <span class="adr">(ADR-0019 D5.5.1)</span></h2>
+    <p class="lead"><code>WorkspaceSwitcher.svelte:215~250</code> —
+      <strong>AttachConfirmModal cancel = "switch 시도 무효화"</strong> 의 정확한 5 step.</p>
+    <div class="graph-wrap">
+      <div class="graph-controls">
+        <button onclick="cyCancel.fit(undefined, 40)">Fit</button>
+        <button onclick="cyCancel.zoom(cyCancel.zoom() * 1.2)">+</button>
+        <button onclick="cyCancel.zoom(cyCancel.zoom() / 1.2)">−</button>
+      </div>
+      <div id="g-cancel-c" class="graph tall"></div>
+      <div class="graph-legend">
+        <span class="item"><span class="dot start"></span> Cancel 클릭</span>
+        <span class="item"><span class="dot decision"></span> 분기 (decision)</span>
+        <span class="item"><span class="dot normal"></span> 액션</span>
+        <span class="item"><span class="dot ready"></span> 최종 (goList)</span>
+      </div>
+    </div>
+
+    <!-- 3.3 -->
+    <h2 id="list-close-target" class="anchor-target">3.3 listCloseTarget 분기 — UI entry-point 별 cancel 의미</h2>
+    <table>
+      <thead><tr><th>Entry point</th><th><code>listCloseTarget</code></th><th>Cancel 시 routing</th></tr></thead>
+      <tbody>
+        <tr><td>AuthDialog (인증 후 dialog, D8)</td><td><code>'choice'</code></td><td>AuthDialog 회귀</td></tr>
+        <tr><td>SessionMenu → "Switch session…"</td><td><code>'choice'</code></td><td>AuthDialog (이전 session 이미 detach)</td></tr>
+        <tr><td>ActiveSessionDropdown 클릭</td><td><code>'closed'</code></td><td>현 canvas (현 active 유지)</td></tr>
+        <tr><td>Toolbar2 active 버튼</td><td><code>'closed'</code></td><td>같음</td></tr>
+        <tr><td>ReconnectModal [Switch session…]</td><td><code>'choice'</code></td><td>AuthDialog (현 attempt 의도적 포기)</td></tr>
+      </tbody>
+    </table>
+
+    <!-- 3.4 silentReattach -->
+    <h2 id="g-silent" class="anchor-target">3.4 Heartbeat + Silent reattach <span class="adr">(ADR-0019 D5.1, ADR-0021 D6.1)</span></h2>
+    <p class="lead">2 trigger source × 6 precondition AND-gate → silentReattach → 결과 분기.</p>
+    <div class="graph-wrap">
+      <div class="graph-controls">
+        <button onclick="cySilent.fit(undefined, 40)">Fit</button>
+        <button onclick="cySilent.zoom(cySilent.zoom() * 1.2)">+</button>
+        <button onclick="cySilent.zoom(cySilent.zoom() / 1.2)">−</button>
+      </div>
+      <div id="g-silent-c" class="graph tall"></div>
+      <div class="graph-legend">
+        <span class="item"><span class="dot start"></span> ready (idle)</span>
+        <span class="item"><span class="dot decision"></span> 분기</span>
+        <span class="item"><span class="dot normal"></span> 액션</span>
+        <span class="item"><span class="dot ready"></span> success (markReady)</span>
+        <span class="item"><span class="dot error"></span> 실패 분기</span>
+      </div>
+    </div>
+
+    <h3 id="precondition" class="anchor-target">3.4.1 6 precondition AND-gate <span class="adr">(+page.svelte:148~157)</span></h3>
+    <table>
+      <thead><tr><th>#</th><th>Condition</th><th>사유</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>typeof document !== 'undefined'</code></td><td>SSR/test 가드</td></tr>
+        <tr><td>2</td><td><code>document.visibilityState === 'visible'</code></td><td>탭이 foreground</td></tr>
+        <tr><td>3</td><td><code>reconnectGate.canMountApp === true</code></td><td>booting/attaching 중에는 silent X</td></tr>
+        <tr><td>4</td><td><code>sessionStore.active !== null</code></td><td>Auth/Dialog 단계 webpage 무시</td></tr>
+        <tr><td>5</td><td><code>sessionStore.reattachInProgress === false</code></td><td>이미 silent 중이면 중복 X</td></tr>
+        <tr><td>6</td><td><code>heartbeatStore.isIdle === true</code></td><td>15s+ 사용자 무활동</td></tr>
+      </tbody>
+    </table>
+
+    <!-- 4.1 Terminal -->
+    <h2 id="g-terminal" class="anchor-target">4.1 Terminal 6-state <span class="adr">(ADR-0021)</span></h2>
+    <p class="lead">PaneId binding lifecycle. Alive 의 self-loop (output broadcast + input typing) 는 생략.</p>
+    <div class="graph-wrap">
+      <div class="graph-controls">
+        <button onclick="cyTerm.fit(undefined, 40)">Fit</button>
+        <button onclick="cyTerm.zoom(cyTerm.zoom() * 1.2)">+</button>
+        <button onclick="cyTerm.zoom(cyTerm.zoom() / 1.2)">−</button>
+      </div>
+      <div id="g-terminal-c" class="graph"></div>
+      <div class="graph-legend">
+        <span class="item"><span class="dot start"></span> Unbound (entry)</span>
+        <span class="item"><span class="dot normal"></span> Spawning / Respawning</span>
+        <span class="item"><span class="dot ready"></span> Alive</span>
+        <span class="item"><span class="dot error"></span> Dangling</span>
+        <span class="item"><span class="dot end"></span> Removed (terminal state)</span>
+      </div>
+    </div>
+
+    <!-- 4.2 Panel close -->
+    <h2 id="g-panel-close" class="anchor-target">4.2 Panel close 3-옵션 <span class="adr">(ADR-0021 D9.2)</span></h2>
+    <div class="graph-wrap">
+      <div class="graph-controls">
+        <button onclick="cyPC.fit(undefined, 40)">Fit</button>
+        <button onclick="cyPC.zoom(cyPC.zoom() * 1.2)">+</button>
+        <button onclick="cyPC.zoom(cyPC.zoom() / 1.2)">−</button>
+      </div>
+      <div id="g-panel-close-c" class="graph"></div>
+    </div>
+
+    <!-- 4.3 sequence -->
+    <h2 id="g-respawn" class="anchor-target">4.3 multi-webpage Terminal mirror <span class="adr">(ADR-0021 D1 + D10.3)</span></h2>
+    <p class="lead">두 webpage 가 같은 terminal_id 를 mirror 하다가 죽고, 거의 동시에 respawn 시도. per-UUID Mutex 가 한 caller 만 실제 spawn, 다른 caller 는 idempotent <code>reused:true</code>.</p>
+    <div class="seq-wrap">
+      <svg class="seq-svg" viewBox="0 0 940 720" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#555"/>
+          </marker>
+          <marker id="arr-dash" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+            <path d="M0,0 L0,6 L9,3 z" fill="#888"/>
+          </marker>
+        </defs>
+        <!-- Lifelines -->
+        <g font-family="-apple-system, sans-serif" font-size="12">
+          <!-- Actor headers -->
+          <rect x="60" y="20" width="140" height="40" fill="#f4f0fa" stroke="#7b45b1" rx="4"/>
+          <text x="130" y="36" text-anchor="middle" font-weight="600">Webpage A</text>
+          <text x="130" y="52" text-anchor="middle" fill="#666" font-size="11">session α attach</text>
+
+          <rect x="260" y="20" width="140" height="40" fill="#f4f0fa" stroke="#7b45b1" rx="4"/>
+          <text x="330" y="36" text-anchor="middle" font-weight="600">Webpage B</text>
+          <text x="330" y="52" text-anchor="middle" fill="#666" font-size="11">session β attach</text>
+
+          <rect x="460" y="20" width="120" height="40" fill="#d4e8f7" stroke="#2a6db5" rx="4"/>
+          <text x="520" y="44" text-anchor="middle" font-weight="600">Server</text>
+
+          <rect x="660" y="20" width="200" height="40" fill="#fae0d4" stroke="#c25a2c" rx="4"/>
+          <text x="760" y="36" text-anchor="middle" font-weight="600">Terminal T</text>
+          <text x="760" y="52" text-anchor="middle" fill="#666" font-size="11">PaneId</text>
+
+          <!-- Lifelines (vertical dashed) -->
+          <line x1="130" y1="60" x2="130" y2="700" stroke="#bbb" stroke-dasharray="4 4"/>
+          <line x1="330" y1="60" x2="330" y2="700" stroke="#bbb" stroke-dasharray="4 4"/>
+          <line x1="520" y1="60" x2="520" y2="700" stroke="#bbb" stroke-dasharray="4 4"/>
+          <line x1="760" y1="60" x2="760" y2="700" stroke="#bbb" stroke-dasharray="4 4"/>
+
+          <!-- Step 1: T stdout -->
+          <line x1="760" y1="90" x2="525" y2="90" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="640" y="84" text-anchor="middle" font-size="11" fill="#444">stdout</text>
+
+          <!-- Step 2: BE → A -->
+          <line x1="520" y1="115" x2="135" y2="115" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="320" y="109" text-anchor="middle" font-size="11" fill="#444">0x02 PANE_OUT (α-side xterm)</text>
+
+          <!-- Step 3: BE → B -->
+          <line x1="520" y1="140" x2="335" y2="140" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="425" y="134" text-anchor="middle" font-size="11" fill="#444">0x02 PANE_OUT (β-side)</text>
+
+          <!-- Note: 같은 terminal_id 두 session mirror -->
+          <rect x="200" y="160" width="540" height="24" fill="#fff8e6" stroke="#f5a623" rx="3"/>
+          <text x="470" y="176" text-anchor="middle" font-size="11" fill="#7b5e1a">같은 terminal_id T 가 α + β 의 layout 에 모두 attach (multi-mirror, D1)</text>
+
+          <!-- A typing -->
+          <line x1="130" y1="210" x2="515" y2="210" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="320" y="204" text-anchor="middle" font-size="11" fill="#444">0x03 PANE_IN (A 가 typing)</text>
+
+          <line x1="520" y1="235" x2="755" y2="235" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="640" y="229" text-anchor="middle" font-size="11" fill="#444">stdin</text>
+
+          <line x1="760" y1="260" x2="525" y2="260" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="640" y="254" text-anchor="middle" font-size="11" fill="#444">echo</text>
+
+          <line x1="520" y1="285" x2="135" y2="285" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="320" y="279" text-anchor="middle" font-size="11" fill="#444">0x02 (sender echo)</text>
+
+          <line x1="520" y1="310" x2="335" y2="310" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="425" y="304" text-anchor="middle" font-size="11" fill="#444">0x02 (mirror echo, ADR-0025)</text>
+
+          <!-- T dies -->
+          <rect x="200" y="335" width="540" height="24" fill="#fae0d4" stroke="#c25a2c" rx="3"/>
+          <text x="470" y="351" text-anchor="middle" font-size="11" fill="#7a3614">T 죽음 (exit) — SIGCHLD</text>
+
+          <line x1="760" y1="385" x2="525" y2="385" stroke="#888" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#arr-dash)"/>
+          <text x="640" y="379" text-anchor="middle" font-size="11" fill="#444">SIGCHLD</text>
+
+          <line x1="520" y1="410" x2="135" y2="410" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="320" y="404" text-anchor="middle" font-size="11" fill="#444">0x88 TERMINAL_DIED { id: T }</text>
+
+          <line x1="520" y1="435" x2="335" y2="435" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="425" y="429" text-anchor="middle" font-size="11" fill="#444">0x88 TERMINAL_DIED { id: T }</text>
+
+          <rect x="200" y="460" width="540" height="24" fill="#fff8e6" stroke="#f5a623" rx="3"/>
+          <text x="470" y="476" text-anchor="middle" font-size="11" fill="#7b5e1a">두 webpage 모두 Dangling overlay 표시</text>
+
+          <!-- A respawn first -->
+          <line x1="130" y1="510" x2="515" y2="510" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="320" y="504" text-anchor="middle" font-size="11" fill="#444">POST /api/terminals/T/respawn (A 가 먼저 click)</text>
+
+          <!-- Self loop: BE 가 respawn_locks 획득 + spawn -->
+          <rect x="430" y="525" width="190" height="50" fill="#f4f0fa" stroke="#7b45b1" rx="3"/>
+          <text x="525" y="543" text-anchor="middle" font-size="11" fill="#5a3088">respawn_locks[T] 획득</text>
+          <text x="525" y="558" text-anchor="middle" font-size="11" fill="#5a3088">kill_and_unregister + spawn → 새 PaneId</text>
+          <text x="525" y="570" text-anchor="middle" font-size="10" fill="#888">(D10.3 per-UUID Mutex)</text>
+
+          <line x1="520" y1="595" x2="135" y2="595" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="320" y="589" text-anchor="middle" font-size="11" fill="#3a8a3a">200 { reused: false, id: T }</text>
+
+          <!-- B 거의 동시 click -->
+          <line x1="330" y1="625" x2="515" y2="625" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="425" y="619" text-anchor="middle" font-size="11" fill="#444">POST .../respawn (B 거의 동시)</text>
+
+          <rect x="430" y="640" width="190" height="40" fill="#d4e8f7" stroke="#2a6db5" rx="3"/>
+          <text x="525" y="658" text-anchor="middle" font-size="11" fill="#1f4c80">lock 대기 → 획득</text>
+          <text x="525" y="672" text-anchor="middle" font-size="11" fill="#1f4c80">lookup_pane(T).is_some() → short-circuit</text>
+
+          <line x1="520" y1="700" x2="335" y2="700" stroke="#555" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="425" y="694" text-anchor="middle" font-size="11" fill="#3a8a3a">200 { reused: true, id: T }</text>
+        </g>
+      </svg>
+    </div>
+    <div class="note">
+      <strong>D10.3 invariant</strong>: 동시 2+ 요청 시 한 caller 만 kill+spawn, 나머지는
+      <code>reused:true</code> short-circuit. UUID 당 alive PaneId 1 보장. PTY leak 0.
+    </div>
+
+    <!-- 5. UI / 예외 -->
+    <h2 id="ui-exception" class="anchor-target">5. UI 분기 / 예외 흐름</h2>
+
+    <h3 id="ui-modal-policy" class="anchor-target">Modal dismissOnBackdrop 정책</h3>
+    <table>
+      <thead><tr><th>Modal</th><th><code>dismissOnBackdrop</code></th><th>사유</th></tr></thead>
+      <tbody>
+        <tr><td><code>SessionListModal</code></td><td><strong>false</strong></td><td>session 결정 = 의도 액션, 우발 위험</td></tr>
+        <tr><td><code>NewSessionModal</code></td><td><strong>false</strong></td><td>같음</td></tr>
+        <tr><td><code>AttachConfirmModal</code></td><td><strong>false</strong></td><td>unmatched terminal respawn 결정</td></tr>
+        <tr><td><code>PanelCloseConfirmModal</code></td><td><strong>false</strong></td><td>destructive</td></tr>
+        <tr><td><code>SessionDeleteConfirmModal</code></td><td><strong>false</strong></td><td>destructive (영구 삭제)</td></tr>
+        <tr><td><code>ShutdownModal</code></td><td><strong>false</strong></td><td>destructive (server shutdown)</td></tr>
+        <tr><td><code>ReconnectModal</code></td><td>N/A</td><td>본 화면 mount 차단 중</td></tr>
+        <tr><td><code>ImportSessionModal</code> / <code>ExportSessionModal</code></td><td>true</td><td>부수 액션 — 우발 OK</td></tr>
+        <tr><td><code>FilePickerModal</code></td><td>true</td><td>같음</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="exception-browser" class="anchor-target">Browser-side 예외 8 시나리오</h3>
+    <table>
+      <thead><tr><th>시나리오</th><th>처리</th></tr></thead>
+      <tbody>
+        <tr><td><strong>새로고침 (F5 / Cmd+R)</strong></td><td>hint 있으면 <code>reconnectGate.start(name)</code>, 없으면 booting → idle → AuthDialog</td></tr>
+        <tr><td><strong>탭 background → foreground</strong></td><td><code>visibilitychange</code> + <code>heartbeat.isIdle</code> 시 <code>silentReattach</code>. perception 0</td></tr>
+        <tr><td><strong>OS sleep / wake</strong></td><td>WS <code>reconnecting → open</code> 시 silentReattach. 200 idempotent 또는 409</td></tr>
+        <tr><td><strong>Network blip</strong></td><td><code>lib/ws/client.ts</code> 1s grace + exp backoff (1/2/4/8/16s)</td></tr>
+        <tr><td><strong>Network drop (&gt;30s)</strong></td><td>BE heartbeat timeout → flock release. 복귀 시 silentReattach 200 또는 409</td></tr>
+        <tr><td><strong>Browser crash / OS kill</strong></td><td>BE 30s timeout 정리. 다음 webpage 진입 시 정상</td></tr>
+        <tr><td><strong>탭 닫기 (정상)</strong></td><td><code>beforeunload</code> → <code>sendBeacon('/api/leave')</code> best-effort</td></tr>
+        <tr><td><strong>여러 탭 동시 운영</strong></td><td>각 탭 = 다른 session. 같은 session 두 번째 탭 = 409 + "in use" badge</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="exception-ui" class="anchor-target">UI 비정상 진입 차단 메커니즘 8</h3>
+    <table>
+      <thead><tr><th>시나리오</th><th>차단 메커니즘</th></tr></thead>
+      <tbody>
+        <tr><td>Boot 직후 빈 canvas flash</td><td><code>reconnectGate.canMountApp</code> 게이트</td></tr>
+        <tr><td>SessionListModal backdrop 우발 cancel</td><td><code>dismissOnBackdrop=false</code></td></tr>
+        <tr><td>AttachConfirmModal 도중 다른 session 클릭</td><td><code>escRouter</code> priority chain</td></tr>
+        <tr><td>Multi-tab 의 같은 session 진입</td><td>D3 single-attach → 두 번째 409</td></tr>
+        <tr><td>SessionListModal 의 active row 클릭</td><td>row <code>disabled</code> + tooltip</td></tr>
+        <tr><td>Cmd+W 로 우발 탭 close</td><td><code>beforeunload</code> sendBeacon 으로 BE 즉시 release</td></tr>
+        <tr><td>silentReattach 중 mutation 시도</td><td><code>ensureMutationOk()</code> guard — 7+ entry point</td></tr>
+        <tr><td>AttachConfirmModal cancel 후 active 잃음</td><td>5-step fallback chain (§3.2.1)</td></tr>
+      </tbody>
+    </table>
+
+    <footer>
+      gtmux state-machines viewer (Cytoscape.js) · v2026-05-18 ·
+      원본 markdown: <code>docs/ssot/state-machines.md</code> ·
+      <a href="https://github.com/iiamaii/gtmux" style="color: var(--accent);">repo</a>
+    </footer>
+  </main>
+</div>
+
+<script>
+// Cytoscape + dagre register
+cytoscape.use(cytoscapeDagre);
+
+// Responsive — ResizeObserver 로 container resize 시 fit 자동 호출.
+// 모든 cy instance 를 한 곳에 모아 관리.
+const cyInstances = [];
+function refitAll() {
+  for (const cy of cyInstances) {
+    cy.resize();
+    cy.fit(undefined, 40);
+  }
+}
+let refitTimer = null;
+function scheduleRefit() {
+  if (refitTimer !== null) clearTimeout(refitTimer);
+  refitTimer = setTimeout(refitAll, 120);
+}
+window.addEventListener('resize', scheduleRefit);
+window.addEventListener('orientationchange', scheduleRefit);
+// ResizeObserver — 부모 layout 변경 (예: sidebar collapse) 도 cover
+if (typeof ResizeObserver !== 'undefined') {
+  const ro = new ResizeObserver(scheduleRefit);
+  // 각 graph container 가 mount 후 observe (cy instance 생성 후 push 시 함께)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 공용 style
+// ─────────────────────────────────────────────────────────────────────────
+const baseStyle = [
+  { selector: 'node',
+    style: {
+      'background-color': '#f4f0fa',
+      'border-color': '#7b45b1',
+      'border-width': 1.5,
+      'shape': 'round-rectangle',
+      'label': 'data(label)',
+      'text-valign': 'center',
+      'text-halign': 'center',
+      'color': '#1a1a1a',
+      'font-size': '12px',
+      'font-family': '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Apple SD Gothic Neo", sans-serif',
+      'text-wrap': 'wrap',
+      'text-max-width': '160px',
+      'padding': '10px',
+      'width': 'label',
+      'height': 'label',
+    }},
+  { selector: 'node.start',
+    style: { 'background-color': '#d4f1d4', 'border-color': '#3a8a3a' }},
+  { selector: 'node.ready',
+    style: { 'background-color': '#d4e8f7', 'border-color': '#2a6db5' }},
+  { selector: 'node.error',
+    style: { 'background-color': '#fae0d4', 'border-color': '#c25a2c' }},
+  { selector: 'node.decision',
+    style: { 'background-color': '#faf3d4', 'border-color': '#c2a02c', 'shape': 'diamond',
+             'text-max-width': '140px', 'padding': '14px' }},
+  { selector: 'node.end',
+    style: { 'background-color': '#e8e8eb', 'border-color': '#6b6b73' }},
+  { selector: 'edge',
+    style: {
+      'curve-style': 'bezier',
+      'target-arrow-shape': 'triangle',
+      'target-arrow-color': '#888',
+      'line-color': '#888',
+      'width': 1.4,
+      'label': 'data(label)',
+      'font-size': '10.5px',
+      'color': '#555',
+      'text-background-color': '#ffffff',
+      'text-background-opacity': 0.9,
+      'text-background-padding': '3px',
+      'text-background-shape': 'round-rectangle',
+      'text-rotation': 'autorotate',
+      'text-wrap': 'wrap',
+      'text-max-width': '180px',
+    }},
+  { selector: 'edge.dashed',
+    style: { 'line-style': 'dashed' }},
+  { selector: 'edge.success',
+    style: { 'line-color': '#3a8a3a', 'target-arrow-color': '#3a8a3a', 'color': '#2a5e2a' }},
+  { selector: 'edge.error',
+    style: { 'line-color': '#c25a2c', 'target-arrow-color': '#c25a2c', 'color': '#7a3614' }},
+  { selector: 'edge.loop',
+    style: { 'curve-style': 'bezier', 'control-point-step-size': 50 }},
+];
+
+function dagreLayout(opts = {}) {
+  return Object.assign({
+    name: 'dagre',
+    rankDir: 'TB',
+    nodeSep: 50,
+    edgeSep: 20,
+    rankSep: 70,
+    padding: 30,
+    animate: false,
+  }, opts);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Graph 1: Auth lifecycle
+// ─────────────────────────────────────────────────────────────────────────
+const cyAuth = cytoscape({
+  container: document.getElementById('g-auth-c'),
+  style: baseStyle,
+  elements: [
+    { data: { id: 'no_cookie', label: 'NoCookie' }, classes: 'start' },
+    { data: { id: 'auth_page', label: 'AuthPage\n(/auth SPA)' } },
+    { data: { id: 'token_input', label: 'TokenInput\n(D4)' } },
+    { data: { id: 'pw_input', label: 'PasswordInput\n(D5)' } },
+    { data: { id: 'verify', label: 'ServerVerify' } },
+    { data: { id: 'auth_failed', label: 'AuthFailed' }, classes: 'error' },
+    { data: { id: 'authenticated', label: 'Authenticated\n(Set-Cookie)' }, classes: 'ready' },
+    { data: { id: 'cookie_valid', label: 'CookieValid' }, classes: 'ready' },
+    { data: { id: 'ws_handshake', label: 'WSHandshake' } },
+    { data: { id: 'logout', label: 'Logout\n(3-step)' } },
+    { data: { id: 'rotation', label: 'Rotation\n(D14)' } },
+
+    { data: { source: 'no_cookie', target: 'auth_page', label: 'GET /' } },
+    { data: { source: 'auth_page', target: 'token_input', label: 'mode=token' } },
+    { data: { source: 'auth_page', target: 'pw_input', label: 'mode=password' } },
+    { data: { source: 'token_input', target: 'verify', label: 'POST /auth/login\n{ token }' } },
+    { data: { source: 'pw_input', target: 'verify', label: 'POST /auth/login\n{ password }' } },
+    { data: { source: 'verify', target: 'authenticated', label: '200 + Set-Cookie' }, classes: 'success' },
+    { data: { source: 'verify', target: 'auth_failed', label: '401 (rate limit)' }, classes: 'error' },
+    { data: { source: 'auth_failed', target: 'auth_page', label: 'retry' }, classes: 'dashed' },
+    { data: { source: 'authenticated', target: 'cookie_valid', label: 'redirect /' } },
+    { data: { source: 'cookie_valid', target: 'ws_handshake', label: 'SPA mount' } },
+    { data: { source: 'ws_handshake', target: 'no_cookie', label: 'Close 1008\n(invalid cookie)' }, classes: 'error' },
+    { data: { source: 'cookie_valid', target: 'logout', label: 'SessionMenu\n[Logout]' } },
+    { data: { source: 'logout', target: 'no_cookie', label: 'POST /logout\n+ window.location' } },
+    { data: { source: 'cookie_valid', target: 'rotation', label: 'POST /auth/rotate' }, classes: 'dashed' },
+    { data: { source: 'rotation', target: 'no_cookie', label: '이전 cookie 무효' } },
+    { data: { source: 'rotation', target: 'authenticated', label: 'new cookie' } },
+  ],
+  layout: dagreLayout({ rankSep: 80 }),
+  minZoom: 0.3, maxZoom: 2.5,
+});
+cyInstances.push(cyAuth);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Graph 2: reconnectGate 8-state
+// ─────────────────────────────────────────────────────────────────────────
+const cyRG = cytoscape({
+  container: document.getElementById('g-reconnect-c'),
+  style: baseStyle,
+  elements: [
+    { data: { id: 'booting', label: 'booting\n(canMountApp=false)' }, classes: 'start' },
+    { data: { id: 'idle', label: 'idle\n(workspaceSwitcher modal)' }, classes: 'ready' },
+    { data: { id: 'attaching', label: 'attaching\n(POST /attach 중)' } },
+    { data: { id: 'hydrating', label: 'hydrating\n(GET /layout 중)' } },
+    { data: { id: 'ready', label: 'ready\n(본 화면 mount)' }, classes: 'ready' },
+    { data: { id: 'confirm_required', label: 'ConfirmRequired\n→ AttachConfirmModal' } },
+    { data: { id: 'in_use', label: 'in_use\n(409)' }, classes: 'error' },
+    { data: { id: 'not_found', label: 'not_found\n(404)' }, classes: 'error' },
+    { data: { id: 'unreachable', label: 'unreachable\n(5xx/network)' }, classes: 'error' },
+
+    { data: { source: 'booting', target: 'attaching', label: 'hint 있음\n→ start(name)' } },
+    { data: { source: 'booting', target: 'idle', label: 'hint 없음\n→ markIdle()' } },
+    { data: { source: 'attaching', target: 'hydrating', label: '200 + unmatched=0' }, classes: 'success' },
+    { data: { source: 'attaching', target: 'confirm_required', label: '200 + unmatched>0\n(2026-05-17 회귀 fix)' } },
+    { data: { source: 'attaching', target: 'in_use', label: '409' }, classes: 'error' },
+    { data: { source: 'attaching', target: 'not_found', label: '404\n(hint clear)' }, classes: 'error' },
+    { data: { source: 'attaching', target: 'unreachable', label: '5xx / network' }, classes: 'error' },
+    { data: { source: 'hydrating', target: 'ready', label: 'layout 200\n+ loadLayout' }, classes: 'success' },
+    { data: { source: 'hydrating', target: 'unreachable', label: 'layout fetch fail' }, classes: 'error' },
+    { data: { source: 'confirm_required', target: 'ready', label: '사용자 confirm\n→ respawn + layout' }, classes: 'success' },
+    { data: { source: 'confirm_required', target: 'idle', label: '사용자 cancel' } },
+    { data: { source: 'in_use', target: 'attaching', label: '[Retry]' }, classes: 'dashed' },
+    { data: { source: 'in_use', target: 'idle', label: '[Switch session…]' }, classes: 'dashed' },
+    { data: { source: 'not_found', target: 'idle', label: '[Switch session…]' }, classes: 'dashed' },
+    { data: { source: 'unreachable', target: 'attaching', label: '[Retry]\n(attempt++)' }, classes: 'dashed' },
+    { data: { source: 'unreachable', target: 'idle', label: '[Switch session…]' }, classes: 'dashed' },
+    { data: { source: 'idle', target: 'attaching', label: 'workspaceSwitcher\nattach flow' } },
+    { data: { source: 'ready', target: 'attaching', label: 'visibilitychange + isIdle\n→ silentReattach' }, classes: 'dashed' },
+    { data: { source: 'ready', target: 'attaching', label: 'WS reconnecting→open\n→ silentReattach' }, classes: 'dashed' },
+  ],
+  layout: dagreLayout({ rankSep: 100, nodeSep: 70 }),
+  minZoom: 0.3, maxZoom: 2.5,
+});
+cyInstances.push(cyRG);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Graph 3: workspaceSwitcher 5-stage
+// ─────────────────────────────────────────────────────────────────────────
+const cySW = cytoscape({
+  container: document.getElementById('g-switcher-c'),
+  style: baseStyle,
+  elements: [
+    { data: { id: 'closed', label: 'closed' }, classes: 'start' },
+    { data: { id: 'choice', label: 'choice\n(AuthDialog)' } },
+    { data: { id: 'create', label: 'create\n(NewSessionModal)' } },
+    { data: { id: 'list', label: 'list\n(SessionListModal)' } },
+    { data: { id: 'attach_confirm', label: 'attach_confirm\n(AttachConfirmModal)' } },
+    { data: { id: 'ready', label: 'ready\n(canvas mount)' }, classes: 'ready' },
+
+    { data: { source: 'closed', target: 'choice', label: 'open()' } },
+    { data: { source: 'choice', target: 'create', label: '[+ New session]' } },
+    { data: { source: 'choice', target: 'list', label: '[Open existing]' } },
+    { data: { source: 'create', target: 'attach_confirm', label: 'POST /sessions\n+ attach 200 unmatched>0' } },
+    { data: { source: 'create', target: 'ready', label: 'attach 200 unmatched=0' }, classes: 'success' },
+    { data: { source: 'create', target: 'closed', label: 'Cancel' }, classes: 'dashed' },
+    { data: { source: 'list', target: 'attach_confirm', label: 'row 클릭\n→ 200 unmatched>0' } },
+    { data: { source: 'list', target: 'ready', label: 'row 클릭\n→ 200 unmatched=0' }, classes: 'success' },
+    { data: { source: 'list', target: 'choice', label: "closeList('choice')\n— AuthDialog 회귀" }, classes: 'dashed' },
+    { data: { source: 'list', target: 'closed', label: "closeList('closed')\n— canvas 로" }, classes: 'dashed' },
+    { data: { source: 'attach_confirm', target: 'ready', label: '사용자 confirm\n→ POST /attach/confirm' }, classes: 'success' },
+    { data: { source: 'attach_confirm', target: 'list', label: '사용자 cancel\n→ 5-step chain (§3.2.1)' }, classes: 'dashed' },
+    { data: { source: 'attach_confirm', target: 'attach_confirm', label: 'restorePrevious\n→ 또 confirm_required (재귀 1회)' }, classes: 'loop' },
+  ],
+  layout: dagreLayout({ rankSep: 90 }),
+  minZoom: 0.3, maxZoom: 2.5,
+});
+cyInstances.push(cySW);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Graph 4: cancelAttachConfirm 5-step
+// ─────────────────────────────────────────────────────────────────────────
+const cyCancel = cytoscape({
+  container: document.getElementById('g-cancel-c'),
+  style: baseStyle,
+  elements: [
+    { data: { id: 'click', label: '[Cancel] 클릭' }, classes: 'start' },
+    { data: { id: 'q1', label: 'tentativeLock\n&& pending !== active?' }, classes: 'decision' },
+    { data: { id: 'detach', label: 'DELETE /sessions/<pending>/attach\n(tentative lock release)' } },
+    { data: { id: 'q2', label: 'previous !== null\n&& previous !== pending?' }, classes: 'decision' },
+    { data: { id: 'restore', label: 'restorePreviousSession(previous)\n= POST /attach + setActiveSession' } },
+    { data: { id: 'q3', label: 'restore 가\n또 confirm_required?' }, classes: 'decision' },
+    { data: { id: 'reentry', label: 'goAttachConfirm 재진입\n(pendingPrevious 이미 clear)' } },
+    { data: { id: 'q4', label: 'restore 가\n예외 throw?' }, classes: 'decision' },
+    { data: { id: 'clear_toast', label: 'sessionStore.clear\n+ 8s warning toast' }, classes: 'error' },
+    { data: { id: 'q5', label: 'sessionStore.active === null?' }, classes: 'decision' },
+    { data: { id: 'clear_only', label: 'sessionStore.clear' } },
+    { data: { id: 'go_list', label: 'workspaceSwitcher.goList()\n(listCloseTarget 분기)' }, classes: 'ready' },
+
+    { data: { source: 'click', target: 'q1' } },
+    { data: { source: 'q1', target: 'detach', label: 'yes' } },
+    { data: { source: 'q1', target: 'q2', label: 'no' } },
+    { data: { source: 'detach', target: 'q2' } },
+    { data: { source: 'q2', target: 'restore', label: 'yes' } },
+    { data: { source: 'q2', target: 'q5', label: 'no' } },
+    { data: { source: 'restore', target: 'q3' } },
+    { data: { source: 'restore', target: 'q4' } },
+    { data: { source: 'q3', target: 'reentry', label: 'yes' } },
+    { data: { source: 'q3', target: 'go_list', label: 'no' } },
+    { data: { source: 'q4', target: 'clear_toast', label: 'yes' }, classes: 'error' },
+    { data: { source: 'q4', target: 'go_list', label: 'no' }, classes: 'success' },
+    { data: { source: 'clear_toast', target: 'go_list' } },
+    { data: { source: 'q5', target: 'clear_only', label: 'yes' } },
+    { data: { source: 'q5', target: 'go_list', label: 'no' } },
+    { data: { source: 'clear_only', target: 'go_list' } },
+  ],
+  layout: dagreLayout({ rankSep: 85, nodeSep: 60 }),
+  minZoom: 0.3, maxZoom: 2.5,
+});
+cyInstances.push(cyCancel);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Graph 5: silentReattach
+// ─────────────────────────────────────────────────────────────────────────
+const cySilent = cytoscape({
+  container: document.getElementById('g-silent-c'),
+  style: baseStyle,
+  elements: [
+    { data: { id: 'ready_state', label: 'ready state' }, classes: 'start' },
+    { data: { id: 'trig_ws', label: 'dispatcher:\nprevWsState=reconnecting\n→ state=open' } },
+    { data: { id: 'trig_vis', label: '+page.svelte:\ndocument.visibilitychange\n=visible' } },
+    { data: { id: 'precond', label: 'maybeSilentReattach\n6 precondition AND-gate' }, classes: 'decision' },
+    { data: { id: 'skip', label: 'skip (no-op)' }, classes: 'end' },
+    { data: { id: 'call', label: 'sessionStore.silentReattach\n(name, signal)' } },
+    { data: { id: 'inflight', label: '이미 in-flight?' }, classes: 'decision' },
+    { data: { id: 'wait', label: 'return 기존\n#silentReattachPromise\n(singleton)' } },
+    { data: { id: 'post', label: 'POST /attach' }, classes: 'decision' },
+    { data: { id: 'success', label: 'markReady\n+ heartbeatStore.reset' }, classes: 'ready' },
+    { data: { id: 'escalation', label: 'silent→modal escalation:\nsetActiveSession\n+ goAttachConfirm' }, classes: 'error' },
+    { data: { id: 'in_use', label: 'in_use toast\n(silent — modal X)' }, classes: 'error' },
+    { data: { id: 'not_found', label: 'not_found toast\n+ hint clear' }, classes: 'error' },
+    { data: { id: 'unauth', label: "window.location='/auth'\n(직접 redirect)" }, classes: 'error' },
+    { data: { id: 'unreach', label: 'unreachable toast' }, classes: 'error' },
+    { data: { id: 'resume', label: 'mutation guard 해제\n+ queued awaiters resume' }, classes: 'ready' },
+
+    { data: { source: 'ready_state', target: 'trig_ws' }, classes: 'dashed' },
+    { data: { source: 'ready_state', target: 'trig_vis' }, classes: 'dashed' },
+    { data: { source: 'trig_ws', target: 'precond' } },
+    { data: { source: 'trig_vis', target: 'precond' } },
+    { data: { source: 'precond', target: 'skip', label: 'any fail' }, classes: 'dashed' },
+    { data: { source: 'precond', target: 'call', label: 'all pass' }, classes: 'success' },
+    { data: { source: 'call', target: 'inflight' } },
+    { data: { source: 'inflight', target: 'wait', label: 'yes' }, classes: 'dashed' },
+    { data: { source: 'inflight', target: 'post', label: 'no' } },
+    { data: { source: 'post', target: 'success', label: '200 unmatched=0' }, classes: 'success' },
+    { data: { source: 'post', target: 'escalation', label: '200 unmatched>0\n(BE 재기동 stale)' }, classes: 'error' },
+    { data: { source: 'post', target: 'in_use', label: '409' }, classes: 'error' },
+    { data: { source: 'post', target: 'not_found', label: '404' }, classes: 'error' },
+    { data: { source: 'post', target: 'unauth', label: '401' }, classes: 'error' },
+    { data: { source: 'post', target: 'unreach', label: '5xx/network' }, classes: 'error' },
+    { data: { source: 'success', target: 'resume' } },
+    { data: { source: 'wait', target: 'resume' }, classes: 'dashed' },
+  ],
+  layout: dagreLayout({ rankSep: 80, nodeSep: 50 }),
+  minZoom: 0.3, maxZoom: 2.5,
+});
+cyInstances.push(cySilent);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Graph 6: Terminal 6-state
+// ─────────────────────────────────────────────────────────────────────────
+const cyTerm = cytoscape({
+  container: document.getElementById('g-terminal-c'),
+  style: baseStyle,
+  elements: [
+    { data: { id: 'unbound', label: 'Unbound\n(layout item 만)' }, classes: 'start' },
+    { data: { id: 'spawning', label: 'Spawning' } },
+    { data: { id: 'alive', label: 'Alive\n(PaneId 바인딩)' }, classes: 'ready' },
+    { data: { id: 'dangling', label: 'Dangling\n([exit] overlay)' }, classes: 'error' },
+    { data: { id: 'respawning', label: 'Respawning\n(per-UUID lock)' } },
+    { data: { id: 'removed', label: 'Removed' }, classes: 'end' },
+    { data: { id: 'end', label: '[*] (terminal SIGTERM)' }, classes: 'end' },
+
+    { data: { source: 'unbound', target: 'spawning', label: 'Auto-mount (D3)\n또는 [New Terminal]' } },
+    { data: { source: 'spawning', target: 'alive', label: 'PaneId 발급\n+ terminal_map.register' }, classes: 'success' },
+    { data: { source: 'spawning', target: 'unbound', label: 'spawn fail (toast)' }, classes: 'error' },
+    { data: { source: 'alive', target: 'dangling', label: 'terminal_died\n(exit / killed)' }, classes: 'error' },
+    { data: { source: 'alive', target: 'dangling', label: '다른 session 의\n[Panel + Terminal] (D9.2)' }, classes: 'error' },
+    { data: { source: 'dangling', target: 'respawning', label: '사용자 focus/click/input\n→ POST /respawn' } },
+    { data: { source: 'dangling', target: 'removed', label: '사용자 Panel close\n또는 panel delete' }, classes: 'dashed' },
+    { data: { source: 'respawning', target: 'alive', label: '200\n+ 새 PaneId' }, classes: 'success' },
+    { data: { source: 'respawning', target: 'alive', label: '동시 호출\n→ reused=true (D10.3)' }, classes: 'success' },
+    { data: { source: 'respawning', target: 'dangling', label: '503 / 500\n(spawn fail)' }, classes: 'error' },
+    { data: { source: 'alive', target: 'end', label: '[Panel + Terminal] close\nSIGTERM' } },
+    { data: { source: 'alive', target: 'end', label: '명시 [Kill terminal]\n(D9.4)' } },
+  ],
+  layout: dagreLayout({ rankSep: 90, nodeSep: 60 }),
+  minZoom: 0.3, maxZoom: 2.5,
+});
+cyInstances.push(cyTerm);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Graph 7: Panel close 3-옵션
+// ─────────────────────────────────────────────────────────────────────────
+const cyPC = cytoscape({
+  container: document.getElementById('g-panel-close-c'),
+  style: baseStyle,
+  elements: [
+    { data: { id: 'click', label: '사용자 panel close 클릭' }, classes: 'start' },
+    { data: { id: 'setting', label: 'Settings.behavior.\nauto_kill_terminal_on_panel_close' }, classes: 'decision' },
+    { data: { id: 'auto', label: '즉시 Panel + Terminal' } },
+    { data: { id: 'modal', label: 'PanelCloseConfirmModal' } },
+    { data: { id: 'cancel', label: 'Cancel — no-op' }, classes: 'end' },
+    { data: { id: 'panel_only', label: 'Panel only\nDELETE items/:id?kill=false' } },
+    { data: { id: 'panel_term', label: 'Panel + Terminal\nDELETE items/:id?kill=true' } },
+    { data: { id: 'pool_keep', label: 'session panel 제거\nterminal pool 유지' }, classes: 'ready' },
+    { data: { id: 'pool_kill', label: 'panel 제거 + SIGTERM\n다른 session = Dangling' }, classes: 'error' },
+
+    { data: { source: 'click', target: 'setting' } },
+    { data: { source: 'setting', target: 'auto', label: 'true' } },
+    { data: { source: 'setting', target: 'modal', label: 'false (default)' } },
+    { data: { source: 'modal', target: 'cancel' }, classes: 'dashed' },
+    { data: { source: 'modal', target: 'panel_only' } },
+    { data: { source: 'modal', target: 'panel_term' } },
+    { data: { source: 'panel_only', target: 'pool_keep' } },
+    { data: { source: 'panel_term', target: 'pool_kill' } },
+    { data: { source: 'auto', target: 'pool_kill' } },
+  ],
+  layout: dagreLayout({ rankSep: 75 }),
+  minZoom: 0.3, maxZoom: 2.5,
+});
+cyInstances.push(cyPC);
+
+// ─────────────────────────────────────────────────────────────────────────
+// ResizeObserver — 모든 graph container 의 size 변경 시 자동 refit.
+// (window resize / orientation 은 이미 위에서 bind)
+// ─────────────────────────────────────────────────────────────────────────
+if (typeof ResizeObserver !== 'undefined') {
+  const observer = new ResizeObserver(scheduleRefit);
+  for (const cy of cyInstances) {
+    observer.observe(cy.container());
+  }
+}
+</script>
+</body>
+</html>
