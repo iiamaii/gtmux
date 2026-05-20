@@ -1,0 +1,1636 @@
+<!doctype html>
+<html lang="en">
+<head><script>(function(){
+  function makeStore(){
+    var data = {};
+    var api = {
+      getItem: function(k){ return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null; },
+      setItem: function(k, v){ data[k] = String(v); },
+      removeItem: function(k){ delete data[k]; },
+      clear: function(){ data = {}; },
+      key: function(i){ return Object.keys(data)[i] || null; }
+    };
+    Object.defineProperty(api, 'length', { get: function(){ return Object.keys(data).length; } });
+    return api;
+  }
+  function tryShim(name){
+    var works = false;
+    try { works = !!window[name] && typeof window[name].getItem === 'function'; void window[name].length; }
+    catch (_) { works = false; }
+    if (works) return;
+    try { Object.defineProperty(window, name, { configurable: true, value: makeStore() }); }
+    catch (_) { try { window[name] = makeStore(); } catch (__) {} }
+  }
+  tryShim('localStorage');
+  tryShim('sessionStorage');
+})();</script>
+<meta charset="utf-8" />
+<title>gtmux — Canvas Item Components</title>
+<style>
+  /* ---- Figma-inspired tokens (synced with index.html) ---- */
+  :root {
+    --bg: #ffffff;
+    --surface: #ffffff;
+    --surface-2: #f5f5f5;
+    --fg: #000000;
+    --muted: #6b6b6b;
+    --border: rgba(0,0,0,0.10);
+    --border-strong: rgba(0,0,0,0.18);
+    --glass-dark: rgba(0,0,0,0.06);
+    --glass-darker: rgba(0,0,0,0.10);
+    --accent: #0d99ff;
+    --canvas-bg: #f3f3f3;
+    --grid: rgba(0,0,0,0.05);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.06), 0 0 0 0.5px rgba(0,0,0,0.06);
+    --shadow-md: 0 8px 24px rgba(0,0,0,0.12), 0 0 0 0.5px rgba(0,0,0,0.08);
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+    --pill: 50px;
+    --font-sans: 'SF Pro Display', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-mono: 'SF Mono', Menlo, 'JetBrains Mono', ui-monospace, monospace;
+  }
+  /* dark theme: applied to a scoped block so light/dark sit side-by-side */
+  .theme-dark {
+    --bg: #1e1e1e;
+    --surface: #2c2c2c;
+    --surface-2: #383838;
+    --fg: #f5f5f5;
+    --muted: #9a9a9a;
+    --border: rgba(255,255,255,0.10);
+    --border-strong: rgba(255,255,255,0.18);
+    --glass-dark: rgba(255,255,255,0.06);
+    --glass-darker: rgba(255,255,255,0.10);
+    --canvas-bg: #1a1a1a;
+    --grid: rgba(255,255,255,0.04);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.4), 0 0 0 0.5px rgba(255,255,255,0.06);
+    --shadow-md: 0 8px 24px rgba(0,0,0,0.5), 0 0 0 0.5px rgba(255,255,255,0.08);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--font-sans);
+    font-feature-settings: "kern" 1;
+    color: var(--fg);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: -0.14px;
+    line-height: 1.45;
+  }
+
+  /* ---------- Page chrome ---------- */
+  .page-header {
+    border-bottom: 1px solid var(--border);
+    padding: 28px 48px 24px;
+    display: flex; align-items: flex-end; justify-content: space-between;
+    gap: 24px;
+  }
+  .brand {
+    font-size: 13px; font-weight: 540;
+    letter-spacing: -0.2px;
+  }
+  .brand .mark {
+    display: inline-block;
+    width: 18px; height: 18px;
+    background: var(--fg);
+    border-radius: 4px;
+    margin-right: 8px;
+    vertical-align: -4px;
+  }
+  .page-header h1 {
+    margin: 12px 0 4px;
+    font-size: 38px; font-weight: 540;
+    letter-spacing: -0.72px; line-height: 1.05;
+  }
+  .page-header .deck {
+    color: var(--muted);
+    font-size: 14px; max-width: 480px;
+    letter-spacing: -0.14px;
+  }
+  .meta {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+    line-height: 1.7;
+  }
+  .meta b { color: var(--fg); font-weight: 540; }
+
+  /* ---------- Section layout ---------- */
+  .section {
+    border-bottom: 1px solid var(--border);
+    padding: 48px 48px 56px;
+  }
+  .section-head {
+    display: grid;
+    grid-template-columns: 100px 1fr auto;
+    gap: 32px; align-items: baseline;
+    margin-bottom: 28px;
+  }
+  .section-num {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .section-title {
+    font-size: 28px; font-weight: 540;
+    letter-spacing: -0.42px; margin: 0 0 4px;
+  }
+  .section-purpose {
+    color: var(--muted);
+    font-size: 14px;
+    max-width: 620px;
+    letter-spacing: -0.1px;
+  }
+  .section-jump {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  /* ---------- Preview stage ---------- */
+  .preview-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    margin-bottom: 28px;
+  }
+  .stage {
+    --canvas-bg: #f3f3f3;
+    --grid: rgba(0,0,0,0.05);
+    background:
+      radial-gradient(circle at 1px 1px, var(--grid) 1px, transparent 0) 0 0/16px 16px,
+      var(--canvas-bg);
+    padding: 56px;
+    display: grid;
+    place-items: center;
+    min-height: 320px;
+    position: relative;
+  }
+  .stage.dark {
+    --canvas-bg: #1a1a1a;
+    --grid: rgba(255,255,255,0.04);
+  }
+  .stage-label {
+    position: absolute;
+    top: 12px; left: 14px;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .stage.dark .stage-label { color: rgba(245,245,245,0.55); }
+
+  /* ---------- 2-col body ---------- */
+  .body-row {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 48px;
+    align-items: flex-start;
+  }
+  .body-row + .body-row { margin-top: 32px; }
+
+  /* ---------- Anatomy callouts ---------- */
+  .anatomy {
+    background: var(--surface-2);
+    border-radius: var(--radius-md);
+    padding: 20px 22px;
+  }
+  .anatomy-title {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 14px;
+  }
+  .anatomy ul {
+    margin: 0; padding: 0; list-style: none;
+    display: grid; gap: 10px;
+  }
+  .anatomy li {
+    display: grid;
+    grid-template-columns: 22px 1fr;
+    gap: 12px;
+    font-size: 13px;
+    line-height: 1.45;
+    letter-spacing: -0.1px;
+  }
+  .anatomy li .num {
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: var(--fg);
+    color: var(--bg);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 540;
+    display: grid; place-items: center;
+    margin-top: 1px;
+  }
+  .anatomy li b { font-weight: 540; }
+  .anatomy li span.path {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    display: block;
+    margin-top: 2px;
+  }
+
+  /* ---------- Token tables ---------- */
+  .props {
+    display: grid;
+    gap: 14px;
+  }
+  .props h3 {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0;
+  }
+  .table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .table th {
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 400;
+    padding: 8px 12px 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .table td {
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+    letter-spacing: -0.1px;
+  }
+  .table tr:last-child td { border-bottom: none; }
+  .table td.k { font-weight: 540; color: var(--fg); width: 30%; }
+  .table td.v { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+
+  /* ---------- Variants strip ---------- */
+  .variants {
+    display: grid;
+    gap: 16px;
+    margin-top: 36px;
+  }
+  .variants-title {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .variant-grid {
+    display: grid;
+    gap: 16px;
+  }
+  .variant-grid.cap { grid-template-columns: repeat(3, 1fr); }
+  .variant-grid.doc { grid-template-columns: 1fr 1fr; }
+  .variant-grid.fp  { grid-template-columns: repeat(4, 1fr); }
+  .variant {
+    background: var(--surface-2);
+    border-radius: var(--radius-md);
+    padding: 24px;
+    display: grid;
+    gap: 12px;
+  }
+  .variant .label {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .variant .frame {
+    display: grid; place-items: center;
+    min-height: 110px;
+  }
+
+  /* ---------- Code block ---------- */
+  pre.code {
+    background: var(--surface-2);
+    border-radius: var(--radius-md);
+    padding: 16px 18px;
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.55;
+    letter-spacing: 0;
+    color: var(--fg);
+    overflow-x: auto;
+  }
+  pre.code .t { color: var(--accent); }
+  pre.code .a { color: #a44; }
+  pre.code .s { color: #060; }
+  pre.code .c { color: var(--muted); }
+
+  /* ---------- Theme toggle ---------- */
+  .theme-toggle {
+    border: none; background: var(--glass-dark);
+    border-radius: 50%;
+    width: 32px; height: 32px;
+    display: grid; place-items: center;
+    cursor: pointer; color: var(--fg);
+    transition: background .15s;
+  }
+  .theme-toggle:hover { background: var(--glass-darker); }
+  .theme-toggle:focus-visible { outline: 2px dashed var(--accent); outline-offset: 2px; }
+
+  body.page-dark {
+    --bg: #1e1e1e;
+    --surface: #2c2c2c;
+    --surface-2: #383838;
+    --fg: #f5f5f5;
+    --muted: #9a9a9a;
+    --border: rgba(255,255,255,0.10);
+    --border-strong: rgba(255,255,255,0.18);
+    --glass-dark: rgba(255,255,255,0.06);
+    --glass-darker: rgba(255,255,255,0.10);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.4), 0 0 0 0.5px rgba(255,255,255,0.06);
+  }
+
+  /* ---------- COMPONENT STYLES (verbatim from index.html) ---------- */
+
+  /* Caption — pinned annotation block (mono header + body, accent rail) */
+  .shape-caption {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 2px solid var(--accent);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px 12px;
+    display: flex; flex-direction: column; gap: 6px;
+    font-family: var(--font-sans);
+    box-shadow: var(--shadow-sm);
+    color: var(--fg);
+    overflow: hidden;
+  }
+  .shape-caption .cap-head {
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .shape-caption .cap-head .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
+  }
+  .shape-caption .cap-head b { color: var(--fg); font-weight: 540; letter-spacing: 0.4px; }
+  .shape-caption .cap-head .ts { margin-left: auto; opacity: .85; }
+  .shape-caption .cap-body {
+    font-size: 12px; line-height: 1.4;
+    letter-spacing: -0.1px;
+    color: var(--fg);
+  }
+
+  /* Document — page-like card with file header + paginated footer */
+  .shape-document {
+    background: var(--surface);
+    border-radius: var(--radius-md);
+    box-shadow: 0 8px 32px rgba(0,0,0,.06), 0 0 0 1px var(--border);
+    color: var(--fg);
+    display: grid;
+    grid-template-rows: 30px 1fr 26px;
+    overflow: hidden;
+  }
+  .shape-document .doc-head,
+  .shape-document .doc-foot {
+    display: flex; align-items: center; gap: 8px;
+    padding: 0 14px;
+    background: var(--surface-2);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.4px;
+    color: var(--muted);
+  }
+  .shape-document .doc-head { border-bottom: 1px solid var(--border); }
+  .shape-document .doc-foot { border-top: 1px solid var(--border); }
+  .shape-document .doc-head svg { flex-shrink: 0; opacity: .75; }
+  .shape-document .doc-head .filename { color: var(--fg); font-weight: 540; }
+  .shape-document .doc-head .sep,
+  .shape-document .doc-foot .sep { color: var(--border-strong); }
+  .shape-document .doc-head .right,
+  .shape-document .doc-foot .right { margin-left: auto; }
+  .shape-document .doc-body { padding: 28px 36px 24px; overflow: hidden; }
+  .shape-document .doc-body .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 18px;
+  }
+  .shape-document .doc-body h2 {
+    margin: 0 0 12px;
+    font-size: 26px; font-weight: 540;
+    letter-spacing: -0.6px; line-height: 1.15;
+    color: var(--fg);
+  }
+  .shape-document .doc-body p {
+    margin: 0 0 8px;
+    font-size: 12.5px; line-height: 1.55;
+    letter-spacing: -0.1px;
+    color: var(--muted);
+  }
+  .shape-document .doc-foot .page-dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--border-strong);
+  }
+  .shape-document .doc-foot .page-dot.on { background: var(--fg); }
+
+  /* File path — code-editor file reference tile */
+  .shape-filepath {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    color: var(--fg);
+    display: grid;
+    grid-template-rows: 1fr auto;
+    overflow: hidden;
+    font-family: var(--font-mono);
+  }
+  .shape-filepath .fp-main {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 11px 12px 10px;
+  }
+  .shape-filepath .fp-icon {
+    width: 24px; height: 24px;
+    flex-shrink: 0;
+    border-radius: var(--radius-sm);
+    background: var(--glass-darker);
+    display: grid; place-items: center;
+    color: var(--fg);
+  }
+  .shape-filepath .fp-meta {
+    display: flex; flex-direction: column; gap: 1px;
+    min-width: 0; flex: 1;
+  }
+  .shape-filepath .fp-path {
+    font-size: 10px;
+    letter-spacing: 0.2px;
+    color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .shape-filepath .fp-name {
+    font-size: 13px;
+    font-weight: 540;
+    letter-spacing: -0.1px;
+    color: var(--fg);
+  }
+  .shape-filepath .fp-foot {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 12px 7px;
+    border-top: 1px solid var(--border);
+    background: var(--surface-2);
+    font-size: 9.5px;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .shape-filepath .fp-foot .sep { opacity: .5; }
+  .shape-filepath .fp-foot .right { margin-left: auto; }
+  .shape-filepath .fp-badge {
+    font-size: 9px;
+    font-weight: 540;
+    letter-spacing: 0.8px;
+    background: var(--fg);
+    color: var(--bg);
+    padding: 2px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+  .shape-filepath .fp-badge.ts  { background: #3178c6; color: #fff; }
+  .shape-filepath .fp-badge.css { background: #2965f1; color: #fff; }
+  .shape-filepath .fp-badge.md  { background: #555;    color: #fff; }
+  .shape-filepath .fp-badge.svg { background: #ff9a3c; color: #000; }
+  .shape-filepath .fp-badge.tsx { background: #61dafb; color: #000; }
+  .shape-filepath .fp-badge.json{ background: #2b2b2b; color: #fff; }
+
+  /* Panel — windowed canvas container (terminal as canonical content) */
+  .shape-panel {
+    background: var(--surface);
+    border-radius: var(--radius-md);
+    box-shadow: 0 12px 40px rgba(0,0,0,.10), 0 0 0 1px var(--border);
+    color: var(--fg);
+    display: grid;
+    grid-template-rows: 32px 1fr;
+    overflow: hidden;
+    font-family: var(--font-sans);
+    position: relative;
+  }
+  .shape-panel.is-min { grid-template-rows: 32px; }
+  .shape-panel .panel-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 0 6px 0 12px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--border);
+    height: 32px;
+    user-select: none;
+    cursor: grab;
+  }
+  .shape-panel.is-min .panel-head { border-bottom: none; }
+  .shape-panel .panel-head .panel-glyph {
+    width: 13px; height: 13px;
+    flex-shrink: 0;
+    color: var(--fg);
+    opacity: .75;
+  }
+  .shape-panel .panel-head .panel-title {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 540;
+    letter-spacing: 0.2px;
+    color: var(--fg);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    min-width: 0;
+  }
+  .shape-panel .panel-head .panel-title .dim { color: var(--muted); font-weight: 400; }
+  .shape-panel .panel-head .panel-status {
+    display: flex; align-items: center; gap: 6px;
+    margin-left: auto;
+    margin-right: 4px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--muted);
+    flex-shrink: 0;
+  }
+  .shape-panel .panel-head .panel-status .led {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: #2dc26b;
+    box-shadow: 0 0 0 2px rgba(45,194,107,0.14);
+  }
+  .shape-panel .panel-head .panel-status.idle .led {
+    background: var(--border-strong);
+    box-shadow: none;
+  }
+  .shape-panel .panel-actions {
+    display: flex; align-items: center; gap: 1px;
+    flex-shrink: 0;
+  }
+  .shape-panel .panel-btn {
+    width: 22px; height: 22px;
+    display: grid; place-items: center;
+    border: none;
+    background: transparent;
+    border-radius: var(--radius-sm);
+    color: var(--muted);
+    cursor: pointer;
+    padding: 0;
+  }
+  .shape-panel .panel-btn:hover {
+    background: var(--glass-darker);
+    color: var(--fg);
+  }
+  .shape-panel .panel-btn.is-active {
+    background: var(--glass-darker);
+    color: var(--fg);
+  }
+  .shape-panel .panel-btn:focus-visible {
+    outline: 1px dashed var(--accent);
+    outline-offset: 1px;
+  }
+  .shape-panel .panel-btn.close:hover {
+    background: #e5484d;
+    color: #fff;
+  }
+  .shape-panel .panel-body {
+    background: #0d0e10;
+    color: #e6e6e6;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    letter-spacing: 0;
+    padding: 12px 14px 14px;
+    overflow: hidden;
+    position: relative;
+  }
+  .shape-panel .term-line { display: block; white-space: pre; }
+  .shape-panel .term-line + .term-line { margin-top: 0; }
+  .shape-panel .term-line.gap { height: .55em; }
+  .shape-panel .term-line .ps-path   { color: #75b6ff; }
+  .shape-panel .term-line .ps-branch { color: #b894ff; }
+  .shape-panel .term-line .ps-arrow  { color: #2dc26b; }
+  .shape-panel .term-line .ps-meta   { color: #6e6e6e; }
+  .shape-panel .term-line .out       { color: #d6d6d6; }
+  .shape-panel .term-line .out-dim   { color: #6e6e6e; }
+  .shape-panel .term-line .ok        { color: #2dc26b; }
+  .shape-panel .term-line .warn      { color: #ffc857; }
+  .shape-panel .term-line .url       { color: #4a9eff; text-decoration: none; }
+  .shape-panel .term-cursor {
+    display: inline-block;
+    width: 7px; height: .92em;
+    background: #e6e6e6;
+    vertical-align: -1px;
+    animation: term-blink 1.05s steps(2) infinite;
+  }
+  @keyframes term-blink { 50% { background: transparent; } }
+
+  /* Settings popover (anchored to ⋯) */
+  .panel-menu {
+    position: absolute;
+    top: 34px;
+    right: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    min-width: 184px;
+    padding: 4px;
+    z-index: 5;
+    font-family: var(--font-sans);
+  }
+  .panel-menu .item {
+    display: flex; align-items: center;
+    height: 26px;
+    padding: 0 8px;
+    font-size: 12px;
+    letter-spacing: -0.1px;
+    color: var(--fg);
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .panel-menu .item .hint {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.3px;
+    color: var(--muted);
+  }
+  .panel-menu .item:hover { background: var(--surface-2); }
+  .panel-menu .item.danger { color: #e5484d; }
+  .panel-menu .sep {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 2px;
+  }
+
+  /* size shells (so each variant can pin a real canvas size) */
+  .size { display: block; }
+  .size-cap-default { width: 300px; height: 92px; }
+  .size-cap-short   { width: 240px; height: 64px; }
+  .size-cap-wide    { width: 360px; height: 116px; }
+  .size-doc-hero    { width: 620px; height: 360px; }
+  .size-doc-small   { width: 360px; height: 260px; }
+  .size-fp          { width: 260px; height: 88px; }
+  .size-panel-default { width: 540px; height: 300px; }
+  .size-panel-min     { width: 360px; height: 32px; }
+  .size-panel-max     { width: 760px; height: 440px; }
+
+  /* page footer */
+  .page-foot {
+    padding: 24px 48px 32px;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    display: flex; justify-content: space-between; gap: 24px;
+  }
+</style>
+</head>
+<body>
+
+<header class="page-header">
+  <div>
+    <div class="brand"><span class="mark"></span>gtmux</div>
+    <h1>Canvas item components</h1>
+    <p class="deck">Four content types that live <em>on</em> the canvas — annotation, document, file reference, and panel (terminal). Spec-grade reference for the implementation agent.</p>
+  </div>
+  <div style="display:flex; align-items:flex-end; gap:24px;">
+    <div class="meta">
+      Version <b>0.4</b><br/>
+      Updated <b>2026-05-16</b><br/>
+      Source <b>index.html</b>
+    </div>
+    <button class="theme-toggle" id="theme-toggle" title="Toggle page theme" aria-label="Toggle page theme">
+      <svg id="theme-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+        <circle cx="8" cy="8" r="3"/>
+        <path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.5 3.5l1 1M11.5 11.5l1 1M3.5 12.5l1-1M11.5 4.5l1-1"/>
+      </svg>
+    </button>
+  </div>
+</header>
+
+<!-- ================================================================
+     01 · CAPTION
+     ================================================================ -->
+<section class="section" id="caption">
+  <div class="section-head">
+    <div class="section-num">01 · Caption</div>
+    <div>
+      <h2 class="section-title">Caption</h2>
+      <p class="section-purpose">Pinned annotation block — used to tag a shape, sketch, or region with a figure number and a short editorial note. Accent rail on the left ties it visually to whatever it annotates.</p>
+    </div>
+    <div class="section-jump">type: <b>caption</b></div>
+  </div>
+
+  <div class="preview-row">
+    <div class="stage">
+      <span class="stage-label">Light</span>
+      <div class="size size-cap-default">
+        <div class="shape-caption">
+          <div class="cap-head">
+            <span class="dot"></span><b>Fig. 02</b> · Ideation sketch
+            <span class="ts">2m · JK</span>
+          </div>
+          <div class="cap-body">Early exploration of the onboarding flow — letting users touch the canvas before any auth gating.</div>
+        </div>
+      </div>
+    </div>
+    <div class="stage dark theme-dark">
+      <span class="stage-label">Dark</span>
+      <div class="size size-cap-default">
+        <div class="shape-caption">
+          <div class="cap-head">
+            <span class="dot"></span><b>Fig. 02</b> · Ideation sketch
+            <span class="ts">2m · JK</span>
+          </div>
+          <div class="cap-body">Early exploration of the onboarding flow — letting users touch the canvas before any auth gating.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="body-row">
+    <div class="anatomy">
+      <div class="anatomy-title">Anatomy</div>
+      <ul>
+        <li><span class="num">1</span><div><b>Accent rail</b> — 2px left border in <code>--accent</code>. Replaces a full border so the card reads as <em>attached</em>, not floating.</div></li>
+        <li><span class="num">2</span><div><b>Cap-head</b> — mono uppercase, <code>9.5px / 0.6px tracking</code>. Pattern: <code>● Fig. NN · Topic   author/time</code>.</div></li>
+        <li><span class="num">3</span><div><b>Dot</b> — 6px accent dot, signals "this is annotation, not content".</div></li>
+        <li><span class="num">4</span><div><b>Bold label</b> — figure number / short noun. <code>--fg / weight 540</code>.</div></li>
+        <li><span class="num">5</span><div><b>Trailing meta</b> — pushed right with <code>margin-left:auto</code>. Author initials, edit time, or both.</div></li>
+        <li><span class="num">6</span><div><b>Cap-body</b> — sans, 12px / 1.4. One paragraph. If you need two — switch to a Document.</div></li>
+      </ul>
+    </div>
+
+    <div class="props">
+      <h3>Tokens</h3>
+      <table class="table">
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Surface</td><td class="v">--surface · radius 4px</td></tr>
+          <tr><td class="k">Border</td><td class="v">1px --border + 2px --accent left</td></tr>
+          <tr><td class="k">Shadow</td><td class="v">--shadow-sm</td></tr>
+          <tr><td class="k">Padding</td><td class="v">10px 12px 12px</td></tr>
+          <tr><td class="k">Gap (head ↔ body)</td><td class="v">6px (flex column)</td></tr>
+          <tr><td class="k">Head font</td><td class="v">--font-mono · 9.5px · 0.6px · uppercase</td></tr>
+          <tr><td class="k">Head color</td><td class="v">--muted (label: --fg / 540)</td></tr>
+          <tr><td class="k">Body font</td><td class="v">--font-sans · 12px / 1.4 / -0.1px</td></tr>
+          <tr><td class="k">Body color</td><td class="v">--fg</td></tr>
+          <tr><td class="k">Min width / height</td><td class="v">220px / 60px (recommended)</td></tr>
+        </tbody>
+      </table>
+
+      <h3 style="margin-top:8px">When to use</h3>
+      <table class="table">
+        <tbody>
+          <tr><td class="k">Use it for</td><td class="v">Pinning a comment to a shape, group, or coordinate. Margin notes. Review markup.</td></tr>
+          <tr><td class="k">Don't use for</td><td class="v">Long-form text (→ Document). Tool tips (→ inspector). File references (→ File path).</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="variants">
+    <div class="variants-title">Variants</div>
+    <div class="variant-grid cap">
+      <div class="variant">
+        <span class="label">Default — figure tag</span>
+        <div class="frame"><div class="size size-cap-default">
+          <div class="shape-caption">
+            <div class="cap-head"><span class="dot"></span><b>Fig. 02</b> · Ideation sketch <span class="ts">2m · JK</span></div>
+            <div class="cap-body">Early exploration of the onboarding flow — letting users touch the canvas before any auth gating.</div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">Short — symbol token</span>
+        <div class="frame"><div class="size size-cap-short">
+          <div class="shape-caption">
+            <div class="cap-head"><span class="dot"></span><b>Fig. 03</b> · Pentagon <span class="ts">MR</span></div>
+            <div class="cap-body">Verified / safety state across all surfaces.</div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">Wide — multi-line note</span>
+        <div class="frame"><div class="size size-cap-wide">
+          <div class="shape-caption">
+            <div class="cap-head"><span class="dot"></span><b>Note 01</b> · Drop-off zone <span class="ts">4h · review</span></div>
+            <div class="cap-body">Heat map shows 42% of users abandon before this step. Test removing the second confirmation entirely — most testers said the first one was already redundant.</div>
+          </div>
+        </div></div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:32px">
+    <pre class="code"><span class="c">&lt;!-- canvas item · type=caption · 300×92 --&gt;</span>
+&lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"canvas-item"</span> <span class="a">data-id</span>=<span class="s">"caption-1"</span> <span class="a">style</span>=<span class="s">"left:-160px; top:158px; width:300px; height:92px"</span>&gt;
+  &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"shape-caption"</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"cap-head"</span>&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"dot"</span>&gt;&lt;/<span class="t">span</span>&gt;&lt;<span class="t">b</span>&gt;Fig. 02&lt;/<span class="t">b</span>&gt; · Ideation sketch
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"ts"</span>&gt;2m · JK&lt;/<span class="t">span</span>&gt;
+    &lt;/<span class="t">div</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"cap-body"</span>&gt;Early exploration of the onboarding flow — …&lt;/<span class="t">div</span>&gt;
+  &lt;/<span class="t">div</span>&gt;
+&lt;/<span class="t">div</span>&gt;</pre>
+  </div>
+</section>
+
+<!-- ================================================================
+     02 · DOCUMENT
+     ================================================================ -->
+<section class="section" id="document">
+  <div class="section-head">
+    <div class="section-num">02 · Document</div>
+    <div>
+      <h2 class="section-title">Document</h2>
+      <p class="section-purpose">A page-like card holding a writable brief, spec, or note. Looks and feels like an opened file — file header on top, paginated meta footer below.</p>
+    </div>
+    <div class="section-jump">type: <b>document</b></div>
+  </div>
+
+  <div class="preview-row">
+    <div class="stage">
+      <span class="stage-label">Light</span>
+      <div class="size size-doc-hero">
+        <div class="shape-document">
+          <div class="doc-head">
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><path d="M3 1.5h4.5L9.5 3.5V10.5H3V1.5z"/><path d="M7.5 1.5V3.5h2"/></svg>
+            <span class="filename">onboarding-rewrite.md</span>
+            <span class="sep">·</span>
+            <span>2.4 KB</span>
+            <span class="right">Edited 2m ago</span>
+          </div>
+          <div class="doc-body">
+            <div class="eyebrow">Brief · Internal</div>
+            <h2>Onboarding rewrite — Q2</h2>
+            <p>Goal: cut drop-off between first-launch and the first saved file from 42% to under 20%. Reduce step count from 7 to 3, and let the user touch the canvas before any auth.</p>
+            <p>Constraints: must reuse the existing identity stack, must not break the SSO partner flow, and must ship before the brand refresh lands in May.</p>
+          </div>
+          <div class="doc-foot">
+            <span class="page-dot on"></span><span class="page-dot"></span>
+            <span>Page 1 of 2</span>
+            <span class="right">md · UTF-8 · LF</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="stage dark theme-dark">
+      <span class="stage-label">Dark</span>
+      <div class="size size-doc-hero">
+        <div class="shape-document">
+          <div class="doc-head">
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><path d="M3 1.5h4.5L9.5 3.5V10.5H3V1.5z"/><path d="M7.5 1.5V3.5h2"/></svg>
+            <span class="filename">onboarding-rewrite.md</span>
+            <span class="sep">·</span>
+            <span>2.4 KB</span>
+            <span class="right">Edited 2m ago</span>
+          </div>
+          <div class="doc-body">
+            <div class="eyebrow">Brief · Internal</div>
+            <h2>Onboarding rewrite — Q2</h2>
+            <p>Goal: cut drop-off between first-launch and the first saved file from 42% to under 20%. Reduce step count from 7 to 3, and let the user touch the canvas before any auth.</p>
+            <p>Constraints: must reuse the existing identity stack, must not break the SSO partner flow, and must ship before the brand refresh lands in May.</p>
+          </div>
+          <div class="doc-foot">
+            <span class="page-dot on"></span><span class="page-dot"></span>
+            <span>Page 1 of 2</span>
+            <span class="right">md · UTF-8 · LF</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="body-row">
+    <div class="anatomy">
+      <div class="anatomy-title">Anatomy</div>
+      <ul>
+        <li><span class="num">1</span><div><b>Doc-head (30px)</b> — file strip. <code>--surface-2</code> bar with file icon, filename, separator, size; <code>Edited Nm ago</code> pinned right.</div></li>
+        <li><span class="num">2</span><div><b>Filename</b> — mono, weight 540, <code>--fg</code>. Always shows extension.</div></li>
+        <li><span class="num">3</span><div><b>Doc-body</b> — generous padding <code>28px 36px 24px</code>. Hosts content blocks.</div></li>
+        <li><span class="num">4</span><div><b>Eyebrow</b> — mono uppercase. Section / category. 18px margin below.</div></li>
+        <li><span class="num">5</span><div><b>H2</b> — sans, 26px / weight 540 / -0.6px tracking. Maximum one per document.</div></li>
+        <li><span class="num">6</span><div><b>Body p</b> — sans, 12.5px / 1.55, <code>--muted</code>. 8px between paragraphs.</div></li>
+        <li><span class="num">7</span><div><b>Doc-foot (26px)</b> — page-dots indicator + count + <code>md · UTF-8 · LF</code> right.</div></li>
+      </ul>
+    </div>
+
+    <div class="props">
+      <h3>Tokens</h3>
+      <table class="table">
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Frame</td><td class="v">grid 30px / 1fr / 26px · radius 6px</td></tr>
+          <tr><td class="k">Surface</td><td class="v">--surface</td></tr>
+          <tr><td class="k">Shadow</td><td class="v">0 8px 32px rgba(0,0,0,.06) + 0 0 0 1px --border</td></tr>
+          <tr><td class="k">Head / Foot bg</td><td class="v">--surface-2 · mono 10px / 0.4px</td></tr>
+          <tr><td class="k">Head / Foot divider</td><td class="v">1px --border</td></tr>
+          <tr><td class="k">Body padding</td><td class="v">28px 36px 24px</td></tr>
+          <tr><td class="k">Eyebrow</td><td class="v">mono 10px / 0.6px / uppercase / --muted</td></tr>
+          <tr><td class="k">H2</td><td class="v">sans 26px / 540 / -0.6px / 1.15</td></tr>
+          <tr><td class="k">P</td><td class="v">sans 12.5px / 1.55 / -0.1px / --muted</td></tr>
+          <tr><td class="k">Page dot</td><td class="v">5px circle · --border-strong → --fg on active</td></tr>
+          <tr><td class="k">Min size</td><td class="v">320 × 220 (small), 620 × 360 (hero)</td></tr>
+        </tbody>
+      </table>
+
+      <h3 style="margin-top:8px">When to use</h3>
+      <table class="table">
+        <tbody>
+          <tr><td class="k">Use it for</td><td class="v">Briefs, specs, meeting notes, anything that wants to feel like an opened file. Editable in place.</td></tr>
+          <tr><td class="k">Don't use for</td><td class="v">A single sentence (→ Caption). A file reference without content (→ File path).</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="variants">
+    <div class="variants-title">Variants</div>
+    <div class="variant-grid doc">
+      <div class="variant">
+        <span class="label">Small — note (360×260)</span>
+        <div class="frame"><div class="size size-doc-small">
+          <div class="shape-document">
+            <div class="doc-head">
+              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><path d="M3 1.5h4.5L9.5 3.5V10.5H3V1.5z"/><path d="M7.5 1.5V3.5h2"/></svg>
+              <span class="filename">decisions.md</span><span class="sep">·</span><span>0.8 KB</span>
+              <span class="right">Today</span>
+            </div>
+            <div class="doc-body">
+              <div class="eyebrow">Decision log</div>
+              <h2 style="font-size:20px; margin-bottom:8px">Auth before canvas?</h2>
+              <p>Resolved: <b style="color:var(--fg)">no</b>. Let users try the canvas before signing in — gate only on save / share.</p>
+            </div>
+            <div class="doc-foot">
+              <span class="page-dot on"></span><span>Page 1 of 1</span>
+              <span class="right">md</span>
+            </div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">Empty — placeholder doc</span>
+        <div class="frame"><div class="size size-doc-small">
+          <div class="shape-document">
+            <div class="doc-head">
+              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><path d="M3 1.5h4.5L9.5 3.5V10.5H3V1.5z"/><path d="M7.5 1.5V3.5h2"/></svg>
+              <span class="filename" style="color:var(--muted)">Untitled.md</span><span class="sep">·</span><span>—</span>
+              <span class="right">Just now</span>
+            </div>
+            <div class="doc-body" style="display:grid; place-items:center; padding:24px">
+              <div style="color:var(--muted); font-size:13px; letter-spacing:-.1px">
+                <span style="font-family:var(--font-mono); font-size:10px; letter-spacing:.6px; text-transform:uppercase; display:block; margin-bottom:6px">Empty</span>
+                Click to start writing.
+              </div>
+            </div>
+            <div class="doc-foot">
+              <span class="page-dot"></span><span>0 words</span>
+              <span class="right">md</span>
+            </div>
+          </div>
+        </div></div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:32px">
+    <pre class="code"><span class="c">&lt;!-- canvas item · type=document · 620×360 --&gt;</span>
+&lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"canvas-item"</span> <span class="a">data-id</span>=<span class="s">"doc-1"</span> <span class="a">style</span>=<span class="s">"left:60px; top:60px; width:620px; height:360px"</span>&gt;
+  &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"shape-document"</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"doc-head"</span>&gt;
+      &lt;<span class="t">svg</span> …file-icon… /&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"filename"</span>&gt;onboarding-rewrite.md&lt;/<span class="t">span</span>&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"sep"</span>&gt;·&lt;/<span class="t">span</span>&gt;&lt;<span class="t">span</span>&gt;2.4 KB&lt;/<span class="t">span</span>&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"right"</span>&gt;Edited 2m ago&lt;/<span class="t">span</span>&gt;
+    &lt;/<span class="t">div</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"doc-body"</span>&gt;
+      &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"eyebrow"</span>&gt;Brief · Internal&lt;/<span class="t">div</span>&gt;
+      &lt;<span class="t">h2</span>&gt;Onboarding rewrite — Q2&lt;/<span class="t">h2</span>&gt;
+      &lt;<span class="t">p</span>&gt;Goal: cut drop-off …&lt;/<span class="t">p</span>&gt;
+    &lt;/<span class="t">div</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"doc-foot"</span>&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"page-dot on"</span>&gt;&lt;/<span class="t">span</span>&gt;&lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"page-dot"</span>&gt;&lt;/<span class="t">span</span>&gt;
+      &lt;<span class="t">span</span>&gt;Page 1 of 2&lt;/<span class="t">span</span>&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"right"</span>&gt;md · UTF-8 · LF&lt;/<span class="t">span</span>&gt;
+    &lt;/<span class="t">div</span>&gt;
+  &lt;/<span class="t">div</span>&gt;
+&lt;/<span class="t">div</span>&gt;</pre>
+  </div>
+</section>
+
+<!-- ================================================================
+     03 · FILE PATH
+     ================================================================ -->
+<section class="section" id="filepath">
+  <div class="section-head">
+    <div class="section-num">03 · File path</div>
+    <div>
+      <h2 class="section-title">File path</h2>
+      <p class="section-purpose">A reference tile pointing at a source file. Reads like an editor tab — folder breadcrumb, filename, language badge, size and branch — so it stays useful when the actual file isn't open.</p>
+    </div>
+    <div class="section-jump">type: <b>filepath</b></div>
+  </div>
+
+  <div class="preview-row">
+    <div class="stage">
+      <span class="stage-label">Light</span>
+      <div style="display:grid; gap:14px;">
+        <div class="size size-fp">
+          <div class="shape-filepath">
+            <div class="fp-main">
+              <div class="fp-icon"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/><path d="M8 1.5v3h3"/></svg></div>
+              <div class="fp-meta"><div class="fp-path">src/components/auth/</div><div class="fp-name">AuthCard.tsx</div></div>
+            </div>
+            <div class="fp-foot">
+              <span class="fp-badge ts">TS</span><span>124 lines</span><span class="sep">·</span><span>4.2 KB</span><span class="right">main</span>
+            </div>
+          </div>
+        </div>
+        <div class="size size-fp">
+          <div class="shape-filepath">
+            <div class="fp-main">
+              <div class="fp-icon"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/><path d="M8 1.5v3h3"/></svg></div>
+              <div class="fp-meta"><div class="fp-path">src/styles/</div><div class="fp-name">canvas-stage.css</div></div>
+            </div>
+            <div class="fp-foot">
+              <span class="fp-badge css">CSS</span><span>96 lines</span><span class="sep">·</span><span>2.8 KB</span><span class="right">main</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="stage dark theme-dark">
+      <span class="stage-label">Dark</span>
+      <div style="display:grid; gap:14px;">
+        <div class="size size-fp">
+          <div class="shape-filepath">
+            <div class="fp-main">
+              <div class="fp-icon"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/><path d="M8 1.5v3h3"/></svg></div>
+              <div class="fp-meta"><div class="fp-path">src/components/auth/</div><div class="fp-name">AuthCard.tsx</div></div>
+            </div>
+            <div class="fp-foot">
+              <span class="fp-badge ts">TS</span><span>124 lines</span><span class="sep">·</span><span>4.2 KB</span><span class="right">main</span>
+            </div>
+          </div>
+        </div>
+        <div class="size size-fp">
+          <div class="shape-filepath">
+            <div class="fp-main">
+              <div class="fp-icon"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/><path d="M8 1.5v3h3"/></svg></div>
+              <div class="fp-meta"><div class="fp-path">src/styles/</div><div class="fp-name">canvas-stage.css</div></div>
+            </div>
+            <div class="fp-foot">
+              <span class="fp-badge css">CSS</span><span>96 lines</span><span class="sep">·</span><span>2.8 KB</span><span class="right">main</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="body-row">
+    <div class="anatomy">
+      <div class="anatomy-title">Anatomy</div>
+      <ul>
+        <li><span class="num">1</span><div><b>Fp-icon</b> — 24px glass square <code>--glass-darker</code>, generic file glyph. NOT a per-language icon — colour comes from the badge.</div></li>
+        <li><span class="num">2</span><div><b>Fp-path</b> — mono 10px <code>--muted</code>. Folder breadcrumb ending with <code>/</code>. Truncates with ellipsis.</div></li>
+        <li><span class="num">3</span><div><b>Fp-name</b> — mono 13px / 540 <code>--fg</code>. Always includes the extension.</div></li>
+        <li><span class="num">4</span><div><b>Fp-foot</b> — <code>--surface-2</code> strip with 1px top border, mono 9.5px / 0.5px / uppercase.</div></li>
+        <li><span class="num">5</span><div><b>Fp-badge</b> — language pill, per-lang color (TS #3178c6, CSS #2965f1, MD #555, SVG #ff9a3c, TSX #61dafb, JSON #2b2b2b).</div></li>
+        <li><span class="num">6</span><div><b>Trailing meta</b> — <code>NN lines · NNN KB</code>, branch name pinned right.</div></li>
+      </ul>
+    </div>
+
+    <div class="props">
+      <h3>Tokens</h3>
+      <table class="table">
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Frame</td><td class="v">grid 1fr / auto · radius 6px · 1px --border</td></tr>
+          <tr><td class="k">Family</td><td class="v">--font-mono throughout</td></tr>
+          <tr><td class="k">Main padding</td><td class="v">11px 12px 10px</td></tr>
+          <tr><td class="k">Main gap</td><td class="v">10px (icon ↔ meta)</td></tr>
+          <tr><td class="k">Icon</td><td class="v">24×24 · radius 4px · --glass-darker</td></tr>
+          <tr><td class="k">Path</td><td class="v">10px · 0.2px · --muted · ellipsis</td></tr>
+          <tr><td class="k">Name</td><td class="v">13px · 540 · -0.1px · --fg</td></tr>
+          <tr><td class="k">Foot padding</td><td class="v">6px 12px 7px · 1px top --border</td></tr>
+          <tr><td class="k">Foot font</td><td class="v">9.5px · 0.5px · uppercase · --muted</td></tr>
+          <tr><td class="k">Badge</td><td class="v">9px · 540 · 0.8px · radius 3px · per-lang bg</td></tr>
+          <tr><td class="k">Recommended size</td><td class="v">260 × 88</td></tr>
+        </tbody>
+      </table>
+
+      <h3 style="margin-top:8px">When to use</h3>
+      <table class="table">
+        <tbody>
+          <tr><td class="k">Use it for</td><td class="v">Linking the canvas to a source file. Annotation that references code. Hand-off tiles.</td></tr>
+          <tr><td class="k">Don't use for</td><td class="v">Showing file content (→ Document). Long file lists (→ list view in right panel).</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="variants">
+    <div class="variants-title">Language badge variants</div>
+    <div class="variant-grid fp">
+      <div class="variant">
+        <span class="label">TS · TypeScript</span>
+        <div class="frame"><div class="size size-fp">
+          <div class="shape-filepath">
+            <div class="fp-main">
+              <div class="fp-icon"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/><path d="M8 1.5v3h3"/></svg></div>
+              <div class="fp-meta"><div class="fp-path">src/lib/canvas/</div><div class="fp-name">store.ts</div></div>
+            </div>
+            <div class="fp-foot"><span class="fp-badge ts">TS</span><span>312 lines</span><span class="sep">·</span><span>9.1 KB</span><span class="right">main</span></div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">TSX · React</span>
+        <div class="frame"><div class="size size-fp">
+          <div class="shape-filepath">
+            <div class="fp-main">
+              <div class="fp-icon"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/><path d="M8 1.5v3h3"/></svg></div>
+              <div class="fp-meta"><div class="fp-path">app/(canvas)/</div><div class="fp-name">CanvasStage.tsx</div></div>
+            </div>
+            <div class="fp-foot"><span class="fp-badge tsx">TSX</span><span>248 lines</span><span class="sep">·</span><span>7.4 KB</span><span class="right">feat/canvas</span></div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">MD · Markdown</span>
+        <div class="frame"><div class="size size-fp">
+          <div class="shape-filepath">
+            <div class="fp-main">
+              <div class="fp-icon"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/><path d="M8 1.5v3h3"/></svg></div>
+              <div class="fp-meta"><div class="fp-path">docs/</div><div class="fp-name">SPEC.md</div></div>
+            </div>
+            <div class="fp-foot"><span class="fp-badge md">MD</span><span>318 lines</span><span class="sep">·</span><span>12.4 KB</span><span class="right">main</span></div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">SVG · Asset</span>
+        <div class="frame"><div class="size size-fp">
+          <div class="shape-filepath">
+            <div class="fp-main">
+              <div class="fp-icon"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/><path d="M8 1.5v3h3"/></svg></div>
+              <div class="fp-meta"><div class="fp-path">assets/icons/</div><div class="fp-name">pentagon.svg</div></div>
+            </div>
+            <div class="fp-foot"><span class="fp-badge svg">SVG</span><span>1 path</span><span class="sep">·</span><span>0.4 KB</span><span class="right">main</span></div>
+          </div>
+        </div></div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:32px">
+    <pre class="code"><span class="c">&lt;!-- canvas item · type=filepath · 260×88 --&gt;</span>
+&lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"canvas-item"</span> <span class="a">data-id</span>=<span class="s">"filepath-1"</span> <span class="a">style</span>=<span class="s">"left:720px; top:90px; width:280px; height:88px"</span>&gt;
+  &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"shape-filepath"</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"fp-main"</span>&gt;
+      &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"fp-icon"</span>&gt;&lt;<span class="t">svg</span> …file-glyph… /&gt;&lt;/<span class="t">div</span>&gt;
+      &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"fp-meta"</span>&gt;
+        &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"fp-path"</span>&gt;src/components/auth/&lt;/<span class="t">div</span>&gt;
+        &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"fp-name"</span>&gt;AuthCard.tsx&lt;/<span class="t">div</span>&gt;
+      &lt;/<span class="t">div</span>&gt;
+    &lt;/<span class="t">div</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"fp-foot"</span>&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"fp-badge ts"</span>&gt;TS&lt;/<span class="t">span</span>&gt;
+      &lt;<span class="t">span</span>&gt;124 lines&lt;/<span class="t">span</span>&gt;&lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"sep"</span>&gt;·&lt;/<span class="t">span</span>&gt;&lt;<span class="t">span</span>&gt;4.2 KB&lt;/<span class="t">span</span>&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"right"</span>&gt;main&lt;/<span class="t">span</span>&gt;
+    &lt;/<span class="t">div</span>&gt;
+  &lt;/<span class="t">div</span>&gt;
+&lt;/<span class="t">div</span>&gt;</pre>
+  </div>
+</section>
+
+<!-- ================================================================
+     04 · PANEL (TERMINAL)
+     ================================================================ -->
+<section class="section" id="panel">
+  <div class="section-head">
+    <div class="section-num">04 · Panel</div>
+    <div>
+      <h2 class="section-title">Panel <span style="color:var(--muted); font-weight:330">— Terminal</span></h2>
+      <p class="section-purpose">A windowed container for live content. Renders its own chrome (title · status · min/max/settings/close) and hosts a fullscreen-dark terminal as canonical content. Behaves like a movable window on the canvas.</p>
+    </div>
+    <div class="section-jump">type: <b>panel</b></div>
+  </div>
+
+  <div class="preview-row">
+    <div class="stage">
+      <span class="stage-label">Light · default</span>
+      <div class="size size-panel-default">
+        <div class="shape-panel">
+          <div class="panel-head">
+            <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/>
+              <path d="M3 5l1.8 1.4L3 7.8"/><path d="M6 8.4h4"/>
+            </svg>
+            <span class="panel-title">zsh <span class="dim">— gtmux/canvas</span></span>
+            <span class="panel-status"><span class="led"></span>running</span>
+            <div class="panel-actions">
+              <button class="panel-btn" title="Minimize" aria-label="Minimize">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 8.5h6"/></svg>
+              </button>
+              <button class="panel-btn" title="Maximize" aria-label="Maximize">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/></svg>
+              </button>
+              <button class="panel-btn" title="More" aria-label="More">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="2.4" cy="6" r="1"/><circle cx="6" cy="6" r="1"/><circle cx="9.6" cy="6" r="1"/></svg>
+              </button>
+              <button class="panel-btn close" title="Close" aria-label="Close">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <span class="term-line"><span class="ps-path">~/dev/gtmux</span><span class="ps-meta">  on </span><span class="ps-branch">main</span><span class="ps-meta">  · 2m ago</span></span>
+            <span class="term-line"><span class="ps-arrow">❯</span> <span class="out">pnpm run dev</span></span>
+            <span class="term-line gap"></span>
+            <span class="term-line"><span class="out-dim">&gt;</span> <span class="out">gtmux@0.3.0 dev</span></span>
+            <span class="term-line"><span class="out-dim">&gt;</span> <span class="out">next dev --turbopack</span></span>
+            <span class="term-line gap"></span>
+            <span class="term-line"><span class="out-dim">▲</span> <span class="out">Next.js 15.1.6 </span><span class="out-dim">(Turbopack)</span></span>
+            <span class="term-line"><span class="out-dim">  - Local:    </span><span class="url">http://localhost:3000</span></span>
+            <span class="term-line"><span class="out-dim">  - Network:  </span><span class="url">http://192.168.1.42:3000</span></span>
+            <span class="term-line gap"></span>
+            <span class="term-line"><span class="ok">✓</span> <span class="out">Ready in 1.4s</span></span>
+            <span class="term-line"><span class="ps-arrow">❯</span> <span class="term-cursor"></span></span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="stage dark theme-dark">
+      <span class="stage-label">Dark · default</span>
+      <div class="size size-panel-default">
+        <div class="shape-panel">
+          <div class="panel-head">
+            <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/>
+              <path d="M3 5l1.8 1.4L3 7.8"/><path d="M6 8.4h4"/>
+            </svg>
+            <span class="panel-title">zsh <span class="dim">— gtmux/canvas</span></span>
+            <span class="panel-status"><span class="led"></span>running</span>
+            <div class="panel-actions">
+              <button class="panel-btn" title="Minimize" aria-label="Minimize">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 8.5h6"/></svg>
+              </button>
+              <button class="panel-btn" title="Maximize" aria-label="Maximize">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/></svg>
+              </button>
+              <button class="panel-btn" title="More" aria-label="More">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="2.4" cy="6" r="1"/><circle cx="6" cy="6" r="1"/><circle cx="9.6" cy="6" r="1"/></svg>
+              </button>
+              <button class="panel-btn close" title="Close" aria-label="Close">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <span class="term-line"><span class="ps-path">~/dev/gtmux</span><span class="ps-meta">  on </span><span class="ps-branch">main</span><span class="ps-meta">  · 2m ago</span></span>
+            <span class="term-line"><span class="ps-arrow">❯</span> <span class="out">pnpm run dev</span></span>
+            <span class="term-line gap"></span>
+            <span class="term-line"><span class="out-dim">&gt;</span> <span class="out">gtmux@0.3.0 dev</span></span>
+            <span class="term-line"><span class="out-dim">&gt;</span> <span class="out">next dev --turbopack</span></span>
+            <span class="term-line gap"></span>
+            <span class="term-line"><span class="out-dim">▲</span> <span class="out">Next.js 15.1.6 </span><span class="out-dim">(Turbopack)</span></span>
+            <span class="term-line"><span class="out-dim">  - Local:    </span><span class="url">http://localhost:3000</span></span>
+            <span class="term-line"><span class="out-dim">  - Network:  </span><span class="url">http://192.168.1.42:3000</span></span>
+            <span class="term-line gap"></span>
+            <span class="term-line"><span class="ok">✓</span> <span class="out">Ready in 1.4s</span></span>
+            <span class="term-line"><span class="ps-arrow">❯</span> <span class="term-cursor"></span></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="body-row">
+    <div class="anatomy">
+      <div class="anatomy-title">Anatomy</div>
+      <ul>
+        <li><span class="num">1</span><div><b>Frame</b> — <code>--surface</code>, radius 6px, soft shadow + 1px <code>--border</code> ring. Drags by the header. <code>overflow: hidden</code> clips terminal body to the frame.</div></li>
+        <li><span class="num">2</span><div><b>Panel head (32px)</b> — <code>--surface-2</code> strip with 1px bottom border. Disappears when minimized. Always 32px tall, never grows.</div></li>
+        <li><span class="num">3</span><div><b>Panel glyph (13px)</b> — generic content icon (terminal here). One per content kind; reuses the layer-tree icon.</div></li>
+        <li><span class="num">4</span><div><b>Title</b> — mono 11px / weight 540 / 0.2px tracking. Pattern: <code>shell <span style="color:var(--muted)">— context</span></code>. Truncates with ellipsis.</div></li>
+        <li><span class="num">5</span><div><b>Status</b> — <code>margin-left: auto</code> pushes it right. 6px LED + mono 9px uppercase label. <code>running</code> (green), <code>idle</code> (grey), <code>err</code> (red).</div></li>
+        <li><span class="num">6</span><div><b>Action cluster</b> — 22×22 ghost buttons, 1px gap. Order is fixed: <b>min · max · ⋯ · close</b>. Hover: <code>--glass-darker</code> tint. Close hover flips to <code>#e5484d</code>.</div></li>
+        <li><span class="num">7</span><div><b>Panel body</b> — terminal background <code>#0d0e10</code>, foreground <code>#e6e6e6</code>. <em>Theme-fixed</em> — dark even when the page is light. Mono 11.5px / 1.55. Padding 12 14 14.</div></li>
+        <li><span class="num">8</span><div><b>Prompt line</b> — path (<code>#75b6ff</code>) · branch (<code>#b894ff</code>) · meta (<code>#6e6e6e</code>), then <code>❯</code> (<code>#2dc26b</code>) + command. Cursor block on the last line.</div></li>
+      </ul>
+    </div>
+
+    <div class="props">
+      <h3>Tokens</h3>
+      <table class="table">
+        <thead><tr><th>Property</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Frame</td><td class="v">grid 32px / 1fr · radius 6px</td></tr>
+          <tr><td class="k">Surface</td><td class="v">--surface</td></tr>
+          <tr><td class="k">Shadow</td><td class="v">0 12px 40px rgba(0,0,0,.10) + 0 0 0 1px --border</td></tr>
+          <tr><td class="k">Head bg</td><td class="v">--surface-2 · 1px bottom --border</td></tr>
+          <tr><td class="k">Head padding</td><td class="v">0 6px 0 12px</td></tr>
+          <tr><td class="k">Title</td><td class="v">mono 11px · 540 · 0.2px · --fg (dim: --muted)</td></tr>
+          <tr><td class="k">Status font</td><td class="v">mono 9px · 0.6px · uppercase · --muted</td></tr>
+          <tr><td class="k">Status LED</td><td class="v">6px circle · #2dc26b run / --border-strong idle</td></tr>
+          <tr><td class="k">Action button</td><td class="v">22×22 · radius 4px · ghost / glass-darker hover</td></tr>
+          <tr><td class="k">Close hover</td><td class="v">bg #e5484d · fg #fff</td></tr>
+          <tr><td class="k">Body bg / fg</td><td class="v">#0d0e10 / #e6e6e6 (theme-fixed)</td></tr>
+          <tr><td class="k">Body font</td><td class="v">--font-mono · 11.5px / 1.55</td></tr>
+          <tr><td class="k">Body padding</td><td class="v">12px 14px 14px</td></tr>
+          <tr><td class="k">Cursor</td><td class="v">7px × .92em block · blink 1.05s steps(2)</td></tr>
+          <tr><td class="k">Min size</td><td class="v">360 × 32 (minimized) · 420 × 220 (default)</td></tr>
+          <tr><td class="k">Recommended</td><td class="v">540 × 300 (default) · 760 × 440 (max)</td></tr>
+        </tbody>
+      </table>
+
+      <h3 style="margin-top:8px">States</h3>
+      <table class="table">
+        <tbody>
+          <tr><td class="k">Default</td><td class="v">grid 32px / 1fr · header + body</td></tr>
+          <tr><td class="k">Minimized</td><td class="v"><code>.is-min</code> → grid 32px only · no body · no head bottom border</td></tr>
+          <tr><td class="k">Maximized</td><td class="v">Same chrome · grows to canvas frame extents · max icon swaps to restore glyph</td></tr>
+          <tr><td class="k">Menu open</td><td class="v">⋯ button <code>.is-active</code> · <code>.panel-menu</code> absolute child anchored to header, top 34px / right 8px</td></tr>
+        </tbody>
+      </table>
+
+      <h3 style="margin-top:8px">When to use</h3>
+      <table class="table">
+        <tbody>
+          <tr><td class="k">Use it for</td><td class="v">Live process output on the canvas — terminal, build log, REPL, file watcher. Anything that needs window-like controls.</td></tr>
+          <tr><td class="k">Don't use for</td><td class="v">Static file references (→ File path). Editable prose (→ Document). Anchored comments (→ Caption).</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="variants">
+    <div class="variants-title">States</div>
+    <div class="variant-grid doc">
+      <div class="variant">
+        <span class="label">Minimized — header only (360 × 32)</span>
+        <div class="frame"><div class="size size-panel-min">
+          <div class="shape-panel is-min">
+            <div class="panel-head">
+              <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/><path d="M3 5l1.8 1.4L3 7.8"/><path d="M6 8.4h4"/>
+              </svg>
+              <span class="panel-title">zsh <span class="dim">— gtmux/canvas</span></span>
+              <span class="panel-status"><span class="led"></span>running</span>
+              <div class="panel-actions">
+                <button class="panel-btn" title="Restore" aria-label="Restore">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 5.5h6"/><path d="M3 8.5h6"/></svg>
+                </button>
+                <button class="panel-btn" title="Maximize" aria-label="Maximize">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/></svg>
+                </button>
+                <button class="panel-btn" title="More" aria-label="More">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="2.4" cy="6" r="1"/><circle cx="6" cy="6" r="1"/><circle cx="9.6" cy="6" r="1"/></svg>
+                </button>
+                <button class="panel-btn close" title="Close" aria-label="Close">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">⋯ menu open</span>
+        <div class="frame"><div class="size" style="width: 360px; height: 240px;">
+          <div class="shape-panel">
+            <div class="panel-head">
+              <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/><path d="M3 5l1.8 1.4L3 7.8"/><path d="M6 8.4h4"/>
+              </svg>
+              <span class="panel-title">zsh <span class="dim">— logs</span></span>
+              <span class="panel-status"><span class="led"></span>running</span>
+              <div class="panel-actions">
+                <button class="panel-btn" title="Minimize"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 8.5h6"/></svg></button>
+                <button class="panel-btn" title="Maximize"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/></svg></button>
+                <button class="panel-btn is-active" title="More"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="2.4" cy="6" r="1"/><circle cx="6" cy="6" r="1"/><circle cx="9.6" cy="6" r="1"/></svg></button>
+                <button class="panel-btn close" title="Close"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <span class="term-line"><span class="ps-path">~/dev/gtmux</span><span class="ps-meta">  on </span><span class="ps-branch">main</span></span>
+              <span class="term-line"><span class="ps-arrow">❯</span> <span class="term-cursor"></span></span>
+            </div>
+            <div class="panel-menu">
+              <div class="item">Rename<span class="hint">F2</span></div>
+              <div class="item">Duplicate<span class="hint">⌘D</span></div>
+              <div class="sep"></div>
+              <div class="item">Clear buffer<span class="hint">⌘K</span></div>
+              <div class="item">Restart shell</div>
+              <div class="sep"></div>
+              <div class="item">Settings…</div>
+              <div class="item danger">Kill process</div>
+            </div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">Idle — empty prompt</span>
+        <div class="frame"><div class="size" style="width: 380px; height: 180px;">
+          <div class="shape-panel">
+            <div class="panel-head">
+              <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/><path d="M3 5l1.8 1.4L3 7.8"/><path d="M6 8.4h4"/>
+              </svg>
+              <span class="panel-title">zsh <span class="dim">— scratch</span></span>
+              <span class="panel-status idle"><span class="led"></span>idle</span>
+              <div class="panel-actions">
+                <button class="panel-btn" title="Minimize"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 8.5h6"/></svg></button>
+                <button class="panel-btn" title="Maximize"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/></svg></button>
+                <button class="panel-btn" title="More"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="2.4" cy="6" r="1"/><circle cx="6" cy="6" r="1"/><circle cx="9.6" cy="6" r="1"/></svg></button>
+                <button class="panel-btn close" title="Close"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <span class="term-line"><span class="ps-path">~/dev/gtmux</span><span class="ps-meta">  on </span><span class="ps-branch">main</span></span>
+              <span class="term-line"><span class="ps-arrow">❯</span> <span class="term-cursor"></span></span>
+            </div>
+          </div>
+        </div></div>
+      </div>
+
+      <div class="variant">
+        <span class="label">Maximized — 760 × 440 (shown at 0.6×)</span>
+        <div class="frame"><div style="width: 456px; height: 264px; overflow: hidden;"><div class="size size-panel-max" style="transform: scale(.6); transform-origin: top left; width: 760px; height: 440px;">
+          <div class="shape-panel">
+            <div class="panel-head">
+              <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/><path d="M3 5l1.8 1.4L3 7.8"/><path d="M6 8.4h4"/>
+              </svg>
+              <span class="panel-title">zsh <span class="dim">— gtmux/canvas (maximized)</span></span>
+              <span class="panel-status"><span class="led"></span>running</span>
+              <div class="panel-actions">
+                <button class="panel-btn" title="Minimize"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 8.5h6"/></svg></button>
+                <button class="panel-btn is-active" title="Restore">
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"><rect x="2" y="3.6" width="6.5" height="6.4" rx=".5"/><path d="M4 3.6V2.4h6.5v6.4H9"/></svg>
+                </button>
+                <button class="panel-btn" title="More"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="2.4" cy="6" r="1"/><circle cx="6" cy="6" r="1"/><circle cx="9.6" cy="6" r="1"/></svg></button>
+                <button class="panel-btn close" title="Close"><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <span class="term-line"><span class="ps-path">~/dev/gtmux</span><span class="ps-meta">  on </span><span class="ps-branch">main</span><span class="ps-meta">  · 2m ago</span></span>
+              <span class="term-line"><span class="ps-arrow">❯</span> <span class="out">pnpm test --filter canvas</span></span>
+              <span class="term-line gap"></span>
+              <span class="term-line"><span class="out-dim">  PASS </span><span class="out"> tests/canvas/viewport.spec.ts</span></span>
+              <span class="term-line"><span class="out-dim">  PASS </span><span class="out"> tests/canvas/layers.spec.ts</span></span>
+              <span class="term-line"><span class="out-dim">  PASS </span><span class="out"> tests/canvas/select.spec.ts</span></span>
+              <span class="term-line"><span class="warn">  WARN </span><span class="out-dim"> tests/canvas/freedraw.spec.ts</span></span>
+              <span class="term-line"><span class="out-dim">         skipped: pointer-events stub</span></span>
+              <span class="term-line gap"></span>
+              <span class="term-line"><span class="ok">Tests:</span><span class="out">       18 passed, 1 skipped, 19 total</span></span>
+              <span class="term-line"><span class="ok">Time:</span><span class="out">        2.114 s</span></span>
+              <span class="term-line gap"></span>
+              <span class="term-line"><span class="ps-arrow">❯</span> <span class="term-cursor"></span></span>
+            </div>
+          </div>
+        </div></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:32px">
+    <pre class="code"><span class="c">&lt;!-- canvas item · type=panel · default 540×300 · minimized 360×32 --&gt;</span>
+&lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"canvas-item"</span> <span class="a">data-id</span>=<span class="s">"panel-1"</span> <span class="a">style</span>=<span class="s">"left:120px; top:60px; width:540px; height:300px"</span>&gt;
+  &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"shape-panel"</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"panel-head"</span>&gt;
+      &lt;<span class="t">svg</span> <span class="a">class</span>=<span class="s">"panel-glyph"</span> …/&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"panel-title"</span>&gt;zsh &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"dim"</span>&gt;— gtmux/canvas&lt;/<span class="t">span</span>&gt;&lt;/<span class="t">span</span>&gt;
+      &lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"panel-status"</span>&gt;&lt;<span class="t">span</span> <span class="a">class</span>=<span class="s">"led"</span>&gt;&lt;/<span class="t">span</span>&gt;running&lt;/<span class="t">span</span>&gt;
+      &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"panel-actions"</span>&gt;
+        &lt;<span class="t">button</span> <span class="a">class</span>=<span class="s">"panel-btn"</span>      <span class="a">data-act</span>=<span class="s">"min"</span>  &gt;…&lt;/<span class="t">button</span>&gt;
+        &lt;<span class="t">button</span> <span class="a">class</span>=<span class="s">"panel-btn"</span>      <span class="a">data-act</span>=<span class="s">"max"</span>  &gt;…&lt;/<span class="t">button</span>&gt;
+        &lt;<span class="t">button</span> <span class="a">class</span>=<span class="s">"panel-btn"</span>      <span class="a">data-act</span>=<span class="s">"more"</span> &gt;…&lt;/<span class="t">button</span>&gt;
+        &lt;<span class="t">button</span> <span class="a">class</span>=<span class="s">"panel-btn close"</span> <span class="a">data-act</span>=<span class="s">"close"</span>&gt;…&lt;/<span class="t">button</span>&gt;
+      &lt;/<span class="t">div</span>&gt;
+    &lt;/<span class="t">div</span>&gt;
+    &lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"panel-body"</span>&gt; <span class="c">/* terminal content */</span> &lt;/<span class="t">div</span>&gt;
+  &lt;/<span class="t">div</span>&gt;
+&lt;/<span class="t">div</span>&gt;
+
+<span class="c">/* state · minimized */</span>
+&lt;<span class="t">div</span> <span class="a">class</span>=<span class="s">"shape-panel is-min"</span>&gt; <span class="c">/* body removed, .is-min collapses grid to 32px */</span> &lt;/<span class="t">div</span>&gt;</pre>
+  </div>
+</section>
+
+<!-- ================================================================
+     05 · SHARED RULES
+     ================================================================ -->
+<section class="section" id="rules" style="border-bottom: none">
+  <div class="section-head">
+    <div class="section-num">05 · Shared rules</div>
+    <div>
+      <h2 class="section-title">Shared rules</h2>
+      <p class="section-purpose">Apply to all three components — they sit on the same canvas and need to read as a family.</p>
+    </div>
+    <div class="section-jump">cross-cut</div>
+  </div>
+
+  <div class="body-row">
+    <div class="anatomy">
+      <div class="anatomy-title">Behaviour</div>
+      <ul>
+        <li><span class="num">A</span><div><b>Outer frame</b> — all three sit inside <code>.canvas-item</code> (absolute on the workspace). Width / height are pinned in style; the shape fills <code>100%</code>.</div></li>
+        <li><span class="num">B</span><div><b>Selection</b> — when selected, the canvas adds a 1.5px <code>--accent</code> outline around <code>.canvas-item</code>, not on the shape. Shapes don't manage selection state.</div></li>
+        <li><span class="num">C</span><div><b>Hover</b> — no per-shape hover effect. Hover state is on the canvas item wrapper (slight outline). Keeps content quiet.</div></li>
+        <li><span class="num">D</span><div><b>Theme</b> — every token is theme-reactive. Don't hard-code colours in shape styles except language badges <em>and the terminal body</em> (which is intentionally dark on both themes).</div></li>
+        <li><span class="num">E</span><div><b>Layer tree</b> — shows the <code>type</code> + <code>name</code>. Caption icon: speech-bubble. Document: doc. Filepath: doc with <code>&lt;/&gt;</code> mark.</div></li>
+        <li><span class="num">F</span><div><b>Overflow</b> — all three use <code>overflow: hidden</code>. Long copy is the author's problem, not the shape's.</div></li>
+      </ul>
+    </div>
+
+    <div class="props">
+      <h3>Layer-tree mapping</h3>
+      <table class="table">
+        <thead><tr><th>Type</th><th>Default name</th><th>Icon</th></tr></thead>
+        <tbody>
+          <tr><td class="k">caption</td><td class="v">Caption · Fig NN</td><td class="v">speech-bubble</td></tr>
+          <tr><td class="k">document</td><td class="v">Doc · filename</td><td class="v">file</td></tr>
+          <tr><td class="k">filepath</td><td class="v">filename</td><td class="v">file w/ &lt;/&gt;</td></tr>
+          <tr><td class="k">panel</td><td class="v">shell · context</td><td class="v">terminal</td></tr>
+        </tbody>
+      </table>
+
+      <h3 style="margin-top:8px">Implementation order</h3>
+      <table class="table">
+        <tbody>
+          <tr><td class="k">1.</td><td class="v">Add type to canvas-item enum + layer-tree icon map.</td></tr>
+          <tr><td class="k">2.</td><td class="v">Drop the shape CSS block from this file (verbatim).</td></tr>
+          <tr><td class="k">3.</td><td class="v">Add the toolbar button + tool data-attribute.</td></tr>
+          <tr><td class="k">4.</td><td class="v">Insert tool spawns a wrapper with default size from the table above.</td></tr>
+          <tr><td class="k">5.</td><td class="v">Right-click context menu picks up automatically (no per-type entries needed).</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<footer class="page-foot">
+  <span>gtmux · canvas item components · v0.4</span>
+  <span>source · index.html</span>
+</footer>
+
+<script>
+  // light/dark page-level toggle. only flips the page chrome — the dark stages stay dark, the light stages stay light.
+  const themeBtn = document.getElementById('theme-toggle');
+  const root = document.body;
+  const STORAGE = 'gtmux-components-theme';
+  function applyTheme(t) {
+    root.classList.toggle('page-dark', t === 'dark');
+    document.getElementById('theme-icon').innerHTML = t === 'dark'
+      ? '<path d="M13 8.5A5.5 5.5 0 0 1 7 2.5 5.5 5.5 0 1 0 13 8.5z"/>'
+      : '<circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.5 3.5l1 1M11.5 11.5l1 1M3.5 12.5l1-1M11.5 4.5l1-1"/>';
+  }
+  applyTheme(localStorage.getItem(STORAGE) || 'light');
+  themeBtn.addEventListener('click', () => {
+    const next = root.classList.contains('page-dark') ? 'light' : 'dark';
+    localStorage.setItem(STORAGE, next);
+    applyTheme(next);
+  });
+</script>
+
+</body>
+</html>

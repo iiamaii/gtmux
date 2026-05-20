@@ -1,0 +1,864 @@
+// SessionStore — session-scoped layout / viewport / M / I / maximize state.
+//
+// 정본:
+// - ADR-0019 D5 (session-scoped store: 모든 layout/viewport/M/I 는 활성 session 단위)
+// - ADR-0021 D5 (session switch 시 store reset)
+// - ADR-0018 D1 (CanvasLayout envelope — schema v2)
+// - ADR-0018 D7 + ADR-0024 D2 (z mutation 정책 — 4 액션은 별 store/util)
+// - frontend-handover §3.1 (architectural invariants — store invariant 1)
+// - frontend-handover §6 Stage 1.3
+// - CONTEXT.md 의 "Manipulation Selection (M)" / "Input Target (I)" 정의
+// - G20 amend: maximized 는 FE-only ephemeral (schema 외) — session 단위 1 item.
+//
+// Stage 1 skeleton 의 범위:
+// - Type / 구조 / 기본 mutation method 만 정의.
+// - 실제 HTTP fetch (`switchSession`) / WS frame dispatch 통합 / 기존
+//   `panels.svelte.ts` 의 server-wide → session-scoped amend 는 Stage 2~4.
+//
+// Reactivity:
+// - SvelteMap / SvelteSet — entry-level reactivity (`panels.svelte.ts` /
+//   `mux.svelte.ts` 패턴 정합).
+// - `$state` — primitive / object 의 reactive root.
+
+import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+
+import { debugCount } from '$lib/common/debugCounts';
+import { deleteItem, EtagMismatchError, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+import { historyStore } from '$lib/stores/historyStore.svelte';
+import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
+import { toastStore } from '$lib/ui/toast-store.svelte';
+import { getWebpageId, webpageHeaders } from '$lib/session/webpageId';
+import {
+  MINIMIZED_TERMINAL_PANEL_HEIGHT,
+  type CanvasItem,
+  type CanvasLayout,
+  type Viewport,
+} from '$lib/types/canvas';
+import type { Group } from '$lib/types/group';
+import type { AttachConfirmSummary } from '$lib/types/sessions';
+
+/** Active session 의 식별 정보. attach 성공 시 set, detach 시 null. */
+export interface ActiveSession {
+  /** Session name (user-facing identifier, ADR-0019). */
+  name: string;
+}
+
+/**
+ * Reattach 결과 — `attemptReattach()` 의 분기 (ADR-0019 D5.1/D5.4 + plan-0008 §4).
+ *
+ * - `success`: 200 응답 + layout fetch + sessionStore.setActiveSession/loadLayout
+ *              완료. 호출자는 본 화면 mount 진입 가능.
+ * - `confirm_required`: 200 응답이지만 `unmatched.length > 0` — BE 의 terminal
+ *              pool 에 매칭 없는 panel UUID 존재 (= server 재기동 후 모든 terminal
+ *              stale 시 가장 흔히 발생). caller (reconnectGate 등) 가 사용자에게
+ *              AttachConfirmModal 노출 — silent 흐름이 panel 만 남기고 terminal
+ *              respawn 을 건너뛰던 회귀 (2026-05-17 사용자 보고) 의 직접 fix.
+ * - `in_use`: 409. 다른 webpage 가 attach 보유.
+ * - `not_found`: 404. session 이 BE 에서 사라짐. hint 도 자동 clear 됨.
+ * - `unauthorized`: 401. cookie 만료 — caller 가 /auth redirect.
+ * - `unreachable`: 5xx / network error / AbortError 외 fetch 실패. message 동봉.
+ */
+export type ReattachResult =
+  | { kind: 'success' }
+  | { kind: 'confirm_required'; summary: AttachConfirmSummary }
+  | { kind: 'in_use'; holderPid?: number }
+  | { kind: 'not_found' }
+  | { kind: 'unauthorized' }
+  | { kind: 'unreachable'; message: string };
+
+/** Viewport 기본값 — session 없는 상태 / fresh layout 의 fallback. */
+const DEFAULT_VIEWPORT: Viewport = { x: 0, y: 0, zoom: 1 };
+
+/** `attemptReattach` 의 WS conn id stub — `WorkspaceSwitcher` 와 동일 패턴. */
+function makeWsConnId(): string {
+  return getWebpageId();
+}
+
+function normalizeLoadedItem(item: CanvasItem): CanvasItem {
+  if (
+    item.type === 'terminal' &&
+    item.minimized === true &&
+    item.h < MINIMIZED_TERMINAL_PANEL_HEIGHT
+  ) {
+    return { ...item, h: MINIMIZED_TERMINAL_PANEL_HEIGHT };
+  }
+  return item;
+}
+
+class SessionStore {
+  /** 현 webpage 가 attach 한 session. null = pre-attach / post-detach. */
+  active = $state<ActiveSession | null>(null);
+
+  /** `items[]` 의 in-memory representation — id 키 SvelteMap. */
+  items = $state(new SvelteMap<string, CanvasItem>());
+
+  /** `groups[]` 의 in-memory representation — id 키 SvelteMap. */
+  groups = $state(new SvelteMap<string, Group>());
+
+  /** Viewport (panel/zoom). 양방향 sync 대상 (Stage 7 FE-9). */
+  viewport = $state<Viewport>({ ...DEFAULT_VIEWPORT });
+
+  /**
+   * Manipulation Selection — 사용자가 제어 대상으로 잡은 Items 의 id 집합.
+   * 다중 선택. CONTEXT.md 정의. session-scoped.
+   */
+  M = $state(new SvelteSet<string>());
+
+  /**
+   * Input Target — 키보드 입력이 라우팅되는 terminal id (또는 null).
+   * 한 session 안 unique. CONTEXT.md 정의.
+   */
+  I = $state<string | null>(null);
+
+  /**
+   * FE-only ephemeral. Maximize 된 item 의 id — MaximizedItemModal 이 본 값
+   * watch 해 workspace 전체를 덮는 modal overlay 렌더링. schema 영속 X.
+   * in-flow PanelNode / NoteNode 는 그대로 마운트 유지 — modal 의 XtermHost 는
+   * dispatcher 의 multi-subscriber (ADR-0021 D1 mirror) 로 동일 paneId fan-out.
+   * 한 session 1 item. attach/switch 시 자동 null 로 reset.
+   */
+  maximizedItemId = $state<string | null>(null);
+
+  /**
+   * Focus mode (ADR-0017 §D5). FE-only ephemeral — session 단위.
+   * targetPanelId === null 이면 currently-selected M[0] 이 대상.
+   * Stage 7 G27 의 시각 효과는 후속.
+   */
+  focusMode = $state<{ enabled: boolean; targetPanelId: string | null }>({
+    enabled: false,
+    targetPanelId: null,
+  });
+
+  /**
+   * Minimize / maximize 직전 옛 geometry 의 *in-memory backup*. FE-only — page
+   * reload 시 손실 (사용자가 restore 누르면 default size 로 복원). Schema 의
+   * item.x/y/w/h 변경 패턴 (PanelNode onMinimize/onMaximize) 에서 옛 값 보존용.
+   *
+   * Key = item id. Value = { x, y, w, h } 직전 snapshot.
+   *
+   * - Minimize 진입 시 h 만 백업 (x/y/w 도 함께 저장 — restore 시 일괄 복원)
+   *   → h = MINIMIZED_TERMINAL_PANEL_HEIGHT 으로 PUT. restore 시 백업 의 h 복원, entry clear.
+   * - Maximize 진입 시 (x, y, w, h) 백업 → viewport visible extent 로 PUT.
+   *   restore 시 백업 복원, entry clear.
+   *
+   * 두 path 가 동시 활성화될 수 없도록 (minimize OR maximize 만), backup entry
+   * 는 한 가지 path 의 *원본* 만 가짐.
+   */
+  restoredItemGeoms = $state<SvelteMap<string, { x: number; y: number; w: number; h: number }>>(
+    new SvelteMap(),
+  );
+
+  backupItemGeom(id: string, geom: { x: number; y: number; w: number; h: number }): void {
+    this.restoredItemGeoms.set(id, { ...geom });
+  }
+
+  getRestoredGeom(id: string): { x: number; y: number; w: number; h: number } | null {
+    return this.restoredItemGeoms.get(id) ?? null;
+  }
+
+  clearRestoredGeom(id: string): void {
+    this.restoredItemGeoms.delete(id);
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Layout lifecycle (loaded ↔ cleared)                                    */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Layout 적용. attach 성공 / LAYOUT_CHANGED rebuild / self-mutate PUT 후 응답
+   * 등 *모든* layout refresh path 에서 호출.
+   *
+   * **M 은 의도적으로 clear 하지 않음** — 사용자 요구 "이동/정렬/크기변경/제거
+   * 외 모든 선택 후 동작 은 자동 해제 안 함". layoutMutation 의 응답으로
+   * loadLayout 이 호출돼도 사용자의 selection 의도는 carry over.
+   *
+   * 외부 source (session 진입 / LAYOUT_CHANGED 으로 *전혀 다른* layout) 일 때는
+   * caller (setActiveSession / WS dispatcher) 가 명시 clear 책임.
+   *
+   * `I` (input target) / `maximizedItemId` / focusMode 도 동일 정책 — *유지*.
+   * 단 *layout 에서 사라진 id* 는 stale 이지만 next user gesture 가 cleanup.
+   */
+  loadLayout(layout: CanvasLayout): void {
+    debugCount('sessionStore.loadLayout');
+    this.items.clear();
+    for (const it of layout.items) {
+      const item = normalizeLoadedItem(it);
+      this.items.set(item.id, item);
+    }
+    this.groups.clear();
+    for (const g of layout.groups) {
+      this.groups.set(g.id, g);
+    }
+    this.viewport = { ...layout.viewport };
+  }
+
+  /**
+   * Session attach 진입. Stage 2~3 의 attach handler 가 호출 — 본 skeleton
+   * 은 state set 만 (실 HTTP/WS 통합은 후속).
+   *
+   * sessionStorage hint 도 함께 set — ADR-0019 D5.4 + plan-0008 §4.5.
+   * AppPage 다음 reload 시점에 ReconnectModal trigger 의 입력.
+   *
+   * Session 진입은 *외부 source* — 이전 session 의 ephemeral state (M / I /
+   * maximize / focus) 를 carry over 해선 안 되므로 본 메서드가 명시 reset.
+   */
+  setActiveSession(session: ActiveSession): void {
+    this.active = session;
+    sessionStorageHint.set(session.name);
+    this.M.clear();
+    this.I = null;
+    this.maximizedItemId = null;
+    this.focusMode = { enabled: false, targetPanelId: null };
+    // ADR-0028 D4 — per-session history. 이전 session 의 stack 은 drop.
+    historyStore.setActive(session.name);
+  }
+
+  /**
+   * Detach / pre-attach 상태로 reset. Session switch 흐름의 시작점.
+   *
+   * sessionStorage hint 도 함께 clear — 명시 detach / logout / [Switch session…]
+   * / session [Delete] 흐름 모두 통과. 다음 reload 도 dialog 흐름으로 자연 회귀.
+   */
+  clear(): void {
+    // Pending viewport debounce timer 도 같이 취소. 안 하면 직전 session 의
+    // pan/zoom 이 500ms 안에 switch 됐을 때 잘못된 active 로 flush 됨.
+    if (this.#viewportTimer !== null) {
+      clearTimeout(this.#viewportTimer);
+      this.#viewportTimer = null;
+    }
+    this.active = null;
+    this.items.clear();
+    this.groups.clear();
+    this.viewport = { ...DEFAULT_VIEWPORT };
+    this.M.clear();
+    this.I = null;
+    this.maximizedItemId = null;
+    this.focusMode = { enabled: false, targetPanelId: null };
+    sessionStorageHint.clear();
+    historyStore.setActive(null);
+  }
+
+  /**
+   * Session switch — 현재 session detach + 새 session attach.
+   *
+   * Stage 1 skeleton 에서는 *reset 만* 처리. 실제 HTTP `POST /api/sessions/<name>/attach`
+   * + match-or-spawn confirm dialog (ADR-0018 D6) 는 Stage 2~3 에서 추가.
+   * Caller 가 attach 응답으로 받은 layout 을 `loadLayout()` 에 넘김.
+   */
+  switchSession(name: string): void {
+    this.clear();
+    this.active = { name };
+    historyStore.setActive(name);
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* M (Manipulation Selection) — multi-id set                              */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  setM(ids: Iterable<string>): void {
+    this.M.clear();
+    for (const id of ids) this.M.add(id);
+  }
+
+  addToM(id: string): void {
+    this.M.add(id);
+  }
+
+  removeFromM(id: string): void {
+    this.M.delete(id);
+  }
+
+  toggleM(id: string): void {
+    if (this.M.has(id)) this.M.delete(id);
+    else this.M.add(id);
+  }
+
+  clearM(): void {
+    this.M.clear();
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* I (Input Target) — single terminal id                                  */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  setI(terminalId: string | null): void {
+    this.I = terminalId;
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Maximize — FE-only ephemeral, 1-at-a-time (G20)                        */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  maximize(itemId: string): void {
+    this.maximizedItemId = itemId;
+  }
+
+  unmaximize(): void {
+    this.maximizedItemId = null;
+  }
+
+  toggleMaximize(itemId: string): void {
+    this.maximizedItemId = this.maximizedItemId === itemId ? null : itemId;
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Focus / zoom-to-item — plan-0010 Task 1                                */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Pending zoom-to-selection signal. ViewportCtrl 의 focus 버튼 클릭 시 set.
+   * Canvas 의 $effect 가 본 field 를 watch — SvelteFlow `setViewport` 으로
+   * 해당 item(s) 의 union BBox 를 viewport 중앙에 + 가득 채움. 처리 후 Canvas
+   * 가 null 로 복귀 (1-shot signal).
+   *
+   * 단일 선택: [id]. 다중 선택: 모든 ids — union BBox.
+   */
+  pendingZoomToIds = $state<string[] | null>(null);
+
+  zoomToIds(ids: string[]): void {
+    if (ids.length === 0) {
+      this.pendingZoomToIds = null;
+      return;
+    }
+    this.pendingZoomToIds = [...ids];
+  }
+
+  zoomToSelection(): void {
+    const ids = Array.from(this.M);
+    this.zoomToIds(ids);
+  }
+
+  clearPendingZoom(): void {
+    this.pendingZoomToIds = null;
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Viewport                                                               */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /** Debounce timer for viewport PUT (Stage 7 FE-9). */
+  #viewportTimer: ReturnType<typeof setTimeout> | null = null;
+  static readonly VIEWPORT_DEBOUNCE_MS = 500;
+
+  /**
+   * Update the in-memory viewport and schedule a debounced PUT to
+   * persist `viewport` into the session's layout.
+   *
+   * The debounce coalesces rapid pan/zoom into a single network round
+   * trip. Failures are swallowed (logged) — viewport is "close enough"
+   * ephemeral state; a missed write only costs the last 500ms of
+   * panning on the next reload.
+   */
+  updateViewport(v: Viewport): void {
+    const cur = this.viewport;
+    if (
+      Math.abs(cur.x - v.x) < 0.5 &&
+      Math.abs(cur.y - v.y) < 0.5 &&
+      Math.abs(cur.zoom - v.zoom) < 0.001
+    ) {
+      return;
+    }
+    this.viewport = { ...v };
+    if (this.active === null) return;
+    // 예약 시점의 session/viewport 를 closure 로 캡처. 500ms 사이에 session
+    // switch 가 일어나도 flush 가 현재 active 에 직전 session 의 viewport 를
+    // 쓰는 race 차단 — flush 에서 sessionName 비교로 폐기.
+    const sessionName = this.active.name;
+    const snapshot: Viewport = { ...v };
+    if (this.#viewportTimer !== null) clearTimeout(this.#viewportTimer);
+    this.#viewportTimer = setTimeout(() => {
+      this.#viewportTimer = null;
+      void this.#flushViewport(sessionName, snapshot);
+    }, SessionStore.VIEWPORT_DEBOUNCE_MS);
+  }
+
+  async #flushViewport(sessionName: string, viewport: Viewport): Promise<void> {
+    const active = this.active;
+    if (active === null || active.name !== sessionName) return;
+    try {
+      await mutateLayout(sessionName, (cur) => ({ ...cur, viewport }));
+    } catch (err) {
+      console.debug('[gtmux] viewport persist failed', err);
+    }
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Reattach — ADR-0019 D5.1 / D5.4, plan-0008 §4.2                        */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Reattach to `name` — silent / blocking 의 공통 utility.
+   *
+   * - POST /api/sessions/<name>/attach (cookie + AbortSignal)
+   * - 200 → GET /layout → setActiveSession + loadLayout → `success`
+   * - 409 → `in_use` (holder.pid 추출)
+   * - 404 → `not_found` (hint 도 자동 clear — caller 도 `cancel()` 으로 재clear 가능)
+   * - 401 → `unauthorized` (caller 가 /auth redirect)
+   * - 5xx / network / fetch throw → `unreachable` (단 AbortError 는 caller 가
+   *   signal.aborted 로 자체 detect — 본 method 도 `unreachable` 로 반환하나
+   *   caller 가 signal 확인 후 무시)
+   *
+   * BE 가 200 + `unmatched.length > 0` 응답 → `confirm_required` 반환 (2026-05-17
+   * 회귀 fix). caller 가 AttachConfirmModal 노출. silent 진입 후 panel 만 남고
+   * terminal respawn 이 누락되던 버그 직접 차단 — WorkspaceSwitcher.tryAttach 의
+   * `confirm_required` 분기와 동일 패턴.
+   */
+  async attemptReattach(
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<ReattachResult> {
+    let attachRes: Response;
+    try {
+      attachRes = await fetch(
+        `/api/sessions/${encodeURIComponent(name)}/attach`,
+        {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            ...webpageHeaders(),
+          },
+          credentials: 'include',
+          body: JSON.stringify({ ws_conn_id: makeWsConnId() }),
+          signal,
+        },
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { kind: 'unreachable', message };
+    }
+
+    if (attachRes.status === 401) {
+      sessionStorageHint.clear();
+      return { kind: 'unauthorized' };
+    }
+    if (attachRes.status === 404) {
+      sessionStorageHint.clear();
+      return { kind: 'not_found' };
+    }
+    if (attachRes.status === 409) {
+      try {
+        const body = (await attachRes.json()) as {
+          holder?: { pid?: number };
+        };
+        return { kind: 'in_use', holderPid: body.holder?.pid };
+      } catch {
+        return { kind: 'in_use' };
+      }
+    }
+    if (attachRes.status >= 500) {
+      return {
+        kind: 'unreachable',
+        message: `server responded ${attachRes.status}`,
+      };
+    }
+    if (!attachRes.ok) {
+      return {
+        kind: 'unreachable',
+        message: `attach returned ${attachRes.status}`,
+      };
+    }
+
+    // 200 — drain body (lock acquired). matched/unmatched 검사 → unmatched > 0
+    // 면 confirm_required 반환 (WorkspaceSwitcher.tryAttach 와 정합). caller 가
+    // AttachConfirmModal 노출 책임. 서버 재기동 후 panel 만 남기고 respawn 누락
+    // 회귀 (2026-05-17) 직접 차단.
+    let attachBody: { matched?: string[]; unmatched?: string[] } = {};
+    try {
+      attachBody = (await attachRes.json()) as {
+        matched?: string[];
+        unmatched?: string[];
+      };
+    } catch {
+      /* body 형식 변화 무관 — 아래 layout fetch 가 진실 */
+    }
+    const matched = attachBody.matched ?? [];
+    const unmatched = attachBody.unmatched ?? [];
+    if (unmatched.length > 0) {
+      return {
+        kind: 'confirm_required',
+        summary: {
+          spawn_count: unmatched.length,
+          unmatched_item_ids: unmatched,
+          matched_item_ids: matched,
+        },
+      };
+    }
+
+    let layoutRes: Response;
+    try {
+      layoutRes = await fetch(
+        `/api/sessions/${encodeURIComponent(name)}/layout`,
+        {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          credentials: 'include',
+          signal,
+        },
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { kind: 'unreachable', message };
+    }
+    if (layoutRes.status === 401) {
+      sessionStorageHint.clear();
+      return { kind: 'unauthorized' };
+    }
+    if (!layoutRes.ok) {
+      return {
+        kind: 'unreachable',
+        message: `layout fetch returned ${layoutRes.status}`,
+      };
+    }
+    try {
+      const layout = (await layoutRes.json()) as CanvasLayout;
+      this.setActiveSession({ name });
+      this.loadLayout(layout);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { kind: 'unreachable', message: `layout parse: ${message}` };
+    }
+    return { kind: 'success' };
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Silent reattach + mutation guard — plan-0008 Phase 2 (Case II)         */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Phase 2 — silent reattach in-flight 여부. visibilitychange / WS reconnect
+   * 등의 trigger 가 호출. mutation guard 가 본 promise 를 await.
+   */
+  reattachInProgress = $state<boolean>(false);
+
+  /** Phase 2 의 마지막 silent reattach 결과 — failure 분기 입력. */
+  lastSilentReattachResult = $state<ReattachResult | null>(null);
+
+  /** Internal promise — 동시 호출 dedup. */
+  #silentReattachPromise: Promise<ReattachResult> | null = null;
+
+  /**
+   * Silent reattach utility — Phase 2 trigger 가 호출.
+   *
+   * 동시 호출은 동일 promise share (dedup). 결과는 `lastSilentReattachResult`
+   * 에 보관. 호출자가 결과에 따라:
+   *  - 'success': mutation 계속 진행.
+   *  - 'in_use'/'not_found'/'unauthorized'/'unreachable': caller 가 modal/toast.
+   *
+   * P0-B (0045) — 사용자 변경 보존: silent 의도 상 viewport 는 사용자가
+   * silentReattach 발화를 인지하지 못해야 함. attemptReattach 내부의
+   * loadLayout 이 viewport 를 layout 의 저장값으로 reset 하므로, wrapper 가
+   * 직전 snapshot 을 잡고 200 성공 후 복원. M/I/maximize/focusMode 의 reset 은
+   * G20 ephemeral 정책 그대로 (server 가 권위).
+   */
+  silentReattach(name: string, signal?: AbortSignal): Promise<ReattachResult> {
+    if (this.#silentReattachPromise !== null) return this.#silentReattachPromise;
+    this.reattachInProgress = true;
+    const preReattachViewport = { ...this.viewport };
+    const promise = (async (): Promise<ReattachResult> => {
+      try {
+        const result = await this.attemptReattach(name, signal);
+        this.lastSilentReattachResult = result;
+        if (result.kind === 'success') {
+          this.viewport = preReattachViewport;
+        }
+        return result;
+      } finally {
+        this.reattachInProgress = false;
+        this.#silentReattachPromise = null;
+      }
+    })();
+    this.#silentReattachPromise = promise;
+    return promise;
+  }
+
+  /**
+   * Mutation guard — outgoing write 진입점 (mutateLayout / deleteItem /
+   * attachConfirm 등) 의 *바로 직전* 에 await 하는 helper.
+   *
+   * 동작:
+   *  - reattach in-flight 면 끝날 때까지 await + result === success 면 통과.
+   *  - lastSilentReattachResult 가 fail 상태면 그 결과 그대로 반환 (caller
+   *    가 modal/toast 분기). caller 는 `await ... ; if (!ok) return;` 패턴.
+   *  - 아무 trigger 도 없었으면 ok 반환 (no-op).
+   *
+   * 호출 예:
+   *   const guard = await sessionStore.guardOutgoingMutation();
+   *   if (!guard.ok) return;
+   *   await mutateLayout(...);
+   */
+  async guardOutgoingMutation(): Promise<{ ok: boolean; result?: ReattachResult }> {
+    if (this.#silentReattachPromise !== null) {
+      const result = await this.#silentReattachPromise;
+      return { ok: result.kind === 'success', result };
+    }
+    if (this.lastSilentReattachResult !== null && this.lastSilentReattachResult.kind !== 'success') {
+      return { ok: false, result: this.lastSilentReattachResult };
+    }
+    return { ok: true };
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Layout mutation entry — ADR-0028 D12                                   */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Current layout 의 deep snapshot — undo/redo 의 history entry 단위 (D7).
+   *
+   * SvelteMap value 들은 frozen-ish 가 아니므로 spread 로 새 object 추출 — 이후
+   * store mutation 이 snapshot 을 mutate 하지 않도록 안전.
+   */
+  layoutSnapshot(): CanvasLayout {
+    return {
+      schema_version: 2,
+      groups: Array.from(this.groups.values()).map((g) => ({ ...g })),
+      items: Array.from(this.items.values()).map((it) => ({ ...it })),
+      viewport: { ...this.viewport },
+    };
+  }
+
+  /**
+   * ADR-0028 D12 — 모든 layout mutation 의 단일 entry point.
+   *
+   * 책임:
+   *  1. mutation guard (Phase 2 silentReattach 결과 검사)
+   *  2. PRE-state snapshot → historyStore.capture (D3 — 1 PUT = 1 entry)
+   *  3. mutateLayout(transform) — etag rebase 1회 자동
+   *  4. loadLayout(response) — store 동기
+   *  5. error 처리 (Unauthorized redirect, toast)
+   *
+   * 반환: `{ ok, layout? }` — ok=false 면 caller 가 추가 처리 없이 early return.
+   *
+   * 기존 직접 `mutateLayout` 호출은 본 helper 로 migration (D11 audit 정합).
+   * 단, history capture 가 부적절한 mutation (viewport debounce flush, undo/redo
+   * 자체) 은 `captureHistory: false` 로 skip.
+   */
+  async applyMutation(
+    transform: (cur: CanvasLayout) => CanvasLayout,
+    options: {
+      abortMessage?: string;
+      failMessage?: string;
+      captureHistory?: boolean;
+      /**
+       * PRE-mutation snapshot — caller 가 명시. Drag commit 처럼 store 가
+       * optimistic 갱신된 *후* 에 applyMutation 호출하는 path 는 본 옵션으로
+       * "optimistic 직전" snapshot 을 전달. 미지정 시 호출 시점의 store snapshot
+       * 사용 (Inspector edit 등 optimistic 없는 path 의 기본 동작).
+       */
+      priorSnapshot?: CanvasLayout;
+    } = {},
+  ): Promise<{ ok: boolean; layout?: CanvasLayout }> {
+    const active = this.active;
+    if (active === null) return { ok: false };
+    const guard = await this.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message:
+          options.abortMessage ??
+          'Session reconnect failed — action aborted.',
+        tone: 'error',
+        durationMs: 6_000,
+      });
+      return { ok: false };
+    }
+    const captureHistory = options.captureHistory !== false;
+    const priorSnapshot = options.priorSnapshot ?? null;
+    const before = captureHistory
+      ? (priorSnapshot ?? this.layoutSnapshot())
+      : null;
+    try {
+      const { layout } = await mutateLayout(active.name, transform);
+      this.loadLayout(layout);
+      if (before !== null) historyStore.capture(active.name, before);
+      return { ok: true, layout };
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return { ok: false };
+      }
+      // 0065 FE-2 — caller 가 priorSnapshot 을 명시했다는 것은 호출 *전* store
+      // 를 optimistic 갱신했다는 신호 (drag stop / NodeResizer / z-order 등).
+      // failure 시 priorSnapshot 으로 store 를 복원해 "FE 는 변경된 상태로
+      // 보이지만 BE 는 옛 상태" 의 silent 회귀를 차단한다. priorSnapshot 미지정
+      // = optimistic update 없는 path (Inspector edit 등) — 별도 복원 무필요.
+      if (priorSnapshot !== null) {
+        this.loadLayout(priorSnapshot);
+      }
+      toastStore.show({
+        message:
+          options.failMessage ??
+          `Mutation failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+      return { ok: false };
+    }
+  }
+
+  /**
+   * ADR-0028 D1 — item 제거 (deleteItem) 의 history capture 통합 entry.
+   *
+   * `deleteItem` 은 별도 BE endpoint (`DELETE /api/sessions/:name/items/:id`) 라
+   * `mutateLayout` 우회 — 본 helper 가 PRE-state snapshot + 각 deleteItem
+   * 호출 + store 동기 + history capture 책임.
+   *
+   * Partial 실패 허용: 성공한 id 만 store 에서 제거, history 는 (변경된 항목
+   * 있을 때) 1 entry 로 capture (PRE-state). undo 시 mutateLayout 으로 PRE
+   * 복원 → BE 가 items[] 에 panel 재추가. terminal 이면 pool 잔존 시 mirror
+   * 자연 회복 (ADR-0028 D1.2), 사라진 경우 D9 toast.
+   *
+   * `killTerminal=true` 호출 시 — terminal 도 죽이므로 undo 시 unmatched 가
+   * 더 흔함. caller (PanelNode performClose 의 kill 선택지) 가 명시 책임.
+   */
+  async applyDeletion(
+    ids: readonly string[],
+    options: {
+      killTerminal?: boolean;
+      abortMessage?: string;
+    } = {},
+  ): Promise<{ ok: number; fail: number }> {
+    const active = this.active;
+    if (active === null) return { ok: 0, fail: 0 };
+    const guard = await this.guardOutgoingMutation();
+    if (!guard.ok) {
+      toastStore.show({
+        message:
+          options.abortMessage ??
+          'Session reconnect failed — delete aborted.',
+        tone: 'error',
+      });
+      return { ok: 0, fail: 0 };
+    }
+    if (ids.length === 0) return { ok: 0, fail: 0 };
+    const before = this.layoutSnapshot();
+    const kill = options.killTerminal === true;
+    let ok = 0;
+    let fail = 0;
+    let unauthorized = false;
+    for (const id of ids) {
+      try {
+        await deleteItem(active.name, id, kill);
+        this.items.delete(id);
+        this.M.delete(id);
+        ok += 1;
+      } catch (err) {
+        if (err instanceof UnauthorizedError) {
+          unauthorized = true;
+          break;
+        }
+        console.warn('[gtmux] deleteItem failed', id, err);
+        fail += 1;
+      }
+    }
+    if (unauthorized) {
+      window.location.href = '/auth';
+      return { ok, fail };
+    }
+    if (ok > 0) {
+      historyStore.capture(active.name, before);
+    }
+    return { ok, fail };
+  }
+
+  /**
+   * ADR-0028 D8 — undo 1 step. Cmd+Z / Ctrl+Z 키바인드의 진입점.
+   *
+   * 동작:
+   *  1. mutation guard
+   *  2. historyStore.popUndo(currentSnapshot) → PRE-state
+   *  3. mutateLayout(() => pre) — full snapshot PUT
+   *  4. 성공 시 loadLayout, currentSnapshot 은 popUndo 가 redo 에 push
+   *  5. 실패 시 D9 — 양 stack reset + toast
+   *
+   * Undo 자체는 captureHistory:false — 그렇지 않으면 undo→stack push→…→cycle.
+   */
+  async undo(): Promise<void> {
+    const active = this.active;
+    if (active === null) return;
+    const guard = await this.guardOutgoingMutation();
+    if (!guard.ok) return;
+    const current = this.layoutSnapshot();
+    const pre = historyStore.popUndo(active.name, current);
+    if (pre === null) return;
+    try {
+      const { layout } = await mutateLayout(active.name, () => pre);
+      this.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      // D9 — etag mismatch (rebase 도 fail) 또는 D1.2 unmatched terminal.
+      historyStore.reset(active.name);
+      const reason =
+        err instanceof EtagMismatchError
+          ? 'layout changed by another source'
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      toastStore.show({
+        message: `Cannot undo — ${reason}. History cleared.`,
+        tone: 'warning',
+      });
+    }
+  }
+
+  /** ADR-0028 D8 — redo 1 step. Cmd+Shift+Z / Ctrl+Y 의 진입점. */
+  async redo(): Promise<void> {
+    const active = this.active;
+    if (active === null) return;
+    const guard = await this.guardOutgoingMutation();
+    if (!guard.ok) return;
+    const current = this.layoutSnapshot();
+    const next = historyStore.popRedo(active.name, current);
+    if (next === null) return;
+    try {
+      const { layout } = await mutateLayout(active.name, () => next);
+      this.loadLayout(layout);
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      historyStore.reset(active.name);
+      const reason =
+        err instanceof EtagMismatchError
+          ? 'layout changed by another source'
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      toastStore.show({
+        message: `Cannot redo — ${reason}. History cleared.`,
+        tone: 'warning',
+      });
+    }
+  }
+}
+
+/** Single session-scoped store instance. */
+export const sessionStore = new SessionStore();
+
+/**
+ * `ensureMutationOk` — Phase 2 mutation guard 의 사용자-facing wrapper.
+ *
+ * 모든 outgoing write 의 *진입점* 에서 await 한 후 false 면 early return
+ * 패턴. 기본 toast 가 portable 하므로 site 별 reword 필요 없음 — site-specific
+ * 메시지가 필요한 경우 `abortMessage` 로 override.
+ *
+ * 사용:
+ *   if (!(await ensureMutationOk('Drag commit aborted.'))) return;
+ *   await mutateLayout(...);
+ */
+export async function ensureMutationOk(abortMessage?: string): Promise<boolean> {
+  const guard = await sessionStore.guardOutgoingMutation();
+  if (!guard.ok) {
+    toastStore.show({
+      message:
+        abortMessage ??
+        'Session reconnect failed — action aborted. Use Switch session… in the menu.',
+      tone: 'error',
+      durationMs: 6_000,
+    });
+    return false;
+  }
+  return true;
+}

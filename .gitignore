@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Claude Code per-developer local settings
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/skills/
+
+# Agent / CLI tool environments (user-specific)
+.agents/skills/
+.codex/
+
+# Agent skill lockfile (regenerated per-user)
+skills-lock.json
+
+# Throwaway experiments (POC, scratch trees)
+experiments/
+
+# Added by code-review-graph
+.code-review-graph/
