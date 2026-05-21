@@ -31,6 +31,19 @@ export type Visibility = 'visible' | 'hidden';
 export type TextAlign = 'left' | 'center' | 'right';
 export type TextVerticalAlign = 'top' | 'middle' | 'bottom';
 
+/**
+ * ADR-0018 D4 amend ① (batch-5, 2026-05-20) — rect/ellipse/line 의 stroke
+ * dash pattern. snake_case wire (BE schema.rs `FigureStrokeDash` 와 정합).
+ * connector 의 `StrokeDash` 와는 의미·default 가 달라 별 enum.
+ */
+export type FigureStrokeDash = 'solid' | 'dash' | 'dot' | 'dash_dot';
+
+/**
+ * ADR-0018 D4 amend ② (batch-5, 2026-05-20) — text 의 font weight 3-bucket.
+ * Grill #6: register 의 100~900 numeric 은 P1 로 미루고 3 variant 채택.
+ */
+export type FontWeight = 'light' | 'normal' | 'bold';
+
 /** 모든 Canvas Item 공통 field. type-specific payload 는 각 variant 가 amend. */
 export interface ItemCommon {
   /** UUID. `type: "terminal"` 인 경우 backend Terminal.id 와 동일 (ADR-0018 D2). */
@@ -78,6 +91,14 @@ export interface TextItem extends ItemCommon {
   text_vertical_align?: TextVerticalAlign;
   /** CSS color string (e.g. `"#333"` or `"rgba(0,0,0,0.6)"`). */
   color: string;
+  /** ADR-0018 D4 amend ② (batch-5) — font weight. default `"normal"`. */
+  font_weight?: FontWeight;
+  /** ADR-0018 D4 amend ② (batch-5) — italic toggle. default false. */
+  italic?: boolean;
+  /** ADR-0018 D4 amend ② (batch-5) — underline toggle. composes with strikethrough. */
+  underline?: boolean;
+  /** ADR-0018 D4 amend ② (batch-5) — strikethrough toggle. composes with underline. */
+  strikethrough?: boolean;
 }
 
 export interface NoteItem extends ItemCommon {
@@ -91,23 +112,52 @@ export interface RectItem extends ItemCommon {
   type: 'rect';
   stroke: string;
   fill: string;
+  /** ADR-0018 D4 amend ① — stroke width. BE-side validation 1≤≤32. */
   stroke_width: number;
+  /**
+   * ADR-0018 D4 amend ① (batch-5) — fill on/off (≠ alpha). `false` 면
+   * SVG fill 도 `none`, hit-test 도 fill area 제외. default `true`.
+   */
+  fill_enabled?: boolean;
+  /**
+   * ADR-0018 D4 amend ① (batch-5) — stroke on/off. `false` 면 border 시각
+   * + hit-target band 모두 제거. default `true`.
+   */
+  stroke_enabled?: boolean;
+  /**
+   * ADR-0018 D4 amend ① (batch-5, Grill #5) — rect 의 corner round 토글.
+   * `true` 면 FE 가 자동 radius `clamp(min(w,h)*0.15, 4, 16)` 계산.
+   * BE schema 는 boolean 만 저장. default `false`.
+   */
+  corner_rounded?: boolean;
+  /** ADR-0018 D4 amend ① (batch-5) — stroke dash pattern. undefined=solid. */
+  stroke_dash?: FigureStrokeDash;
 }
 
 export interface EllipseItem extends ItemCommon {
   type: 'ellipse';
   stroke: string;
   fill: string;
+  /** ADR-0018 D4 amend ① — stroke width. BE-side validation 1≤≤32. */
   stroke_width: number;
+  /** ADR-0018 D4 amend ① (batch-5) — see RectItem.fill_enabled. */
+  fill_enabled?: boolean;
+  /** ADR-0018 D4 amend ① (batch-5) — see RectItem.stroke_enabled. */
+  stroke_enabled?: boolean;
+  /** ADR-0018 D4 amend ① (batch-5) — stroke dash pattern. undefined=solid. */
+  stroke_dash?: FigureStrokeDash;
 }
 
 export interface LineItem extends ItemCommon {
   type: 'line';
   stroke: string;
+  /** ADR-0018 D4 amend ① — stroke width. BE-side validation 1≤≤32. */
   stroke_width: number;
   /** 끝 점 좌표 — (x, y) 가 시작, (x2, y2) 가 끝. canvas 절대 좌표. */
   x2: number;
   y2: number;
+  /** ADR-0018 D4 amend ① (batch-5) — stroke dash pattern. undefined=solid. */
+  stroke_dash?: FigureStrokeDash;
 }
 
 export interface Point {

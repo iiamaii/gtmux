@@ -50,7 +50,7 @@
 
 <script lang="ts">
   /**
-   * ColorPicker — Figma-style popover (ref/frontend-design/components-v4.html
+   * ColorPicker — Figma-style popover (ref/frontend-design/components-v6.html
    * §.shape-colorpicker spec 정합).
    *
    * Phase 1: visual shell — trigger swatch + popover layout (v4 시안).
@@ -396,6 +396,7 @@
 
   // ── State ────────────────────────────────────────────────────────
   let open = $state(false);
+  let pinned = $state(false);
   let textInput = $state('');
   let alphaInput = $state('100');
   let editing = $state(false);
@@ -512,6 +513,7 @@
       if (containerEl?.contains(target)) return;
       if (popoverEl?.contains(target)) return;
       formatMenuOpen = false;
+      if (pinned) return;
       open = false;
     }
     const onReflow = () => updatePopoverPos();
@@ -529,6 +531,12 @@
   });
 
   // ── Commit paths ─────────────────────────────────────────────────
+  function closePopover(): void {
+    formatMenuOpen = false;
+    pinned = false;
+    open = false;
+  }
+
   function commitColor(next: string): void {
     if (next === value) return;
     oncommit(next);
@@ -813,21 +821,22 @@
       style:background={mixed || isTransparent ? undefined : (allowAlpha && effectiveAlpha < 100 ? combineHexAlpha(effectiveHex, effectiveAlpha) : effectiveHex)}
     >
       {#if mixed}
-        <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
-          <line x1="2" y1="20" x2="20" y2="2" stroke="var(--color-fg-subtle)" stroke-width="1" />
+        <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">
+          <line x1="2" y1="18" x2="18" y2="2" stroke="var(--color-fg-subtle)" stroke-width="1" />
         </svg>
       {:else if isTransparent}
-        <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">
-          <line x1="2" y1="20" x2="20" y2="2" stroke="var(--color-danger)" stroke-width="1.2" />
+        <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">
+          <line x1="2" y1="18" x2="18" y2="2" stroke="var(--color-danger)" stroke-width="1.2" />
         </svg>
       {/if}
     </span>
   </button>
 
-  <!-- Inline hex value — trigger 옆 항상 표시 + 명시적 입력. InspectorField 와
-       동일 패턴 (label wrapper + .k prefix + native input). -->
+  <!-- Inline color value — trigger 옆 항상 표시 + 명시적 입력. InspectorField 와
+       동일 패턴 (label wrapper + .k prefix + native input). label "C" = Color
+       (HEX/RGB/HSL/OKLCH 등 formatMode 와 무관한 일관 라벨, 사용자 디자인 규칙). -->
   <label class="inline-hex">
-    <span class="k" aria-hidden="true">HEX</span>
+    <span class="k" aria-hidden="true">C</span>
     <input
       type="text"
       class="field"
@@ -895,15 +904,47 @@
           <button
             type="button"
             class="cp-btn"
+            class:is-active={pinned}
+            title={pinned ? 'Unpin color picker' : 'Pin color picker'}
+            aria-label={pinned ? 'Unpin color picker' : 'Pin color picker'}
+            aria-pressed={pinned}
+            onclick={() => (pinned = !pinned)}
+          >
+            <svg width="12" height="12" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M5 1.5h4l-.6 3.2 2.6 2.6L10 9 7 6 4 9V6.3L1.5 4l3.2-.5z"/>
+              <path d="M7 9v3.5"/>
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="cp-btn"
             title="Close"
             aria-label="Close color picker"
-            onclick={() => (open = false)}
+            onclick={closePopover}
           >
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
               <path d="M3 3l6 6M9 3l-6 6"/>
             </svg>
           </button>
         </div>
+      </div>
+
+      <div class="cp-modes" role="group" aria-label="Color mode">
+        <button type="button" class="cp-mode active" title="Solid" aria-label="Solid color" aria-pressed="true">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><circle cx="6" cy="6" r="4"/></svg>
+        </button>
+        <button type="button" class="cp-mode" title="Linear gradient (not available yet)" aria-label="Linear gradient" aria-disabled="true" tabindex="-1">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><defs><linearGradient id="gtmux-cp-linear" x1="0" x2="1"><stop offset="0" stop-color="currentColor" stop-opacity="1"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs><rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="url(#gtmux-cp-linear)" stroke="currentColor" stroke-width="0.8"/></svg>
+        </button>
+        <button type="button" class="cp-mode" title="Radial gradient (not available yet)" aria-label="Radial gradient" aria-disabled="true" tabindex="-1">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><defs><radialGradient id="gtmux-cp-radial" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="currentColor" stop-opacity="1"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></radialGradient></defs><rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="url(#gtmux-cp-radial)" stroke="currentColor" stroke-width="0.8"/></svg>
+        </button>
+        <button type="button" class="cp-mode" title="Angular gradient (not available yet)" aria-label="Angular gradient" aria-disabled="true" tabindex="-1">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true"><circle cx="6" cy="6" r="4"/><path d="M6 6 L10 6 A4 4 0 0 0 6 2 Z" fill="currentColor"/></svg>
+        </button>
+        <button type="button" class="cp-mode" title="Image fill (not available yet)" aria-label="Image fill" aria-disabled="true" tabindex="-1">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2" width="9" height="8" rx="1"/><circle cx="4" cy="5" r=".8" fill="currentColor"/><path d="M2 9l2.4-2.4 1.6 1.6 2.2-2.2L10 8.4"/></svg>
+        </button>
       </div>
 
       <!-- SV square -->
@@ -1118,18 +1159,20 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-4);
-    height: 22px;
+    /* Inspector design 규칙 (2026-05-21): component 24px 통일. */
+    height: 24px;
+    width: 100%;
   }
   .color-picker.disabled { opacity: 0.55; }
 
-  /* Inline hex / alpha — trigger 옆 항상 보이는 값 표시 + 직접 입력.
-     InspectorField .inspector-input 과 동일 패턴 (label wrapper + .k prefix). */
+  /* Inline color / alpha — trigger 옆 항상 보이는 값 표시 + 직접 입력.
+     Inspector design 규칙 (2026-05-21): height 24px (component 통일). */
   .inline-hex,
   .inline-alpha {
     display: flex;
     align-items: center;
     gap: 4px;
-    height: 22px;
+    height: 24px;
     padding: 0 6px;
     box-sizing: border-box;
     background: var(--color-bg);
@@ -1212,18 +1255,21 @@
   }
 
   .swatch-trigger {
-    width: 22px;
-    height: 22px;
+    /* Inspector design 규칙 (2026-05-21 polish): component 24px slot 안에서
+       정사각 swatch 는 20px (4px 양쪽 inset). 정사각 비례 유지. */
+    width: 20px;
+    height: 20px;
     padding: 0;
     border: 0;
     background: transparent;
     cursor: pointer;
     display: block;
+    flex: 0 0 20px;
   }
   .swatch {
     display: block;
-    width: 22px;
-    height: 22px;
+    width: 20px;
+    height: 20px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--color-border);
     background-clip: padding-box;
@@ -1286,6 +1332,44 @@
     transition: background var(--motion-fast) var(--motion-easing), color var(--motion-fast) var(--motion-easing);
   }
   .cp-btn:hover { background: var(--color-glass-2); color: var(--color-fg); }
+  .cp-btn.is-active {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+  }
+
+  .cp-modes {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 2px;
+    padding: 4px;
+    background: var(--color-surface-2);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .cp-mode {
+    height: 22px;
+    display: grid;
+    place-items: center;
+    border: none;
+    background: transparent;
+    border-radius: var(--radius-sm);
+    color: var(--color-fg-muted);
+    cursor: default;
+    padding: 0;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  .cp-mode:not(.active) {
+    opacity: 0.55;
+  }
+
+  .cp-mode.active {
+    background: var(--color-surface);
+    color: var(--color-fg);
+    box-shadow: var(--shadow-sm);
+  }
 
   .cp-sv {
     position: relative;

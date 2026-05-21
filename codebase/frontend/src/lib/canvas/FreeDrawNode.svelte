@@ -13,7 +13,8 @@
 
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { Point } from '$lib/types/canvas';
-  import CanvasCloseButton from './CanvasCloseButton.svelte';
+  // 2026-05-20 figure UX 정리: rect/ellipse/line/free 는 canvas X 버튼 미제공
+  // (Backspace / Cmd+Delete / ContextMenu Delete 로만 제거).
 
   interface FreeDrawNodeData {
     id: string;
@@ -89,7 +90,6 @@
         stroke-linejoin="round"
       />
     </svg>
-    <CanvasCloseButton id={data.id} disabled={isLocked} />
   </div>
 {/if}
 

@@ -19,6 +19,7 @@
   import { onMount } from 'svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import { pickLocalFile } from '$lib/files/localFilePicker';
@@ -32,10 +33,13 @@
     type DistributeMode,
   } from '$lib/canvas/alignment';
   import ColorPicker from '$lib/ui/ColorPicker.svelte';
+  import Toggle from '$lib/ui/Toggle.svelte';
+  import DashSegments from './DashSegments.svelte';
   import InspectorField from './InspectorField.svelte';
   import {
     MINIMIZED_TERMINAL_PANEL_HEIGHT,
     type CanvasItem,
+    type FigureStrokeDash,
     type LineItem,
     type NoteItem,
     type TextAlign,
@@ -201,13 +205,17 @@
   type CommonNumKey = 'x' | 'y' | 'w' | 'h' | 'z';
   type CommonBoolKey = 'visible' | 'locked' | 'minimized';
 
+  function supportsMinimize(it: CanvasItem): boolean {
+    return it.type === 'terminal' || it.type === 'note' || it.type === 'document';
+  }
+
   async function broadcastMutation(
     abortMessage: string,
     transform: (it: CanvasItem) => CanvasItem,
   ): Promise<void> {
     if (selectedItems.length === 0) return;
     const ids = new Set(selectedIds);
-    await sessionStore.applyMutation(
+    await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it) => (ids.has(it.id) ? transform(it) : it)),
@@ -245,6 +253,7 @@
         return { ...it, visibility: v } as CanvasItem;
       }
       if (key === 'minimized') {
+        if (!supportsMinimize(it)) return it;
         return applyMinimizeGeom(it, next);
       }
       return { ...it, [key]: next } as CanvasItem;
@@ -261,9 +270,7 @@
   // terminal/note 가 하나도 없으면 hide. (selectionSupportsMinimize)
   function applyMinimizeGeom(it: CanvasItem, next: boolean): CanvasItem {
     if (it.minimized === next) return it;
-    if (it.type !== 'terminal' && it.type !== 'note' && it.type !== 'document') {
-      return { ...it, minimized: next } as CanvasItem;
-    }
+    if (!supportsMinimize(it)) return it;
     // node-side 상수 정합:
     //   NoteNode.svelte:  MIN_CHIP=32, RESTORE_DEFAULT_W=240, RESTORE_DEFAULT_H=96
     //   PanelNode.svelte: MIN_HEADER_H=34, RESTORE_DEFAULT_H=220
@@ -308,9 +315,8 @@
 
   // selectedItems 중 minimize 지원 (terminal / note) 가 하나라도 있는지.
   // figure 만 선택된 경우 inspector 의 minimize 버튼 숨김.
-  const selectionSupportsMinimize = $derived.by(() =>
-    selectedItems.some((it) => it.type === 'terminal' || it.type === 'note' || it.type === 'document'),
-  );
+  const minimizableSelectedItems = $derived.by(() => selectedItems.filter(supportsMinimize));
+  const selectionSupportsMinimize = $derived(minimizableSelectedItems.length > 0);
 
   async function applyLineEndpoint(field: 'x2' | 'y2', value: number): Promise<void> {
     await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
@@ -344,7 +350,7 @@
     const item = sessionItem;
     if (item?.type !== 'file_path' || item.locked) return;
     filePicker.openFor('', (path) => {
-      void sessionStore.applyMutation(
+      void sessionStore.optimisticMutation(
         (cur) => ({
           ...cur,
           items: cur.items.map((it: CanvasItem) =>
@@ -368,7 +374,7 @@
     if (file === null) return;
     try {
       const uploaded = await uploadAsset(file, 'image');
-      await sessionStore.applyMutation(
+      await sessionStore.optimisticMutation(
         (cur) => ({
           ...cur,
           items: cur.items.map((it: CanvasItem) =>
@@ -401,7 +407,7 @@
     if (file === null) return;
     try {
       const uploaded = await uploadAsset(file, 'document');
-      await sessionStore.applyMutation(
+      await sessionStore.optimisticMutation(
         (cur) => ({
           ...cur,
           items: cur.items.map((it: CanvasItem) =>
@@ -428,18 +434,18 @@
   }
 
   /** Multi-select 의 boolean 동질성 — 모두 같으면 그 값, 아니면 null (mixed). */
-  function commonBool(reader: (it: CanvasItem) => boolean): boolean | null {
-    if (selectedItems.length === 0) return null;
-    const first = reader(selectedItems[0] as CanvasItem);
-    for (const it of selectedItems) {
+  function commonBoolIn(items: readonly CanvasItem[], reader: (it: CanvasItem) => boolean): boolean | null {
+    if (items.length === 0) return null;
+    const first = reader(items[0] as CanvasItem);
+    for (const it of items) {
       if (reader(it) !== first) return null;
     }
     return first;
   }
 
-  const visibleState = $derived.by(() => commonBool((it) => it.visibility === 'visible'));
-  const lockedState = $derived.by(() => commonBool((it) => it.locked));
-  const minimizedState = $derived.by(() => commonBool((it) => it.minimized));
+  const visibleState = $derived.by(() => commonBoolIn(selectedItems, (it) => it.visibility === 'visible'));
+  const lockedState = $derived.by(() => commonBoolIn(selectedItems, (it) => it.locked));
+  const minimizedState = $derived.by(() => commonBoolIn(minimizableSelectedItems, (it) => it.minimized));
 
   /* ── Multi-select node alignment (ADR-0027 D4~D8, plan-0010 Task 5) ──
    * Selection BBox 기준의 6 align + 2 distribute. M.size ≥ 2 일 때 button
@@ -451,7 +457,7 @@
     abortMessage: string,
   ): Promise<void> {
     if (moves.size === 0) return;
-    await sessionStore.applyMutation(
+    await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it) => {
@@ -487,11 +493,12 @@
   ): Promise<void> {
     if (selectedItems.length === 0) return;
     const ids = new Set(selectedIds);
-    await sessionStore.applyMutation(
+    await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
+          if (it.locked) return it;
           if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line') return it;
           // line 에는 fill 이 없음 — 무시.
           if (field === 'fill' && it.type === 'line') return it;
@@ -505,6 +512,89 @@
     );
   }
 
+  /* ── Shape boolean toggle (batch-5 R1+R2) ──
+   * fill_enabled / stroke_enabled / corner_rounded 의 toggle. multi 시
+   * 같은 type 의 selected item 에 broadcast. corner_rounded 는 rect 만 적용.
+   */
+  async function applyShapeBoolean(
+    field: 'fill_enabled' | 'stroke_enabled' | 'corner_rounded',
+    next: boolean,
+  ): Promise<void> {
+    if (selectedItems.length === 0) return;
+    const ids = new Set(selectedIds);
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it) => {
+          if (!ids.has(it.id)) return it;
+          if (it.locked) return it;
+          if (field === 'corner_rounded') {
+            if (it.type !== 'rect') return it;
+            return { ...it, corner_rounded: next } as CanvasItem;
+          }
+          if (it.type !== 'rect' && it.type !== 'ellipse') return it;
+          return { ...it, [field]: next } as CanvasItem;
+        }),
+      }),
+      {
+        abortMessage: 'Toggle aborted — session reconnect failed.',
+        failMessage: 'Toggle failed',
+      },
+    );
+  }
+
+  /* ── Shape stroke_width / stroke_dash editor (batch-5 R2) ──
+   * 두 field 모두 rect/ellipse/line 공통. stroke_width 는 BE 의 1..=32 cap
+   * (ValidationError::StrokeWidthOutOfRange) 와 정합 — 본 함수도 clamp.
+   */
+  async function applyShapeStrokeWidth(width: number): Promise<void> {
+    if (selectedItems.length === 0) return;
+    const clamped = Math.max(1, Math.min(32, Math.round(width)));
+    const ids = new Set(selectedIds);
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it) => {
+          if (!ids.has(it.id)) return it;
+          if (it.locked) return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line') return it;
+          return { ...it, stroke_width: clamped } as CanvasItem;
+        }),
+      }),
+      {
+        abortMessage: 'Stroke width aborted — session reconnect failed.',
+        failMessage: 'Stroke width failed',
+      },
+    );
+  }
+
+  async function applyShapeDash(dash: FigureStrokeDash | undefined): Promise<void> {
+    if (selectedItems.length === 0) return;
+    const ids = new Set(selectedIds);
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it) => {
+          if (!ids.has(it.id)) return it;
+          if (it.locked) return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line') return it;
+          // undefined = solid → field 제거 (옵셔널 의미 보존)
+          const next = { ...it } as CanvasItem & { stroke_dash?: FigureStrokeDash };
+          if (dash === undefined || dash === 'solid') {
+            delete next.stroke_dash;
+          } else {
+            next.stroke_dash = dash;
+          }
+          return next;
+        }),
+      }),
+      {
+        abortMessage: 'Dash change aborted — session reconnect failed.',
+        failMessage: 'Dash change failed',
+      },
+    );
+  }
+
   /* ── Text alignment — Figma-style segmented control ──────────────
    * Inspector 가 text item 의 alignment 를 직접 mutate. 옛
    * ToolbarSubbar/TextNode 에 분산되어 있던 로직을 본 곳으로 단일화. */
@@ -513,8 +603,9 @@
     target: TextItem,
     next: TextAlign,
   ): Promise<void> {
+    if (target.locked) return;
     if (next === (target.text_align ?? 'center')) return;
-    await sessionStore.applyMutation(
+    await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
@@ -531,8 +622,9 @@
     target: TextItem,
     next: TextVerticalAlign,
   ): Promise<void> {
+    if (target.locked) return;
     if (next === (target.text_vertical_align ?? 'middle')) return;
-    await sessionStore.applyMutation(
+    await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
@@ -542,6 +634,83 @@
         ),
       }),
       { failMessage: 'Text vertical align failed' },
+    );
+  }
+
+  /* ── Text font style — font_weight / italic / underline / strikethrough /
+   *    font_size / color (batch-5 R3) ──
+   * 모두 selected text item 의 broadcast (multi-aware).
+   */
+  async function applyTextFontWeight(next: 'light' | 'normal' | 'bold'): Promise<void> {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          ids.has(it.id) && it.type === 'text'
+            && !it.locked
+            ? ({ ...it, font_weight: next } as TextItem)
+            : it,
+        ),
+      }),
+      { failMessage: 'Font weight failed' },
+    );
+  }
+
+  async function applyTextBoolean(
+    field: 'italic' | 'underline' | 'strikethrough',
+    next: boolean,
+  ): Promise<void> {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          ids.has(it.id) && it.type === 'text'
+            && !it.locked
+            ? ({ ...it, [field]: next } as TextItem)
+            : it,
+        ),
+      }),
+      { failMessage: 'Text style failed' },
+    );
+  }
+
+  async function applyTextFontSize(size: number): Promise<void> {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
+    // BE 의 TextFontSizeOutOfRange 와 정합 — 8..=96.
+    const clamped = Math.max(8, Math.min(96, Math.round(size)));
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          ids.has(it.id) && it.type === 'text'
+            && !it.locked
+            ? ({ ...it, font_size: clamped } as TextItem)
+            : it,
+        ),
+      }),
+      { failMessage: 'Font size failed' },
+    );
+  }
+
+  async function applyTextColor(hex: string): Promise<void> {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          ids.has(it.id) && it.type === 'text'
+            && !it.locked
+            ? ({ ...it, color: hex } as TextItem)
+            : it,
+        ),
+      }),
+      { failMessage: 'Text color failed' },
     );
   }
 </script>
@@ -609,6 +778,25 @@
             <div class="display-row">
               <span class="k">id</span>
               <span class="display-val mono" title={selectedPanel.id as string}>{selectedPanel.id}</span>
+              {#if isSelectedTerminal}
+                <!-- Change terminal — header button 과 동일 entry (사용자 요구
+                     2026-05-21). DocumentNode/FilePathNode 의 inline-action
+                     패턴 정합. -->
+                <button
+                  type="button"
+                  class="inline-action"
+                  title="Change terminal"
+                  aria-label="Change terminal"
+                  disabled={(selectedPanel as { locked?: boolean }).locked === true}
+                  onclick={() => changeTerminalDialog.show(selectedPanel.id as string)}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+                    <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
+                    <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
+                    <line x1="8" x2="16" y1="12" y2="12"/>
+                  </svg>
+                </button>
+              {/if}
             </div>
           </div>
         {/if}
@@ -766,27 +954,94 @@
         <section class="prop-section">
           <div class="prop-head"><h4>Item Payload</h4></div>
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
-            <div class="prop-row full">
-              <div class="display-row picker">
-                <span class="k">stroke</span>
-                <ColorPicker
-                  value={sessionItem.stroke}
-                  allowAlpha={true}
-                  oncommit={(hex) => void applyShapeColor('stroke', hex)}
-                />
-              </div>
-            </div>
-            <div class="prop-row full">
-              <div class="display-row picker">
+            {@const shape = sessionItem}
+            {@const fillOn = shape.fill_enabled !== false}
+            {@const strokeOn = shape.stroke_enabled !== false}
+            <!-- Inspector design 규칙 (사용자 정의): fill/stroke/rounded 가
+                 border-style group. header (label + toggle 우측) ↔ body 가
+                 1px divider 로 분리. background/border 색은 state-row 와 통일
+                 (var(--color-surface-2) + var(--color-border)). color picker
+                 는 자체 라벨 ("C") 보유라 외부 label 무. -->
+
+            <!-- FILL group -->
+            <div class="fig-group" class:is-on={fillOn}>
+              <div class="fig-group-head">
                 <span class="k">fill</span>
-                <ColorPicker
-                  value={sessionItem.fill}
-                  allowAlpha={true}
-                  allowTransparent={true}
-                  oncommit={(hex) => void applyShapeColor('fill', hex)}
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={fillOn}
+                  disabled={shape.locked}
+                  ariaLabel="Toggle fill"
+                  onchange={(next) => void applyShapeBoolean('fill_enabled', next)}
                 />
               </div>
+              {#if fillOn}
+                <div class="fig-group-body">
+                  <ColorPicker
+                    value={shape.fill}
+                    allowAlpha={true}
+                    allowTransparent={true}
+                    disabled={shape.locked}
+                    oncommit={(hex) => void applyShapeColor('fill', hex)}
+                  />
+                </div>
+              {/if}
             </div>
+
+            <!-- STROKE group -->
+            <div class="fig-group" class:is-on={strokeOn}>
+              <div class="fig-group-head">
+                <span class="k">stroke</span>
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={strokeOn}
+                  disabled={shape.locked}
+                  ariaLabel="Toggle stroke"
+                  onchange={(next) => void applyShapeBoolean('stroke_enabled', next)}
+                />
+              </div>
+              {#if strokeOn}
+                <div class="fig-group-body">
+                  <ColorPicker
+                    value={shape.stroke}
+                    allowAlpha={true}
+                    disabled={shape.locked}
+                    oncommit={(hex) => void applyShapeColor('stroke', hex)}
+                  />
+                  <InspectorField
+                    type="number"
+                    k="width"
+                    value={String(shape.stroke_width)}
+                    mixed={false}
+                    ariaLabel="Stroke width"
+                    disabled={shape.locked}
+                    oncommit={(s) => void applyShapeStrokeWidth(Number(s))}
+                  />
+                  <DashSegments
+                    value={shape.stroke_dash ?? 'solid'}
+                    disabled={shape.locked}
+                    onpick={(next) => void applyShapeDash(next)}
+                  />
+                </div>
+              {/if}
+            </div>
+
+            <!-- ROUNDED group (rect only, single toggle no body) -->
+            {#if shape.type === 'rect'}
+              {@const rounded = shape.corner_rounded === true}
+              <div class="fig-group" class:is-on={rounded}>
+                <div class="fig-group-head">
+                  <span class="k">rounded</span>
+                  <span class="fig-spacer"></span>
+                  <Toggle
+                    checked={rounded}
+                    disabled={shape.locked}
+                    ariaLabel="Toggle rounded corners"
+                    onchange={(next) => void applyShapeBoolean('corner_rounded', next)}
+                  />
+                </div>
+              </div>
+            {/if}
           {:else if sessionItem.type === 'line'}
             {@const line = sessionItem}
             <div class="prop-row">
@@ -796,6 +1051,7 @@
                 value={String(Math.round(line.x2))}
                 mixed={false}
                 ariaLabel="x2"
+                disabled={line.locked}
                 oncommit={(s) => void applyLineEndpoint('x2', Number(s))}
               />
               <InspectorField
@@ -804,16 +1060,35 @@
                 value={String(Math.round(line.y2))}
                 mixed={false}
                 ariaLabel="y2"
+                disabled={line.locked}
                 oncommit={(s) => void applyLineEndpoint('y2', Number(s))}
               />
             </div>
-            <div class="prop-row full">
-              <div class="display-row picker">
+            <!-- line stroke: figma-style group (no toggle, color + w + style 항상 노출) -->
+            <div class="fig-group is-on">
+              <div class="fig-group-head">
                 <span class="k">stroke</span>
+              </div>
+              <div class="fig-group-body">
                 <ColorPicker
                   value={line.stroke}
                   allowAlpha={true}
+                  disabled={line.locked}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
+                />
+                <InspectorField
+                  type="number"
+                  k="width"
+                  value={String(line.stroke_width)}
+                  mixed={false}
+                  ariaLabel="Stroke width"
+                  disabled={line.locked}
+                  oncommit={(s) => void applyShapeStrokeWidth(Number(s))}
+                />
+                <DashSegments
+                  value={line.stroke_dash ?? 'solid'}
+                  disabled={line.locked}
+                  onpick={(next) => void applyShapeDash(next)}
                 />
               </div>
             </div>
@@ -821,125 +1096,224 @@
             {@const txt = sessionItem}
             {@const h = txt.text_align ?? 'center'}
             {@const v = txt.text_vertical_align ?? 'middle'}
+            {@const fw = txt.font_weight ?? 'normal'}
+            {@const isItalic = txt.italic === true}
+            {@const isUnderline = txt.underline === true}
+            {@const isStrike = txt.strikethrough === true}
+            <!-- chars meta (read-only) — group 밖, info row -->
             <div class="prop-row full">
               <div class="display-row">
                 <span class="k">chars</span>
                 <span class="display-val mono">{txt.text.length}</span>
               </div>
             </div>
-            <div class="prop-row full">
-              <div class="display-row picker">
-                <span class="k">align</span>
-                <div class="align-group" role="group" aria-label="Horizontal alignment">
-                  <button
-                    type="button"
-                    class="align-btn"
-                    class:active={h === 'left'}
-                    aria-pressed={h === 'left'}
-                    title="Align left"
-                    aria-label="Align left"
-                    onclick={() => void applyTextAlign(txt, 'left')}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                      <line x1="4" y1="6" x2="20" y2="6"/>
-                      <line x1="4" y1="12" x2="14" y2="12"/>
-                      <line x1="4" y1="18" x2="18" y2="18"/>
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="align-btn"
-                    class:active={h === 'center'}
-                    aria-pressed={h === 'center'}
-                    title="Align center"
-                    aria-label="Align center"
-                    onclick={() => void applyTextAlign(txt, 'center')}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                      <line x1="4" y1="6" x2="20" y2="6"/>
-                      <line x1="7" y1="12" x2="17" y2="12"/>
-                      <line x1="5" y1="18" x2="19" y2="18"/>
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="align-btn"
-                    class:active={h === 'right'}
-                    aria-pressed={h === 'right'}
-                    title="Align right"
-                    aria-label="Align right"
-                    onclick={() => void applyTextAlign(txt, 'right')}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                      <line x1="4" y1="6" x2="20" y2="6"/>
-                      <line x1="10" y1="12" x2="20" y2="12"/>
-                      <line x1="6" y1="18" x2="20" y2="18"/>
-                    </svg>
-                  </button>
-                </div>
+            <!-- Figure 와 통일성 정합 — text controls 도 Figma-style fig-group
+                 안에. text 는 on/off toggle 없음 → head 에 label 만, 항상 is-on. -->
+            <div class="fig-group is-on">
+              <div class="fig-group-head">
+                <span class="k">text</span>
               </div>
-            </div>
-            <div class="prop-row full">
-              <div class="display-row picker">
-                <span class="k">v-align</span>
-                <div class="align-group" role="group" aria-label="Vertical alignment">
-                  <button
-                    type="button"
-                    class="align-btn"
-                    class:active={v === 'top'}
-                    aria-pressed={v === 'top'}
-                    title="Align top"
-                    aria-label="Align top"
-                    onclick={() => void applyTextVerticalAlign(txt, 'top')}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                      <line x1="5" y1="5" x2="19" y2="5"/>
-                      <line x1="8" y1="10" x2="16" y2="10"/>
-                      <line x1="10" y1="15" x2="14" y2="15"/>
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="align-btn"
-                    class:active={v === 'middle'}
-                    aria-pressed={v === 'middle'}
-                    title="Align middle"
-                    aria-label="Align middle"
-                    onclick={() => void applyTextVerticalAlign(txt, 'middle')}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                      <line x1="6" y1="7" x2="18" y2="7"/>
-                      <line x1="4" y1="12" x2="20" y2="12"/>
-                      <line x1="6" y1="17" x2="18" y2="17"/>
-                    </svg>
-                  </button>
-                  <button
-                    type="button"
-                    class="align-btn"
-                    class:active={v === 'bottom'}
-                    aria-pressed={v === 'bottom'}
-                    title="Align bottom"
-                    aria-label="Align bottom"
-                    onclick={() => void applyTextVerticalAlign(txt, 'bottom')}
-                  >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-                      <line x1="10" y1="9" x2="14" y2="9"/>
-                      <line x1="8" y1="14" x2="16" y2="14"/>
-                      <line x1="5" y1="19" x2="19" y2="19"/>
-                    </svg>
-                  </button>
+              <div class="fig-group-body">
+                <InspectorField
+                  type="number"
+                  k="size"
+                  value={String(txt.font_size)}
+                  mixed={false}
+                  ariaLabel="Font size"
+                  disabled={txt.locked}
+                  oncommit={(s) => void applyTextFontSize(Number(s))}
+                />
+                <ColorPicker
+                  value={txt.color}
+                  allowAlpha={true}
+                  disabled={txt.locked}
+                  oncommit={(hex) => void applyTextColor(hex)}
+                />
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">weight</span>
+                  <div class="segmented-control" role="group" aria-label="Font weight">
+                    <button
+                      type="button"
+                      class="seg-btn weight-btn weight-light"
+                      class:active={fw === 'light'}
+                      aria-pressed={fw === 'light'}
+                      title="Light (300)"
+                      aria-label="Light weight"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextFontWeight('light')}
+                    >L</button>
+                    <button
+                      type="button"
+                      class="seg-btn weight-btn weight-normal"
+                      class:active={fw === 'normal'}
+                      aria-pressed={fw === 'normal'}
+                      title="Normal (400)"
+                      aria-label="Normal weight"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextFontWeight('normal')}
+                    >N</button>
+                    <button
+                      type="button"
+                      class="seg-btn weight-btn weight-bold"
+                      class:active={fw === 'bold'}
+                      aria-pressed={fw === 'bold'}
+                      title="Bold (700)"
+                      aria-label="Bold weight"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextFontWeight('bold')}
+                    >B</button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">style</span>
+                  <div class="segmented-control multi" role="group" aria-label="Text style">
+                    <button
+                      type="button"
+                      class="seg-btn style-btn style-italic"
+                      class:active={isItalic}
+                      aria-pressed={isItalic}
+                      title="Italic"
+                      aria-label="Toggle italic"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextBoolean('italic', !isItalic)}
+                    >I</button>
+                    <button
+                      type="button"
+                      class="seg-btn style-btn style-underline"
+                      class:active={isUnderline}
+                      aria-pressed={isUnderline}
+                      title="Underline"
+                      aria-label="Toggle underline"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextBoolean('underline', !isUnderline)}
+                    >U</button>
+                    <button
+                      type="button"
+                      class="seg-btn style-btn style-strike"
+                      class:active={isStrike}
+                      aria-pressed={isStrike}
+                      title="Strikethrough"
+                      aria-label="Toggle strikethrough"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextBoolean('strikethrough', !isStrike)}
+                    >S</button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">align</span>
+                  <div class="segmented-control icon-segments" role="group" aria-label="Horizontal alignment">
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      class:active={h === 'left'}
+                      aria-pressed={h === 'left'}
+                      title="Align left"
+                      aria-label="Align left"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextAlign(txt, 'left')}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                        <line x1="4" y1="6" x2="20" y2="6"/>
+                        <line x1="4" y1="12" x2="14" y2="12"/>
+                        <line x1="4" y1="18" x2="18" y2="18"/>
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      class:active={h === 'center'}
+                      aria-pressed={h === 'center'}
+                      title="Align center"
+                      aria-label="Align center"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextAlign(txt, 'center')}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                        <line x1="4" y1="6" x2="20" y2="6"/>
+                        <line x1="7" y1="12" x2="17" y2="12"/>
+                        <line x1="5" y1="18" x2="19" y2="18"/>
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      class:active={h === 'right'}
+                      aria-pressed={h === 'right'}
+                      title="Align right"
+                      aria-label="Align right"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextAlign(txt, 'right')}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                        <line x1="4" y1="6" x2="20" y2="6"/>
+                        <line x1="10" y1="12" x2="20" y2="12"/>
+                        <line x1="6" y1="18" x2="20" y2="18"/>
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">v-align</span>
+                  <div class="segmented-control icon-segments" role="group" aria-label="Vertical alignment">
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      class:active={v === 'top'}
+                      aria-pressed={v === 'top'}
+                      title="Align top"
+                      aria-label="Align top"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextVerticalAlign(txt, 'top')}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                        <line x1="5" y1="5" x2="19" y2="5"/>
+                        <line x1="8" y1="10" x2="16" y2="10"/>
+                        <line x1="10" y1="15" x2="14" y2="15"/>
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      class:active={v === 'middle'}
+                      aria-pressed={v === 'middle'}
+                      title="Align middle"
+                      aria-label="Align middle"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextVerticalAlign(txt, 'middle')}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                        <line x1="6" y1="7" x2="18" y2="7"/>
+                        <line x1="4" y1="12" x2="20" y2="12"/>
+                        <line x1="6" y1="17" x2="18" y2="17"/>
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      class="seg-btn"
+                      class:active={v === 'bottom'}
+                      aria-pressed={v === 'bottom'}
+                      title="Align bottom"
+                      aria-label="Align bottom"
+                      disabled={txt.locked}
+                      onclick={() => void applyTextVerticalAlign(txt, 'bottom')}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                        <line x1="10" y1="9" x2="14" y2="9"/>
+                        <line x1="8" y1="14" x2="16" y2="14"/>
+                        <line x1="5" y1="19" x2="19" y2="19"/>
+                      </svg>
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
           {:else if sessionItem.type === 'note'}
+            <!-- ColorPicker 자체 "C" 라벨 보유 → 외부 label 무. -->
             <div class="prop-row full">
-              <div class="display-row picker">
-                <span class="k">color</span>
-                <ColorPicker
-                  value={sessionItem.color}
-                  oncommit={(hex) => void applyNoteColor(hex)}
-                />
-              </div>
+              <ColorPicker
+                value={sessionItem.color}
+                oncommit={(hex) => void applyNoteColor(hex)}
+              />
             </div>
           {:else if sessionItem.type === 'file_path'}
             <div class="prop-row full">
@@ -1017,11 +1391,16 @@
             class:active={visibleState === true}
             class:mixed={visibleState === null}
             aria-pressed={visibleState === true}
-            aria-label={visibleState === true ? 'Hide' : 'Show'}
-            title={visibleState === null ? 'Visibility · Mixed' : visibleState ? 'Visible (click to hide)' : 'Hidden (click to show)'}
+            aria-label={visibleState === null ? 'Show all' : visibleState ? 'Hide' : 'Show'}
+            title={visibleState === null ? 'Visibility mixed (click to show all)' : visibleState ? 'Visible (click to hide)' : 'Hidden (click to show)'}
             onclick={() => void applyCommonBool('visible', !(visibleState ?? false))}
           >
-            {#if visibleState === false}
+            {#if visibleState === null}
+              <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+            {:else if visibleState === false}
               <!-- eye-off -->
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
@@ -1036,7 +1415,6 @@
                 <circle cx="12" cy="12" r="3"/>
               </svg>
             {/if}
-            {#if visibleState === null}<span class="dash" aria-hidden="true"></span>{/if}
           </button>
 
           <button
@@ -1045,11 +1423,16 @@
             class:active={lockedState === true}
             class:mixed={lockedState === null}
             aria-pressed={lockedState === true}
-            aria-label={lockedState === true ? 'Unlock' : 'Lock'}
-            title={lockedState === null ? 'Lock · Mixed' : lockedState ? 'Locked (click to unlock)' : 'Unlocked (click to lock)'}
+            aria-label={lockedState === null ? 'Lock all' : lockedState ? 'Unlock' : 'Lock'}
+            title={lockedState === null ? 'Lock mixed (click to lock all)' : lockedState ? 'Locked (click to unlock)' : 'Unlocked (click to lock)'}
             onclick={() => void applyCommonBool('locked', !(lockedState ?? false))}
           >
-            {#if lockedState === true}
+            {#if lockedState === null}
+              <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+            {:else if lockedState === true}
               <!-- lock closed -->
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <rect x="4" y="11" width="16" height="10" rx="2"/>
@@ -1062,7 +1445,6 @@
                 <path d="M8 11V8a4 4 0 0 1 7.5-2"/>
               </svg>
             {/if}
-            {#if lockedState === null}<span class="dash" aria-hidden="true"></span>{/if}
           </button>
 
           {#if selectionSupportsMinimize}
@@ -1072,11 +1454,16 @@
               class:active={minimizedState === true}
               class:mixed={minimizedState === null}
               aria-pressed={minimizedState === true}
-              aria-label={minimizedState === true ? 'Restore' : 'Minimize'}
-              title={minimizedState === null ? 'Minimized · Mixed' : minimizedState ? 'Minimized (click to restore)' : 'Visible (click to minimize)'}
+              aria-label={minimizedState === null ? 'Minimize all supported items' : minimizedState ? 'Restore' : 'Minimize'}
+              title={minimizedState === null ? 'Minimize mixed (click to minimize all supported items)' : minimizedState ? 'Minimized (click to restore)' : 'Normal (click to minimize)'}
               onclick={() => void applyCommonBool('minimized', !(minimizedState ?? false))}
             >
-              {#if minimizedState === true}
+              {#if minimizedState === null}
+                <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
+                  <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                </svg>
+              {:else if minimizedState === true}
                 <!-- restore — PanelNode header 의 restore 아이콘과 정합 (두 줄). -->
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <line x1="5" y1="12" x2="19" y2="12"/>
@@ -1089,22 +1476,13 @@
                   <line x1="5" y1="18" x2="19" y2="18"/>
                 </svg>
               {/if}
-              {#if minimizedState === null}<span class="dash" aria-hidden="true"></span>{/if}
             </button>
           {/if}
 
           <!-- Focus 는 ViewportCtrl 의 focus 버튼으로 이동. -->
         </div>
-        {#if selectionCount === 1 && isSelectedTerminal}
-          <div class="prop-row full">
-            <div class="display-row">
-              <span class="k">alive</span>
-              <span class="display-val mono" class:dead={isDead}>
-                {isDead ? 'dead' : 'live'}
-              </span>
-            </div>
-          </div>
-        {/if}
+        <!-- alive row 폐기 (사용자 요구 2026-05-21) — Terminal·Pool section 의
+             alive row 와 중복. State section 은 visibility/lock/minimize 만. -->
       </section>
     {/if}
   </div>
@@ -1230,15 +1608,6 @@
     background: var(--color-glass-1);
   }
 
-  .display-row.picker {
-    /* ColorPicker / align-group 등 inline control 을 안에 두는 row — 컨트롤이
-     * 자체 surface 를 가져 height 가 늘어날 수 있음. */
-    height: auto;
-    min-height: 28px;
-    padding: 4px 8px;
-    flex-wrap: wrap;
-  }
-
   /* Fixed-width label — 모든 row 의 value 시작 x 정렬 (color box / button
    * group 의 가로 위치 일치). 가장 긴 label "v-align" (7자) 기준 + buffer. */
   .display-row .k {
@@ -1250,18 +1619,166 @@
     letter-spacing: 0.4px;
   }
 
-  /* .picker row 의 control (ColorPicker / align-group) 이 row 너비 full
-   * 채우도록 — RightPanel resize 와 정합. */
-  .display-row.picker > .align-group,
-  .display-row.picker > :global(.color-picker) {
+  /* .display-row.picker / .shape-style-row CSS 폐기 (2026-05-21) — Inspector
+     design 규칙 재편 후 ColorPicker 가 자체 라벨 + width full 처리, 외부
+     wrapper 불요. fig-group 이 layout 책임. */
+
+  /* ── Inspector design 규칙 (2026-05-21 사용자 정의) ──────────────
+     - Group: border-style container (state-row 참조). border + surface-2
+       background 통일 (header / body 색 차별 X). header ↔ body 는 1px
+       divider 로만 구분.
+     - Height 24px 통일 (모든 component 평균).
+     - Width full.
+   */
+  .fig-group {
+    display: flex;
+    flex-direction: column;
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    width: 100%;
+    /* overflow visible — DashSegments dropdown 의 popover 가 group 아래로
+       돌출되어야 함. head/body 가 transparent bg 라 corner clipping 무관. */
+    overflow: visible;
+  }
+  .fig-group + .fig-group {
+    margin-top: 4px;
+  }
+  /* head row — 24px 통일. label 좌측 .k 56px 고정, toggle 우측 fig-spacer.
+     body expand 여부와 무관, 위치/높이 절대 변경 X (사용자 요구). */
+  .fig-group-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 24px;
+    padding: 0 6px;
+    box-sizing: border-box;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-fg);
+  }
+  .fig-group-head > .k {
+    flex: 0 0 56px;
+    width: 56px;
+    color: var(--color-fg-muted);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.4px;
+  }
+  .fig-group-head > .fig-spacer {
     flex: 1 1 auto;
+  }
+  /* on 시 head 와 body 사이 hairline divider — group 시각 결속. */
+  .fig-group.is-on .fig-group-head {
+    border-bottom: 1px solid var(--color-border);
+  }
+  /* body — 같은 surface-2 bg 유지 (사용자 요구: 색 통일). 내부 component 들이
+     각자 자체 border + bg 를 가져서 group 색에 겹쳐 자연 정합. */
+  .fig-group-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 4px 6px;
+  }
+  /* body 안의 InspectorField / DashSegments / ColorPicker 가 width full. */
+  .fig-group-body > :global(.inspector-input),
+  .fig-group-body > :global(.color-picker),
+  .fig-group-body > :global(.style-dropdown) {
+    width: 100%;
+    min-width: 0;
+  }
+  /* 2-column body row (stroke 의 w + style) — 1:1 균등 분배, gap 4px. */
+  /* .fig-body-pair (2-col stroke w + style) 폐기 — 사용자 요구로 width / style
+     각자 full row 로 분리. style 의 SVG preview 가 narrow column 에서 overflow
+     하던 문제 해소 + label "width" full text 복원. */
+
+  .control-row {
+    justify-content: flex-start;
+    gap: 10px;
+  }
+
+  .control-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.4px;
+    color: var(--color-fg-muted);
+    text-transform: uppercase;
+    /* label-front 정합 (사용자 요구) — .k 라벨 (56px) 과 같은 fixed width 로
+       picker row 의 label column 과 좌측 정렬 맞춤. */
+    flex: 0 0 56px;
+    width: 56px;
+  }
+
+  .segmented-control {
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+
+  /* control-row 안의 segmented-control 은 row 의 남은 너비 전체 차지 (사용자
+     요구: "button 그룹의 너비가 full"). 자식 seg-btn 도 flex:1 로 균등 분포. */
+  .control-row > .segmented-control {
+    flex: 1 1 auto;
+    width: 100%;
+  }
+  .control-row > .segmented-control > .seg-btn {
+    flex: 1 1 0;
+    width: auto;
     min-width: 0;
   }
 
-  .display-row.picker > :global(.color-picker .hex-input) {
-    flex: 1 1 auto;
-    min-width: 0;
-    width: auto;
+  .seg-btn {
+    width: 28px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-right: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+    color: var(--color-fg);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  .seg-btn:last-child {
+    border-right: 0;
+  }
+
+  .seg-btn:hover:not(:disabled):not(.active) {
+    background: var(--color-glass-1);
+  }
+
+  .seg-btn.active {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+    font-weight: var(--weight-semibold);
+  }
+
+  .seg-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .seg-btn:focus-visible {
+    outline: none;
+  }
+
+  .icon-segments .seg-btn {
+    color: var(--color-fg-muted);
+  }
+
+  .icon-segments .seg-btn.active {
+    color: var(--color-accent-fg);
   }
 
   /* Read-only value — editable InspectorField (color-fg) 와 색 차별. */
@@ -1385,17 +1902,6 @@
     border-radius: var(--radius-sm);
   }
 
-  /* picker row 의 align-group 은 row 너비 채움 + button 들 균등 분포. */
-  .display-row.picker > .align-group {
-    display: flex;
-  }
-
-  .display-row.picker > .align-group > .align-btn {
-    flex: 1 1 0;
-    width: auto;
-    min-width: 0;
-  }
-
   .align-btn {
     width: 26px;
     height: 22px;
@@ -1415,13 +1921,6 @@
   .align-btn:hover {
     background: var(--color-glass-1);
     color: var(--color-fg);
-  }
-
-
-  .align-btn.active {
-    background: var(--color-surface);
-    color: var(--color-fg);
-    box-shadow: var(--shadow-sm);
   }
 
   /* Figma-style state icon row (visibility / lock / minimize) — panel full width. */
@@ -1464,18 +1963,35 @@
     color: var(--color-fg);
   }
 
-  /* Mixed: dash overlay across the icon (indeterminate marker — ADR-0027 D3). */
+  /* Mixed: replace the state glyph with an indeterminate square. Overlaying a
+   * dash on the normal icon made minimize/restore ambiguous in mixed selection. */
   .state-btn.mixed {
     color: var(--color-fg-subtle);
   }
 
-  .state-btn .dash {
-    position: absolute;
-    inset: 50% 4px auto 4px;
-    height: 2px;
-    background: var(--color-fg-muted);
-    border-radius: 1px;
-    transform: translateY(-50%);
-    pointer-events: none;
+  .state-btn.mixed:hover {
+    color: var(--color-fg-muted);
   }
+
+  /* batch-5 polish — 옛 .dash-picker (<select> 기반) 폐기. DashSegments
+     컴포넌트가 icon-segmented control 로 대체 (사용자 요구: "line style 은
+     icon 으로 대체"). */
+
+  /* batch-5 R3 — Text weight (3-segment) + style (3 toggle) 버튼.
+     align-btn 의 SVG 자리에 글자 (L/N/B / I/U/S) 표시. 각 글자가 그 weight/
+     style 의 시각 단서 역할 — L 은 thin, N 은 regular, B 는 bold;
+     I 는 italic, U 는 underline, S 는 line-through. */
+  .weight-btn,
+  .style-btn {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.4px;
+  }
+  .weight-btn.weight-light  { font-weight: 300; }
+  .weight-btn.weight-normal { font-weight: 400; }
+  .weight-btn.weight-bold   { font-weight: 700; }
+
+  .style-btn.style-italic    { font-style: italic; }
+  .style-btn.style-underline { text-decoration: underline; }
+  .style-btn.style-strike    { text-decoration: line-through; }
 </style>

@@ -6,10 +6,11 @@
   //
   // 현재 단계: 더블 클릭 → InlineEditTextarea (body) → commit 시 mutateLayout.
 
+  import { untrack } from 'svelte';
   import { NodeResizer } from '@xyflow/svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
-  import type { TextAlign, TextVerticalAlign, TextItem, CanvasItem } from '$lib/types/canvas';
+  import type { CanvasItem, FontWeight, TextAlign, TextItem, TextVerticalAlign } from '$lib/types/canvas';
   import CanvasCloseButton from './CanvasCloseButton.svelte';
   // 텍스트 정렬 UI 는 ToolbarSubbar (lib/toolbar/ToolbarSubbar.svelte) 로 이전.
   // 본 컴포넌트는 더 이상 alignment toolbar 를 그리지 않는다.
@@ -28,6 +29,24 @@
     text_align?: TextAlign;
     text_vertical_align?: TextVerticalAlign;
     color: string;
+    label?: string;
+    /** batch-5 R3 — font weight (Light/Normal/Bold). default 'normal'. */
+    font_weight?: FontWeight;
+    /** batch-5 R3 — italic toggle. default false. */
+    italic?: boolean;
+    /** batch-5 R3 — underline toggle. default false. */
+    underline?: boolean;
+    /** batch-5 R3 — strikethrough toggle. default false. */
+    strikethrough?: boolean;
+  }
+
+  // R7 (batch-5 Grill #18) — label auto-derive 알고리즘. 첫 줄만 + trim +
+  // 기존 label cap (4096B, ADR-0018 D8) 자연 활용. 4 KB slice 는 byte 가 아닌
+  // char 기준 (byte-cap 은 BE validation 이 강제) — UI-friendly conservative.
+  const TEXT_LABEL_CHAR_CAP = 4000;
+  function deriveLabel(text: string): string {
+    const firstLine = text.split('\n', 1)[0] ?? '';
+    return firstLine.trim().slice(0, TEXT_LABEL_CHAR_CAP);
   }
 
   let {
@@ -57,9 +76,36 @@
   const textAlign = $derived(data.text_align ?? 'center');
   const textVerticalAlign = $derived(data.text_vertical_align ?? 'middle');
 
+  // batch-5 R3 — font weight / italic / underline / strikethrough.
+  // FontWeight: light=300 / normal=400 / bold=700 (Grill #6, 3-bucket).
+  const fontWeight = $derived(data.font_weight ?? 'normal');
+  const fontWeightCss = $derived(
+    fontWeight === 'light' ? 300 : fontWeight === 'bold' ? 700 : 400,
+  );
+  const fontStyleCss = $derived(data.italic === true ? 'italic' : 'normal');
+  const textDecorationCss = $derived.by(() => {
+    const parts: string[] = [];
+    if (data.underline === true) parts.push('underline');
+    if (data.strikethrough === true) parts.push('line-through');
+    return parts.length === 0 ? 'none' : parts.join(' ');
+  });
+
   let editing = $state(false);
   const minTextHeight = $derived(Math.max(16, Math.ceil(data.font_size)));
   type ResizeParams = { x: number; y: number; width: number; height: number };
+
+  // R7 (batch-5) — text item spawn 직후 auto-edit 진입. itemFactory 의 성공
+  // path 가 sessionStore.justSpawnedTextId 를 set. mount 시 self id 와 일치
+  // 하면 editing=true + flag clear (untrack 으로 read/write 분리, $effect 의
+  // dependency 추적 제외).
+  $effect(() => {
+    if (sessionStore.justSpawnedTextId === data.id) {
+      untrack(() => {
+        editing = true;
+        sessionStore.justSpawnedTextId = null;
+      });
+    }
+  });
 
   function onDblClick(e: MouseEvent): void {
     if (isLocked) return;
@@ -76,12 +122,22 @@
       editing = false;
       return;
     }
-    const result = await sessionStore.applyMutation(
+    // R7 (batch-5 Grill #18) — label-empty trigger derive. label 이 비어있고
+    // next 가 비지 않은 경우에만 deriveLabel(next) 로 갱신. 이후 사용자가
+    // Inspector 에서 label 을 따로 입력하면 자동 derive 가 비활성 (자율성).
+    const curLabel = data.label ?? '';
+    const shouldDerive = curLabel === '' && next.length > 0;
+    // Inspector hot-path 와 같은 패턴: optimisticMutation 으로 commit 즉시
+    // 반영 + PUT 실패 시 priorSnapshot 으로 자동 rollback. server 부하 변화
+    // 0 — InlineEditTextarea 가 이미 commit-based (Enter/blur 1회).
+    const result = await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'text'
-            ? ({ ...it, text: next } as TextItem)
+            ? (shouldDerive
+                ? ({ ...it, text: next, label: deriveLabel(next) } as TextItem)
+                : ({ ...it, text: next } as TextItem))
             : it,
         ),
       }),
@@ -117,7 +173,7 @@
     class="text-node"
     class:m-single={isInM}
     class:locked={isLocked}
-    style="width: 100%; height: 100%; font-size: {data.font_size}px; color: {data.color}; text-align: {textAlign};"
+    style="width: 100%; height: 100%; font-size: {data.font_size}px; color: {data.color}; text-align: {textAlign}; font-weight: {fontWeightCss}; font-style: {fontStyleCss}; text-decoration: {textDecorationCss};"
     role="group"
     aria-label="Text item"
     ondblclick={onDblClick}

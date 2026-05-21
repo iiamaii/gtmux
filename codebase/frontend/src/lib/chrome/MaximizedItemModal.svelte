@@ -313,7 +313,17 @@
             <PanelDanglingOverlay terminalId={itemId} />
           {/if}
         {:else if isNote && item.type === 'note'}
-          <div class="note-body-host">
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <!--
+            R6 (ADR-0018 D9 amend, batch-5 Grill #13): MaximizedItemModal 안의
+            note body 도 NoteNode 와 동일하게 host wrapper 전체가 dblclick zone.
+            padding / empty area 어디서든 dblclick → body editing 진입.
+          -->
+          <div
+            class="note-body-host"
+            ondblclick={() => (bodyEditing = true)}
+          >
             {#if bodyEditing}
               <InlineEditTextarea
                 value={item.body}
@@ -325,12 +335,9 @@
                 onCancel={() => (bodyEditing = false)}
               />
             {:else}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
               <pre
                 class="note-body-text"
                 class:empty={item.body.length === 0}
-                ondblclick={() => (bodyEditing = true)}
               >{item.body.length > 0 ? item.body : 'Double-click to add body'}</pre>
             {/if}
           </div>

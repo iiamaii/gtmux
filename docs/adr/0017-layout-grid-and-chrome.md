@@ -597,6 +597,88 @@ Lock / Hide 토글은 *batch 일관 상태* 정책:
 - `lib/chrome/ContextMenu.svelte` — `onHide` / `onLock` placeholder → real toggle wire (selection batch)
 - ADR-0010 group helper land 시 본 amend cross-link 갱신
 
+## Amend (2026-05-20 ⑩) — Tool-active node click forward to onpaneclick (R4)
+
+### 맥락
+
+UI/UX batch-5 (`docs/reports/2026-05-20-ui-ux-batch-5-analysis.md` §R4 / FE handover §B6) — point-spawn 도구 (text/note/file_path/terminal) active 인 동안 사용자가 *기존 panel 위* 를 click 했을 때, 기존 동작은 `onnodeclick` 의 early return (`if (!isSelectMode) return;`) 으로 *아무 일도 안 일어남*. 사용자 의도는 "도구가 active 인 동안은 위치 상관없이 새 item 생성" — 기존 동작과 충돌.
+
+### 결정 — Canvas.svelte::onnodeclick forward
+
+```
+function onnodeclick({ node, event }) {
+  if (isSelectMode) {
+    // 기존 동작 — single / meta-toggle.
+    ...
+    return;
+  }
+  // tool active — onpaneclick 의 spawn 로직 forward (같은 좌표).
+  if (event instanceof MouseEvent) onpaneclick({ event });
+}
+```
+
+- **select 모드**: 기존 single / meta-toggle 동작 보존 (회귀 0).
+- **point-spawn tool active (text/note/file_path/terminal)**: node hit 도 pane hit 처럼 처리 → 새 item 그 좌표 spawn.
+- **drag-spawn tool (rect/ellipse/line/free_draw)**: 별 pointer handler (`pointerdown/move/up` capture) 가 처리 — `onnodeclick` 까지 도달 안 함, 별도 분기 불요.
+- **hand tool**: `onpaneclick` 의 첫 줄 `if (isHandTool) return;` 가 자연 흡수 — node 위 click 도 no-op.
+
+### 거절된 대안
+
+- **R28.** Tool active 시에도 node click 으로 *기존 item 선택*. — 도구 의도와 충돌 (도구가 켜져 있는데 selection 이 바뀜).
+- **R29.** Tool active 시 onnodeclick 을 SvelteFlow 의 `nodesFocusable=false` 로 차단. — global flag 변경은 회귀 risk + 도구 ↔ select 전환 시 flap.
+
+### 결과
+
+- 도구 활성 중 *어디든 click* 으로 새 item 생성 — Figma/Sketch 의 도구 사용 mental model 정합.
+- Canvas.svelte 의 변경 범위 = onnodeclick 함수 한 곳 + forward 한 줄. 회귀 위험 작음.
+
+### 산출물 / 정합 작업
+
+- `lib/canvas/Canvas.svelte::onnodeclick` — forward 분기 land.
+- AC-D3 (FE handover §D-3) — manual E2E: text/note tool active + 기존 panel 위 click → 새 item 생성 + 기존 panel 미선택.
+
+## Amend (2026-05-21 ⑪) — Hand tool mode (component event 절대 격리)
+
+### 맥락
+
+`toolStore.current === 'hand'` 는 Figma 의 **H 키 = pan mode** 컨벤션 — 캔버스 viewport 만 조작 (왼-드래그 pan), canvas component 자체에는 *어떤 상호작용도 발생하지 않음*. 직전까지 구현은:
+- Pan: ✅ `panOnDragMask = isHandTool ? [0, 1, 2] : [1, 2]` (Canvas.svelte:307)
+- Selection / drag: ✅ `elementsSelectable / nodesDraggable / selectionOnDrag = isSelectMode` 가 자연 차단 (hand 모드 = !select)
+- **Click**: ✅ `onpaneclick / onnodeclick` 의 `if (isHandTool) return;` 으로 차단
+- **Right-click**: ❌ `onpanecontextmenu / onnodecontextmenu` 가 hand 모드 무시 → ContextMenu 열림. 사용자 보고 결함.
+
+### 결정
+
+Hand tool active 인 동안 canvas component / pane 의 *모든 mouse interaction* 차단:
+
+| Event | hand 모드 동작 |
+|---|---|
+| Left click (`onpaneclick / onnodeclick`) | early return (현 동작 유지) |
+| Right click (`onpanecontextmenu / onnodecontextmenu`) | **early return — ContextMenu 열지 않음 (본 amend 신규)** |
+| Left-drag | pan (`panOnDragMask` 0 포함) |
+| Selection box | 차단 (`selectionOnDrag={isSelectMode && !isSpacePressed && !isMaximizedActive}` 가 자연 차단) |
+| Node drag | 차단 (`nodesDraggable={isSelectMode && !isMaximizedActive}`) |
+| Resize handle | 차단 (NodeResizer 의 `isVisible={isInM && !isLocked}` — hand 모드는 M 갱신 안 되므로 자연 차단) |
+| Hover / cursor | grab cursor (`pan-cursor` class) |
+| Keyboard shortcut (Cmd+C/V/Z 등) | 그대로 동작 (도구와 직교) |
+
+**원칙**: hand 모드는 *canvas 와 component 의 wall* — 사용자는 viewport 만 본다. 어떤 component-level event 도 fire 하지 않는다.
+
+### 거절된 대안
+
+- **R30.** Right-click 은 ContextMenu 열되 액션은 차단 (visual feedback) — 사용자가 "왜 안 되지" 혼란. 거절: 아예 안 여는 게 mental model 일관.
+- **R31.** Hand 모드 자체를 폐기 (Space 만으로 충분) — Space-hold 는 momentary pan, Hand 는 sustained mode. 둘은 mutually distinct UX (Figma 컨벤션).
+
+### 결과
+
+- Pan 외 component interaction = 0. 사용자가 layout 만 navigate.
+- Selection 보존 (hand 모드 진입 후 사라지지 않음) — select 모드 복귀 시 직전 selection 그대로.
+
+### 산출물 / 정합 작업
+
+- `lib/canvas/Canvas.svelte::onpanecontextmenu / onnodecontextmenu` — `if (isHandTool) return;` 추가.
+- 후속: `lib/keyboard/chromeShortcuts.svelte.ts` 의 도구 shortcut (V/H 등) 회귀 확인 — 도구 전환은 항상 정상.
+
 ## 변경 이력
 
 - 2026-05-15: 초안 + Accepted — plan 0005 Stage C 진입 시점. 6 영역 grid + 7 chrome 컴포넌트 책임 매트릭스 + Session lifecycle 7-step flow + Session 이름 surface.
@@ -610,3 +692,5 @@ Lock / Hide 토글은 *batch 일관 상태* 정책:
 - 2026-05-17 ⑦ (D6 amend ⑤): Basic editing shortcut matrix register. (a) `Cmd/Ctrl+A` (Select all — 신규 결정, focus 4 모드 분기: canvas / LayerTreeView / xterm / editable), (b) `Cmd/Ctrl+C` / `X` / `V` (ADR-0030 D5 cross-link), (c) `Cmd/Ctrl+Z` / `Shift+Z` (ADR-0028 cross-link). 비범위 OS-standard 5종 (Cmd+S auto-save 정합 / Cmd+P print / Cmd+W tab close browser / Cmd+R reload — D5.1/D5.4 자연 처리 / Cmd+Tab OS) 명시. Find (Cmd+F) 는 P2 deferred — 별 ADR 후보 (Cmd+K palette 와 분기). 거절: R18 별 ADR 신규 / R19 canvas Cmd+A 의 hidden 포함 / R20 editable Cmd+Z 의 app undo. `plan-0007 §14.20.5.2 / .4` + `handover-v3 §10.5.2 / .4` + 각 변경 이력 동시 amend.
 - 2026-05-19 ⑧ (D6 amend ⑥): Arrow nudge + Cmd+D 매트릭스. (a) Plain `↑↓←→` = 1px / `Shift+↑↓←→` = 8px / `Cmd/Ctrl+↑↓←→` = 64px nudge — 모두 M.size ≥ 1, locked 제외, editable/xterm focus 시 OS default. (b) `Cmd/Ctrl+D` Duplicate — ADR-0030 D11 cross-link (clipboard 미오염 1-step in-place clone). Nudge 의 history grain = **250ms idle debounce = 1 entry** (Figma 패턴, ADR-0028 D11.1 의 optimistic failure rollback 정합). 거절: R21 매 keydown 1 entry / R22 Cmd+Arrow = viewport step dynamic / R23 Cmd+D clipboard 갱신 (Sketch 패턴) / R24 Alt+Arrow 확장 (P1).
 - 2026-05-19 ⑨ (D6 amend ⑦): Lock/Hide toggle 매트릭스 + Group/Ungroup deferred. (a) `Cmd/Ctrl+L` Lock toggle (batch — all locked → unlock, 그 외 → lock; Figma 패턴), (b) `Cmd/Ctrl+Shift+H` Hide toggle (batch — all hidden → visible, 그 외 → hide). 둘 다 ADR-0018 D3 cross-link, M.size ≥ 1, editable/xterm focus 시 OS default. ContextMenu 의 `[Hide / Show]` + `[Lock / Unlock]` placeholder → real wire 같은 batch. (c) `Cmd/Ctrl+G` Group + `Cmd/Ctrl+Shift+G` Ungroup — *매트릭스 register only, wire deferred* (ADR-0010 group helper 미land). 거절: R25 mixed→비활성 (Sketch) / R26 Group wire 본 batch / R27 Cmd+H (OS hide 충돌).
+- 2026-05-20 ⑩: UI/UX batch-5 R4 — Canvas.svelte::onnodeclick 의 tool-active forward. select 모드는 기존 single/meta-toggle 보존. point-spawn tool (text/note/file_path/terminal) active 시 node 위 click 도 onpaneclick 의 spawn 로직 forward — 사용자가 어디든 click 으로 새 item 생성 가능 (Figma/Sketch 정합). drag-spawn / hand 는 별 분기 불요 (자연 흡수). 거절: R28 tool-active 시 기존 item 선택 / R29 SvelteFlow nodesFocusable=false. cross-link: `2026-05-20-ui-ux-batch-5-analysis.md` §R4 / `2026-05-20-fe-handover-ui-ux-batch-5.md` §B6.
+- 2026-05-21 ⑪: Hand tool mode 의 component event 절대 격리. 직전엔 left click 만 차단, right click (ContextMenu) 은 hand 모드에서도 열림. 본 amend 가 `onpanecontextmenu / onnodecontextmenu` 도 `if (isHandTool) return;` 으로 차단. 원칙: hand 모드 = canvas/component 간 wall, 사용자는 viewport pan 만. 거절: R30 ContextMenu 열되 액션만 차단 (mental model 혼란) / R31 hand 모드 폐기 (Space momentary vs sustained 의 distinct UX).

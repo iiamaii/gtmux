@@ -69,8 +69,26 @@
     titleEditing = true;
   }
 
-  function onBodyDblClick(e: MouseEvent): void {
+  // R6 (ADR-0018 D9 amend, batch-5 Grill #13): body dblclick zone 을 root
+  // .note-node 까지 확장. body / padding / head-row 의 *비라벨* 영역 모두에서
+  // 더블 클릭 → body editing. title 영역은 별 처리 없음 — 기존 .note-label
+  // 의 ondblclick (onTitleDblClick) 만이 title editing 진입.
+  //
+  // 회피 path:
+  //  - locked / minimized 시 no-op.
+  //  - target 이 button 또는 그 자손 (svg path) 이면 자체 click handler 우선.
+  //  - target 이 .note-label (또는 그 자손) 이면 stopPropagation 으로 이미
+  //    onTitleDblClick 이 흡수 — root 까지 안 옴.
+  function onContentDblClick(e: MouseEvent): void {
     if (isLocked || isMinimized) return;
+    const target = e.target as HTMLElement | null;
+    if (target === null) return;
+    const currentTarget = e.currentTarget as HTMLElement | null;
+    let cursor: HTMLElement | null = target;
+    while (cursor !== null && cursor !== currentTarget) {
+      if (cursor.tagName === 'BUTTON') return;
+      cursor = cursor.parentElement;
+    }
     e.stopPropagation();
     bodyEditing = true;
   }
@@ -85,7 +103,8 @@
       return;
     }
     if (sessionStore.active === null) return;
-    const result = await sessionStore.applyMutation(
+    // Inspector hot-path 와 동일: optimisticMutation 으로 commit 즉시 반영.
+    const result = await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
@@ -193,6 +212,7 @@
     aria-label={isMinimized ? `Restore note ${data.title || 'Untitled'}` : `Note ${data.title || 'Untitled'}`}
     onclick={isMinimized ? onChipClick : undefined}
     onkeydown={isMinimized ? (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') onChipClick(e as unknown as MouseEvent); } : undefined}
+    ondblclick={isMinimized ? undefined : onContentDblClick}
     tabindex={isMinimized ? 0 : -1}
     title={isMinimized ? `${data.title || 'Untitled'} — click to restore` : undefined}
   >
@@ -282,7 +302,7 @@
       {/if}
     </div>
 
-    <div class="note-body-wrap" ondblclick={onBodyDblClick} role="presentation">
+    <div class="note-body-wrap" role="presentation">
       {#if bodyEditing}
         <InlineEditTextarea
           value={data.body}

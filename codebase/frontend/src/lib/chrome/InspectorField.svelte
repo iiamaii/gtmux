@@ -22,6 +22,7 @@
     /** Optional prefix label inside the field (e.g. "X", "W"). */
     k?: string;
     ariaLabel?: string;
+    disabled?: boolean;
   }
 
   const {
@@ -33,6 +34,7 @@
     step = 1,
     k,
     ariaLabel,
+    disabled = false,
   }: Props = $props();
 
   let draft = $state('');
@@ -43,6 +45,7 @@
   });
 
   function commit(): void {
+    if (disabled) return;
     editing = false;
     const trimmed = draft.trim();
     if (trimmed.length === 0) {
@@ -63,6 +66,7 @@
   }
 
   function onfocus(): void {
+    if (disabled) return;
     editing = true;
   }
 
@@ -94,6 +98,7 @@
     value={draft}
     placeholder={mixed ? 'Mixed' : placeholder}
     aria-label={ariaLabel ?? k}
+    {disabled}
     oninput={(e) => (draft = (e.currentTarget as HTMLInputElement).value)}
     {onfocus}
     {onblur}
@@ -102,15 +107,15 @@
 </label>
 
 <style>
-  /* ColorPicker inline-hex / inline-alpha 와 동일한 box style — 디자인 통일
-     (2026-05-17). h22 + bg-bg + visible border + hover-strong + focus-accent. */
+  /* Inspector component box style — 디자인 규칙 (2026-05-21 사용자 정의):
+     모든 component 24px 통일 + width full + label 내부 좌측. */
   .inspector-input {
     display: flex;
     align-items: center;
     gap: 4px;
     width: 100%;
     min-width: 0;
-    height: 22px;
+    height: 24px;
     padding: 0 6px;
     box-sizing: border-box;
     background: var(--color-bg);
@@ -172,6 +177,11 @@
   .inspector-input.mixed .field::placeholder {
     color: var(--color-fg-subtle);
     font-style: italic;
+  }
+
+  .field:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 
   /* Strip native number arrows — Figma 패턴. */

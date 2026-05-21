@@ -224,6 +224,9 @@
     // sessionStore 동기. terminal item 은 kill_terminal=false 기본 (G25 —
     // panel 제거만, terminal pool 유지). xterm/editable focus 시 무시.
     if (e.key === 'Delete' || e.key === 'Backspace') {
+      // Hand mode is viewport-only. Do not allow selected element mutation from
+      // keyboard while the cursor tool is active.
+      if (isHandTool) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       if (isEditableFocused()) return;
       if (sessionStore.M.size === 0) return;
@@ -380,7 +383,33 @@
   /** Drag 가 click 으로 취급되는 임계 — flow 좌표 기준 8px. */
   const DRAG_CLICK_THRESHOLD = 8;
 
+  // ADR-0032 D9 — Right-click on selected node 의 M 보존 snapshot.
+  // SvelteFlow 의 click-to-select internal logic 이 mousedown(button=2) 시점에
+  // M 을 단일 clicked id 로 reset → onnodecontextmenu 가 fire 될 때엔 이미
+  // M.size === 1 → ContextMenu 가 항상 single-mode 로 열림 (multi-mode 진입 X).
+  //
+  // 본 snapshot 은 capture-phase pointerdown 에서 SvelteFlow internal 보다
+  // *먼저* 실행되어 pre-reset M 을 보존. onnodecontextmenu 가 clicked node 가
+  // snapshot ∈ 면 setM 으로 복원 → multi-mode 진입 정합.
+  //
+  // Drag-lasso 와 Cmd-click multi-select 양쪽 모두 같은 회귀 (둘 다 right-click
+  // 시 SvelteFlow 가 reset). 단 lasso 는 one-shot → 즉시 right-click 패턴이
+  // 더 빈번해서 사용자 체감이 큼.
+  let rightClickMSnapshot: Set<string> | null = null;
+
   function onCanvasPointerDown(e: PointerEvent) {
+    // Right-button on canvas: snapshot M for context menu restore (button=2).
+    if (e.button === 2 && isSelectMode) {
+      const target = e.target as HTMLElement | null;
+      const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
+      const nodeId = nodeEl?.dataset.id ?? null;
+      if (nodeId !== null && sessionStore.M.has(nodeId) && sessionStore.M.size >= 2) {
+        rightClickMSnapshot = new Set(sessionStore.M);
+      } else {
+        rightClickMSnapshot = null;
+      }
+    }
+
     if (!isDragTool) return;
     if (e.button !== 0) return; // left button only
     if (sessionStore.active === null) return;
@@ -610,7 +639,10 @@
         // No type-specific payload
         break;
       case 'text':
-        payload = `|${item.text}|${item.font_size}|${item.color}|${item.text_align ?? ''}|${item.text_vertical_align ?? ''}`;
+        // batch-5 R3 신규: font_weight / italic / underline / strikethrough.
+        // 누락 시 Inspector 변경이 cached Node 로 흡수되어 selection 해제 전엔
+        // 반영 안 됨 — 회귀 가드.
+        payload = `|${item.text}|${item.font_size}|${item.color}|${item.text_align ?? ''}|${item.text_vertical_align ?? ''}|${item.font_weight ?? ''}|${item.italic ? 1 : 0}|${item.underline ? 1 : 0}|${item.strikethrough ? 1 : 0}`;
         break;
       case 'note':
         payload = `|${item.title ?? ''}|${item.body ?? ''}|${item.color ?? ''}`;
@@ -619,11 +651,16 @@
         payload = `|${item.path}|${item.kind ?? ''}`;
         break;
       case 'rect':
+        // batch-5 R1+R2 신규: fill_enabled / stroke_enabled / corner_rounded / stroke_dash.
+        payload = `|${item.stroke}|${item.fill}|${item.stroke_width}|${item.fill_enabled === false ? 0 : 1}|${item.stroke_enabled === false ? 0 : 1}|${item.corner_rounded ? 1 : 0}|${item.stroke_dash ?? ''}`;
+        break;
       case 'ellipse':
-        payload = `|${item.stroke}|${item.fill}|${item.stroke_width}`;
+        // batch-5 R1+R2 신규: fill_enabled / stroke_enabled / stroke_dash (corner_rounded 없음).
+        payload = `|${item.stroke}|${item.fill}|${item.stroke_width}|${item.fill_enabled === false ? 0 : 1}|${item.stroke_enabled === false ? 0 : 1}|${item.stroke_dash ?? ''}`;
         break;
       case 'line':
-        payload = `|${item.x2}|${item.y2}|${item.stroke}|${item.stroke_width}`;
+        // batch-5 R2 신규: stroke_dash.
+        payload = `|${item.x2}|${item.y2}|${item.stroke}|${item.stroke_width}|${item.stroke_dash ?? ''}`;
         break;
       case 'free_draw':
         // P2 — placeholder until ship
@@ -649,6 +686,20 @@
   function itemToNode(item: CanvasItem): Node {
     const visible = effectiveVisibility(item.visibility, item.parent_id, sessionGroupsById);
     const locked = effectiveLocked(item.locked, item.parent_id, sessionGroupsById);
+    // 2026-05-20 figure hit-test — fill_enabled=false rect/ellipse 의 interior 는
+    // mouse event 제외. ShapeNode 의 .pass-through (자식 wrapper) 만으로는
+    // SvelteFlow 의 .svelte-flow__node 가 bbox 전체를 catch — wrapper 자체에
+    // 'fill-off' class 를 부여해 CSS rule 로 pointer-events:none. NodeResizer
+    // handle 은 SvelteFlow 의 `.svelte-flow__resize-control { pointer-events:all }`
+    // 로 그대로 hit 가능 (pointer-events 는 CSS 비상속).
+    const classes: string[] = [];
+    if (item.minimized) classes.push('is-minimized');
+    if (
+      (item.type === 'rect' || item.type === 'ellipse') &&
+      item.fill_enabled === false
+    ) {
+      classes.push('fill-off');
+    }
     const common = {
       id: item.id,
       position: { x: item.x, y: item.y },
@@ -657,7 +708,7 @@
       zIndex: item.z,
       width: item.w,
       height: item.h,
-      class: item.minimized ? 'is-minimized' : '',
+      class: classes.join(' '),
     };
     if (item.type === 'terminal') {
       return {
@@ -915,17 +966,26 @@
   // 노드 클릭 → M 갱신. dual source.
   //   plain    : single (clear + add)
   //   meta    : toggle in/out
+  //
+  // R4 (ADR-0017 §Toolbar2 amend, batch-5): point-spawn tool active 인 동안
+  // 기존 node 위 click 도 onpaneclick 의 spawn 로직으로 forward — 사용자가
+  // *다른 panel 위에 새 item 만들고 싶음* 의도 허용. drag-spawn tool 은 별
+  // pointer handler 가 처리해 onnodeclick 까지 안 옴.
   function onnodeclick({ node, event }: { node: Node; event: MouseEvent | TouchEvent }) {
-    // Select mode 만 selection 허용 — hand / 도구 mode 는 click no-op (Figma).
-    if (!isSelectMode) return;
-    const id = node.id;
-    const isModifierClick =
-      event instanceof MouseEvent &&
-      event.metaKey;
-    if (isModifierClick) {
-      sessionStore.toggleM(id);
-    } else {
-      sessionStore.setM([id]);
+    if (isSelectMode) {
+      const id = node.id;
+      const isModifierClick =
+        event instanceof MouseEvent &&
+        event.metaKey;
+      if (isModifierClick) {
+        sessionStore.toggleM(id);
+      } else {
+        sessionStore.setM([id]);
+      }
+      return;
+    }
+    if (event instanceof MouseEvent) {
+      onpaneclick({ event });
     }
   }
 
@@ -1219,10 +1279,114 @@
   // they're acting on.
   function onpanecontextmenu({ event }: { event: MouseEvent | TouchEvent }) {
     if (!(event instanceof MouseEvent)) return;
+    // ADR-0017 Amend ⑪ — hand 모드는 canvas/component 의 모든 mouse
+    // interaction 차단 (pan 만 허용). ContextMenu 열지 않음.
+    if (isHandTool) return;
     event.preventDefault();
+    // Amend ⑤ — outside-wrapper 우 클릭 = Figma 의 deselect + empty menu.
+    rightClickMSnapshot = null;
+    sessionStore.clearM();
     onContextMenuRequest?.({
       clientX: event.clientX,
       clientY: event.clientY,
+      paneId: null,
+      panelId: null,
+    });
+  }
+
+  // ADR-0032 Amend ⑤ — Selection-wrapper 의 hit-test helper. wrapper 의
+  // pointer-events:all 이 underlying node 의 click 을 가로채므로, 시각상
+  // node 가 있는지 알려면 elementsFromPoint 로 wrapper 를 무시한 hit-test
+  // 가 필요. wrapper 안 empty 영역인지 (Figma 의 deselect 트리거) 판정용.
+  function nodeIdAtPoint(clientX: number, clientY: number): string | null {
+    if (typeof document === 'undefined') return null;
+    const elements = document.elementsFromPoint(clientX, clientY);
+    for (const el of elements) {
+      const e = el as HTMLElement;
+      if (e.closest?.('.svelte-flow__selection-wrapper')) continue;
+      const nodeEl = e.closest?.('.svelte-flow__node') as HTMLElement | null;
+      if (nodeEl !== null) return nodeEl.dataset.id ?? null;
+    }
+    return null;
+  }
+
+  // ADR-0017 ⑪ + ADR-0032 Amend ② D15 — Global capture-phase contextmenu
+  // handler. SvelteFlow 의 3 callback (onpane/onnode/onselection)contextmenu
+  // 가 정상이라면 이 capture 는 redundant 지만, defense-in-depth 로 유지.
+  //
+  // 회귀 사후 진단 (Amend ²): drag-lasso 종료 후 SvelteFlow 가 selected node 들의
+  // bounding box overlay `.svelte-flow__selection-wrapper` (z:2000, pointer-events:all)
+  // 를 깔아 모든 right-click 의 hit target 이 됨. 우리 closest('.svelte-flow__node')
+  // 는 null → empty-area menu 가 노출되던 회귀. 본 handler 의 else 분기에서
+  // wrapper 를 인지하여 multi mode 진입 (panelId = M 의 임의 멤버).
+  function onCanvasContextMenu(e: MouseEvent): void {
+    // Hand 모드 — 어떤 menu 도 열지 않음 (ADR-0017 ⑪).
+    if (isHandTool) {
+      e.preventDefault();
+      return;
+    }
+    if (sessionStore.active === null) return;
+    const target = e.target as HTMLElement | null;
+    const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
+    const nodeId = nodeEl?.dataset.id ?? null;
+    e.preventDefault();
+    if (nodeId !== null) {
+      // Node 우 클릭 — onnodecontextmenu 와 동일 로직 (D9 snapshot restore).
+      if (rightClickMSnapshot !== null && rightClickMSnapshot.has(nodeId)) {
+        sessionStore.setM([...rightClickMSnapshot]);
+      } else if (!sessionStore.M.has(nodeId)) {
+        sessionStore.setM([nodeId]);
+      }
+      rightClickMSnapshot = null;
+      // pane_id (terminal item id = backend pane_id, ADR-0018 D2)
+      const item = sessionStore.items.get(nodeId);
+      const paneId = item?.type === 'terminal' ? nodeId : null;
+      onContextMenuRequest?.({
+        clientX: e.clientX,
+        clientY: e.clientY,
+        paneId,
+        panelId: nodeId,
+      });
+      return;
+    }
+    // ADR-0032 Amend ② D15 + Amend ⑤ — selection-wrapper 위 우 클릭.
+    // hit-test 로 *node 가 시각상 있는지* 판정 (wrapper 는 z:2000 pointer:all
+    // 라 click 가로채지만, 그 아래 node 가 있을 수도 빈 공간일 수도 있음):
+    //   - node under wrapper → multi menu (기존 동작 유지)
+    //   - 빈 공간 under wrapper → empty menu + clearM (Figma deselect)
+    const wrapperEl = target?.closest('.svelte-flow__selection-wrapper');
+    if (wrapperEl !== null) {
+      rightClickMSnapshot = null;
+      const nodeUnder = nodeIdAtPoint(e.clientX, e.clientY);
+      if (nodeUnder !== null && sessionStore.M.size >= 2) {
+        const anyId = [...sessionStore.M][0];
+        if (anyId !== undefined) {
+          onContextMenuRequest?.({
+            clientX: e.clientX,
+            clientY: e.clientY,
+            paneId: null,
+            panelId: anyId,
+          });
+        }
+        return;
+      }
+      // Empty under wrapper — Amend ⑤: clearM + empty menu.
+      sessionStore.clearM();
+      onContextMenuRequest?.({
+        clientX: e.clientX,
+        clientY: e.clientY,
+        paneId: null,
+        panelId: null,
+      });
+      return;
+    }
+    // Pane / 기타 — empty-area menu + clearM (Amend ⑤: outside-wrapper 우
+    // 클릭 = Figma 의 deselect + empty menu. Scope-A 의 'M 보존' 정책은 폐기.).
+    rightClickMSnapshot = null;
+    sessionStore.clearM();
+    onContextMenuRequest?.({
+      clientX: e.clientX,
+      clientY: e.clientY,
       paneId: null,
       panelId: null,
     });
@@ -1259,9 +1423,75 @@
     sessionStore.setM(ids);
   }
 
+  // ADR-0032 Amend ② D15 + Amend ⑤ — Selection-wrapper right-click.
+  // wrapper 위 우 클릭: hit-test 로 *node 가 시각상 있는지* 판정.
+  //   - node under → multi mode menu (panelId = M 의 임의 멤버. ContextMenu 의
+  //     isMultiMode 가 panelId ∈ M && M.size >= 2 으로 판정.)
+  //   - empty under → empty menu + clearM (Figma deselect).
+  function onselectioncontextmenu({
+    event,
+    nodes,
+  }: {
+    event: MouseEvent | TouchEvent;
+    nodes: Node[];
+  }) {
+    if (!(event instanceof MouseEvent)) return;
+    if (isHandTool) return;
+    event.preventDefault();
+    rightClickMSnapshot = null;
+    const nodeUnder = nodeIdAtPoint(event.clientX, event.clientY);
+    if (nodeUnder === null) {
+      // Empty under wrapper — Amend ⑤: clearM + empty menu.
+      sessionStore.clearM();
+      onContextMenuRequest?.({
+        clientX: event.clientX,
+        clientY: event.clientY,
+        paneId: null,
+        panelId: null,
+      });
+      return;
+    }
+    const anyId = nodes[0]?.id ?? [...sessionStore.M][0];
+    if (anyId === undefined) return;
+    onContextMenuRequest?.({
+      clientX: event.clientX,
+      clientY: event.clientY,
+      paneId: null,
+      panelId: anyId,
+    });
+  }
+
+  // ADR-0032 Amend ⑤ — Selection-wrapper left click on empty space → clearM
+  // (Figma deselect). node under 가 있으면 무시 — 사용자 요구는 *component 가
+  // 없는 영역* 만. (node under 위 click 의 동작은 별 결정 — 현 미설정.)
+  function onselectionclick({
+    event,
+  }: {
+    event: MouseEvent | TouchEvent;
+    nodes: Node[];
+  }) {
+    if (!(event instanceof MouseEvent)) return;
+    if (isHandTool) return;
+    const nodeUnder = nodeIdAtPoint(event.clientX, event.clientY);
+    if (nodeUnder !== null) return;
+    sessionStore.clearM();
+  }
+
   function onnodecontextmenu({ event, node }: { event: MouseEvent | TouchEvent; node: Node }) {
     if (!(event instanceof MouseEvent)) return;
+    // ADR-0017 Amend ⑪ — hand 모드는 component event 절대 격리.
+    if (isHandTool) return;
     event.preventDefault();
+    // ADR-0032 D9 — clicked node 가 right-click 직전 M ∈ 이었다면 M 복원
+    // (SvelteFlow internal 의 click-to-single reset 회귀 차단). clicked ∉
+    // pre-reset M 이면 ADR-0032 D9 의 "M = {clicked} replace" — 명시 setM
+    // (SvelteFlow 가 이미 reset 했더라도 idempotent).
+    if (rightClickMSnapshot !== null && rightClickMSnapshot.has(node.id)) {
+      sessionStore.setM([...rightClickMSnapshot]);
+    } else if (!sessionStore.M.has(node.id)) {
+      sessionStore.setM([node.id]);
+    }
+    rightClickMSnapshot = null;
     const data = node.data as Record<string, unknown> | undefined;
     const paneId = typeof data?.['pane_id'] === 'string' ? (data['pane_id'] as string) : null;
     onContextMenuRequest?.({
@@ -1284,11 +1514,13 @@
   class:drag-cursor={isDragTool && !isSpacePressed && !isHandTool}
   class:text-cursor={isTextTool && !isSpacePressed && !isHandTool}
   class:pan-cursor={isSpacePressed || isHandTool}
+  class:hand-mode={isHandTool}
   onpointerdowncapture={onCanvasPointerDown}
   onpointermovecapture={onCanvasPointerMove}
   onpointerupcapture={onCanvasPointerUp}
   onpointercancelcapture={onCanvasPointerCancel}
   onpointerleave={() => (hoverScreen = null)}
+  oncontextmenucapture={onCanvasContextMenu}
 >
   <!-- NewPanelButton overlay 제거 — 기능은 Toolbar2 의 terminal 도구로 마이그레이션.
        legacy 진입은 `handleTerminalClick(legacy branch)` 가 `requestLegacyNewPane`
@@ -1303,6 +1535,8 @@
     {onmove}
     {onpanecontextmenu}
     {onnodecontextmenu}
+    {onselectioncontextmenu}
+    {onselectionclick}
     {onselectionchange}
     panOnDrag={isMaximizedActive ? [] : panOnDragMask}
     panOnScroll={!isMaximizedActive}
@@ -1311,7 +1545,7 @@
     zoomOnDoubleClick={!isMaximizedActive}
     selectionOnDrag={isSelectMode && !isSpacePressed && !isMaximizedActive}
     nodesDraggable={isSelectMode && !isMaximizedActive}
-    elementsSelectable={isSelectMode}
+    elementsSelectable={isSelectMode && !isMaximizedActive}
     selectionKey={null}
     multiSelectionKey="Meta"
     minZoom={0.05}
@@ -1458,6 +1692,38 @@
   .canvas-root :global(.svelte-flow__node-line:focus),
   .canvas-root :global(.svelte-flow__node-line:focus-visible) {
     box-shadow: none;
+  }
+
+  /*
+   * 2026-05-20 figure hit-test 좁힘 — SvelteFlow 의 `.svelte-flow__node`
+   * wrapper 가 bbox 전체 mouse event 를 catch 하던 옛 동작 폐기. 자식 SVG 의
+   * pointer-events attribute 가 authoritative hit-test 가 되도록 wrapper
+   * 자체를 pass-through.
+   *  - `.svelte-flow__node-line` — 모든 line. LineNode 의 invisible hit-target
+   *    line (pointer-events="stroke") 만 catch.
+   *  - `.svelte-flow__node.fill-off` — fill_enabled=false rect/ellipse.
+   *    ShapeNode 의 SVG `<rect>` / `<ellipse>` 의 pointer-events="visibleStroke"
+   *    가 stroke ring 만 catch — 내부 클릭은 뒤 layer (canvas / panel) 로 전달.
+   *
+   * NodeResizer handle 은 SvelteFlow 의
+   *   .svelte-flow__resize-control { pointer-events: all }
+   * 로 그대로 hit (CSS pointer-events 비상속 — child 의 explicit value 가 자체
+   * 활성). resize / drag 기능 회귀 0.
+   */
+  .canvas-root :global(.svelte-flow__node-line),
+  .canvas-root :global(.svelte-flow__node.fill-off) {
+    pointer-events: none;
+  }
+
+  /* Hand tool is viewport-only. Make every node wrapper transparent to pointer
+   * hit-testing so left-drag pans even when the cursor starts over an element,
+   * and node-local controls (resize handles, xterm input, double-click editors,
+   * image/document action buttons) cannot receive interaction. */
+  .canvas-root.hand-mode :global(.svelte-flow__node),
+  .canvas-root.hand-mode :global(.svelte-flow__resize-control),
+  .canvas-root.hand-mode :global(.svelte-flow__edge),
+  .canvas-root.hand-mode :global(.svelte-flow__connection) {
+    pointer-events: none !important;
   }
 
   /* Drag-to-create tool cursor — Batch 2 (rect/ellipse/line). */

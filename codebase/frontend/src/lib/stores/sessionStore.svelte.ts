@@ -130,6 +130,15 @@ class SessionStore {
   });
 
   /**
+   * R7 (batch-5) — 직전 spawn 된 text item id. `itemFactory.commitNewItem`
+   * 의 성공 path 가 text type 이면 set. TextNode 가 mount $effect 에서
+   * 본 값과 자신의 id 가 일치하면 즉시 editing=true 진입 + flag clear.
+   *
+   * FE-only ephemeral — page reload 시 null. session switch / clear 시 reset.
+   */
+  justSpawnedTextId = $state<string | null>(null);
+
+  /**
    * Minimize / maximize 직전 옛 geometry 의 *in-memory backup*. FE-only — page
    * reload 시 손실 (사용자가 restore 누르면 default size 로 복원). Schema 의
    * item.x/y/w/h 변경 패턴 (PanelNode onMinimize/onMaximize) 에서 옛 값 보존용.
@@ -209,6 +218,7 @@ class SessionStore {
     this.I = null;
     this.maximizedItemId = null;
     this.focusMode = { enabled: false, targetPanelId: null };
+    this.justSpawnedTextId = null;
     // ADR-0028 D4 — per-session history. 이전 session 의 stack 은 drop.
     historyStore.setActive(session.name);
   }
@@ -234,6 +244,7 @@ class SessionStore {
     this.I = null;
     this.maximizedItemId = null;
     this.focusMode = { enabled: false, targetPanelId: null };
+    this.justSpawnedTextId = null;
     sessionStorageHint.clear();
     historyStore.setActive(null);
   }
@@ -633,6 +644,47 @@ class SessionStore {
    * 단, history capture 가 부적절한 mutation (viewport debounce flush, undo/redo
    * 자체) 은 `captureHistory: false` 로 skip.
    */
+  /**
+   * ADR-0028 D12 amend (batch-5 후속) — applyMutation 의 optimistic-update
+   * 래퍼. 호출 시점에 priorSnapshot 캡처 → transform 을 *로컬 store 에 먼저*
+   * 적용 (surgical items.set / delete) → 같은 transform 으로 applyMutation
+   * 호출 (server 동기 + priorSnapshot 으로 PUT 실패 시 자동 rollback).
+   *
+   * 효과: Inspector toggle / dropdown / ColorPicker oncommit 처럼 *commit-
+   * based* 1-shot 액션이 round-trip 대기 없이 즉시 UI 반영. server 부하는
+   * 그대로 (1 액션 = 1 PUT — Inspector 컨트롤이 이미 commit-based 라 spam
+   * 없음). 실패 시 toast + priorSnapshot 으로 store 복원.
+   *
+   * 사용처: Inspector 의 applyXxx helper. drag stop / NodeResizer onResizeEnd
+   * 등 *이미* 수동 optimistic 인 caller 는 기존대로 applyMutation 직접 호출
+   * (priorSnapshot 명시) — 본 helper 가 추가 mutation 안 함.
+   */
+  async optimisticMutation(
+    transform: (cur: CanvasLayout) => CanvasLayout,
+    options: {
+      abortMessage?: string;
+      failMessage?: string;
+      captureHistory?: boolean;
+    } = {},
+  ): Promise<{ ok: boolean; layout?: CanvasLayout }> {
+    if (this.active === null) return { ok: false };
+    const priorSnapshot = this.layoutSnapshot();
+    const optimistic = transform(priorSnapshot);
+    // Surgical: 사라진 id delete + 변경된 id set. items.clear() + 재추가는
+    // O(n) reactive churn 이라 큰 layout 에서 frame drop 위험 — 본 path 는
+    // *Inspector 1~N item 변경* 의 hot path 라 surgical 유지.
+    const nextIds = new Set<string>();
+    for (const it of optimistic.items) {
+      nextIds.add(it.id);
+      const cur = this.items.get(it.id);
+      if (cur !== it) this.items.set(it.id, it);
+    }
+    for (const id of [...this.items.keys()]) {
+      if (!nextIds.has(id)) this.items.delete(id);
+    }
+    return await this.applyMutation(transform, { ...options, priorSnapshot });
+  }
+
   async applyMutation(
     transform: (cur: CanvasLayout) => CanvasLayout,
     options: {

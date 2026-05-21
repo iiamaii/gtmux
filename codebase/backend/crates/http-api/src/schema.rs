@@ -265,6 +265,51 @@ pub enum StrokeDash {
     Dot,
 }
 
+/// Figure stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20 batch 5,
+/// rect / ellipse / line). Kept distinct from connector's [`StrokeDash`]
+/// because the figure form is a 4-variant enum with an explicit `Solid`
+/// default, while connector's wire uses `null` for solid (round-trip
+/// compatibility would break if the two were unified).
+///
+/// Wire form is `snake_case`: `"solid" | "dash" | "dot" | "dash_dot"`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FigureStrokeDash {
+    Solid,
+    Dash,
+    Dot,
+    DashDot,
+}
+
+impl Default for FigureStrokeDash {
+    fn default() -> Self {
+        Self::Solid
+    }
+}
+
+/// Text font weight (ADR-0018 D4 amend ② — 2026-05-20 batch 5). MVP carries
+/// three named buckets; numeric weights (100…900) are P1.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FontWeight {
+    Light,
+    Normal,
+    Bold,
+}
+
+impl Default for FontWeight {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+/// `#[serde(default = "default_true")]` helper — used by Rect/Ellipse to
+/// keep `fill_enabled` / `stroke_enabled` defaulting to `true` for legacy
+/// records that pre-date the 2026-05-20 batch 5 schema amend.
+fn default_true() -> bool {
+    true
+}
+
 /// Canvas Item discriminated union (ADR-0018 D1, D4).
 ///
 /// On the wire each variant becomes `{ "type": "<snake>", ...common, ...payload }`
@@ -286,6 +331,20 @@ pub enum Item {
         #[serde(default)]
         text_vertical_align: TextVerticalAlign,
         color: String,
+        /// ADR-0018 D4 amend ② (2026-05-20 batch 5) — text font weight.
+        /// Defaults to `Normal` when absent so legacy records round-trip.
+        #[serde(default)]
+        font_weight: FontWeight,
+        /// ADR-0018 D4 amend ② — italic toggle. CSS `font-style: italic`.
+        #[serde(default)]
+        italic: bool,
+        /// ADR-0018 D4 amend ② — underline toggle. Composes with
+        /// `strikethrough` via CSS `text-decoration: underline line-through`.
+        #[serde(default)]
+        underline: bool,
+        /// ADR-0018 D4 amend ② — strikethrough toggle.
+        #[serde(default)]
+        strikethrough: bool,
     },
     Note {
         #[serde(flatten)]
@@ -300,6 +359,25 @@ pub enum Item {
         stroke: String,
         fill: String,
         stroke_width: u32,
+        /// ADR-0018 D4 amend ① (2026-05-20 batch 5) — fill on/off.
+        /// `false` is *not* alpha=0: hit-testing is also disabled by the FE
+        /// (the painted area no longer captures pointer events). Legacy
+        /// records default to `true`.
+        #[serde(default = "default_true")]
+        fill_enabled: bool,
+        /// ADR-0018 D4 amend ① — stroke on/off. `false` removes both the
+        /// rendered border and its hit-target band.
+        #[serde(default = "default_true")]
+        stroke_enabled: bool,
+        /// ADR-0018 D4 amend ① — rounded-corner toggle (rect only). The
+        /// actual radius is computed FE-side as `clamp(min(w,h)*0.15, 4, 16)`;
+        /// the BE only persists the boolean.
+        #[serde(default)]
+        corner_rounded: bool,
+        /// ADR-0018 D4 amend ① — stroke dash pattern. `None` means solid;
+        /// `Some(Solid)` round-trips identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke_dash: Option<FigureStrokeDash>,
     },
     Ellipse {
         #[serde(flatten)]
@@ -307,6 +385,15 @@ pub enum Item {
         stroke: String,
         fill: String,
         stroke_width: u32,
+        /// ADR-0018 D4 amend ① — see `Rect::fill_enabled`.
+        #[serde(default = "default_true")]
+        fill_enabled: bool,
+        /// ADR-0018 D4 amend ① — see `Rect::stroke_enabled`.
+        #[serde(default = "default_true")]
+        stroke_enabled: bool,
+        /// ADR-0018 D4 amend ① — stroke dash pattern. `None` = solid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke_dash: Option<FigureStrokeDash>,
     },
     Line {
         #[serde(flatten)]
@@ -315,6 +402,9 @@ pub enum Item {
         stroke_width: u32,
         x2: f64,
         y2: f64,
+        /// ADR-0018 D4 amend ① — stroke dash pattern. `None` = solid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke_dash: Option<FigureStrokeDash>,
     },
     FreeDraw {
         #[serde(flatten)]
@@ -481,6 +571,14 @@ pub enum ValidationError {
     /// ADR-0036 Q3 / O2 — self-loop (`from_id == to_id`) reject for MVP.
     #[error("connector from_id and to_id must differ (self-loop reject, MVP)")]
     ConnectorSelfLoop,
+    /// ADR-0018 D4 amend ① (2026-05-20 batch 5) — figure stroke_width is
+    /// out of the inspector-enforced 1..=32 range. Rect / Ellipse / Line.
+    #[error("figure stroke_width {width} must be in 1..=32")]
+    StrokeWidthOutOfRange { width: u32 },
+    /// ADR-0018 D4 amend ② (2026-05-20 batch 5) — text font_size is out of
+    /// the 8..=96 range.
+    #[error("text font_size {font_size} must be in 8..=96")]
+    TextFontSizeOutOfRange { font_size: u32 },
 }
 
 impl ValidationError {
@@ -504,6 +602,8 @@ impl ValidationError {
             Self::ConnectorEndpointMissing => "connector_endpoint_missing",
             Self::ConnectorInvalidEndpoint => "connector_invalid_endpoint",
             Self::ConnectorSelfLoop => "connector_self_loop",
+            Self::StrokeWidthOutOfRange { .. } => "stroke_width_out_of_range",
+            Self::TextFontSizeOutOfRange { .. } => "text_font_size_out_of_range",
         }
     }
 }
@@ -578,9 +678,29 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
             return Err(ValidationError::DescriptionTooLong);
         }
         match it {
-            Item::Text { text, .. } => {
+            Item::Text {
+                text, font_size, ..
+            } => {
                 if text.len() > TEXT_PAYLOAD_MAX_BYTES {
                     return Err(ValidationError::TextTooLong);
+                }
+                // ADR-0018 D4 amend ② — Inspector slider caps at 8..=96.
+                if !(8..=96).contains(font_size) {
+                    return Err(ValidationError::TextFontSizeOutOfRange {
+                        font_size: *font_size,
+                    });
+                }
+            }
+            // ADR-0018 D4 amend ① — figure stroke_width is bounded to the
+            // inspector-enforced 1..=32 band. Rect / Ellipse / Line share
+            // the same bound; FreeDraw / Connector are scoped separately.
+            Item::Rect { stroke_width, .. }
+            | Item::Ellipse { stroke_width, .. }
+            | Item::Line { stroke_width, .. } => {
+                if !(1..=32).contains(stroke_width) {
+                    return Err(ValidationError::StrokeWidthOutOfRange {
+                        width: *stroke_width,
+                    });
                 }
             }
             Item::FreeDraw { points, .. } => {
@@ -862,6 +982,10 @@ mod tests {
                     text_align: TextAlign::Center,
                     text_vertical_align: TextVerticalAlign::Middle,
                     color: "#333".into(),
+                    font_weight: FontWeight::Normal,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
                 },
                 Item::FreeDraw {
                     common: item_common(UUID_B),
@@ -964,6 +1088,10 @@ mod tests {
             text_align: TextAlign::Center,
             text_vertical_align: TextVerticalAlign::Middle,
             color: "#000".into(),
+            font_weight: FontWeight::Normal,
+            italic: false,
+            underline: false,
+            strikethrough: false,
         });
         assert_eq!(validate(&l), Err(ValidationError::TextTooLong));
     }
@@ -1173,6 +1301,10 @@ mod tests {
             stroke: "#000".into(),
             fill: "#fff".into(),
             stroke_width: 1,
+            fill_enabled: true,
+            stroke_enabled: true,
+            corner_rounded: false,
+            stroke_dash: None,
         }
     }
 
@@ -1368,5 +1500,331 @@ mod tests {
         assert_eq!(conn["direction"], "uni");
         assert_eq!(conn["head_to"], "arrow");
         assert_eq!(conn["routing"], "straight");
+    }
+
+    // ── ADR-0018 D4 amend ① — Rect / Ellipse / Line schema batch 5 ──
+
+    /// Explicit values for every new field round-trip losslessly, and the
+    /// `FigureStrokeDash::DashDot` wire form serialises as `"dash_dot"`
+    /// (snake_case rename, distinct from the connector enum).
+    #[test]
+    fn rect_fill_stroke_enabled_round_trip() {
+        let raw = json!({
+            "type": "rect",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "fill": "#fff", "stroke_width": 2,
+            "fill_enabled": false, "stroke_enabled": true,
+            "corner_rounded": true, "stroke_dash": "dash_dot",
+        });
+        let item: Item = serde_json::from_value(raw.clone()).unwrap();
+        let Item::Rect {
+            fill_enabled,
+            stroke_enabled,
+            corner_rounded,
+            stroke_dash,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Rect");
+        };
+        assert!(!fill_enabled);
+        assert!(stroke_enabled);
+        assert!(corner_rounded);
+        assert_eq!(*stroke_dash, Some(FigureStrokeDash::DashDot));
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["fill_enabled"], false);
+        assert_eq!(v["stroke_enabled"], true);
+        assert_eq!(v["corner_rounded"], true);
+        assert_eq!(v["stroke_dash"], "dash_dot");
+        let item2: Item = serde_json::from_value(v).unwrap();
+        assert_eq!(item, item2);
+    }
+
+    /// A legacy rect record from before batch 5 — `fill_enabled`,
+    /// `stroke_enabled`, `corner_rounded`, `stroke_dash` are all absent.
+    /// `#[serde(default = "default_true")]` keeps the booleans `true` so
+    /// existing layouts render the same way they always did.
+    #[test]
+    fn rect_old_layout_defaults_fill_stroke_enabled_true() {
+        let raw = json!({
+            "type": "rect",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "fill": "#fff", "stroke_width": 2,
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Rect {
+            fill_enabled,
+            stroke_enabled,
+            corner_rounded,
+            stroke_dash,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Rect");
+        };
+        assert!(fill_enabled);
+        assert!(stroke_enabled);
+        assert!(!corner_rounded);
+        assert_eq!(*stroke_dash, None);
+    }
+
+    /// Ellipse mirrors Rect for the enabled / dash fields (corner_rounded
+    /// is rect-only).
+    #[test]
+    fn ellipse_fill_stroke_enabled_round_trip() {
+        let raw = json!({
+            "type": "ellipse",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 100.0, "h": 60.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "fill": "#fff", "stroke_width": 3,
+            "fill_enabled": false, "stroke_enabled": false,
+            "stroke_dash": "dot",
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Ellipse {
+            fill_enabled,
+            stroke_enabled,
+            stroke_dash,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Ellipse");
+        };
+        assert!(!fill_enabled);
+        assert!(!stroke_enabled);
+        assert_eq!(*stroke_dash, Some(FigureStrokeDash::Dot));
+    }
+
+    /// Line carries `stroke_dash` only (no fill side). `None` round-trips
+    /// to a serialised form that omits the key entirely.
+    #[test]
+    fn line_stroke_dash_round_trip() {
+        let raw = json!({
+            "type": "line",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 100.0, "h": 0.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "stroke_width": 4,
+            "x2": 100.0, "y2": 0.0,
+            "stroke_dash": "dash",
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Line { stroke_dash, .. } = &item else {
+            panic!("expected Item::Line");
+        };
+        assert_eq!(*stroke_dash, Some(FigureStrokeDash::Dash));
+        // None round-trips by skipping the field on serialise.
+        let raw_solid = json!({
+            "type": "line",
+            "id": UUID_B, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 100.0, "h": 0.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "stroke_width": 4,
+            "x2": 100.0, "y2": 0.0,
+        });
+        let solid: Item = serde_json::from_value(raw_solid).unwrap();
+        let v = serde_json::to_value(&solid).unwrap();
+        assert!(v.get("stroke_dash").is_none(), "None must skip on serialise");
+    }
+
+    /// `FigureStrokeDash` wire form is `snake_case`, not the connector
+    /// enum's lowercase. The two enums are deliberately separate.
+    #[test]
+    fn figure_stroke_dash_snake_case_wire() {
+        assert_eq!(
+            serde_json::to_string(&FigureStrokeDash::Solid).unwrap(),
+            "\"solid\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FigureStrokeDash::DashDot).unwrap(),
+            "\"dash_dot\""
+        );
+        let parsed: FigureStrokeDash = serde_json::from_str("\"dash\"").unwrap();
+        assert_eq!(parsed, FigureStrokeDash::Dash);
+    }
+
+    /// `stroke_width = 0` is rejected. Inspector slider caps at 1 so this
+    /// only fires for direct PUTs that bypass the FE.
+    #[test]
+    fn figure_stroke_width_zero_rejected() {
+        let mut l = Layout::empty();
+        let mut c = item_common(UUID_A);
+        c.w = 100.0;
+        c.h = 50.0;
+        l.items.push(Item::Rect {
+            common: c,
+            stroke: "#000".into(),
+            fill: "#fff".into(),
+            stroke_width: 0,
+            fill_enabled: true,
+            stroke_enabled: true,
+            corner_rounded: false,
+            stroke_dash: None,
+        });
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "stroke_width_out_of_range");
+    }
+
+    /// `stroke_width > 32` is rejected. Inspector slider caps at 32.
+    #[test]
+    fn figure_stroke_width_over_32_rejected() {
+        let mut l = Layout::empty();
+        let mut c = item_common(UUID_A);
+        c.w = 100.0;
+        c.h = 50.0;
+        l.items.push(Item::Ellipse {
+            common: c,
+            stroke: "#000".into(),
+            fill: "#fff".into(),
+            stroke_width: 33,
+            fill_enabled: true,
+            stroke_enabled: true,
+            stroke_dash: None,
+        });
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "stroke_width_out_of_range");
+    }
+
+    /// Boundary values 1 and 32 are accepted on Rect, Ellipse, and Line.
+    #[test]
+    fn figure_stroke_width_boundary_accepted() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Rect {
+            common: item_common(UUID_A),
+            stroke: "#000".into(),
+            fill: "#fff".into(),
+            stroke_width: 1,
+            fill_enabled: true,
+            stroke_enabled: true,
+            corner_rounded: false,
+            stroke_dash: None,
+        });
+        l.items.push(Item::Line {
+            common: item_common(UUID_B),
+            stroke: "#000".into(),
+            stroke_width: 32,
+            x2: 100.0,
+            y2: 0.0,
+            stroke_dash: None,
+        });
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    // ── ADR-0018 D4 amend ② — Text full-style schema batch 5 ──
+
+    /// Explicit values for every new field round-trip losslessly. Note that
+    /// `italic`, `underline`, `strikethrough` are plain `bool` (not
+    /// `Option<bool>`) so they always appear in the wire form.
+    #[test]
+    fn text_full_style_round_trip() {
+        let raw = json!({
+            "type": "text",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "text": "Hello", "font_size": 16, "color": "#333",
+            "font_weight": "bold",
+            "italic": true, "underline": true, "strikethrough": false,
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Text {
+            font_weight,
+            italic,
+            underline,
+            strikethrough,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Text");
+        };
+        assert_eq!(*font_weight, FontWeight::Bold);
+        assert!(*italic);
+        assert!(*underline);
+        assert!(!*strikethrough);
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["font_weight"], "bold");
+        assert_eq!(v["italic"], true);
+        assert_eq!(v["underline"], true);
+        assert_eq!(v["strikethrough"], false);
+    }
+
+    /// Legacy text record without any of the batch-5 fields. `font_weight`
+    /// defaults to `Normal`; the three booleans default to `false`.
+    #[test]
+    fn text_old_layout_no_decorations() {
+        let raw = json!({
+            "type": "text",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "text": "Hello", "font_size": 16, "color": "#333",
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Text {
+            font_weight,
+            italic,
+            underline,
+            strikethrough,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Text");
+        };
+        assert_eq!(*font_weight, FontWeight::Normal);
+        assert!(!italic);
+        assert!(!underline);
+        assert!(!strikethrough);
+    }
+
+    /// `font_size = 7` is rejected. Inspector slider caps at 8.
+    #[test]
+    fn text_font_size_under_8_rejected() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Text {
+            common: item_common(UUID_A),
+            text: "Hi".into(),
+            font_size: 7,
+            text_align: TextAlign::Center,
+            text_vertical_align: TextVerticalAlign::Middle,
+            color: "#000".into(),
+            font_weight: FontWeight::Normal,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        });
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "text_font_size_out_of_range");
+    }
+
+    /// `font_size = 97` is rejected. Inspector slider caps at 96.
+    #[test]
+    fn text_font_size_over_96_rejected() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Text {
+            common: item_common(UUID_A),
+            text: "Hi".into(),
+            font_size: 97,
+            text_align: TextAlign::Center,
+            text_vertical_align: TextVerticalAlign::Middle,
+            color: "#000".into(),
+            font_weight: FontWeight::Normal,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        });
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "text_font_size_out_of_range");
     }
 }
