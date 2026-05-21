@@ -93,10 +93,6 @@
           </svg>
         </div>
         <div class="empty-title">Terminal stopped</div>
-        <div class="empty-msg">
-          Process ended by an <b>explicit kill</b>.<br />
-          Restart when you need the panel again.
-        </div>
         <div class="empty-actions">
           <button
             type="button"
@@ -117,6 +113,10 @@
             </svg>
             {respawning ? 'Restarting…' : 'Restart terminal'}
           </button>
+        </div>
+        <div class="empty-msg">
+          Process ended by an <b>explicit kill</b>.<br />
+          Restart when you need the panel again.
         </div>
         <div class="empty-hint">
           or press <span class="kbd">⌘</span><span class="kbd">R</span> while focused
@@ -257,16 +257,17 @@
     opacity: 0.7;
   }
 
-  /* Primary — success(green) 14% tint, 40% border, success fg.
-   * components-v5 의 #2dc26b / #6ee59b 패턴을 token-driven 으로 변환. */
+  /* Primary — Button.svelte 의 primary variant 정합 (2026-05-21):
+   * --color-accent solid background. 다른 dialog 의 primary button 과 동일.
+   * 옛 success(green) tint 는 폐기 — 사용자 UX 통일 요구. */
   .empty-cta.primary {
-    border-color: color-mix(in srgb, var(--color-success) 40%, transparent);
-    background: color-mix(in srgb, var(--color-success) 14%, transparent);
-    color: var(--color-success);
+    border-color: var(--color-accent);
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
   }
 
   .empty-cta.primary:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--color-success) 22%, transparent);
+    background: color-mix(in srgb, var(--color-accent) 88%, white);
   }
 
   .empty-hint {
