@@ -10,6 +10,7 @@
 
 import type { CanvasItem, CanvasLayout, LineItem } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
+import { generateUuidV4 } from '$lib/uuid';
 
 export interface PasteOptions {
   /** 누적 offset (dx, dy). clipboardStore.consumePasteOffset() 결과 또는 Duplicate 의 고정 offset. */
@@ -79,7 +80,7 @@ function cloneWithOffset(
   const clone = structuredClone($state.snapshot(src)) as CanvasItem;
   const out = {
     ...clone,
-    id: crypto.randomUUID(),
+    id: generateUuidV4(),
     x: bboxX + dx + (src.x - bboxX),
     y: bboxY + dy + (src.y - bboxY),
   } as CanvasItem;
