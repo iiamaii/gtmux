@@ -117,11 +117,15 @@
 </script>
 
 {#if editing}
+  <!-- ADR-0005 D4 wiring (2026-05-21) — `nodrag` 로 SvelteFlow 의 node drag
+       intercept 차단. InlineEditField 는 canvas Node 안에서도 사용 (NoteNode
+       title / PanelNode label) — input 위 mousedown 이 drag start 로 가로채여
+       cursor 위치 변경 불가했던 회귀 fix. -->
   <input
     bind:this={inputEl}
     bind:value={draft}
     {placeholder}
-    class="inline-edit-input {extraClass}"
+    class="inline-edit-input nodrag {extraClass}"
     class:plain
     class:has-error={validationError !== null}
     aria-invalid={validationError !== null}
