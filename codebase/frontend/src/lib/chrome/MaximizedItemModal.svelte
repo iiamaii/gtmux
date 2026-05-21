@@ -16,6 +16,12 @@
   import PanelDanglingOverlay from '$lib/canvas/PanelDanglingOverlay.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
+  import {
+    renderMarkdown,
+    renderHtml,
+    isToggleableFileType,
+    type DocumentViewMode,
+  } from '$lib/canvas/documentRender';
   import type { CanvasItem, NoteItem } from '$lib/types/canvas';
 
   const itemId = $derived(sessionStore.maximizedItemId);
@@ -49,39 +55,31 @@
   let documentAssetLoading = $state(false);
   let documentAssetError = $state<string | null>(null);
 
-  function parseDocumentText(raw: string): { heading: string; paragraphs: string[] } {
-    if (raw.length === 0) return { heading: '', paragraphs: [] };
-    const lines = raw.split(/\r?\n/);
-    let heading = '';
-    let i = 0;
-    const headingMatch = lines[0]?.match(/^#{1,6}\s+(.+)$/);
-    if (headingMatch) {
-      heading = headingMatch[1] ?? '';
-      i = 1;
-    }
-    while (i < lines.length && lines[i]?.trim() === '') i++;
-    const paragraphs: string[] = [];
-    let buf: string[] = [];
-    for (; i < lines.length; i++) {
-      const line = lines[i] ?? '';
-      if (line.trim() === '') {
-        if (buf.length > 0) {
-          paragraphs.push(buf.join(' '));
-          buf = [];
-        }
-      } else {
-        buf.push(line.replace(/^#{1,6}\s+/, ''));
-      }
-    }
-    if (buf.length > 0) paragraphs.push(buf.join(' '));
-    return { heading, paragraphs };
-  }
-
+  /** ADR-0018 D10 amend ③/④ (2026-05-21) — DocumentNode 와 동일 helper 사용
+   *  으로 normal / maximize 양쪽 rendering 동기화. 옛 parseDocumentText 의
+   *  paragraph slice 폐기. */
   const documentText = $derived.by(() => {
     if (item?.type !== 'document') return '';
     return item.asset_id ? (documentAssetText ?? '') : (item.content ?? '');
   });
-  const documentParsed = $derived.by(() => parseDocumentText(documentText));
+  const documentFileTypeLabel = $derived.by(() => {
+    if (item?.type !== 'document') return '';
+    if (!item.asset_id) return 'markdown';
+    const name = item.file_name.toLowerCase();
+    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
+    if (ext === 'md' || ext === 'markdown') return 'markdown';
+    if (ext === 'html' || ext === 'htm') return 'html';
+    const mime = (item.mime ?? '').toLowerCase();
+    if (mime.startsWith('text/markdown')) return 'markdown';
+    if (mime.startsWith('text/html')) return 'html';
+    return ext;
+  });
+  let documentViewMode = $state<DocumentViewMode>('rendered');
+  const documentCanToggleView = $derived(isToggleableFileType(documentFileTypeLabel));
+  const documentHtml = $derived.by(() => {
+    if (documentFileTypeLabel === 'html') return renderHtml(documentText);
+    return renderMarkdown(documentText);
+  });
   const canPreviewDocumentAsset = $derived.by(() => {
     if (item?.type !== 'document' || !item.asset_id) return false;
     const mime = (item.mime ?? '').toLowerCase();
@@ -280,6 +278,32 @@
           <span class="spacer"></span>
         {/if}
         <div class="max-actions">
+          {#if isDocument && documentCanToggleView}
+            <!-- ADR-0018 D10 amend ④ — source / rendered toggle (maximize 도 normal 과 동일). -->
+            <button
+              type="button"
+              class="max-btn"
+              class:is-active={documentViewMode === 'source'}
+              aria-label={documentViewMode === 'source' ? 'Show rendered' : 'Show source'}
+              title={documentViewMode === 'source' ? 'Show rendered' : 'Show source'}
+              onclick={(e: MouseEvent) => {
+                e.stopPropagation();
+                documentViewMode = documentViewMode === 'source' ? 'rendered' : 'source';
+              }}
+            >
+              {#if documentViewMode === 'source'}
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              {:else}
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+                  <polyline points="16 18 22 12 16 6"/>
+                  <polyline points="8 6 2 12 8 18"/>
+                </svg>
+              {/if}
+            </button>
+          {/if}
           <button
             type="button"
             class="max-btn"
@@ -361,10 +385,13 @@
               <div class="document-empty">Empty document</div>
             {:else}
               <div class="document-eyebrow">{item.asset_id ? 'Document file' : 'Inline document'}</div>
-              <h1>{documentParsed.heading || item.file_name}</h1>
-              {#each documentParsed.paragraphs as line}
-                <p>{line}</p>
-              {/each}
+              <!-- ADR-0018 D10 amend ③/④ — DocumentNode 와 동일 markdown/html
+                   rendering. source toggle 시 raw 그대로. -->
+              {#if documentViewMode === 'source'}
+                <pre class="document-source">{documentText}</pre>
+              {:else}
+                <div class="document-md">{@html documentHtml}</div>
+              {/if}
             {/if}
           </article>
         {/if}
@@ -580,6 +607,89 @@
     font-size: 14px;
     line-height: 1.6;
     color: var(--color-fg-muted);
+    overflow-wrap: anywhere;
+  }
+
+  /* ADR-0018 D10 amend ③/④ — markdown rendered + source view (maximize). */
+  .document-md {
+    color: var(--color-fg-muted);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.6;
+    max-width: 80ch;
+    overflow-wrap: anywhere;
+  }
+  .document-md :global(h1),
+  .document-md :global(h2) {
+    margin: 0 0 18px;
+    font-size: 34px;
+    font-weight: var(--weight-semibold);
+    line-height: 1.12;
+    color: var(--color-fg);
+  }
+  .document-md :global(h3) {
+    margin: 20px 0 10px;
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--color-fg);
+  }
+  .document-md :global(h4),
+  .document-md :global(h5),
+  .document-md :global(h6) {
+    margin: 16px 0 8px;
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--color-fg);
+  }
+  .document-md :global(p) { margin: 0 0 10px; }
+  .document-md :global(ul),
+  .document-md :global(ol) { margin: 0 0 10px; padding-left: 24px; }
+  .document-md :global(li) { margin: 3px 0; }
+  .document-md :global(blockquote) {
+    margin: 0 0 10px; padding-left: 14px;
+    border-left: 3px solid var(--color-border-strong);
+    color: var(--color-fg-subtle);
+  }
+  .document-md :global(code) {
+    font-family: var(--font-mono); font-size: 12.5px;
+    padding: 1px 5px;
+    background: var(--color-surface-2);
+    border-radius: var(--radius-sm);
+  }
+  .document-md :global(pre) {
+    margin: 0 0 12px; padding: 12px 14px;
+    background: var(--color-surface-2);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    font-family: var(--font-mono); font-size: 12.5px;
+    line-height: 1.55;
+  }
+  .document-md :global(pre code) {
+    padding: 0; background: transparent; border-radius: 0;
+  }
+  .document-md :global(a) { color: var(--color-accent); text-decoration: underline; }
+  .document-md :global(table) {
+    border-collapse: collapse; margin: 0 0 12px; font-size: 13px;
+  }
+  .document-md :global(th),
+  .document-md :global(td) {
+    border: 1px solid var(--color-border); padding: 6px 10px; text-align: left;
+  }
+  .document-md :global(th) {
+    background: var(--color-surface-2); font-weight: 600; color: var(--color-fg);
+  }
+  .document-md :global(hr) {
+    border: 0; border-top: 1px solid var(--color-border); margin: 18px 0;
+  }
+  .document-md :global(img) { max-width: 100%; height: auto; }
+
+  .document-source {
+    margin: 0; padding: 0;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--color-fg-muted);
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
 

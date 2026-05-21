@@ -115,6 +115,8 @@
     pane_id?: string; // e.g. "%0" — SSoT pattern `^%[0-9]+$`
     type?: CanvasItemType | 'panel';
     label?: string | null;
+    title?: string;
+    file_name?: string;
     visibility?: boolean;
     locked?: boolean;
     minimized?: boolean;
@@ -159,6 +161,8 @@
       pane_id: it.type === 'terminal' ? it.id : undefined,
       type: it.type,
       label: it.label ?? null,
+      title: it.type === 'note' ? it.title : undefined,
+      file_name: it.type === 'document' ? it.file_name : undefined,
       visibility: it.visibility === 'visible',
       locked: it.locked,
       minimized: it.minimized,
@@ -238,7 +242,13 @@
       const poolLabel = terminalPool.byId(p.id)?.label?.trim();
       if (poolLabel != null && poolLabel.length > 0) return poolLabel;
     }
+    if (p.type === 'note' && p.title != null && p.title.length > 0) return p.title;
     if (p.label != null && p.label.length > 0) return p.label;
+    if (p.type === 'document' && p.file_name != null && p.file_name.length > 0) {
+      const base = p.file_name.trim().split('/').pop() ?? p.file_name.trim();
+      const dot = base.lastIndexOf('.');
+      return dot > 0 ? base.slice(0, dot) : base;
+    }
     const n = paneNumeric(p.pane_id);
     if (n !== null) return `%${n}`;
     const type = p.type === 'file_path' ? 'file' : (p.type ?? 'panel');

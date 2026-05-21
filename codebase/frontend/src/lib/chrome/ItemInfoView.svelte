@@ -21,6 +21,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
+  import { patchTerminalLabel } from '$lib/http/terminals';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import { pickLocalFile } from '$lib/files/localFilePicker';
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
@@ -108,20 +109,34 @@
     return fallback;
   }
 
-  /**
-   * Note 의 `title` 은 의미상 Common label 과 동일 — Inspector 의 label field 가
-   * note 의 title 을 read/write 한다. mixed 판정도 type-별 source 를 정규화 후 비교.
-   */
-  function noteAwareLabel(it: CanvasItem): string {
-    return it.type === 'note' ? it.title : (it.label ?? '');
+  function fileStem(fileName: string): string {
+    const base = fileName.trim().split('/').pop() ?? fileName.trim();
+    const dot = base.lastIndexOf('.');
+    if (dot <= 0) return base;
+    return base.slice(0, dot);
   }
-  function commonNoteAwareLabel(): string | 'Mixed' | null {
+
+  /**
+   * Common label 은 surface 별 표시 title 과 같은 값을 읽는다.
+   * - terminal: terminalPool label 이 server-wide source 이므로 우선.
+   * - note: title 이 canvas header title.
+   * - document: label 이 canvas header title, 없으면 filename stem.
+   */
+  function displayLabel(it: CanvasItem): string {
+    if (it.type === 'terminal') {
+      return terminalPool.byId(it.id)?.label?.trim() || it.label || '';
+    }
+    if (it.type === 'note') return it.title;
+    if (it.type === 'document') return it.label?.trim() || fileStem(it.file_name);
+    return it.label ?? '';
+  }
+  function commonDisplayLabel(): string | 'Mixed' | null {
     if (selectedItems.length === 0) return null;
     const first = selectedItems[0];
     if (first === undefined) return null;
-    const firstVal = noteAwareLabel(first);
+    const firstVal = displayLabel(first);
     for (const it of selectedItems) {
-      if (noteAwareLabel(it) !== firstVal) return 'Mixed';
+      if (displayLabel(it) !== firstVal) return 'Mixed';
     }
     return firstVal;
   }
@@ -237,13 +252,29 @@
   }
 
   async function applyCommonLabel(next: string): Promise<void> {
-    // Note 는 title 이 label 의미 — type-aware broadcast (ADR-0027 D1/D6 변형).
+    const terminalIds = selectedItems
+      .filter((it) => it.type === 'terminal')
+      .map((it) => it.id);
     await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
       if (it.type === 'note') {
         return { ...it, title: next } as CanvasItem;
       }
       return { ...it, label: next } as CanvasItem;
     });
+    if (terminalIds.length === 0) return;
+    try {
+      await Promise.all(terminalIds.map((id) => patchTerminalLabel(id, next)));
+      await terminalPool.refresh();
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Terminal label sync failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
   }
 
   async function applyCommonBool(key: CommonBoolKey, next: boolean): Promise<void> {
@@ -415,6 +446,7 @@
               ? ({
                   ...it,
                   asset_id: uploaded.asset_id,
+                  label: uploaded.file_name.replace(/\.[^/.]+$/, ''),
                   file_name: uploaded.file_name,
                   mime: uploaded.mime,
                   size_bytes: uploaded.size_bytes,
@@ -764,10 +796,10 @@
           <InspectorField
             k="label"
             value={(() => {
-              const v = commonNoteAwareLabel();
+              const v = commonDisplayLabel();
               return typeof v === 'string' ? v : '';
             })()}
-            mixed={commonNoteAwareLabel() === 'Mixed'}
+            mixed={commonDisplayLabel() === 'Mixed'}
             placeholder="—"
             ariaLabel="Label"
             oncommit={(next) => void applyCommonLabel(next)}

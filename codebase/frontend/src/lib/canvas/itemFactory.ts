@@ -202,6 +202,7 @@ export function createDocumentItem(pos: { x: number; y: number }): DocumentItem 
     visibility: 'visible',
     locked: false,
     minimized: false,
+    label: 'document',
     type: 'document',
     // BE schema.rs `Item::Document` 는 mime/size_bytes 가 required. inline-
     // stored mode 에서 placeholder: mime="" (text/markdown 미지정), size_bytes=

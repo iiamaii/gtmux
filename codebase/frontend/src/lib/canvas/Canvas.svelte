@@ -1120,6 +1120,7 @@
             const item = {
               ...createDocumentItem(pos),
               asset_id: uploaded.asset_id,
+              label: uploaded.file_name.replace(/\.[^/.]+$/, ''),
               mime: uploaded.mime,
               file_name: uploaded.file_name,
               size_bytes: uploaded.size_bytes,

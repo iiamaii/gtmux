@@ -37,6 +37,7 @@
   import { encodePaneIn, encodePaneResize, FRAME_TYPE } from '$lib/ws/decode';
   import { debugCount } from '$lib/common/debugCounts';
   import { themeStore } from '$lib/stores/theme.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { WsClient } from '$lib/ws/client';
 
   // paneId 는 항상 numeric (legacy `%N` 의 N 또는 0x88 binding 으로 얻은 PaneId).
@@ -51,6 +52,49 @@
    *  sibling $effect can hot-reload `options.theme` whenever the chrome
    *  theme flips. `null` while unmounted. */
   let termRef = $state<Terminal | null>(null);
+
+  /** ADR-0004 D6 amend ② (2026-05-21) — SvelteFlow viewport scale 안에서
+   *  xterm.js v6 의 mouse 좌표 mismatch 보정. xterm 의 mouse handler 는
+   *  `element.getBoundingClientRect()` + `clientX - rect.left` 로 character
+   *  index 계산 — viewport scale(z) 안에서 rect 는 visual size (scaled),
+   *  cell width 는 unscaled fontMetrics base. ratio mismatch = z factor →
+   *  사용자 visual click N cells 옆이 N×z 의 char index 로 계산.
+   *
+   *  Fix: capture-phase mouse listener — z ≠ 1 일 때 좌표를 z 로 나눠
+   *  synthetic event redispatch. WeakSet 으로 synth 재진입 차단. */
+  const synthSet = new WeakSet<Event>();
+  const MOUSE_TYPES = ['mousedown', 'mousemove', 'mouseup', 'click', 'contextmenu', 'dblclick'] as const;
+
+  function relayMouse(e: MouseEvent): void {
+    if (synthSet.has(e)) return;
+    const z = sessionStore.viewport.zoom;
+    if (Math.abs(z - 1) < 0.001) return; // unit zoom — natural handling.
+    if (!containerEl) return;
+    const rect = containerEl.getBoundingClientRect();
+    const synthClientX = rect.left + (e.clientX - rect.left) / z;
+    const synthClientY = rect.top + (e.clientY - rect.top) / z;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    const synth = new MouseEvent(e.type, {
+      bubbles: true,
+      cancelable: true,
+      view: e.view ?? window,
+      detail: e.detail,
+      screenX: e.screenX,
+      screenY: e.screenY,
+      clientX: synthClientX,
+      clientY: synthClientY,
+      button: e.button,
+      buttons: e.buttons,
+      ctrlKey: e.ctrlKey,
+      shiftKey: e.shiftKey,
+      altKey: e.altKey,
+      metaKey: e.metaKey,
+      relatedTarget: e.relatedTarget,
+    });
+    synthSet.add(synth);
+    (e.target as Element | null)?.dispatchEvent(synth);
+  }
 
   // R2 F8 resize debounce — fit() 폭주 방지 (DOM 측정 → reflow 비용).
   // NodeResizer 드래그 중에는 컨테이너만 커지고 xterm 내부 .xterm-screen 의
@@ -101,6 +145,13 @@
       console.debug('[xterm] post-fit pane=%s cols=%d rows=%d', paneId, term.cols, term.rows);
     } catch (e) {
       console.debug('[xterm] initial fit failed pane=%s err=%o', paneId, e);
+    }
+
+    // ADR-0004 D6 amend ② — Capture-phase mouse coord 변환 listener.
+    // viewport zoom ≠ 1 일 때 좌표를 z 로 나눠 synthetic redispatch → xterm
+    // 의 unscaled cell width 계산과 정합 → 정확한 char index.
+    for (const type of MOUSE_TYPES) {
+      containerEl.addEventListener(type, relayMouse, { capture: true });
     }
 
     // PaneOut 등록 — WS dispatcher 가 이 paneId 로 도착한 PANE_OUT(0x02) 을 본
@@ -221,6 +272,12 @@
       ro.disconnect();
       dataDisposable.dispose();
       unregisterPaneOut(paneId, paneOutHandler);
+      // ADR-0004 D6 amend ② cleanup — capture-phase mouse listener 해제.
+      if (containerEl) {
+        for (const type of MOUSE_TYPES) {
+          containerEl.removeEventListener(type, relayMouse, { capture: true });
+        }
+      }
       termRef = null;
       term.dispose();
     };
