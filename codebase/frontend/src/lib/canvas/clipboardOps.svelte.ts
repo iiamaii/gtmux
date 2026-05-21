@@ -10,6 +10,10 @@
 
 import type { CanvasItem, CanvasLayout, LineItem } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
+import { terminalPool } from '$lib/stores/terminalPool.svelte';
+import { attachConfirm } from '$lib/http/sessions';
+import { toastStore } from '$lib/ui/toast-store.svelte';
+import { UnauthorizedError } from '$lib/http/sessions';
 import { generateUuidV4 } from '$lib/uuid';
 
 export interface PasteOptions {
@@ -48,6 +52,42 @@ export async function pasteItems(
   if (res.ok && options.setSelection !== false) {
     sessionStore.setM(fresh.map((it) => it.id));
   }
+
+  // ADR-0030 D3 amend ② (2026-05-21) — terminal item 포함 시 즉시 BE 의
+  // unmatched-spawn 발동. 옛 동작은 layout PUT 만 — unmatched UUID 가 BE 에
+  // 누적되어 새로고침 시 AttachConfirmModal (ADR-0019 D5.1 amend ②) 노출.
+  // 사용자 mental model = "paste 즉시 spawn" → attachConfirm 자동 호출로
+  // dialog 우회 + 즉시 spawn. spawnMultiSessionTerminal (Canvas.svelte:1146)
+  // 의 단일 spawn 패턴 정합.
+  if (res.ok && fresh.some((it) => it.type === 'terminal')) {
+    const active = sessionStore.active;
+    if (active !== null) {
+      try {
+        const confirmRes = await attachConfirm(active.name);
+        if (confirmRes.failed.length > 0) {
+          const firstFailed = confirmRes.failed[0];
+          if (firstFailed !== undefined) {
+            toastStore.show({
+              message: `Terminal spawn failed: ${firstFailed.error}`,
+              tone: 'error',
+            });
+          }
+        }
+        // pool refresh → PanelNode 의 terminalPaneId derived 갱신 → XtermHost mount.
+        void terminalPool.refresh();
+      } catch (err) {
+        if (err instanceof UnauthorizedError) {
+          window.location.href = '/auth';
+          return res.ok;
+        }
+        toastStore.show({
+          message: `Paste spawn failed: ${err instanceof Error ? err.message : String(err)}`,
+          tone: 'error',
+        });
+      }
+    }
+  }
+
   return res.ok;
 }
 

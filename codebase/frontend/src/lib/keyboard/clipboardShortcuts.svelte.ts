@@ -12,6 +12,7 @@
 import type { CanvasItem } from '$lib/types/canvas';
 import { clipboardStore } from '$lib/stores/clipboardStore.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
+import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
 import { pasteItems } from '$lib/canvas/clipboardOps.svelte';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
@@ -40,8 +41,15 @@ function doCut(): boolean {
   const items = selectionMutable();
   if (items.length === 0) return false;
   clipboardStore.cut(items);
-  const ids = items.map((it) => it.id);
-  void sessionStore.applyDeletion(ids, { killTerminal: false });
+  // ADR-0032 Amend ⑥ — terminal 포함 시 PanelCloseConfirmModal 경유.
+  // ContextMenu / Delete-key / Cmd+X 의 destructive path 통일.
+  panelCloseDialog.show({
+    items,
+    onConfirm: async (killTerminal) => {
+      const ids = items.map((it) => it.id);
+      await sessionStore.applyDeletion(ids, { killTerminal });
+    },
+  });
   return true;
 }
 

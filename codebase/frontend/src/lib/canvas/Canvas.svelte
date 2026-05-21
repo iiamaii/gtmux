@@ -25,6 +25,7 @@
   import type { CanvasItem } from '$lib/types/canvas';
   import { effectiveLocked, effectiveVisibility } from '$lib/types/group';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
   import FilePickerModal from '$lib/chrome/FilePickerModal.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import { pickLocalFile } from '$lib/files/localFilePicker';
@@ -247,31 +248,38 @@
   }
 
   /**
-   * Remove every item in `sessionStore.M` via BE `deleteItem` + store sync.
-   *
-   * - terminal item: `kill_terminal=false` (G25 default) — panel 만 제거,
-   *   terminal 은 pool 에 남음 (다른 panel 이 같은 UUID 를 mirror 할 수 있음).
-   * - 다른 item type: BE 가 layout 에서만 제거. body 무관.
-   * - 부분 실패 허용 — 성공한 것만 store 에서 빼고 토스트로 카운트 표시.
+   * Remove every item in `sessionStore.M` — ADR-0032 Amend ⑥ 정합. Terminal
+   * 포함 시 PanelCloseConfirmModal 경유 (Panel(s) only / Panel(s) + Terminal(s)
+   * 선택). ContextMenu 의 Delete / Cut / Clear all path 와 동일 dispatch.
    */
   async function deleteSelected(): Promise<void> {
     const ids = Array.from(sessionStore.M);
     if (ids.length === 0) return;
-    const { ok, fail } = await sessionStore.applyDeletion(ids, {
-      killTerminal: false,
+    const items = ids
+      .map((id) => sessionStore.items.get(id))
+      .filter((it): it is NonNullable<typeof it> => it !== undefined);
+    panelCloseDialog.show({
+      items,
+      onConfirm: async (killTerminal) => {
+        const { ok, fail } = await sessionStore.applyDeletion(ids, {
+          killTerminal,
+        });
+        if (ok === 0 && fail === 0) return;
+        if (fail === 0) {
+          toastStore.show({
+            message: killTerminal
+              ? `Removed ${ok} item${ok === 1 ? '' : 's'} (terminals killed).`
+              : `Removed ${ok} item${ok === 1 ? '' : 's'}.`,
+            tone: 'success',
+          });
+        } else {
+          toastStore.show({
+            message: `Removed ${ok}, failed ${fail}.`,
+            tone: 'error',
+          });
+        }
+      },
     });
-    if (ok === 0 && fail === 0) return;
-    if (fail === 0) {
-      toastStore.show({
-        message: `Removed ${ok} item${ok === 1 ? '' : 's'}.`,
-        tone: 'success',
-      });
-    } else {
-      toastStore.show({
-        message: `Removed ${ok}, failed ${fail}.`,
-        tone: 'error',
-      });
-    }
   }
 
   function onWindowKeyUp(e: KeyboardEvent): void {
