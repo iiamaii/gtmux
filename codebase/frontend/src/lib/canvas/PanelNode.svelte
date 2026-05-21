@@ -225,7 +225,7 @@
 
   async function onLabelCommit(next: string): Promise<void> {
     const trimmed = next.trim();
-    if (trimmed === (data.label ?? '')) {
+    if (trimmed === headerLabel) {
       labelEditing = false;
       return;
     }
@@ -384,7 +384,7 @@
       {#if labelEditing}
         <span class="panel-label-host" role="presentation">
           <InlineEditField
-            value={data.label ?? ''}
+            value={headerLabel}
             editing={true}
             allowEmpty={true}
             plain={true}
@@ -517,7 +517,7 @@
 
 <PanelCloseConfirmModal
   open={confirmOpen}
-  panelLabel={typeof data.label === 'string' && data.label.length > 0 ? data.label : data.id.slice(0, 8)}
+  panelLabel={headerLabel}
   {attachCount}
   {otherSessions}
   onCancel={() => (confirmOpen = false)}

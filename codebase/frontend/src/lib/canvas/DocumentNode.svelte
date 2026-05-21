@@ -27,6 +27,12 @@
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
   import { pickLocalFile } from '$lib/files/localFilePicker';
+  import {
+    renderMarkdown,
+    renderHtml,
+    isToggleableFileType,
+    type DocumentViewMode,
+  } from './documentRender';
   import type { CanvasItem, DocumentItem } from '$lib/types/canvas';
 
   /** Inline content cap = ADR-0018 D4 amend ② / BE DOCUMENT_INLINE_MAX_BYTES. */
@@ -39,6 +45,7 @@
     visibility: boolean;
     locked: boolean;
     minimized?: boolean;
+    label?: string;
     asset_id?: string;
     file_name: string;
     content?: string;
@@ -124,45 +131,27 @@
     }
   });
 
-  /** content 를 (heading, paragraphs) 로 분할. 첫 줄이 markdown `# `, `## ` 등
-   * 으로 시작하면 그 부분을 heading 으로, 아니면 빈 heading. */
-  function parseDocumentText(raw: string): { heading: string; paragraphs: string[] } {
-    if (raw.length === 0) return { heading: '', paragraphs: [] };
-    const lines = raw.split(/\r?\n/);
-    let heading = '';
-    let i = 0;
-    const headingMatch = lines[0]?.match(/^#{1,6}\s+(.+)$/);
-    if (headingMatch) {
-      heading = headingMatch[1] ?? '';
-      i = 1;
-    }
-    // skip blank lines after heading
-    while (i < lines.length && lines[i]?.trim() === '') i++;
-    // group remaining content into paragraphs (blank-line separated).
-    const paragraphs: string[] = [];
-    let buf: string[] = [];
-    for (; i < lines.length; i++) {
-      const line = lines[i] ?? '';
-      if (line.trim() === '') {
-        if (buf.length > 0) {
-          paragraphs.push(buf.join(' '));
-          buf = [];
-        }
-      } else {
-        buf.push(line);
-      }
-    }
-    if (buf.length > 0) paragraphs.push(buf.join(' '));
-    return { heading, paragraphs };
+  /** ADR-0018 D10 amend ③/④ (2026-05-21) — markdown/html viewer + source/rendered
+   *  toggle. helper 는 documentRender.ts 에 외부화 — DocumentNode (normal) 와
+   *  MaximizedItemModal (maximize) 가 같은 helper 사용 → rendering 동기화 보장. */
+  let viewMode = $state<DocumentViewMode>('rendered');
+  const canToggleView = $derived(isToggleableFileType(fileTypeLabel));
+  // Inline content (data.content) 의 mime 추정은 markdown 으로 기본 — fileTypeLabel
+  // 이 'markdown' 이면 marked parse, 'html' 이면 sanitize only.
+  function renderContent(raw: string): string {
+    if (fileTypeLabel === 'html') return renderHtml(raw);
+    return renderMarkdown(raw);
   }
-
-  const parsed = $derived.by((): { heading: string; paragraphs: string[] } => {
-    return parseDocumentText(data.content ?? '');
+  const inlineHtml = $derived(renderContent(data.content ?? ''));
+  const assetHtml = $derived(renderContent(assetPreviewText ?? ''));
+  const isEmpty = $derived(isInline && (data.content ?? '').trim().length === 0);
+  const fileStem = $derived.by((): string => {
+    const base = data.file_name.trim().split('/').pop() ?? data.file_name.trim();
+    const dot = base.lastIndexOf('.');
+    if (dot <= 0) return base;
+    return base.slice(0, dot);
   });
-  const assetParsed = $derived.by((): { heading: string; paragraphs: string[] } => {
-    return parseDocumentText(assetPreviewText ?? '');
-  });
-  const isEmpty = $derived(isInline && parsed.heading === '' && parsed.paragraphs.length === 0);
+  const documentTitle = $derived((data.label ?? '').trim() || fileStem || 'Untitled');
   const canPreviewAssetText = $derived.by(() => {
     if (isInline) return false;
     const mime = (data.mime ?? '').toLowerCase();
@@ -213,7 +202,14 @@
   //   - commit 시 applyMutation 통과 → history capture (Cmd+Z 자연 정합).
   //   - inline-stored 모드에서만 편집 진입 — asset-based 는 read-only.
   let nameEditing = $state(false);
+  let labelEditing = $state(false);
   let contentEditing = $state(false);
+
+  function onLabelDblClick(e: MouseEvent): void {
+    if (isLocked) return;
+    e.stopPropagation();
+    labelEditing = true;
+  }
 
   function onNameDblClick(e: MouseEvent): void {
     if (isLocked || !isInline) return;
@@ -234,12 +230,23 @@
       return;
     }
     if (sessionStore.active === null) return;
+    const oldStem = fileStem;
+    const nextBase = trimmed.split('/').pop() ?? trimmed;
+    const nextDot = nextBase.lastIndexOf('.');
+    const nextStem = nextDot > 0 ? nextBase.slice(0, nextDot) : nextBase;
     const result = await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'document'
-            ? ({ ...it, file_name: trimmed } as DocumentItem)
+            ? ({
+                ...it,
+                file_name: trimmed,
+                label:
+                  (it.label ?? '').trim().length === 0 || (it.label ?? '') === oldStem
+                    ? nextStem
+                    : it.label,
+              } as DocumentItem)
             : it,
         ),
       }),
@@ -249,6 +256,30 @@
       },
     );
     if (result.ok) nameEditing = false;
+  }
+
+  async function commitLabel(next: string): Promise<void> {
+    const trimmed = next.trim();
+    if (trimmed === (data.label ?? '')) {
+      labelEditing = false;
+      return;
+    }
+    if (sessionStore.active === null) return;
+    const result = await sessionStore.applyMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          it.id === data.id && it.type === 'document'
+            ? ({ ...it, label: trimmed } as DocumentItem)
+            : it,
+        ),
+      }),
+      {
+        abortMessage: 'Document title edit aborted — session reconnect failed.',
+        failMessage: 'Document title edit failed',
+      },
+    );
+    if (result.ok) labelEditing = false;
   }
 
   async function commitContent(next: string): Promise<void> {
@@ -375,6 +406,7 @@
               ? ({
                   ...it,
                   asset_id: uploaded.asset_id,
+                  label: uploaded.file_name.replace(/\.[^/.]+$/, ''),
                   file_name: uploaded.file_name,
                   mime: uploaded.mime,
                   size_bytes: uploaded.size_bytes,
@@ -420,7 +452,7 @@
     class:is-min={data.minimized === true}
     style="width: 100%; height: 100%;"
     role="article"
-    aria-label={`Document ${data.file_name}`}
+    aria-label={`Document ${documentTitle}`}
     onclick={data.minimized !== true && isEmpty ? onRootClick : undefined}
   >
     <NodeResizer
@@ -433,32 +465,61 @@
       lineClass="panel-resize-line"
       {onResizeEnd}
     />
-    <!-- 1. Doc-head: file svg + filename + sep + size + right -->
+    <!-- 1. Doc-head: file svg + title + actions. Filename lives in footer. -->
     <header class="doc-head">
       <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
         <path d="M3 1.5h4.5L9.5 3.5V10.5H3V1.5z" />
         <path d="M7.5 1.5V3.5h2" />
       </svg>
-      {#if nameEditing}
+      {#if labelEditing}
         <InlineEditField
-          value={data.file_name}
+          value={documentTitle}
           editing={true}
           plain={true}
-          placeholder="filename.md"
-          class="doc-name-edit"
-          onCommit={(next: string) => void commitName(next)}
-          onCancel={() => (nameEditing = false)}
+          placeholder={fileStem || 'Untitled'}
+          class="doc-title-edit"
+          onCommit={(next: string) => void commitLabel(next)}
+          onCancel={() => (labelEditing = false)}
         />
       {:else}
         <span
-          class="filename"
-          title={isInline ? `${data.file_name} — double-click to rename` : data.file_name}
-          ondblclick={onNameDblClick}
+          class="doc-title"
+          title={`${documentTitle} — double-click to rename`}
+          ondblclick={onLabelDblClick}
           role="presentation"
-        >{data.file_name}</span>
+        >{documentTitle}</span>
       {/if}
       {#if !isLocked}
         <div class="doc-actions">
+          {#if canToggleView}
+            <!-- ADR-0018 D10 amend ④ — source / rendered toggle (html / markdown). -->
+            <button
+              type="button"
+              class="doc-btn"
+              class:is-active={viewMode === 'source'}
+              title={viewMode === 'source' ? 'Show rendered' : 'Show source'}
+              aria-label={viewMode === 'source' ? 'Show rendered' : 'Show source'}
+              onclick={(e: MouseEvent) => {
+                e.stopPropagation();
+                viewMode = viewMode === 'source' ? 'rendered' : 'source';
+              }}
+              onmousedown={(e: MouseEvent) => e.stopPropagation()}
+            >
+              {#if viewMode === 'source'}
+                <!-- eye (rendered preview) -->
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                </svg>
+              {:else}
+                <!-- < / > code -->
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+                  <polyline points="16 18 22 12 16 6"/>
+                  <polyline points="8 6 2 12 8 18"/>
+                </svg>
+              {/if}
+            </button>
+          {/if}
           <button
             type="button"
             class="doc-btn"
@@ -551,30 +612,21 @@
         </div>
       {:else if isInline}
         <div class="eyebrow">Inline document</div>
-        {#if parsed.heading.length > 0}
-          <h2>{parsed.heading}</h2>
-        {/if}
-        {#each parsed.paragraphs.slice(0, 3) as para}
-          <p>{para}</p>
-        {/each}
-        {#if parsed.paragraphs.length > 3}
-          <p class="more">… {parsed.paragraphs.length - 3} more</p>
+        <!-- ADR-0018 D10 amend ③/④ — markdown/html rendered HTML or source. -->
+        {#if viewMode === 'source'}
+          <pre class="doc-source">{data.content ?? ''}</pre>
+        {:else}
+          <div class="doc-md">{@html inlineHtml}</div>
         {/if}
       {:else}
         <div class="eyebrow">Document file</div>
         {#if assetPreviewLoading}
           <p>Loading preview…</p>
-        {:else if assetPreviewText !== null && (assetParsed.heading.length > 0 || assetParsed.paragraphs.length > 0)}
-          {#if assetParsed.heading.length > 0}
-            <h2>{assetParsed.heading}</h2>
+        {:else if assetPreviewText !== null && (assetPreviewText.trim().length > 0)}
+          {#if viewMode === 'source'}
+            <pre class="doc-source">{assetPreviewText}</pre>
           {:else}
-            <h2>{data.file_name}</h2>
-          {/if}
-          {#each assetParsed.paragraphs.slice(0, 3) as para}
-            <p>{para}</p>
-          {/each}
-          {#if assetParsed.paragraphs.length > 3}
-            <p class="more">… {assetParsed.paragraphs.length - 3} more</p>
+            <div class="doc-md">{@html assetHtml}</div>
           {/if}
         {:else}
           <div class="asset-summary">
@@ -594,6 +646,24 @@
     <footer class="doc-foot">
       <span class="page-dot on" aria-hidden="true"></span>
       <span>Page 1</span>
+      {#if nameEditing}
+        <InlineEditField
+          value={data.file_name}
+          editing={true}
+          plain={true}
+          placeholder="filename.md"
+          class="doc-name-edit"
+          onCommit={(next: string) => void commitName(next)}
+          onCancel={() => (nameEditing = false)}
+        />
+      {:else}
+        <span
+          class="filename"
+          title={isInline ? `${data.file_name} — double-click to rename` : data.file_name}
+          ondblclick={onNameDblClick}
+          role="presentation"
+        >{data.file_name}</span>
+      {/if}
       {#if (data.size_bytes ?? 0) > 0}
         <span class="doc-size" title={sizeLabel}>{sizeLabel}</span>
       {/if}
@@ -656,20 +726,25 @@
     opacity: 0.75;
   }
 
-  .doc-head .filename {
+  .doc-head .doc-title,
+  .doc-foot .filename {
     flex: 1 1 auto;
     color: var(--color-fg);
     font-size: 9.5px;
     font-weight: var(--weight-medium);
     letter-spacing: 0.4px;
-    text-transform: uppercase;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     min-width: 0;
   }
 
-  .doc-head > span:not(.filename),
+  .doc-foot .filename {
+    max-width: 42%;
+    text-transform: uppercase;
+  }
+
+  .doc-head > span:not(.doc-title),
   .doc-foot > span:not(.page-dot) {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -801,9 +876,119 @@
     overflow-wrap: anywhere;
   }
 
-  .doc-body p.more {
+  /* ADR-0018 D10 amend ④ — source view (raw markdown / html source code). */
+  .doc-source {
+    margin: 0;
+    padding: 0;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--color-fg-muted);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  /* plan 0011 follow-up (2026-05-21) — marked output container styling.
+     ADR-0018 D10 의 inline/asset markdown 모두 본 container 안. */
+  .doc-md {
+    color: var(--color-fg-muted);
+    font-family: var(--font-sans);
+    font-size: 12.5px;
+    line-height: 1.55;
+    letter-spacing: -0.1px;
+    overflow-wrap: anywhere;
+  }
+  .doc-md :global(h1),
+  .doc-md :global(h2) {
+    margin: 0 0 12px;
+    font-family: var(--font-sans);
+    font-size: 26px;
+    font-weight: 540;
+    letter-spacing: -0.6px;
+    line-height: 1.15;
+    color: var(--color-fg);
+  }
+  .doc-md :global(h3) {
+    margin: 16px 0 8px;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--color-fg);
+  }
+  .doc-md :global(h4),
+  .doc-md :global(h5),
+  .doc-md :global(h6) {
+    margin: 14px 0 6px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--color-fg);
+  }
+  .doc-md :global(p) {
+    margin: 0 0 10px;
+  }
+  .doc-md :global(ul),
+  .doc-md :global(ol) {
+    margin: 0 0 10px;
+    padding-left: 22px;
+  }
+  .doc-md :global(li) {
+    margin: 2px 0;
+  }
+  .doc-md :global(blockquote) {
+    margin: 0 0 10px;
+    padding-left: 12px;
+    border-left: 2px solid var(--color-border-strong);
     color: var(--color-fg-subtle);
-    font-style: italic;
+  }
+  .doc-md :global(code) {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    padding: 0 4px;
+    background: var(--color-surface-2);
+    border-radius: var(--radius-sm);
+  }
+  .doc-md :global(pre) {
+    margin: 0 0 10px;
+    padding: 10px 12px;
+    background: var(--color-surface-2);
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+  }
+  .doc-md :global(pre code) {
+    padding: 0;
+    background: transparent;
+    border-radius: 0;
+  }
+  .doc-md :global(a) {
+    color: var(--color-accent);
+    text-decoration: underline;
+  }
+  .doc-md :global(table) {
+    border-collapse: collapse;
+    margin: 0 0 10px;
+    font-size: 12px;
+  }
+  .doc-md :global(th),
+  .doc-md :global(td) {
+    border: 1px solid var(--color-border);
+    padding: 4px 8px;
+    text-align: left;
+  }
+  .doc-md :global(th) {
+    background: var(--color-surface-2);
+    font-weight: 600;
+    color: var(--color-fg);
+  }
+  .doc-md :global(hr) {
+    border: 0;
+    border-top: 1px solid var(--color-border);
+    margin: 14px 0;
+  }
+  .doc-md :global(img) {
+    max-width: 100%;
+    height: auto;
   }
 
   .asset-summary {
@@ -826,7 +1011,7 @@
     cursor: pointer;
   }
 
-  .document-node.is-empty .doc-head .filename {
+  .document-node.is-empty .doc-head .doc-title {
     color: var(--color-fg-muted);
   }
 
@@ -870,7 +1055,8 @@
     color: var(--color-fg);
   }
 
-  :global(.doc-name-edit) {
+  :global(.doc-name-edit),
+  :global(.doc-title-edit) {
     flex: 1 1 auto;
     min-width: 0;
     font-family: var(--font-mono);
@@ -879,6 +1065,10 @@
     letter-spacing: 0.4px;
     text-transform: uppercase;
     color: var(--color-fg);
+  }
+
+  :global(.doc-title-edit) {
+    text-transform: none;
   }
 
   /* page-dot indicator — 5px circle */
