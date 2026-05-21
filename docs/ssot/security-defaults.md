@@ -176,7 +176,7 @@ list-panes -a -F <fmt>
 
 | key | default | type | source | note |
 |---|---|---|---|---|
-| `cloud.tls_required` | `true` | bool | D12 (R5 §A.4) | HTTPS·WSS만. HTTP 부팅 시 stderr 경고 + 명시 `--allow-cloud-without-tls` 없으면 거부 |
+| `cloud.tls_required` | `true` | bool | D12 (R5 §A.4) | HTTPS·WSS 전제. `false` 를 명시하면 신뢰된 네트워크에서 평문 HTTP cloud 모드를 허용하고 Secure cookie/HSTS를 생략 |
 | `cloud.reverse_proxy_required` | `true` | bool | D12 (R5 §A.4) | Caddy/nginx + ACME 권장. gtmux 자체 TLS 종단 미지원 (MVP) |
 | `cloud.hsts_enabled` | `true` | bool | D12 + R5 §F.1 | `Strict-Transport-Security` 자동 부착 |
 | `cloud.trusted_proxy_ips_required` | `true` | bool | D12 (R5 §F.2) | 미설정 시 `X-Forwarded-*` 헤더 전체 무시 (fail-closed) |
@@ -386,7 +386,7 @@ Derived effect:
   - HTTP cookie `Secure` 속성 생략 가능 (TLS 없으므로)
 - `mode == Cloud`:
   - `token.rotation_policy = persist_explicit_rotate`
-  - `cloud.tls_required = true` → TLS 없으면 startup에서 `--allow-cloud-without-tls` 검사 후 거부
+  - `cloud.tls_required = true` → Secure cookie + HSTS 전제. `false` 면 평문 HTTP cloud 모드로 진행하며 cookie `Secure`와 HSTS 생략
   - `cloud.trusted_proxy_ips_required = true` → 미설정 시 `X-Forwarded-*` 헤더 무시
   - HSTS 자동 부착
   - CSP = `csp.template_cloud` (`{CONFIGURED_HOST}` 치환)
@@ -406,7 +406,7 @@ Rust `auth` + `config` crate가 startup에 *순서대로* 검증:
 6. **EUID != 0** 또는 `--allow-root` 플래그 명시 — 위반 시 exit 5
 7. **mode 도출** (§4)
 8. **mode == Cloud 추가 검증**:
-   - `cloud.tls_required` AND TLS 종단 없음 → exit 2 (배포 가이드 안내) unless `--allow-cloud-without-tls`
+   - `cloud.tls_required` 기본값은 `true`. 평문 HTTP cloud 모드는 `[cloud].tls_required = false` 를 명시해야 하며 Secure cookie/HSTS를 생략
    - `cloud.trusted_proxy_ips_required` AND `trusted_proxy_ips == []` → stderr 경고 + `X-Forwarded-*` 무시 모드로 진행
    - `host_allowlist == ["127.0.0.1:<port>", …]` 자동 디폴트 그대로 → exit 2 (cloud는 명시 필수)
 9. **`host_allowlist` 비어 있지 않음** — 비어 있으면 모든 HTTP 거부 → 의도된 거부면 명시 `[]` 허용, 빈 디폴트는 exit 2

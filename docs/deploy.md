@@ -442,7 +442,7 @@ XDG 경로:
 | `pidfile exists but process is gone` | 직전 실행이 비정상 종료 | `gtmux teardown --session <name> --force --keep-state` |
 | 브라우저에 `Forbidden` (cloud) | `host_allowlist` 또는 `cors_origins` 누락 | 위 §3.4 표대로 외부 origin / host 명시 |
 | 로그인 시 `connect-src` 위반 | cloud CSP 가 `wss://<host>` 를 모름 | `host_allowlist[0]` 또는 향후 `[cloud].public_host` 가 실제 외부 host 와 일치하는지 확인 |
-| HTTP 로 cloud 부팅 거부 | TLS 미설치 + `--allow-cloud-without-tls` 미지정 | reverse proxy + ACME 설치, 또는 *위험을 알고* 명시 플래그 사용 |
+| HTTP 로 cloud cookie 가 저장되지 않음 | `[cloud].tls_required = true` 인 상태에서 평문 HTTP 로 접속 | reverse proxy + ACME 설치, 또는 *위험을 알고* `[cloud].tls_required = false` 명시 |
 | `EUID==0` 거부 | root 실행 차단 | 일반 유저로 재실행. 다른 유저의 PTY 와 권한이 섞이는 표면 차단. |
 | Cookie 만료 후 접근 불가 | rolling 7d 초과 | banner URL 재오픈 (token mode) 또는 `/auth` 에서 password 재입력 |
 

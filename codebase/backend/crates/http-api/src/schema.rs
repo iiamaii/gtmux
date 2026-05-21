@@ -1634,7 +1634,10 @@ mod tests {
         });
         let solid: Item = serde_json::from_value(raw_solid).unwrap();
         let v = serde_json::to_value(&solid).unwrap();
-        assert!(v.get("stroke_dash").is_none(), "None must skip on serialise");
+        assert!(
+            v.get("stroke_dash").is_none(),
+            "None must skip on serialise"
+        );
     }
 
     /// `FigureStrokeDash` wire form is `snake_case`, not the connector

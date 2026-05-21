@@ -454,18 +454,12 @@ impl Hub {
         let (terminal_died_events, _) = broadcast::channel(TERMINAL_DIED_BROADCAST_CAPACITY);
         let (terminal_list_change_events, _) =
             broadcast::channel(TERMINAL_LIST_CHANGE_BROADCAST_CAPACITY);
-        let (terminal_spawned_events, _) =
-            broadcast::channel(TERMINAL_SPAWNED_BROADCAST_CAPACITY);
-        let (manipulation_events, _) =
-            broadcast::channel(MANIPULATION_BROADCAST_CAPACITY);
-        let (mount_cascade_events, _) =
-            broadcast::channel(MOUNT_CASCADE_BROADCAST_CAPACITY);
-        let (server_shutdown_events, _) =
-            broadcast::channel(SERVER_SHUTDOWN_BROADCAST_CAPACITY);
-        let (session_change_events, _) =
-            broadcast::channel(SESSION_CHANGE_BROADCAST_CAPACITY);
-        let (attach_replay_events, _) =
-            broadcast::channel(ATTACH_REPLAY_BROADCAST_CAPACITY);
+        let (terminal_spawned_events, _) = broadcast::channel(TERMINAL_SPAWNED_BROADCAST_CAPACITY);
+        let (manipulation_events, _) = broadcast::channel(MANIPULATION_BROADCAST_CAPACITY);
+        let (mount_cascade_events, _) = broadcast::channel(MOUNT_CASCADE_BROADCAST_CAPACITY);
+        let (server_shutdown_events, _) = broadcast::channel(SERVER_SHUTDOWN_BROADCAST_CAPACITY);
+        let (session_change_events, _) = broadcast::channel(SESSION_CHANGE_BROADCAST_CAPACITY);
+        let (attach_replay_events, _) = broadcast::channel(ATTACH_REPLAY_BROADCAST_CAPACITY);
 
         let mux_backend = backend.clone();
         let mux_tx = pane_output.clone();
@@ -747,9 +741,7 @@ impl Hub {
     /// Subscribe to terminal-list change deltas. Each WS connection pulls
     /// from this channel and filters via [`Hub::session_for_owner`] —
     /// see WS handler's `terminal_list_change_rx` select arm.
-    pub fn subscribe_terminal_list_change(
-        &self,
-    ) -> broadcast::Receiver<TerminalListChangeEvent> {
+    pub fn subscribe_terminal_list_change(&self) -> broadcast::Receiver<TerminalListChangeEvent> {
         self.terminal_list_change_events.subscribe()
     }
 
@@ -900,7 +892,10 @@ impl Hub {
     /// clones this once per upgrade so a provider registered mid-flight is
     /// honoured only by subsequent handshakes.
     pub fn terminal_uuid_provider(&self) -> Option<Arc<dyn TerminalUuidProvider>> {
-        self.terminal_uuid_provider.lock().ok().and_then(|s| s.clone())
+        self.terminal_uuid_provider
+            .lock()
+            .ok()
+            .and_then(|s| s.clone())
     }
 
     /// Live subscriber count on the multiplexed pane-output channel.
@@ -1056,11 +1051,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_list_change_publish_silent_without_subscribers() {
         let hub = Hub::new(PtyBackend::new());
-        hub.publish_terminal_list_change(
-            "demo",
-            &["u1".to_string()],
-            &[],
-        );
+        hub.publish_terminal_list_change("demo", &["u1".to_string()], &[]);
     }
 
     #[tokio::test]

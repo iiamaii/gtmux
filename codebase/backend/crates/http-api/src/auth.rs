@@ -20,8 +20,9 @@
 //!   * Settings UI / change-password endpoint — Stage 7 (BE-9).
 //!
 //! Cookie shape: `gtmux_auth=<base64url-32-bytes>; Path=/; HttpOnly;
-//! SameSite=Strict; Max-Age=<seconds>; [Secure]`. `Secure` only in Cloud
-//! mode (Local is plain HTTP — browser drops Secure cookies on `http://`).
+//! SameSite=Strict; Max-Age=<seconds>; [Secure]`. `Secure` is attached when
+//! the effective config requires TLS; explicit non-TLS cloud mode omits it
+//! because browsers drop Secure cookies on `http://`.
 
 #![allow(missing_docs)]
 
@@ -40,7 +41,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
 use gtmux_auth::{verify_token, TokenString};
-use gtmux_config::Mode;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use serde_json::json;
@@ -562,7 +562,7 @@ pub async fn auth_rotate_handler(State(state): State<AppState>, req: Request<Bod
                 .into_response();
         }
     };
-    let secure = matches!(state.config.mode(), Mode::Cloud);
+    let secure = state.config.tls_required();
     let cookie_header = build_session_cookie(&new_token, state.session_table.max_age(), secure);
 
     let revoked_count = revoked_others + 1;
@@ -577,7 +577,7 @@ pub async fn auth_rotate_handler(State(state): State<AppState>, req: Request<Bod
     if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie_header) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
-    apply_security_headers(resp.headers_mut(), state.config.mode());
+    apply_security_headers(resp.headers_mut(), &state.config);
     resp
 }
 
@@ -588,7 +588,7 @@ pub async fn auth_logout_handler(State(state): State<AppState>, req: Request<Bod
     if let Some(value) = extract_cookie_value(req.headers(), COOKIE_NAME) {
         state.session_table.revoke(&value).await;
     }
-    let secure = matches!(state.config.mode(), Mode::Cloud);
+    let secure = state.config.tls_required();
     let clear = clear_session_cookie(secure);
     let mut resp = Response::builder()
         .status(StatusCode::OK)
@@ -596,7 +596,7 @@ pub async fn auth_logout_handler(State(state): State<AppState>, req: Request<Bod
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({ "ok": true }).to_string()))
         .expect("static headers");
-    apply_security_headers(resp.headers_mut(), state.config.mode());
+    apply_security_headers(resp.headers_mut(), &state.config);
     resp
 }
 
@@ -617,7 +617,7 @@ async fn issue_cookie_response(
         }
     };
     let target = normalise_redirect_target(redirect_raw);
-    let secure = matches!(state.config.mode(), Mode::Cloud);
+    let secure = state.config.tls_required();
     let max_age = Duration::from_secs(
         u64::from(state.config.auth.cookie_max_age_days).saturating_mul(24 * 3600),
     );
@@ -630,7 +630,7 @@ async fn issue_cookie_response(
             json!({ "ok": true, "redirect": target }).to_string(),
         ))
         .expect("static headers");
-    apply_security_headers(resp.headers_mut(), state.config.mode());
+    apply_security_headers(resp.headers_mut(), &state.config);
     resp
 }
 
@@ -674,8 +674,8 @@ pub(crate) fn normalise_redirect_target(raw: Option<&str>) -> String {
 // `lib.rs` owns the real `apply_security_headers`; we re-export through a
 // crate-private wrapper so handlers in this module can call it without
 // recursive imports. The wrapper is `pub(crate)` to keep the surface tight.
-pub(crate) fn apply_security_headers(headers: &mut HeaderMap, mode: Mode) {
-    crate::apply_security_headers(headers, mode);
+pub(crate) fn apply_security_headers(headers: &mut HeaderMap, config: &gtmux_config::Config) {
+    crate::apply_security_headers_for_config(headers, config);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
