@@ -50,6 +50,25 @@ export async function pasteItems(
   return res.ok;
 }
 
+/**
+ * Full clone of `src` with a fresh UUID, repositioned by `(dx, dy)` from the
+ * source group's bounding-box top-left.
+ *
+ * **Invariant** (ADR-0030 D3 amend ① — batch-5 R8 / Grill #17): every type,
+ * *including `terminal`*, is full-cloned — `id` 만 새 UUID, 나머지 모든 필드
+ * (label / description / visibility / locked / minimized / restored_geom /
+ * parent_id / terminal_overrides) 는 source 에서 그대로 보존. Terminal 의 새
+ * BE spawn 은 *id 가 unmatched* 라는 사실로 자연 trigger 됨 (D6 + ADR-0021
+ * D6 match-or-spawn). 사용자 mental model = "복제 = 시각·메타 동일한 새
+ * 인스턴스" — 따라서 terminal type 도 별도 metadata strip 분기 *없음*.
+ *
+ * Line 만 추가 처리: x2/y2 endpoint 도 offset 적용 (geometry 의 일부, 다른
+ * type 의 w/h 같은 의미).
+ *
+ * 이 invariant 가 회귀되면 (e.g. terminal 분기로 label="" reset) batch-5 R8
+ * 의 user-intent 가 깨지고, 0079 connector / 0080 asset 같은 후속 batch 의
+ * "복제 = 동일" 가정이 무너짐.
+ */
 function cloneWithOffset(
   src: CanvasItem,
   bboxX: number,

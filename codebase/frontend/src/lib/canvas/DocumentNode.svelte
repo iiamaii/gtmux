@@ -70,6 +70,9 @@
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(selected || sessionStore.M.has(data.id));
+  const isMultiM = $derived(isInM && sessionStore.M.size > 1);
+  const isSingleM = $derived(isInM && sessionStore.M.size <= 1);
+  const isMaximized = $derived(sessionStore.maximizedItemId === data.id);
   /** Asset-based vs inline-stored 모드 구분 (ADR-0018 D4 amend ②). */
   const isInline = $derived((data.asset_id ?? '').length === 0);
   let assetPreviewText = $state<string | null>(null);
@@ -280,7 +283,7 @@
   }
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
-  const DOC_MIN_H = 30;
+  const DOC_MIN_H = 35;
   const DOC_RESTORE_W = 360;
   const DOC_RESTORE_H = 220;
 
@@ -410,7 +413,8 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
     class="document-node shape-document"
-    class:m-single={isInM}
+    class:m-single={isSingleM}
+    class:m-multi={isMultiM}
     class:locked={isLocked}
     class:is-empty={isEmpty}
     class:is-min={data.minimized === true}
@@ -461,6 +465,7 @@
             title="Change document"
             aria-label="Change document"
             onclick={(e) => void onLoadFileClick(e)}
+            onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
               <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
@@ -471,9 +476,11 @@
           <button
             type="button"
             class="doc-btn"
+            class:is-active={data.minimized === true}
             title={data.minimized === true ? 'Restore' : 'Minimize'}
             aria-label={data.minimized === true ? 'Restore' : 'Minimize'}
             onclick={(e) => void onMinimizeClick(e)}
+            onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
             {#if data.minimized === true}
               <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
@@ -488,9 +495,11 @@
           <button
             type="button"
             class="doc-btn"
-            title="Maximize"
-            aria-label="Maximize"
+            class:is-active={isMaximized}
+            title={isMaximized ? 'Restore' : 'Maximize'}
+            aria-label={isMaximized ? 'Restore' : 'Maximize'}
             onclick={onMaximizeClick}
+            onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
             <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
               <rect x="2.5" y="2.5" width="7" height="7" rx="0.5"/>
@@ -502,6 +511,7 @@
             title="Close"
             aria-label="Close"
             onclick={(e) => void onCloseClick(e)}
+            onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
             <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
               <path d="M3 3l6 6M9 3l-6 6"/>
@@ -607,7 +617,8 @@
     overflow: hidden;
   }
 
-  .document-node.m-single {
+  .document-node.m-single,
+  .document-node.m-multi {
     outline: none;
   }
 
@@ -681,21 +692,22 @@
   }
 
   .doc-actions {
-    display: flex;
+    display: inline-flex;
     align-items: center;
     gap: 1px;
-    flex-shrink: 0;
+    flex: 0 0 auto;
     margin-left: 2px;
   }
 
   .doc-btn {
-    width: 18px;
-    height: 20px;
-    display: grid;
-    place-items: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
     border: none;
     background: transparent;
-    border-radius: var(--radius-sm);
+    border-radius: 4px;
     color: var(--color-fg-muted);
     cursor: pointer;
     padding: 0;
@@ -704,12 +716,17 @@
       color var(--motion-fast) var(--motion-easing);
   }
 
-  .doc-btn:hover {
+  .doc-btn:hover:not(:disabled) {
     background: var(--color-glass-2);
     color: var(--color-fg);
   }
 
-  .doc-btn.close:hover {
+  .doc-btn.is-active {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
+  }
+
+  .doc-btn.close:hover:not(:disabled) {
     background: #e5484d;
     color: #ffffff;
   }
@@ -735,7 +752,8 @@
     box-shadow: 0 1px 10px rgba(0, 0, 0, 0.10);
   }
 
-  .document-node.is-min.m-single .doc-head {
+  .document-node.is-min.m-single .doc-head,
+  .document-node.is-min.m-multi .doc-head {
     border-color: var(--color-accent);
     border-width: 1.5px;
   }

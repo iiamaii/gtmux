@@ -146,6 +146,44 @@ Undo 직후 redo stack 이 있는 상태에서 **새 mutation 발생** → redo 
 - `zStore.svelte.ts:112` `#commit` — `#mutate`/`#applyTwo` 가 optimistic `sessionStore.items.set(...)` 후 fire-and-forget. `priorSnapshot` 전달하면 본 계약으로 자동 rollback 가능.
 - `PanelNode.svelte:125` `onResizeEnd` — NodeResizer 가 DOM 을 controlled 로 그려 store 와 desync. resize start 시 또는 onResizeEnd 진입 시 (store 가 아직 PRE 상태) snapshot 캡처 → 동일 계약 적용 가능.
 
+### D11.2 — `optimisticMutation` wrapper (2026-05-20 amend, batch-5 후속)
+
+D11.1 의 *수동 optimistic pattern* (caller 가 (a) `layoutSnapshot()` 캡처 → (b) `items.set(...)` 로 store 갱신 → (c) `applyMutation(transform, { priorSnapshot })` 호출) 은 Canvas drag stop / NodeResizer 처럼 *이미 SvelteFlow 가 DOM-controlled* 인 path 에는 자연이지만, Inspector / TextNode / NoteNode 처럼 *store ↔ render 의 단방향 path* 에서는 boilerplate 가 큰 데다 누락 시 *round-trip 대기 (GET+PUT 합 50~500ms)* 동안 UI 가 stale 인 회귀가 발생한다 (2026-05-20 사용자 보고: "Text/figure inspector 변경이 선택 해제되어야 적용").
+
+본 amend 는 `sessionStore.optimisticMutation(transform, options)` helper 를 추가해 caller boilerplate 를 1줄로 통일한다:
+
+```ts
+async optimisticMutation(transform, options): Promise<{ ok: boolean; layout? }> {
+  const priorSnapshot = this.layoutSnapshot();
+  const optimistic = transform(priorSnapshot);
+  // surgical items.set / delete — clear+repopulate 의 reactive churn 회피
+  for (const it of optimistic.items) this.items.set(it.id, it);
+  for (const id of this.items.keys()) if (!nextIds.has(id)) this.items.delete(id);
+  return await this.applyMutation(transform, { ...options, priorSnapshot });
+}
+```
+
+**적용 callsite (본 amend 의 ship)**:
+- `ItemInfoView.svelte` 의 15+ `applyXxx` helper — broadcastMutation / applyShapeColor·Boolean·StrokeWidth·Dash / applyTextAlign·VerticalAlign·FontWeight·Boolean·FontSize·Color / applyNoteColor / applyLineEndpoint / changeFilePath·Image·Document.
+- `TextNode.svelte::onCommit` — text + label 동시 갱신.
+- `NoteNode.svelte::commit` — title / body 갱신.
+
+**Server 부하 영향 = 0**: Inspector 컨트롤 (toggle button / dropdown / InspectorField oncommit / ColorPicker oncommit) 가 *모두 commit-based* — 1 액션 = 1 PUT, optimistic 적용 전후 동일. 본 helper 의 효과는 *round-trip latency 의 가시화* 만 (50~500ms → 0ms).
+
+**적용 제외**: drag stop / NodeResizer onResizeEnd — 이미 수동 optimistic. WS-driven mutation (dispatcher) — optimistic 의미 없음. itemFactory.commitNewItem — 신규 item 의 server 부여 z 가 필요해 PUT 응답 후 selection 정합 (본 helper 미적용).
+
+### D11.3 — `flowNodes` cache signature 완전성 invariant (2026-05-20 amend, batch-5 후속)
+
+`Canvas.svelte::makeSignature` 의 type-specific payload field 누락은 cache hit 으로 인한 *stale render bug*. 2026-05-20 batch-5 R1+R2+R3 ship 후 사용자 보고로 발견: text 의 `font_weight/italic/underline/strikethrough` + rect/ellipse 의 `fill_enabled/stroke_enabled/corner_rounded/stroke_dash` + line 의 `stroke_dash` 가 signature 에 빠져 Inspector 변경이 store 까지 반영되어도 cached Node object 재사용 → SvelteFlow 가 prop unchanged 로 판단 → TextNode/ShapeNode 가 mount-time 의 옛 data 그대로 렌더. selection 해제 시점에 `selected` bit 가 signature 를 바꿔 cache miss → 그제야 re-render.
+
+**Invariant (batch-5 amend)**:
+
+- `makeSignature` 는 *render 에 영향을 주는 모든 schema field* 를 명시 concat 한다.
+- ADR-0018 D4 의 type-specific payload 가 amend 될 때마다 본 함수도 *반드시* 같이 amend.
+- 누락 = stale render bug. 본 invariant 의 회귀를 차단하려면 schema field 추가 PR 의 self-check 에 "makeSignature 갱신" 명시.
+
+**왜 JSON.stringify(item) 으로 통일 안 하는가**: SvelteMap entry 가 reactive proxy 라 stringify 가 *모든 field 의 subscription* 을 등록 → derived 가 전체 field 변경에 폭발적 re-derive (0045 P0-A 의 effect_update_depth_exceeded 원인). 명시 concat 이 subscription 면적을 의도된 field 로 제한한다.
+
 ### D12 — Implementation entry point
 
 `historyStore.svelte.ts` (신규) 가 단일 진입점:

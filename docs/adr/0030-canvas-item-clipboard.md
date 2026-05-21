@@ -114,7 +114,7 @@ UI 노출 = ADR-0017 D6 amend ⑧ 매트릭스. ContextMenu 의 별 `[Duplicate]
 ## 미해결
 
 - **O1.** Terminal mirror paste (P1) 의 ADR-0021 D7 정합 — `attached_sessions` 의 multi-session 의미 확장 필요.
-- **O2.** Paste anchor 좌표 = *마우스 위치* vs *bounding-box (24, 24)* — D4 의 default 는 후자, but right-click context 에서 paste 시 *마우스 위치* 를 anchor 로 하는 게 자연스러움. P1 의 `[Paste here]` 항목 spec 보완.
+- **O2.** ~~Paste anchor 좌표 = *마우스 위치* vs *bounding-box (24, 24)*~~ — **resolved (2026-05-21)**. ContextMenu 의 paste 는 *클릭 위치* anchor (bbox top-left = click point in flow coords). 단축키 (⌘V) 는 D4 의 default (bbox + 누적 (24,24)*pasteCount) 유지. 두 경로의 분기는 사용자 의도 mismatch 회피 — right-click 은 *위치* 가 의도, 단축키는 *복제* 가 의도. ADR-0032 Amend ④ 참조.
 - **O3.** 잘라낸 (cut) item 의 *원본 z-index* 보존 여부 — 본 ADR 은 paste 시 새 z = max(z) + 1. cut 의 *원래 z* 정합은 추후.
 
 ## 변경 이력
@@ -122,3 +122,4 @@ UI 노출 = ADR-0017 D6 amend ⑧ 매트릭스. ContextMenu 의 별 `[Duplicate]
 - 2026-05-17: 신규 draft. ADR-0028 (Undo/Redo) Phase 3 land 후 follow-up.
 - 2026-05-19: Promote Draft → Accepted. Spec 본문 변경 없음 — D1~D10 그대로. ADR-0017 D6 amend ⑤ (D6 amend ⑦ 의 ⑦번) 의 (b) Copy/Cut/Paste cross-link 가 본 ADR 의 spec 을 정본으로 지목하므로, wire 진입 (clipboardStore + bindClipboardShortcuts + ContextMenu [Copy]/[Cut]/[Paste] entry + +page.svelte bind) 의 ADR-before-code rule 정합을 위해 promote. 미해결 O1/O2/O3 그대로 유지.
 - 2026-05-19 ②: D11 신규 — Duplicate (Cmd/Ctrl+D). Clipboard 미오염 1-step in-place clone. ADR-0017 D6 amend ⑧ 매트릭스 와 짝. paste 와 동일 동작 (D4/D6/D3 재활용) + clipboard state 변경 0.
+- 2026-05-20 (**D3 amend ① — Terminal paste = full clone + id-only fresh, batch-5 R8 / Grill #17**): D3 의 default (a) Clone 정책을 정밀화. 옛 batch-5 §B13 draft 는 *terminal 분기* 로 (label/description/minimized/restored_geom) 등 metadata 를 fresh default 로 strip 하는 코드를 명시했었으나, Grill #17 결정에서 *reversal* — terminal paste 도 **non-terminal 과 동일하게 `structuredClone(src) + id 만 새 UUID`** 의 full clone. 보존 필드 매트릭스: `type / x / y / w / h / z / parent_id / visibility / locked / label / description / minimized / restored_geom / terminal_overrides` 모두 source 에서 보존. **새로 갈리는 것은 `id` 와 (자연 따라오는) BE 의 신규 terminal spawn** (D6 의 unmatched-spawn 분기). 근거: 사용자 mental model = "복제 = 시각/메타 동일한 새 인스턴스" (Figma 패턴) — label/description 도 의미 단위. 사용자가 명시 reset 원하면 Inspector 에서 직접 수정. 본 amend 는 `clipboardOps.cloneWithOffset` 의 *현 구현* 을 spec 으로 끌어올림 — 추가 코드 변경 0. 정본 cross-link: `2026-05-20-ui-ux-batch-5-analysis.md` §R8 / `2026-05-20-fe-handover-ui-ux-batch-5.md` §B13 (Grill #17 amend).

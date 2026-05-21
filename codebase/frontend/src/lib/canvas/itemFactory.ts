@@ -236,21 +236,33 @@ export function createShapeItem(
     locked: false,
     minimized: false,
   };
+  // ADR-0018 D4 amend ① factory default (batch-5 Grill #3):
+  //   fill_enabled=false (outline-only 시각, sketching 도구에 자연) +
+  //   stroke_enabled=true + fill 색은 회색 `#D9D9D9` 로 stored — 사용자가
+  //   Inspector 에서 fill toggle ON 시 즉시 회색 채움 (no color picker 추가
+  //   step). 옛 default `fill: "transparent"` 는 alpha 0 의 의미였으나, 본
+  //   batch 후 *enabled boolean* 이 of-off 의 진짜 source — `transparent`
+  //   string 은 옛 record 호환용 의미만 유지 (D4 표 주석).
+  const SHAPE_FACTORY_DEFAULT_FILL = '#D9D9D9';
   if (type === 'rect') {
     return {
       ...common,
       type: 'rect',
       stroke: 'var(--color-fg)',
-      fill: 'transparent',
+      fill: SHAPE_FACTORY_DEFAULT_FILL,
       stroke_width: 2,
+      fill_enabled: false,
+      stroke_enabled: true,
     };
   }
   return {
     ...common,
     type: 'ellipse',
     stroke: 'var(--color-fg)',
-    fill: 'transparent',
+    fill: SHAPE_FACTORY_DEFAULT_FILL,
     stroke_width: 2,
+    fill_enabled: false,
+    stroke_enabled: true,
   };
 }
 
@@ -359,5 +371,10 @@ export async function commitNewItem(item: CanvasItem): Promise<CanvasItem | null
   );
   if (!result.ok) return null;
   sessionStore.setM([committed.id]);
+  // R7 (batch-5) — text item spawn 직후 auto-edit 진입 signal. TextNode 의
+  // mount $effect 가 본 flag 읽고 editing=true 설정 + flag clear.
+  if (committed.type === 'text') {
+    sessionStore.justSpawnedTextId = committed.id;
+  }
   return committed;
 }

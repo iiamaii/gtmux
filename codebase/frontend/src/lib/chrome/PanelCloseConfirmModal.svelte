@@ -23,11 +23,13 @@
 
   interface Props {
     open: boolean;
-    /** 표시용 panel 라벨 (label 또는 short-id). */
+    /** 표시용 panel 라벨 (single = label/short-id, batch = "N items"). */
     panelLabel: string;
-    /** 이 panel 의 terminal UUID 가 다른 session 에서 reference 되는 수. */
+    /** Batch item count — 1 = single, >1 = batch (title 분기). */
+    count?: number;
+    /** 이 panel 들의 terminal UUID 가 다른 session 에서 reference 되는 수 합. */
     attachCount: number;
-    /** Mirror 인 attached session 이름 list (현 session 제외). */
+    /** Mirror 인 attached session 이름 list union (현 session 제외). */
     otherSessions: string[];
     onCancel: () => void;
     onPanelOnly: () => void;
@@ -37,12 +39,18 @@
   const {
     open,
     panelLabel,
+    count = 1,
     attachCount,
     otherSessions,
     onCancel,
     onPanelOnly,
     onPanelAndTerminal,
   }: Props = $props();
+
+  const isBatch = $derived(count > 1);
+  const modalTitle = $derived(
+    isBatch ? `Remove ${panelLabel} from canvas?` : `Close panel ‘${panelLabel}’?`,
+  );
 
   let mirrorHint = $derived(otherSessions.length > 0);
   // 다른 session 의 mirror 가 있으면 Panel+Terminal 차단 — kill 시 그 session
@@ -53,26 +61,29 @@
 <Modal
   {open}
   onclose={onCancel}
-  title="Close panel ‘{panelLabel}’?"
+  title={modalTitle}
   dismissOnBackdrop={false}
 >
   {#snippet body()}
     <p class="lead">
-      Choose what happens to the underlying terminal:
+      {isBatch
+        ? 'Selection includes terminal(s). Choose what happens to them:'
+        : 'Choose what happens to the underlying terminal:'}
     </p>
 
     <div class="choice-list">
       <div class="choice">
-        <div class="choice-title">Panel only</div>
+        <div class="choice-title">{isBatch ? 'Panels only' : 'Panel only'}</div>
         <div class="choice-desc">
-          Remove panel from this canvas. The terminal stays running in the
-          server pool — re-attach later from the Terminals list.
+          {isBatch
+            ? 'Remove items from this canvas. Terminals stay running in the server pool — re-attach later from the Terminals list.'
+            : 'Remove panel from this canvas. The terminal stays running in the server pool — re-attach later from the Terminals list.'}
         </div>
       </div>
       <div class="choice danger" class:disabled={killBlocked}>
-        <div class="choice-title">Panel + Terminal</div>
+        <div class="choice-title">{isBatch ? 'Panels + Terminals' : 'Panel + Terminal'}</div>
         <div class="choice-desc">
-          Remove panel and stop the terminal (SIGTERM).
+          {isBatch ? 'Remove items and stop the terminals (SIGTERM).' : 'Remove panel and stop the terminal (SIGTERM).'}
           {#if killBlocked}
             <strong class="warn">
               ⚠ Disabled — this terminal is also attached to
@@ -91,7 +102,7 @@
   {/snippet}
   {#snippet footer()}
     <Button variant="ghost" onclick={onCancel}>Cancel</Button>
-    <Button variant="secondary" onclick={onPanelOnly}>Panel only</Button>
+    <Button variant="secondary" onclick={onPanelOnly}>{isBatch ? 'Panels only' : 'Panel only'}</Button>
     <Button
       variant="danger"
       onclick={onPanelAndTerminal}
@@ -100,7 +111,7 @@
         ? `Disabled — terminal is mirrored in: ${otherSessions.join(', ')}`
         : undefined}
     >
-      Panel + Terminal
+      {isBatch ? 'Panels + Terminals' : 'Panel + Terminal'}
     </Button>
   {/snippet}
 </Modal>

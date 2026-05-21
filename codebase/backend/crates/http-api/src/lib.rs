@@ -5447,4 +5447,280 @@ mod tests {
         assert!(v.get("original_w").is_none() || v["original_w"].is_null());
         assert!(v.get("original_h").is_none() || v["original_h"].is_null());
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  UI/UX batch-5 — ADR-0018 D4 amend ①+② (figure + text payload)
+    //
+    //  schema.rs unit tests already cover the (de)serialise + validate
+    //  surface in isolation. These integration tests fire real HTTP
+    //  requests through the Router so the FE's wire round-trips — and the
+    //  disk write that backs it — pick up the new fields end-to-end.
+    // ─────────────────────────────────────────────────────────────────────
+
+    const BATCH5_UUID_RECT: &str = "b5b50000-0000-4111-8222-000000000001";
+    const BATCH5_UUID_TEXT: &str = "b5b50000-0000-4111-8222-000000000002";
+
+    /// Helper: GET layout, return current ETag.
+    async fn batch5_fetch_etag(app: &Router, token: &TokenString, session: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/sessions/{session}/layout"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Helper: PUT a layout body and return the response.
+    async fn batch5_put_layout(
+        app: &Router,
+        token: &TokenString,
+        session: &str,
+        etag: &str,
+        layout: &Value,
+    ) -> Response {
+        let body = serde_json::to_vec(layout).unwrap();
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/sessions/{session}/layout"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header("x-gtmux-webpage-id", session)
+                    .header(header::IF_MATCH, etag)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Helper: GET layout body as `serde_json::Value` (no ETag assertion).
+    async fn batch5_get_layout(app: &Router, token: &TokenString, session: &str) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/sessions/{session}/layout"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 16 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// End-to-end: PUT a Rect carrying every D4 amend ① field (fill off,
+    /// stroke on, corner rounded, dash_dot) → 204 + new ETag. GET back →
+    /// every field preserved by the disk-of-truth write.
+    #[tokio::test]
+    async fn batch5_layout_put_rect_full_payload_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        attach_idx_create_session(&app, &token, "fig1").await;
+        let etag = batch5_fetch_etag(&app, &token, "fig1").await;
+
+        let layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "rect",
+                "id": BATCH5_UUID_RECT,
+                "parent_id": null,
+                "x": 50.0, "y": 60.0, "w": 200.0, "h": 120.0, "z": 1,
+                "visibility": "visible", "locked": false,
+                "label": "", "description": "", "minimized": false,
+                "stroke": "#0d99ff", "fill": "#abcdef", "stroke_width": 4,
+                "fill_enabled": false,
+                "stroke_enabled": true,
+                "corner_rounded": true,
+                "stroke_dash": "dash_dot",
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        });
+        let resp = batch5_put_layout(&app, &token, "fig1", &etag, &layout).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let got = batch5_get_layout(&app, &token, "fig1").await;
+        let rect = got["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["id"] == BATCH5_UUID_RECT)
+            .expect("rect persisted");
+        assert_eq!(rect["fill_enabled"], false);
+        assert_eq!(rect["stroke_enabled"], true);
+        assert_eq!(rect["corner_rounded"], true);
+        assert_eq!(rect["stroke_dash"], "dash_dot");
+        assert_eq!(rect["stroke_width"], 4);
+    }
+
+    /// Legacy compat: PUT a Rect *without* any of the D4 amend ① fields →
+    /// 204. GET back: `fill_enabled` / `stroke_enabled` deserialise to
+    /// `true` (via `default = "default_true"`), `corner_rounded` defaults
+    /// to `false`, `stroke_dash` is omitted from the wire form.
+    #[tokio::test]
+    async fn batch5_layout_put_legacy_rect_get_defaults() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        attach_idx_create_session(&app, &token, "fig2").await;
+        let etag = batch5_fetch_etag(&app, &token, "fig2").await;
+
+        let legacy_layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "rect",
+                "id": BATCH5_UUID_RECT,
+                "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0, "z": 0,
+                "visibility": "visible", "locked": false,
+                "label": "", "description": "", "minimized": false,
+                "stroke": "#000", "fill": "#fff", "stroke_width": 1,
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        });
+        let resp = batch5_put_layout(&app, &token, "fig2", &etag, &legacy_layout).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let got = batch5_get_layout(&app, &token, "fig2").await;
+        let rect = got["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["id"] == BATCH5_UUID_RECT)
+            .expect("rect persisted");
+        assert_eq!(rect["fill_enabled"], true);
+        assert_eq!(rect["stroke_enabled"], true);
+        assert_eq!(rect["corner_rounded"], false);
+        assert!(
+            rect.get("stroke_dash").is_none() || rect["stroke_dash"].is_null(),
+            "None stroke_dash must be skipped on wire (`skip_serializing_if`)"
+        );
+    }
+
+    /// Validation surface: PUT a Rect with `stroke_width = 99` (over the
+    /// 1..=32 inspector band) → 400 with the stable
+    /// `stroke_width_out_of_range` envelope code so the FE can render a
+    /// precise message instead of a generic "bad request".
+    #[tokio::test]
+    async fn batch5_layout_put_stroke_width_overflow_returns_400() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        attach_idx_create_session(&app, &token, "fig3").await;
+        let etag = batch5_fetch_etag(&app, &token, "fig3").await;
+
+        let bad_layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "rect",
+                "id": BATCH5_UUID_RECT,
+                "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0, "z": 0,
+                "visibility": "visible", "locked": false,
+                "label": "", "description": "", "minimized": false,
+                "stroke": "#000", "fill": "#fff", "stroke_width": 99,
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        });
+        let resp = batch5_put_layout(&app, &token, "fig3", &etag, &bad_layout).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let env: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["error"], "stroke_width_out_of_range");
+    }
+
+    /// Validation surface: PUT a Text with `font_size = 200` (over the
+    /// 8..=96 inspector band) → 400 + `text_font_size_out_of_range`.
+    #[tokio::test]
+    async fn batch5_layout_put_text_font_size_overflow_returns_400() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        attach_idx_create_session(&app, &token, "txt1").await;
+        let etag = batch5_fetch_etag(&app, &token, "txt1").await;
+
+        let bad_layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "text",
+                "id": BATCH5_UUID_TEXT,
+                "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+                "visibility": "visible", "locked": false,
+                "label": "", "description": "", "minimized": false,
+                "text": "Hello", "font_size": 200, "color": "#333",
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        });
+        let resp = batch5_put_layout(&app, &token, "txt1", &etag, &bad_layout).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let env: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(env["error"], "text_font_size_out_of_range");
+    }
+
+    /// End-to-end Text style round-trip: PUT Text with bold + italic +
+    /// underline (strikethrough off) → 204. GET back → every batch-5
+    /// field present with the exact value.
+    #[tokio::test]
+    async fn batch5_layout_put_text_full_style_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        attach_idx_create_session(&app, &token, "txt2").await;
+        let etag = batch5_fetch_etag(&app, &token, "txt2").await;
+
+        let layout = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "text",
+                "id": BATCH5_UUID_TEXT,
+                "parent_id": null,
+                "x": 10.0, "y": 20.0, "w": 240.0, "h": 64.0, "z": 5,
+                "visibility": "visible", "locked": false,
+                "label": "Heading", "description": "", "minimized": false,
+                "text": "Build Plan", "font_size": 18, "color": "#222",
+                "font_weight": "bold",
+                "italic": true,
+                "underline": true,
+                "strikethrough": false,
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        });
+        let resp = batch5_put_layout(&app, &token, "txt2", &etag, &layout).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let got = batch5_get_layout(&app, &token, "txt2").await;
+        let text = got["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["id"] == BATCH5_UUID_TEXT)
+            .expect("text persisted");
+        assert_eq!(text["font_weight"], "bold");
+        assert_eq!(text["italic"], true);
+        assert_eq!(text["underline"], true);
+        assert_eq!(text["strikethrough"], false);
+        assert_eq!(text["font_size"], 18);
+    }
 }

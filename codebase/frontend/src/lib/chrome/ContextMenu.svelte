@@ -27,6 +27,8 @@
   import { pasteItems } from '$lib/canvas/clipboardOps.svelte';
   import { doToggleLock, doToggleVisibility } from '$lib/keyboard/editingShortcuts.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
+  import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
+  import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import {
     commitNewItem,
@@ -38,12 +40,22 @@
   import { toolStore } from '$lib/stores/toolStore.svelte';
   import { useSvelteFlow } from '@xyflow/svelte';
   import type { CanvasItem, CanvasItemType } from '$lib/types/canvas';
+  import {
+    alignItems,
+    distributeItems,
+    type AlignMode,
+    type DistributeMode,
+  } from '$lib/canvas/alignment';
 
   let open = $state(false);
   let pos = $state<{ x: number; y: number }>({ x: 0, y: 0 });
+  /** Original click viewport coords — pre-clamp, used as anchor for Paste / Add. */
+  let clickPos = $state<{ x: number; y: number }>({ x: 0, y: 0 });
   let paneIdStr = $state<string | null>(null);
   let panelIdStr = $state<string | null>(null);
   let menuEl: HTMLDivElement | undefined = $state();
+  /** Add ▸ sub-menu hover state (empty-area branch only). */
+  let addSubmenuOpen = $state(false);
 
   /** External trigger — Canvas passes the raw MouseEvent + (optional)
    *  panel + pane identifiers. */
@@ -58,11 +70,15 @@
     open = true;
     // Initial position; clamped after the menu lays out (next tick).
     pos = { x: args.clientX, y: args.clientY };
+    // Anchor 용 원본 click 좌표 — clampPos 가 menu 위치를 viewport 안으로
+    // 옮겨도 paste / add 의 anchor 는 사용자가 실제로 클릭한 곳이어야 함.
+    clickPos = { x: args.clientX, y: args.clientY };
     queueMicrotask(clampPos);
   }
 
   function close(): void {
     open = false;
+    addSubmenuOpen = false;
   }
 
   function clampPos(): void {
@@ -77,9 +93,21 @@
     pos = { x: nx, y: ny };
   }
 
-  function onWindowMousedown(e: MouseEvent): void {
+  // ADR-0032 Amend ② lifecycle — 어떤 user input event 가 발생하든 기존 menu 는
+  // 즉시 close 되고 새 event 는 그대로 진행. capture phase 로 등록하여 underlying
+  // element 의 handler 보다 먼저 close 가 일어나도록 한다. propagate 는 그대로 —
+  // close 된 후 click / select / contextmenu 모두 정상 흐른다.
+  //
+  // Coverage:
+  // - `pointerdown` capture: mouse / touch / pen 의 모든 down — 좌·우 클릭, drag 시작,
+  //   다른 menu / item 진입 등 모두 cover. right-click → close → 새 contextmenu 가
+  //   다시 open 하는 sequence 가 자연 동작.
+  // - `Escape` keydown: 명시적 dismiss.
+  // - `blur` window: 탭 전환 / focus 손실 시 close.
+  function onWindowPointerDown(e: PointerEvent): void {
     if (!open || !menuEl) return;
-    if (!menuEl.contains(e.target as Node)) close();
+    if (menuEl.contains(e.target as Node)) return;
+    close();
   }
 
   function onWindowKey(e: KeyboardEvent): void {
@@ -89,13 +117,19 @@
     }
   }
 
+  function onWindowBlur(): void {
+    if (open) close();
+  }
+
   $effect(() => {
     if (typeof window === 'undefined') return;
-    window.addEventListener('mousedown', onWindowMousedown);
+    window.addEventListener('pointerdown', onWindowPointerDown, { capture: true });
     window.addEventListener('keydown', onWindowKey);
+    window.addEventListener('blur', onWindowBlur);
     return () => {
-      window.removeEventListener('mousedown', onWindowMousedown);
+      window.removeEventListener('pointerdown', onWindowPointerDown, { capture: true });
       window.removeEventListener('keydown', onWindowKey);
+      window.removeEventListener('blur', onWindowBlur);
     };
   });
 
@@ -119,6 +153,37 @@
     }
     return sessionStore.items.has(panelIdStr) ? [panelIdStr] : [];
   }
+
+  /* ── ADR-0032 amend ① (2026-05-21) — Multi-select mode + type intersection.
+   *
+   * D10: clicked-item ∈ M && M.size ≥ 2 → multi mode.
+   *      selectedItems 가 모두 같은 type 이면 commonType, 다르면 null (mixed).
+   *      mixed 시 type-specific 액션 (Change terminal / Copy pane_id / Rename)
+   *      은 모두 hide — *공통 속성만 노출*.
+   */
+  const isMultiMode = $derived.by(() => {
+    if (panelIdStr === null) return false;
+    return sessionStore.M.has(panelIdStr) && sessionStore.M.size >= 2;
+  });
+  const effectiveItems = $derived.by((): CanvasItem[] => {
+    if (panelIdStr === null) return [];
+    if (isMultiMode) {
+      const out: CanvasItem[] = [];
+      for (const id of sessionStore.M) {
+        const it = sessionStore.items.get(id);
+        if (it !== undefined) out.push(it);
+      }
+      return out;
+    }
+    const it = sessionStore.items.get(panelIdStr);
+    return it !== undefined ? [it] : [];
+  });
+  const commonType = $derived.by((): CanvasItemType | null => {
+    if (effectiveItems.length === 0) return null;
+    const first = effectiveItems[0]!.type;
+    return effectiveItems.every((it) => it.type === first) ? first : null;
+  });
+  const targetIds = $derived(effectiveItems.map((it) => it.id));
 
   function onHide(): void {
     doToggleVisibility(effectiveToggleIds());
@@ -168,10 +233,17 @@
     }
     clipboardStore.cut(targets);
     close();
-    await sessionStore.applyDeletion(
-      targets.map((it) => it.id),
-      { killTerminal: false },
-    );
+    // ADR-0032 Amend ④ — terminal 포함 batch 는 PanelCloseConfirmModal 경유.
+    // terminal 없으면 store 가 즉시 onConfirm(false) → 기존 동작과 동일.
+    panelCloseDialog.show({
+      items: targets,
+      onConfirm: async (killTerminal) => {
+        await sessionStore.applyDeletion(
+          targets.map((it) => it.id),
+          { killTerminal },
+        );
+      },
+    });
   }
 
   async function onPaste(): Promise<void> {
@@ -179,37 +251,79 @@
       close();
       return;
     }
-    // ADR-0030 O2 — right-click 의 *마우스 위치 anchor* 는 P1 deferred.
-    // 본 entry 는 단축키 와 동일 default (bbox + (24,24)*pasteCount).
-    const offset = clipboardStore.consumePasteOffset();
+    // ADR-0030 O2 정합 (Amend 2026-05-21 ④) — right-click paste 는 *마우스
+    // 위치 anchor*. clipboard items 의 bbox top-left 이 클릭 위치로 오도록
+    // offset 계산. clickPos = pre-clamp 원본 viewport 좌표.
+    const flow = screenToFlowPosition({ x: clickPos.x, y: clickPos.y });
+    const sources = clipboardStore.entries;
+    const bboxX = sources.reduce(
+      (m, it) => Math.min(m, it.x),
+      Number.POSITIVE_INFINITY,
+    );
+    const bboxY = sources.reduce(
+      (m, it) => Math.min(m, it.y),
+      Number.POSITIVE_INFINITY,
+    );
+    const offset = { dx: flow.x - bboxX, dy: flow.y - bboxY };
     close();
-    await pasteItems(clipboardStore.entries, { offset, failMessage: 'Paste failed' });
+    await pasteItems(sources, { offset, failMessage: 'Paste failed' });
   }
 
-  /* ── ARRANGE 4 z actions (ADR-0024 D2) — multi-session 만. ───────── */
+  /* ── ARRANGE 4 z actions (ADR-0024 D2 / ADR-0032 D11) — multi 시 batch. ── */
 
   function onBringToFront(): void {
-    if (!panelIdStr) return;
-    zStore.bringToFront(panelIdStr);
+    for (const id of targetIds) zStore.bringToFront(id);
     close();
   }
 
   function onSendToBack(): void {
-    if (!panelIdStr) return;
-    zStore.sendToBack(panelIdStr);
+    for (const id of targetIds) zStore.sendToBack(id);
     close();
   }
 
   function onBringForward(): void {
-    if (!panelIdStr) return;
-    zStore.bringForward(panelIdStr);
+    for (const id of targetIds) zStore.bringForward(id);
     close();
   }
 
   function onSendBackward(): void {
-    if (!panelIdStr) return;
-    zStore.sendBackward(panelIdStr);
+    for (const id of targetIds) zStore.sendBackward(id);
     close();
+  }
+
+  /* ── ALIGN / DISTRIBUTE (ADR-0027 / ADR-0032 D13) ──────────────────── */
+
+  async function applyAlignBatch(
+    moves: Map<string, { x: number; y: number; x2?: number; y2?: number }>,
+    abortMessage: string,
+  ): Promise<void> {
+    if (moves.size === 0) return;
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it) => {
+          const m = moves.get(it.id);
+          if (m === undefined) return it;
+          if (it.type === 'line' && m.x2 !== undefined && m.y2 !== undefined) {
+            return { ...it, x: m.x, y: m.y, x2: m.x2, y2: m.y2 } as CanvasItem;
+          }
+          return { ...it, x: m.x, y: m.y } as CanvasItem;
+        }),
+      }),
+      { abortMessage, failMessage: 'Align failed' },
+    );
+  }
+
+  async function onAlign(mode: AlignMode): Promise<void> {
+    const moves = alignItems(effectiveItems, mode);
+    close();
+    await applyAlignBatch(moves, 'Align aborted — session reconnect failed.');
+  }
+
+  async function onDistribute(mode: DistributeMode): Promise<void> {
+    const moves = distributeItems(effectiveItems, mode);
+    close();
+    await applyAlignBatch(moves, 'Distribute aborted — session reconnect failed.');
   }
 
   /* ── "Add ___" sub-menu (pane right-click only) ──────────────────── */
@@ -235,7 +349,9 @@
   const DEFAULT_SHAPE_BOUNDS = { w: 0, h: 0 } as const;
 
   async function onAddItem(type: AddableType): Promise<void> {
-    const flow = screenToFlowPosition({ x: pos.x, y: pos.y });
+    // Add 도 paste 와 동일하게 *click 위치 anchor* — clampPos 가 menu 위치를
+    // 옮겨도 새 item 은 사용자가 실제 클릭한 곳에 spawn.
+    const flow = screenToFlowPosition({ x: clickPos.x, y: clickPos.y });
     let item: CanvasItem;
     switch (type) {
       case 'text':
@@ -274,6 +390,69 @@
     }
   }
 
+  /* ── EMPTY-AREA only — Select all / Clear all / Switch session ──────── */
+
+  /** Select all visible items (matches editingShortcuts 의 ⌘A 동작). */
+  function onSelectAll(): void {
+    if (sessionStore.active === null) {
+      close();
+      return;
+    }
+    const ids: string[] = [];
+    for (const [id, it] of sessionStore.items) {
+      if (it.visibility === 'visible') ids.push(id);
+    }
+    if (ids.length === 0) {
+      close();
+      return;
+    }
+    sessionStore.setM(ids);
+    close();
+  }
+
+  /** Clear all — applyDeletion 로 canvas 전체 비움. Terminal 은 pool 유지
+   *  (ADR-0030 D5 패턴). 사용자 확인 dialog 없음 — Cmd+Z 로 복원 가능. */
+  const canClearAll = $derived(
+    sessionStore.active !== null && sessionStore.items.size > 0,
+  );
+  async function onClearAll(): Promise<void> {
+    if (!canClearAll) {
+      close();
+      return;
+    }
+    const items = [...sessionStore.items.values()];
+    close();
+    // ADR-0032 Amend ④ — terminal 포함 시 PanelCloseConfirmModal 경유.
+    panelCloseDialog.show({
+      items,
+      onConfirm: async (killTerminal) => {
+        const ids = items.map((it) => it.id);
+        const { ok, fail } = await sessionStore.applyDeletion(ids, {
+          killTerminal,
+        });
+        if (ok > 0) {
+          toastStore.show({
+            message: killTerminal
+              ? `${ok} items removed (terminals killed).`
+              : `${ok} items removed from canvas.`,
+            tone: 'success',
+          });
+        } else if (fail > 0) {
+          toastStore.show({ message: 'Clear failed.', tone: 'error' });
+        }
+      },
+    });
+  }
+
+  /** Switch session — workspaceSwitcher 모달 open (SessionMenu 의 entry 와 동일). */
+  function onSwitchSession(): void {
+    workspaceSwitcher.open();
+    close();
+  }
+
+  /** Paste 활성 여부 — clipboard 에 내용이 있을 때만. */
+  const canPasteEmpty = $derived(clipboardStore.hasItems);
+
   /** ChangeTerminal — open the ChangeTerminalModal targeting this panel. */
   function onChangeTerminal(): void {
     if (!panelIdStr) return;
@@ -281,35 +460,53 @@
     close();
   }
 
-  /** Whether the right-clicked panel is a terminal item — guards the
-   *  [Change terminal...] entry. */
-  const isPanelTerminal = $derived.by(() => {
-    if (!panelIdStr) return false;
-    const it = sessionStore.items.get(panelIdStr);
-    return it?.type === 'terminal';
-  });
+  /** ADR-0032 D10 — type-specific 액션 가시성. mixed (commonType=null) 또는
+   *  multi-mode 의 single-only 액션은 hide. */
+  const isPanelTerminal = $derived(commonType === 'terminal' && !isMultiMode);
+  /** Change terminal: terminal common type 일 때 single + multi 모두 노출
+   *  가능. 다만 multi 시 일괄 교체 의도 모호 (ADR-0032 D3) → single 만. */
+  const canChangeTerminal = $derived(commonType === 'terminal' && !isMultiMode);
+  /** Copy pane_id: single terminal 에서만 의미. */
+  const canCopyPaneId = $derived(paneIdStr !== null && !isMultiMode);
+  /** Align/Distribute: M.size ≥ 2 / ≥ 3. */
+  const canAlign = $derived(isMultiMode && effectiveItems.length >= 2);
+  const canDistribute = $derived(isMultiMode && effectiveItems.length >= 3);
 
-  /** Delete (multi-session): item only — terminal pool 미touch. */
+  /** Delete (ADR-0032 D12 / Amend ④) — batch in multi mode. Terminal 포함 시
+   *  PanelCloseConfirmModal 경유 (Panel only / Panel+Terminal 선택). */
   async function onDeleteItem(): Promise<void> {
-    if (sessionStore.active === null || !panelIdStr) {
+    if (sessionStore.active === null || targetIds.length === 0) {
       close();
       return;
     }
-    const { ok, fail } = await sessionStore.applyDeletion([panelIdStr], {
-      killTerminal: false,
-    });
-    if (ok > 0) {
-      toastStore.show({
-        message: 'Panel removed from canvas. Terminal still in pool.',
-        tone: 'success',
-      });
-    } else if (fail > 0) {
-      toastStore.show({
-        message: 'Delete failed.',
-        tone: 'error',
-      });
-    }
+    const items = targetIds
+      .map((id) => sessionStore.items.get(id))
+      .filter((it): it is NonNullable<typeof it> => it !== undefined);
     close();
+    panelCloseDialog.show({
+      items,
+      onConfirm: async (killTerminal) => {
+        const { ok, fail } = await sessionStore.applyDeletion(targetIds, {
+          killTerminal,
+        });
+        const total = ok + fail;
+        if (ok > 0) {
+          toastStore.show({
+            message:
+              total === 1
+                ? killTerminal
+                  ? 'Panel + terminal closed.'
+                  : 'Panel removed from canvas. Terminal still in pool.'
+                : killTerminal
+                  ? `${ok} items removed (terminals killed).`
+                  : `${ok} items removed from canvas.`,
+            tone: 'success',
+          });
+        } else if (fail > 0) {
+          toastStore.show({ message: 'Delete failed.', tone: 'error' });
+        }
+      },
+    });
   }
 </script>
 
@@ -321,28 +518,64 @@
     style="left: {pos.x}px; top: {pos.y}px;"
   >
     {#if !panelIdStr}
-      {#if clipboardStore.hasItems}
-        <div class="ctx-section">Edit</div>
-        <button type="button" class="ctx-item" onclick={() => void onPaste()}>
-          <span class="label">Paste</span>
-          <span class="kbd mono">⌘V</span>
-        </button>
-        <div class="ctx-sep"></div>
-      {/if}
-      <div class="ctx-section">Add</div>
-      {#each ADDABLE as a (a.type)}
-        <button
-          type="button"
-          class="ctx-item"
-          onclick={() => void onAddItem(a.type)}
-        >
-          <span class="label">{a.label}</span>
-        </button>
-      {/each}
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!canPasteEmpty}
+        onclick={() => void onPaste()}
+      >
+        <span class="label">Paste</span>
+        <span class="kbd mono">⌘V</span>
+      </button>
       <div class="ctx-sep"></div>
+
+      <button type="button" class="ctx-item" onclick={onSelectAll}>
+        <span class="label">Select all</span>
+        <span class="kbd mono">⌘A</span>
+      </button>
+
+      <div
+        class="ctx-item-with-sub"
+        role="none"
+        onmouseenter={() => (addSubmenuOpen = true)}
+        onmouseleave={() => (addSubmenuOpen = false)}
+      >
+        <button type="button" class="ctx-item" aria-haspopup="menu" aria-expanded={addSubmenuOpen}>
+          <span class="label">Add</span>
+          <span class="kbd">▸</span>
+        </button>
+        {#if addSubmenuOpen}
+          <div class="ctx-submenu" role="menu">
+            {#each ADDABLE as a (a.type)}
+              <button
+                type="button"
+                class="ctx-item"
+                onclick={() => void onAddItem(a.type)}
+              >
+                <span class="label">{a.label}</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+      <div class="ctx-sep"></div>
+
+      <button
+        type="button"
+        class="ctx-item danger"
+        disabled={!canClearAll}
+        onclick={() => void onClearAll()}
+      >
+        <span class="label">Clear all</span>
+      </button>
+      <div class="ctx-sep"></div>
+
+      <button type="button" class="ctx-item" onclick={onSwitchSession}>
+        <span class="label">Switch session…</span>
+      </button>
     {/if}
 
-    {#if paneIdStr}
+    {#if canCopyPaneId}
       <div class="ctx-section">Pane</div>
       <button
         type="button"
@@ -397,15 +630,51 @@
 
       <div class="ctx-section">Visibility</div>
       <button type="button" class="ctx-item" onclick={onHide}>
-        <span class="label">Hide / Show</span>
+        <span class="label">Hide / Show{isMultiMode ? ' (batch)' : ''}</span>
         <span class="kbd mono">⇧⌘H</span>
       </button>
       <button type="button" class="ctx-item" onclick={onLock}>
-        <span class="label">Lock / Unlock</span>
+        <span class="label">Lock / Unlock{isMultiMode ? ' (batch)' : ''}</span>
         <span class="kbd mono">⌘L</span>
       </button>
 
-      {#if isPanelTerminal}
+      {#if canAlign}
+        <!-- ADR-0032 D13 — Align / Distribute (M.size ≥ 2). mixed type 도
+             적용 가능 — bbox 기반 이동만 (type-agnostic). ContextMenu 는 모든
+             entry 가 text-only line-by-line (사용자 규칙 2026-05-21). -->
+        <div class="ctx-sep"></div>
+        <div class="ctx-section">Align ({effectiveItems.length})</div>
+        <button type="button" class="ctx-item" onclick={() => void onAlign('left')}>
+          <span class="label">Align left</span>
+        </button>
+        <button type="button" class="ctx-item" onclick={() => void onAlign('center-x')}>
+          <span class="label">Align center horizontally</span>
+        </button>
+        <button type="button" class="ctx-item" onclick={() => void onAlign('right')}>
+          <span class="label">Align right</span>
+        </button>
+        <button type="button" class="ctx-item" onclick={() => void onAlign('top')}>
+          <span class="label">Align top</span>
+        </button>
+        <button type="button" class="ctx-item" onclick={() => void onAlign('center-y')}>
+          <span class="label">Align center vertically</span>
+        </button>
+        <button type="button" class="ctx-item" onclick={() => void onAlign('bottom')}>
+          <span class="label">Align bottom</span>
+        </button>
+        {#if canDistribute}
+          <div class="ctx-sep"></div>
+          <div class="ctx-section">Distribute</div>
+          <button type="button" class="ctx-item" onclick={() => void onDistribute('horizontal')}>
+            <span class="label">Distribute horizontally</span>
+          </button>
+          <button type="button" class="ctx-item" onclick={() => void onDistribute('vertical')}>
+            <span class="label">Distribute vertically</span>
+          </button>
+        {/if}
+      {/if}
+
+      {#if canChangeTerminal}
         <div class="ctx-sep"></div>
         <div class="ctx-section">Terminal</div>
         <button type="button" class="ctx-item" onclick={onChangeTerminal}>
@@ -414,7 +683,7 @@
       {/if}
       <div class="ctx-sep"></div>
       <button type="button" class="ctx-item danger" onclick={() => void onDeleteItem()}>
-        <span class="label">Remove from canvas</span>
+        <span class="label">Remove from canvas{isMultiMode ? ` (${effectiveItems.length})` : ''}</span>
         <span class="kbd mono">⌫</span>
       </button>
     {/if}
@@ -499,6 +768,28 @@
 
   .kbd.mono {
     font-family: var(--font-mono);
+  }
+
+  /* ADR-0032 D13 amend (2026-05-21) — Align / Distribute icon grid 폐기.
+     ContextMenu 의 모든 entry 는 text-only line-by-line (사용자 design 규칙). */
+
+  /* Add ▸ hover submenu — empty-area branch only. */
+  .ctx-item-with-sub {
+    position: relative;
+  }
+
+  .ctx-submenu {
+    position: absolute;
+    left: 100%;
+    top: calc(-1 * var(--space-6));
+    min-width: 180px;
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-lg);
+    padding: var(--space-6) 0;
+    z-index: 1;
+    animation: ctx-in var(--motion-fast) var(--motion-easing);
   }
 
   @keyframes ctx-in {

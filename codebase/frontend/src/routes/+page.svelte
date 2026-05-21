@@ -20,6 +20,8 @@
   import MaximizedItemModal from '$lib/chrome/MaximizedItemModal.svelte';
   import ChangeTerminalModal from '$lib/chrome/ChangeTerminalModal.svelte';
   import GroupCloseConfirmModal from '$lib/chrome/GroupCloseConfirmModal.svelte';
+  import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
+  import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
   import SettingsOverlay from '$lib/chrome/SettingsOverlay.svelte';
   import WorkspaceSwitcher from '$lib/chrome/WorkspaceSwitcher.svelte';
   import ImportSessionModal from '$lib/chrome/ImportSessionModal.svelte';
@@ -442,6 +444,16 @@
 <WorkspaceSwitcher />
 <ChangeTerminalModal />
 <GroupCloseConfirmModal />
+<PanelCloseConfirmModal
+  open={panelCloseDialog.open}
+  panelLabel={panelCloseDialog.panelLabel}
+  count={panelCloseDialog.count}
+  attachCount={panelCloseDialog.attachCount}
+  otherSessions={panelCloseDialog.otherSessions}
+  onCancel={() => panelCloseDialog.cancel()}
+  onPanelOnly={() => panelCloseDialog.confirm(false)}
+  onPanelAndTerminal={() => panelCloseDialog.confirm(true)}
+/>
 <SettingsOverlay />
 <ImportSessionModal />
 <ExportSessionModal />

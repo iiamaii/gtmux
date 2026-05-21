@@ -15,9 +15,11 @@
   import { useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
-  import type { CanvasItem, LineItem } from '$lib/types/canvas';
+  import type { CanvasItem, FigureStrokeDash, LineItem } from '$lib/types/canvas';
   import { LINE_HIT_PADDING, LINE_MIN_LENGTH, lineBoxFromEndpoints } from './itemFactory';
-  import CanvasCloseButton from './CanvasCloseButton.svelte';
+  // 2026-05-20 figure UX 정리: rect/ellipse/line/free 는 canvas X 버튼 미제공
+  // (Backspace / Cmd+Delete / ContextMenu Delete 로만 제거).
+  import { strokeDashArray } from './strokeDash';
 
   interface LineNodeData {
     id: string;
@@ -31,6 +33,7 @@
     stroke_width: number;
     x2: number;
     y2: number;
+    stroke_dash?: FigureStrokeDash;
     /** Canvas itemToNode 가 주입 — box-local 시작점. 4 방향 모두 처리. */
     _boxX1: number;
     _boxY1: number;
@@ -80,6 +83,24 @@
   const startY = $derived(renderLine === null ? data._boxY1 : renderLine.y - nodeBoxTop);
   const endX = $derived(renderLine === null ? data._boxX2 : renderLine.x2 - nodeBoxLeft);
   const endY = $derived(renderLine === null ? data._boxY2 : renderLine.y2 - nodeBoxTop);
+
+  // ADR-0018 D4 amend ① (batch-5) — stroke dash pattern.
+  const svgDashArray = $derived(strokeDashArray(data.stroke_dash, data.stroke_width));
+
+  // 2026-05-20 figure UX 정리 — 본 wrapper bbox 가 클릭 영역으로 잡히는 옛
+  // 동작 (line 을 포함한 큰 사각형이 hit-test 흡수) 을 폐기. 시각적 line 은
+  // pointer-events:none 으로 두고, 같은 좌표의 *invisible thick line* 을
+  // hit-target 으로 둠 — 사용자가 line 근처만 클릭/cursor 변경 가능.
+  //
+  // hit-target 두께 = max(stroke_width + HIT_TOLERANCE_PX, MIN_HIT_PX).
+  // 매우 얇은 stroke 도 안정적으로 hit 가능 + 너무 두꺼우면 SvelteFlow 의
+  // marquee selection 영역과 시각 충돌. 2026-05-20 사용자 보고로 24px 까지
+  // 확대 (옛 16px 가 좁다는 피드백).
+  const HIT_TOLERANCE_PX = 20;
+  const MIN_HIT_PX = 24;
+  const hitStrokeWidth = $derived(
+    Math.max(data.stroke_width + HIT_TOLERANCE_PX, MIN_HIT_PX),
+  );
 
   function onEndpointDown(endpoint: Endpoint, e: PointerEvent): void {
     if (isLocked) return;
@@ -207,6 +228,7 @@
       preserveAspectRatio="none"
       aria-hidden="true"
     >
+      <!-- Visible stroke — pointer-events:none, hit-target line 이 catch. -->
       <line
         x1={startX}
         y1={startY}
@@ -214,7 +236,25 @@
         y2={endY}
         stroke={data.stroke}
         stroke-width={data.stroke_width}
+        stroke-dasharray={svgDashArray}
         stroke-linecap="round"
+        pointer-events="none"
+      />
+      <!--
+        Invisible hit-target — line 근처에서만 click / cursor 변경. SVG
+        `pointer-events="stroke"` 는 paint 의 가시 여부와 무관하게 stroke
+        geometry 안의 hit 를 catch. transparent paint 라 시각 없음.
+      -->
+      <line
+        x1={startX}
+        y1={startY}
+        x2={endX}
+        y2={endY}
+        stroke="transparent"
+        stroke-width={hitStrokeWidth}
+        stroke-linecap="round"
+        pointer-events="stroke"
+        class="line-hit"
       />
     </svg>
     {#if isInM && !isLocked}
@@ -233,15 +273,25 @@
         onpointerdown={(e) => onEndpointDown('end', e)}
       ></button>
     {/if}
-    <CanvasCloseButton id={data.id} disabled={isLocked} />
   </div>
 {/if}
 
 <style>
+  /*
+   * 2026-05-20 hit-test 정리 — wrapper bbox 가 line 을 둘러싼 사각형 전체
+   * 에서 click / cursor 변경을 catch 하던 옛 동작을 폐기. wrapper 는
+   * pointer-events:none 으로 통과, SVG 안의 invisible hit-target line 만
+   * authoritative.
+   *  - .line-node       → pointer-events:none (bbox 통과)
+   *  - svg              → 상속 받지만 child line 의 pointer-events attribute 가 우선
+   *  - .line-hit  (SVG) → pointer-events="stroke" + transparent paint
+   *  - .endpoint        → 자체 pointer-events:auto (button 의 hit-target)
+   */
   .line-node {
     box-sizing: border-box;
     position: relative;
     overflow: visible;
+    pointer-events: none;
   }
 
   .line-node.m-single {
@@ -255,7 +305,14 @@
   .line-node svg {
     display: block;
     overflow: visible;
-    pointer-events: none;
+  }
+
+  /* Invisible hit-target — cursor 만 시각 단서. */
+  .line-hit {
+    cursor: pointer;
+  }
+  .line-node.locked .line-hit {
+    cursor: default;
   }
 
   .endpoint {

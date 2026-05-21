@@ -16,7 +16,6 @@
   //   + PUT /api/sessions/<name>/layout 으로 영속화.
   // - visibility=false → 렌더 X.
 
-  import { getContext } from 'svelte';
   import { NodeResizer } from '@xyflow/svelte';
   import PanelDanglingOverlay from './PanelDanglingOverlay.svelte';
   import XtermHost from './XtermHost.svelte';
@@ -29,30 +28,20 @@
   import { UnauthorizedError } from '$lib/http/sessions';
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
   import {
     MINIMIZED_TERMINAL_PANEL_HEIGHT,
     type CanvasItem,
     type TerminalItem,
   } from '$lib/types/canvas';
 
-  // ContextMenu summoner — header (…) button opens the same menu the
-  // right-click would (ADR-0017 §D2 amend: panel header more menu).
-  interface ContextMenuHolder {
-    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null }) => void;
-  }
-  const contextMenuHolder = getContext<ContextMenuHolder | undefined>('contextMenu');
-
-  function onMoreClick(e: MouseEvent): void {
+  // ADR-0032 D14 follow-up (2026-05-21) — header 의 옛 "panel actions" kebab
+  // 은 right-click ContextMenu 와 100% 동일 기능이라 중복. 폐기. 대신 가장
+  // 빈번한 single 액션 "Change terminal" 을 직접 entry button 으로 노출 —
+  // DocumentNode 의 change document button (link icon) 과 동일 패턴.
+  function onChangeTerminalClick(e: MouseEvent): void {
     e.stopPropagation();
-    if (!contextMenuHolder) return;
-    const btn = e.currentTarget as HTMLElement | null;
-    const rect = btn?.getBoundingClientRect();
-    contextMenuHolder.openAt({
-      clientX: rect ? rect.right : e.clientX,
-      clientY: rect ? rect.bottom + 4 : e.clientY,
-      paneId: typeof data.pane_id === 'string' ? data.pane_id : null,
-      panelId: data.id,
-    });
+    changeTerminalDialog.show(data.id);
   }
 
   interface PanelData {
@@ -434,6 +423,22 @@
         {#if isLocked}
           <span class="badge badge-lock" aria-label="Locked" title="Locked">L</span>
         {/if}
+        <!-- Change terminal (leftmost, 사용자 요구 2026-05-21 polish) — 가장
+             빈번한 액션이라 우선 노출. DocumentNode change document link icon. -->
+        <button
+          type="button"
+          class="panel-btn"
+          aria-label="Change terminal"
+          title="Change terminal"
+          onclick={onChangeTerminalClick}
+          onmousedown={(e: MouseEvent) => e.stopPropagation()}
+        >
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+            <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
+            <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
+            <line x1="8" x2="16" y1="12" y2="12"/>
+          </svg>
+        </button>
         <button
           type="button"
           class="panel-btn"
@@ -472,21 +477,6 @@
               <rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/>
             </svg>
           {/if}
-        </button>
-        <button
-          type="button"
-          class="panel-btn"
-          aria-label="Panel actions"
-          aria-haspopup="menu"
-          title="Panel actions (arrange · change terminal · remove)"
-          onclick={onMoreClick}
-          onmousedown={(e: MouseEvent) => e.stopPropagation()}
-        >
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true">
-            <circle cx="2.4" cy="6" r="1"/>
-            <circle cx="6" cy="6" r="1"/>
-            <circle cx="9.6" cy="6" r="1"/>
-          </svg>
         </button>
         <button
           type="button"
