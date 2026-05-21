@@ -21,6 +21,7 @@
 import type { WsClient } from './client';
 import { FRAME_TYPE } from './decode';
 import { encodeCtrlRequest } from '$lib/types/envelope';
+import { generateUuidV4 } from '$lib/uuid';
 
 /** CTRL 응답 JSON 의 정규화된 형태. */
 export interface CtrlResponse {
@@ -97,32 +98,4 @@ export function rejectAllPending(reason: Error): void {
     entry.reject(reason);
     pending.delete(id);
   }
-}
-
-// ── UUID v4 ────────────────────────────────────────────────────────────────
-
-/**
- * SSoT §2.4 의 id 는 UUID v4. 브라우저 native `crypto.randomUUID()` 우선,
- * 부재 시 (구형 브라우저) `crypto.getRandomValues` 폴백.
- */
-function generateUuidV4(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  // Fallback: RFC 4122 §4.4 — 16 random bytes, set version / variant bits.
-  const bytes = new Uint8Array(16);
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    crypto.getRandomValues(bytes);
-  } else {
-    // crypto 자체가 없는 환경 — Node.js test 등. Math.random 폴백 (보안 의미는 없지만 id 충돌 회피만 충족).
-    for (let i = 0; i < 16; i += 1) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  // version 4 (random) + variant 10.
-  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
-  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
-  const hex: string[] = [];
-  for (let i = 0; i < 16; i += 1) {
-    hex.push((bytes[i] ?? 0).toString(16).padStart(2, '0'));
-  }
-  return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10, 16).join('')}`;
 }

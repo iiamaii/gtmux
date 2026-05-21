@@ -1,10 +1,9 @@
+import { generateUuidV4 } from '$lib/uuid';
+
 const STORAGE_KEY = 'gtmux_webpage_id';
 
 function mintWebpageId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `webpage-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
+  return generateUuidV4();
 }
 
 export function getWebpageId(): string {

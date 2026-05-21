@@ -28,6 +28,7 @@ import type {
   Point,
 } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
+import { generateUuidV4 } from '$lib/uuid';
 
 /** 신규 item 의 기본 좌표 + 크기 default. ADR-0018 D7 의 z 정책은 commit 시점에 결정. */
 export const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
@@ -69,7 +70,7 @@ export function lineBoxFromEndpoints(
 
 /** UUID v4 (browser-native crypto). 모든 신규 item.id 에 사용. */
 function freshId(): string {
-  return crypto.randomUUID();
+  return generateUuidV4();
 }
 
 /**
