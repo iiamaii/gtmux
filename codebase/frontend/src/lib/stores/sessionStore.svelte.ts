@@ -23,8 +23,10 @@
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 import { debugCount } from '$lib/common/debugCounts';
-import { deleteItem, EtagMismatchError, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+import { attachConfirm, deleteItem, EtagMismatchError, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
 import { historyStore } from '$lib/stores/historyStore.svelte';
+import { terminalPool } from '$lib/stores/terminalPool.svelte';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 import { toastStore } from '$lib/ui/toast-store.svelte';
 import { getWebpageId, webpageHeaders } from '$lib/session/webpageId';
@@ -706,8 +708,9 @@ class SessionStore {
     if (!guard.ok) {
       toastStore.show({
         message:
-          options.abortMessage ??
-          'Session reconnect failed — action aborted.',
+          (options.abortMessage ??
+            'Session reconnect failed — action aborted.') +
+          ' Try refreshing the page.',
         tone: 'error',
         durationMs: 6_000,
       });
@@ -774,8 +777,9 @@ class SessionStore {
     if (!guard.ok) {
       toastStore.show({
         message:
-          options.abortMessage ??
-          'Session reconnect failed — delete aborted.',
+          (options.abortMessage ??
+            'Session reconnect failed — delete aborted.') +
+          ' Try refreshing the page.',
         tone: 'error',
       });
       return { ok: 0, fail: 0 };
@@ -834,6 +838,11 @@ class SessionStore {
     try {
       const { layout } = await mutateLayout(active.name, () => pre);
       this.loadLayout(layout);
+      // ADR-0028 D13 (2026-05-21) — restore 후 unmatched terminal 자동 spawn.
+      // Panel+Terminal delete 후 undo 시 killed terminal UUID 가 layout 으로
+      // 돌아오지만 BE pool 엔 없음 → empty + Restart 회피 + 새로고침 시 dialog
+      // 회피. attachConfirm 의 unmatched-spawn 분기 자연 활용.
+      void this.respawnUnmatched(active.name);
     } catch (err) {
       if (err instanceof UnauthorizedError) {
         window.location.href = '/auth';
@@ -854,6 +863,35 @@ class SessionStore {
     }
   }
 
+  /**
+   * ADR-0028 D13 (2026-05-21) — undo/redo restore 후 layout 에 unmatched
+   * terminal (UUID 는 layout 에 있는데 terminalPool 엔 없는 상태) 가 있으면
+   * attachConfirm 으로 자동 spawn. paste / spawnMultiSessionTerminal 패턴 정합
+   * — dialog 없이 즉시 spawn. spawned UUID 들의 dangling 마킹도 clear.
+   */
+  async respawnUnmatched(name: string): Promise<void> {
+    const needsSpawn = [...this.items.values()].some(
+      (it) => it.type === 'terminal' && terminalPool.byId(it.id) === null,
+    );
+    if (!needsSpawn) return;
+    try {
+      const res = await attachConfirm(name);
+      for (const id of res.spawned) {
+        danglingTerminals.clear(id);
+      }
+      void terminalPool.refresh();
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Terminal restore failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
+  }
+
   /** ADR-0028 D8 — redo 1 step. Cmd+Shift+Z / Ctrl+Y 의 진입점. */
   async redo(): Promise<void> {
     const active = this.active;
@@ -866,6 +904,8 @@ class SessionStore {
     try {
       const { layout } = await mutateLayout(active.name, () => next);
       this.loadLayout(layout);
+      // ADR-0028 D13 (2026-05-21) — restore 후 unmatched terminal 자동 spawn (undo 와 동일).
+      void this.respawnUnmatched(active.name);
     } catch (err) {
       if (err instanceof UnauthorizedError) {
         window.location.href = '/auth';
@@ -905,8 +945,9 @@ export async function ensureMutationOk(abortMessage?: string): Promise<boolean> 
   if (!guard.ok) {
     toastStore.show({
       message:
-        abortMessage ??
-        'Session reconnect failed — action aborted. Use Switch session… in the menu.',
+        (abortMessage ??
+          'Session reconnect failed — action aborted.') +
+        ' Try refreshing the page or use Switch session… in the menu.',
       tone: 'error',
       durationMs: 6_000,
     });
