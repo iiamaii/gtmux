@@ -964,8 +964,14 @@
 
 
   // 노드 클릭 → M 갱신. dual source.
-  //   plain    : single (clear + add)
-  //   meta    : toggle in/out
+  //   plain          : single (clear + add)
+  //   meta or ctrl   : toggle in/out (Mac = Cmd, Windows/Linux = Ctrl)
+  //
+  // Cross-platform: Mac 의 Ctrl+click 은 native 가 right-click 으로 변환 → 본
+  // handler 는 fire 안 됨. Windows/Linux 의 Ctrl+click 은 plain left-click 으로
+  // 본 handler 에 도달 → ctrlKey 가 true 일 때 toggle 로 처리. 따라서
+  // `metaKey || ctrlKey` 둘 다 허용해도 Mac 의 Ctrl+click=contextmenu 와
+  // 충돌하지 않음.
   //
   // R4 (ADR-0017 §Toolbar2 amend, batch-5): point-spawn tool active 인 동안
   // 기존 node 위 click 도 onpaneclick 의 spawn 로직으로 forward — 사용자가
@@ -976,7 +982,7 @@
       const id = node.id;
       const isModifierClick =
         event instanceof MouseEvent &&
-        event.metaKey;
+        (event.metaKey || event.ctrlKey);
       if (isModifierClick) {
         sessionStore.toggleM(id);
       } else {
@@ -1547,7 +1553,7 @@
     nodesDraggable={isSelectMode && !isMaximizedActive}
     elementsSelectable={isSelectMode && !isMaximizedActive}
     selectionKey={null}
-    multiSelectionKey="Meta"
+    multiSelectionKey={['Meta', 'Control']}
     minZoom={0.05}
     maxZoom={3}
     fitView={false}
