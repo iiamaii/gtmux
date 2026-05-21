@@ -22,8 +22,11 @@ import type { CanvasLayout } from './canvas';
 export interface SessionInfo {
   /** 사용자 부여 이름. ADR-0019 정규식 `^[A-Za-z0-9_-]{1,64}$`. */
   name: string;
-  /** ISO 8601 timestamp — 마지막 attach 종료 시각. fresh session 은 created_at. */
-  last_used_at: string;
+  /**
+   * ISO 8601 timestamp — 마지막 attach 종료 시각. fresh session 은 created_at.
+   * 현재 BE list endpoint 는 아직 이 값을 내려주지 않으므로 optional.
+   */
+  last_used_at?: string;
   /** 다른 webpage 가 현재 attach 상태인가. SessionListModal 의 "in use" 섹션 결정. */
   active: boolean;
   /**
