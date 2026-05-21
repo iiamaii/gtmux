@@ -147,8 +147,15 @@
      - fillEnabled=false → 'none' (div 통과, SVG element 의 pointer-events 만
        authoritative). interior 클릭은 뒤 panel/canvas 로 전달. SVG 의 ring 만
        hit 가능 (stroke_enabled=true 면).
-    NodeResizer 의 resize handle 은 wrapper 바깥의 absolute element + 자체
-    pointer-events:all 이라 wrapper 의 'none' 와 무관.
+
+    [정정 2026-05-21] 직전 버전 comment 의 "NodeResizer handle 은 자체
+    pointer-events:all 이라 wrapper none 와 무관" 가정은 *틀렸음*. xyflow 의
+    `.svelte-flow__resize-control` 의 CSS 는 `position: absolute` 만 명시 —
+    `pointer-events` 미지정이라 inheritable property 가 wrapper 로부터
+    `none` 상속 → fill-off shape 의 resize handle 이 클릭 불가가 되어
+    scale 변경 불가 회귀. `position: absolute` 는 시각 위치만 분리할 뿐 DOM
+    상속은 유지. 본 component 의 `:global(.svelte-flow__resize-control)`
+    rule 로 resize handle 에 한해 `pointer-events: all` 명시 override.
   -->
   <div
     class="shape-node"
@@ -249,6 +256,14 @@
   /* Fill off — wrapper pass-through. SVG element 의 pointer-events attribute 가 authoritative hit-test. */
   .shape-node.pass-through {
     pointer-events: none;
+  }
+
+  /* xyflow NodeResizer handle 의 inherit 차단 — fill-off shape 도 resize 가능.
+     `.svelte-flow__resize-control` 는 xyflow internal class (style.css 기본은
+     position:absolute 만 명시, pointer-events 미지정). wrapper 의 `none` 이
+     inherit 되면 handle 클릭 불가 → scale 변경 불가 회귀 (2026-05-21 fix). */
+  .shape-node.pass-through :global(.svelte-flow__resize-control) {
+    pointer-events: all;
   }
 
   .shape-node.m-single {
