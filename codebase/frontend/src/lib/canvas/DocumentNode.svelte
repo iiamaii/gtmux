@@ -31,6 +31,9 @@
     renderMarkdown,
     renderHtml,
     isToggleableFileType,
+    getNextViewMode,
+    getNextViewModeLabel,
+    INTERACTIVE_IFRAME_SANDBOX,
     type DocumentViewMode,
   } from './documentRender';
   import type { CanvasItem, DocumentItem } from '$lib/types/canvas';
@@ -131,11 +134,18 @@
     }
   });
 
-  /** ADR-0018 D10 amend ③/④ (2026-05-21) — markdown/html viewer + source/rendered
-   *  toggle. helper 는 documentRender.ts 에 외부화 — DocumentNode (normal) 와
-   *  MaximizedItemModal (maximize) 가 같은 helper 사용 → rendering 동기화 보장. */
+  /** ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — markdown/html viewer + 3-mode toggle.
+   *  helper 는 documentRender.ts 에 외부화 — DocumentNode (normal) 와
+   *  MaximizedItemModal (maximize) 가 같은 helper 사용 → rendering + 전이 동기화. */
   let viewMode = $state<DocumentViewMode>('rendered');
   const canToggleView = $derived(isToggleableFileType(fileTypeLabel));
+  const nextViewModeLabel = $derived(getNextViewModeLabel(viewMode, fileTypeLabel));
+  /** 'interactive' 는 fileType=html 일 때만 의미. fileType 가 바뀌면 reset. */
+  $effect(() => {
+    if (viewMode === 'interactive' && fileTypeLabel !== 'html') {
+      viewMode = 'rendered';
+    }
+  });
   // Inline content (data.content) 의 mime 추정은 markdown 으로 기본 — fileTypeLabel
   // 이 'markdown' 이면 marked parse, 'html' 이면 sanitize only.
   function renderContent(raw: string): string {
@@ -492,27 +502,34 @@
       {#if !isLocked}
         <div class="doc-actions">
           {#if canToggleView}
-            <!-- ADR-0018 D10 amend ④ — source / rendered toggle (html / markdown). -->
+            <!-- ADR-0037 D1/D4 — markdown 은 2-mode (rendered↔source),
+                 html 은 3-mode cyclic (rendered→interactive→source→rendered).
+                 icon = next mode 의 힌트 (사용자 click 시 가는 곳). -->
             <button
               type="button"
               class="doc-btn"
-              class:is-active={viewMode === 'source'}
-              title={viewMode === 'source' ? 'Show rendered' : 'Show source'}
-              aria-label={viewMode === 'source' ? 'Show rendered' : 'Show source'}
+              class:is-active={viewMode !== 'rendered'}
+              title={nextViewModeLabel}
+              aria-label={nextViewModeLabel}
               onclick={(e: MouseEvent) => {
                 e.stopPropagation();
-                viewMode = viewMode === 'source' ? 'rendered' : 'source';
+                viewMode = getNextViewMode(viewMode, fileTypeLabel);
               }}
               onmousedown={(e: MouseEvent) => e.stopPropagation()}
             >
-              {#if viewMode === 'source'}
-                <!-- eye (rendered preview) -->
+              {#if viewMode === 'rendered' && fileTypeLabel === 'html'}
+                <!-- play (run interactively) -->
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
+                  <polygon points="6 4 20 12 6 20"/>
+                </svg>
+              {:else if viewMode === 'source'}
+                <!-- book-open (show rendered) — visibility eye 와 겹침 회피. -->
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
-                  <circle cx="12" cy="12" r="3"/>
+                  <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+                  <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
                 </svg>
               {:else}
-                <!-- < / > code -->
+                <!-- </> code (show source) -->
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
                   <polyline points="16 18 22 12 16 6"/>
                   <polyline points="8 6 2 12 8 18"/>
@@ -612,9 +629,19 @@
         </div>
       {:else if isInline}
         <div class="eyebrow">Inline document</div>
-        <!-- ADR-0018 D10 amend ③/④ — markdown/html rendered HTML or source. -->
+        <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — markdown/html rendered or
+             interactive (sandboxed iframe, html 만) or source. -->
         {#if viewMode === 'source'}
           <pre class="doc-source">{data.content ?? ''}</pre>
+        {:else if viewMode === 'interactive' && fileTypeLabel === 'html'}
+          <!-- svelte-ignore a11y_missing_attribute -->
+          <iframe
+            class="doc-iframe"
+            sandbox={INTERACTIVE_IFRAME_SANDBOX}
+            referrerpolicy="no-referrer"
+            loading="lazy"
+            srcdoc={data.content ?? ''}
+          ></iframe>
         {:else}
           <div class="doc-md">{@html inlineHtml}</div>
         {/if}
@@ -625,6 +652,15 @@
         {:else if assetPreviewText !== null && (assetPreviewText.trim().length > 0)}
           {#if viewMode === 'source'}
             <pre class="doc-source">{assetPreviewText}</pre>
+          {:else if viewMode === 'interactive' && fileTypeLabel === 'html'}
+            <!-- svelte-ignore a11y_missing_attribute -->
+            <iframe
+              class="doc-iframe"
+              sandbox={INTERACTIVE_IFRAME_SANDBOX}
+              referrerpolicy="no-referrer"
+              loading="lazy"
+              srcdoc={assetPreviewText}
+            ></iframe>
           {:else}
             <div class="doc-md">{@html assetHtml}</div>
           {/if}
@@ -874,6 +910,27 @@
     letter-spacing: -0.1px;
     color: var(--color-fg-muted);
     overflow-wrap: anywhere;
+  }
+
+  /* ADR-0037 D3 — interactive mode (sandboxed iframe). iframe 가 doc-body 의
+     padding 영역 가득 채우고 eyebrow 는 숨김. :has() 로 dedicated branch
+     CSS — markup churn 없이 layout 분기. */
+  .doc-iframe {
+    display: block;
+    flex: 1 1 auto;
+    width: 100%;
+    min-height: 200px;
+    border: 0;
+    background: #ffffff;
+  }
+  .doc-body:has(.doc-iframe) {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .doc-body:has(.doc-iframe) .eyebrow {
+    display: none;
   }
 
   /* ADR-0018 D10 amend ④ — source view (raw markdown / html source code). */

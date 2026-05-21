@@ -128,22 +128,27 @@
     }
   }
 
-  function formatLastUsed(iso: string): string {
-    try {
-      const d = new Date(iso);
-      const now = Date.now();
-      const diffMs = now - d.getTime();
-      const sec = Math.round(diffMs / 1000);
-      if (sec < 60) return 'just now';
-      const min = Math.round(sec / 60);
-      if (min < 60) return `${min}m ago`;
-      const hr = Math.round(min / 60);
-      if (hr < 24) return `${hr}h ago`;
-      const day = Math.round(hr / 24);
-      return `${day}d ago`;
-    } catch {
-      return iso;
-    }
+  function formatLastUsed(iso: string | undefined): string | null {
+    if (iso === undefined || iso.trim().length === 0) return null;
+    const time = new Date(iso).getTime();
+    if (!Number.isFinite(time)) return null;
+    const diffMs = Math.max(0, Date.now() - time);
+    const sec = Math.round(diffMs / 1000);
+    if (sec < 60) return 'just now';
+    const min = Math.round(sec / 60);
+    if (min < 60) return `${min}m ago`;
+    const hr = Math.round(min / 60);
+    if (hr < 24) return `${hr}h ago`;
+    const day = Math.round(hr / 24);
+    return `${day}d ago`;
+  }
+
+  function sessionMeta(s: SessionInfo): string {
+    const parts: string[] = [];
+    const lastUsed = formatLastUsed(s.last_used_at);
+    if (lastUsed !== null) parts.push(`last used ${lastUsed}`);
+    if (s.item_count !== undefined) parts.push(`${s.item_count} items`);
+    return parts.length > 0 ? parts.join(' · ') : 'Ready to open';
   }
 </script>
 
@@ -175,10 +180,7 @@
                   <span class="row-main">
                     <span class="row-name">{s.name}</span>
                     <span class="row-meta">
-                      last used {formatLastUsed(s.last_used_at)}
-                      {#if s.item_count !== undefined}
-                        · {s.item_count} items
-                      {/if}
+                      {sessionMeta(s)}
                     </span>
                   </span>
                   <svg
@@ -245,7 +247,7 @@
                   <span class="row-main">
                     <span class="row-name">{s.name}</span>
                     <span class="row-meta">
-                      last used {formatLastUsed(s.last_used_at)}
+                      {sessionMeta(s)}
                     </span>
                   </span>
                   <span class="badge">

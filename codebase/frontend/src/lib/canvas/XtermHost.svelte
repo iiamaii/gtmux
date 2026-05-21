@@ -37,7 +37,6 @@
   import { encodePaneIn, encodePaneResize, FRAME_TYPE } from '$lib/ws/decode';
   import { debugCount } from '$lib/common/debugCounts';
   import { themeStore } from '$lib/stores/theme.svelte';
-  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { WsClient } from '$lib/ws/client';
 
   // paneId 는 항상 numeric (legacy `%N` 의 N 또는 0x88 binding 으로 얻은 PaneId).
@@ -67,10 +66,18 @@
 
   function relayMouse(e: MouseEvent): void {
     if (synthSet.has(e)) return;
-    const z = sessionStore.viewport.zoom;
-    if (Math.abs(z - 1) < 0.001) return; // unit zoom — natural handling.
     if (!containerEl) return;
+    // ADR-0004 D6 amend ② 정정 (2026-05-21) — sessionStore.viewport.zoom 직접
+    // 사용하면 maximize 모달 (XtermHost DOM 이 modal 로 reparent — SvelteFlow
+    // viewport transform *밖*) 에서도 zoom 적용되어 좌표 어긋남 (회귀). 대신
+    // 실제 effective transform 측정 — getBoundingClientRect().width 와
+    // offsetWidth 의 비율 = 실효 scale. modal 에서는 transform 없으니 비율 1.0
+    // → natural handling. viewport 안에서만 zoom != 1.
     const rect = containerEl.getBoundingClientRect();
+    const layoutW = containerEl.offsetWidth;
+    if (layoutW === 0) return;
+    const z = rect.width / layoutW;
+    if (Math.abs(z - 1) < 0.001) return; // identity transform — natural handling.
     const synthClientX = rect.left + (e.clientX - rect.left) / z;
     const synthClientY = rect.top + (e.clientY - rect.top) / z;
     e.preventDefault();

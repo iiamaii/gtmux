@@ -20,6 +20,9 @@
     renderMarkdown,
     renderHtml,
     isToggleableFileType,
+    getNextViewMode,
+    getNextViewModeLabel,
+    INTERACTIVE_IFRAME_SANDBOX,
     type DocumentViewMode,
   } from '$lib/canvas/documentRender';
   import type { CanvasItem, NoteItem } from '$lib/types/canvas';
@@ -76,6 +79,15 @@
   });
   let documentViewMode = $state<DocumentViewMode>('rendered');
   const documentCanToggleView = $derived(isToggleableFileType(documentFileTypeLabel));
+  const documentNextViewModeLabel = $derived(
+    getNextViewModeLabel(documentViewMode, documentFileTypeLabel),
+  );
+  /** ADR-0037 — fileType 가 html 이 아니면 interactive 의미 없음. reset. */
+  $effect(() => {
+    if (documentViewMode === 'interactive' && documentFileTypeLabel !== 'html') {
+      documentViewMode = 'rendered';
+    }
+  });
   const documentHtml = $derived.by(() => {
     if (documentFileTypeLabel === 'html') return renderHtml(documentText);
     return renderMarkdown(documentText);
@@ -279,22 +291,29 @@
         {/if}
         <div class="max-actions">
           {#if isDocument && documentCanToggleView}
-            <!-- ADR-0018 D10 amend ④ — source / rendered toggle (maximize 도 normal 과 동일). -->
+            <!-- ADR-0037 D1/D4 — DocumentNode 와 동일한 3-mode toggle.
+                 markdown: rendered↔source, html: rendered→interactive→source. -->
             <button
               type="button"
               class="max-btn"
-              class:is-active={documentViewMode === 'source'}
-              aria-label={documentViewMode === 'source' ? 'Show rendered' : 'Show source'}
-              title={documentViewMode === 'source' ? 'Show rendered' : 'Show source'}
+              class:is-active={documentViewMode !== 'rendered'}
+              aria-label={documentNextViewModeLabel}
+              title={documentNextViewModeLabel}
               onclick={(e: MouseEvent) => {
                 e.stopPropagation();
-                documentViewMode = documentViewMode === 'source' ? 'rendered' : 'source';
+                documentViewMode = getNextViewMode(documentViewMode, documentFileTypeLabel);
               }}
             >
-              {#if documentViewMode === 'source'}
+              {#if documentViewMode === 'rendered' && documentFileTypeLabel === 'html'}
+                <!-- play (run interactively) -->
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
+                  <polygon points="6 4 20 12 6 20"/>
+                </svg>
+              {:else if documentViewMode === 'source'}
+                <!-- book-open (show rendered) — visibility eye 와 겹침 회피. -->
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/>
-                  <circle cx="12" cy="12" r="3"/>
+                  <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+                  <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
                 </svg>
               {:else}
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
@@ -385,10 +404,19 @@
               <div class="document-empty">Empty document</div>
             {:else}
               <div class="document-eyebrow">{item.asset_id ? 'Document file' : 'Inline document'}</div>
-              <!-- ADR-0018 D10 amend ③/④ — DocumentNode 와 동일 markdown/html
-                   rendering. source toggle 시 raw 그대로. -->
+              <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — DocumentNode 와 동일
+                   markdown/html/interactive/source rendering. -->
               {#if documentViewMode === 'source'}
                 <pre class="document-source">{documentText}</pre>
+              {:else if documentViewMode === 'interactive' && documentFileTypeLabel === 'html'}
+                <!-- svelte-ignore a11y_missing_attribute -->
+                <iframe
+                  class="document-iframe"
+                  sandbox={INTERACTIVE_IFRAME_SANDBOX}
+                  referrerpolicy="no-referrer"
+                  loading="lazy"
+                  srcdoc={documentText}
+                ></iframe>
               {:else}
                 <div class="document-md">{@html documentHtml}</div>
               {/if}
@@ -691,6 +719,28 @@
     color: var(--color-fg-muted);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+
+  /* ADR-0037 D3 — interactive mode (sandboxed iframe). normal 의 DocumentNode
+     와 동일 정책: iframe 가 host 의 padding 영역 가득 + eyebrow 숨김. */
+  .document-iframe {
+    display: block;
+    flex: 1 1 auto;
+    width: 100%;
+    height: 100%;
+    min-height: 300px;
+    border: 0;
+    background: #ffffff;
+    border-radius: var(--radius-sm);
+  }
+  .document-body-host:has(.document-iframe) {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .document-body-host:has(.document-iframe) .document-eyebrow {
+    display: none;
   }
 
   .document-asset-summary h1 {

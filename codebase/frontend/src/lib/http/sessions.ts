@@ -80,9 +80,8 @@ export async function listSessions(): Promise<SessionListResponse> {
   const sessions: SessionInfo[] = arr.map((s) => ({
     name: s.name,
     active: s.active ?? false,
-    // BE 가 last_used_at / item_count 미노출 — placeholder. SessionInfo 의
-    // 해당 필드는 optional 이라 빈 값 허용.
-    last_used_at: '',
+    // BE 가 last_used_at / item_count 를 아직 미노출. 없는 값은 생략해서
+    // SessionListModal 이 unknown metadata 로 처리하게 한다.
   }));
   return { sessions };
 }
@@ -115,7 +114,6 @@ export async function createSession(req: CreateSessionRequest): Promise<CreateSe
     session: {
       name: body.name,
       active: false,
-      last_used_at: '',
     },
   };
 }
