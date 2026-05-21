@@ -529,7 +529,7 @@ pub(crate) async fn password_handler(
                 .into_response();
         }
     };
-    let secure = matches!(state.config.mode(), gtmux_config::Mode::Cloud);
+    let secure = state.config.tls_required();
     let cookie_header =
         crate::auth::build_session_cookie(&new_token, state.session_table.max_age(), secure);
 

@@ -92,8 +92,7 @@ const PAUSE_DEBOUNCE: Duration = Duration::from_millis(300);
 /// once per WS handshake so the manipulation broadcast can identify the
 /// sender connection and skip its own echo. Need not be unguessable —
 /// only unique within a single server boot.
-static CONNECTION_ID_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static CONNECTION_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn mint_connection_id() -> Arc<str> {
     let n = CONNECTION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -428,12 +427,12 @@ async fn ws_handler(
     // Webpages and therefore distinct attach owners. When `webpage_id` is
     // absent the owner key falls back to the cookie verbatim — legacy clients
     // and unit tests keep working unchanged.
-    let owner_key = auth_cookie.as_ref().map(|cookie| {
-        match webpage_id_from_query(uri.query()) {
+    let owner_key = auth_cookie
+        .as_ref()
+        .map(|cookie| match webpage_id_from_query(uri.query()) {
             Some(webpage_id) => format!("{cookie}\x1f{webpage_id}"),
             None => cookie.clone(),
-        }
-    });
+        });
 
     // D10 α additive auth: accept the upgrade when **either** the cookie
     // validates **or** the subprotocol bearer matches the canonical
@@ -486,7 +485,13 @@ async fn ws_handler(
     let mut response = ws
         .protocols(["gtmux.v1"])
         .on_upgrade(move |socket| async move {
-            handle_socket(socket, hub.clone(), owner_key.clone(), connection_id.clone()).await;
+            handle_socket(
+                socket,
+                hub.clone(),
+                owner_key.clone(),
+                connection_id.clone(),
+            )
+            .await;
             if let Some(owner) = owner_key {
                 if let Some(sink) = hub.disconnect_sink() {
                     // Errors here only mean "no consumer registered" —
@@ -495,9 +500,7 @@ async fn ws_handler(
                     // way the session lock will be released by the
                     // server-shutdown path; warn for visibility only.
                     if sink.send(owner).is_err() {
-                        tracing::debug!(
-                            "ws disconnect sink closed; auto-release skipped"
-                        );
+                        tracing::debug!("ws disconnect sink closed; auto-release skipped");
                     }
                 }
             }
@@ -1267,10 +1270,7 @@ async fn handle_socket(
 ///   WS boundary.
 /// * `None` — legacy bearer-only / pre-attach path: pass through (matches
 ///   `pane_output` arm's legacy semantics).
-fn pane_id_in_session_set(
-    pane_id: u32,
-    set: Option<&std::collections::HashSet<u64>>,
-) -> bool {
+fn pane_id_in_session_set(pane_id: u32, set: Option<&std::collections::HashSet<u64>>) -> bool {
     match set {
         None => true,
         Some(s) => s.contains(&u64::from(pane_id)),
@@ -2002,8 +2002,7 @@ bind = "127.0.0.1"
                     if env.payload.is_empty() || env.payload[0] != 0x00 {
                         continue;
                     }
-                    let json: serde_json::Value =
-                        serde_json::from_slice(&env.payload[1..]).ok()?;
+                    let json: serde_json::Value = serde_json::from_slice(&env.payload[1..]).ok()?;
                     return Some(json);
                 }
                 Ok(Some(Ok(_))) => continue, // other frame types — ignore
@@ -2049,8 +2048,8 @@ bind = "127.0.0.1"
 
         // A must NOT receive a 0x87 — drain for a window and require silence
         // on that frame type. Other frames (heartbeat / hello) are ignored.
-        let echo = expect_terminal_list_update(&mut ws_a, std::time::Duration::from_millis(150))
-            .await;
+        let echo =
+            expect_terminal_list_update(&mut ws_a, std::time::Duration::from_millis(150)).await;
         assert!(
             echo.is_none(),
             "trigger session must not receive its own 0x87 echo: {echo:?}"
@@ -2075,11 +2074,9 @@ bind = "127.0.0.1"
 
         hub.publish_terminal_list_change("alpha", &["uuid".to_string()], &[]);
 
-        let echo = expect_terminal_list_update(
-            &mut ws_no_cookie,
-            std::time::Duration::from_millis(200),
-        )
-        .await;
+        let echo =
+            expect_terminal_list_update(&mut ws_no_cookie, std::time::Duration::from_millis(200))
+                .await;
         assert!(echo.is_none(), "WS without cookie must not receive 0x87");
     }
 
@@ -2124,8 +2121,7 @@ bind = "127.0.0.1"
         ws.send(TM::Binary(bad.to_vec().into())).await.unwrap();
 
         let mut got_policy_close = false;
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
         while tokio::time::Instant::now() < deadline {
             let remaining = deadline - tokio::time::Instant::now();
             match tokio::time::timeout(remaining, ws.next()).await {
@@ -2253,8 +2249,7 @@ bind = "127.0.0.1"
                     if env.payload.is_empty() || env.payload[0] != 0x00 {
                         continue;
                     }
-                    let json: serde_json::Value =
-                        serde_json::from_slice(&env.payload[1..]).ok()?;
+                    let json: serde_json::Value = serde_json::from_slice(&env.payload[1..]).ok()?;
                     return Some(json);
                 }
                 Ok(Some(Ok(_))) => continue,
@@ -2314,8 +2309,7 @@ bind = "127.0.0.1"
                     if env.payload.is_empty() || env.payload[0] != 0x00 {
                         continue;
                     }
-                    if let Ok(json) =
-                        serde_json::from_slice::<serde_json::Value>(&env.payload[1..])
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&env.payload[1..])
                     {
                         out.push(json);
                     }
@@ -2423,7 +2417,10 @@ bind = "127.0.0.1"
                 command: Some("/bin/sh".into()),
                 args: vec![],
                 cwd: None,
-                env: vec![("PS1".into(), "$ ".into()), ("ENV".into(), "/dev/null".into())],
+                env: vec![
+                    ("PS1".into(), "$ ".into()),
+                    ("ENV".into(), "/dev/null".into()),
+                ],
                 rows: 24,
                 cols: 80,
             };
@@ -2501,8 +2498,7 @@ bind = "127.0.0.1"
         let mut ws = connect_authed_with_cookie(addr, &token, "c1").await;
         let spawned =
             collect_catchup_pane_spawned(&mut ws, std::time::Duration::from_secs(2)).await;
-        let got: std::collections::HashSet<u64> =
-            spawned.iter().map(|p| u64::from(*p)).collect();
+        let got: std::collections::HashSet<u64> = spawned.iter().map(|p| u64::from(*p)).collect();
         assert!(
             got.contains(&id_a),
             "in-set pane {id_a} must catch-up, got: {got:?}"
@@ -2531,8 +2527,7 @@ bind = "127.0.0.1"
         let mut ws = connect_authed(addr, &token).await;
         let spawned =
             collect_catchup_pane_spawned(&mut ws, std::time::Duration::from_secs(2)).await;
-        let got: std::collections::HashSet<u64> =
-            spawned.iter().map(|p| u64::from(*p)).collect();
+        let got: std::collections::HashSet<u64> = spawned.iter().map(|p| u64::from(*p)).collect();
         assert!(
             got.contains(&id_a) && got.contains(&id_b),
             "legacy demo (no cookie) must catch-up every pane, got: {got:?} expected both {id_a} and {id_b}"
@@ -2556,8 +2551,7 @@ bind = "127.0.0.1"
         let mut ws = connect_authed_with_cookie(addr, &token, "c1").await;
         let spawned =
             collect_catchup_pane_spawned(&mut ws, std::time::Duration::from_secs(2)).await;
-        let got: std::collections::HashSet<u64> =
-            spawned.iter().map(|p| u64::from(*p)).collect();
+        let got: std::collections::HashSet<u64> = spawned.iter().map(|p| u64::from(*p)).collect();
         assert!(
             got.contains(&id_a) && got.contains(&id_b),
             "no provider → server-wide catch-up, got: {got:?} expected both {id_a} and {id_b}"
@@ -2841,8 +2835,7 @@ bind = "127.0.0.1"
         // First N bytes = original payload; trailing bytes = varint-len +
         // UTF-8 "alpha".
         assert!(payload_b.starts_with(&body));
-        let session = read_trailing_session_id(&payload_b)
-            .expect("trailing session_id must parse");
+        let session = read_trailing_session_id(&payload_b).expect("trailing session_id must parse");
         assert_eq!(session, "alpha");
 
         // A must NOT receive its own echo.
@@ -2873,8 +2866,8 @@ bind = "127.0.0.1"
             .unwrap();
         ws_a.send(TM::Binary(frame.to_vec().into())).await.unwrap();
 
-        let leak = expect_manipulation_frame(&mut ws_c, std::time::Duration::from_millis(200))
-            .await;
+        let leak =
+            expect_manipulation_frame(&mut ws_c, std::time::Duration::from_millis(200)).await;
         assert!(
             leak.is_none(),
             "session-β connection must not receive session-α manipulation: {leak:?}"
@@ -2992,8 +2985,10 @@ bind = "127.0.0.1"
         // Subprotocol carries only the marker, no bearer token.
         req.headers_mut()
             .insert(SEC_WEBSOCKET_PROTOCOL, "gtmux.v1".parse().unwrap());
-        req.headers_mut()
-            .insert(http::header::COOKIE, "gtmux_auth=good-cookie".parse().unwrap());
+        req.headers_mut().insert(
+            http::header::COOKIE,
+            "gtmux_auth=good-cookie".parse().unwrap(),
+        );
         let (ws, _resp) = tokio_tungstenite::connect_async(req)
             .await
             .expect("cookie-only upgrade should succeed");
@@ -3010,8 +3005,10 @@ bind = "127.0.0.1"
         let mut req = url.into_client_request().unwrap();
         req.headers_mut()
             .insert(SEC_WEBSOCKET_PROTOCOL, "gtmux.v1".parse().unwrap());
-        req.headers_mut()
-            .insert(http::header::COOKIE, "gtmux_auth=stale-cookie".parse().unwrap());
+        req.headers_mut().insert(
+            http::header::COOKIE,
+            "gtmux_auth=stale-cookie".parse().unwrap(),
+        );
         let res = tokio_tungstenite::connect_async(req).await;
         assert!(res.is_err(), "invalid cookie + no bearer must fail");
     }
@@ -3045,8 +3042,10 @@ bind = "127.0.0.1"
         let proto = format!("gtmux.v1, bearer.{}", token.0);
         req.headers_mut()
             .insert(SEC_WEBSOCKET_PROTOCOL, proto.parse().unwrap());
-        req.headers_mut()
-            .insert(http::header::COOKIE, "gtmux_auth=stale-cookie".parse().unwrap());
+        req.headers_mut().insert(
+            http::header::COOKIE,
+            "gtmux_auth=stale-cookie".parse().unwrap(),
+        );
         let (ws, _resp) = tokio_tungstenite::connect_async(req)
             .await
             .expect("invalid cookie + valid bearer must still succeed");
@@ -3246,11 +3245,10 @@ bind = "127.0.0.1"
         // The handle_socket return path also fires `disconnect_sink` with
         // the owner key, which is how `release_lock_for_owner` runs
         // in production. *This* assertion is the load-bearing one.
-        let received =
-            tokio::time::timeout(std::time::Duration::from_secs(2), disc_rx.recv())
-                .await
-                .expect("disconnect emission within 2s")
-                .expect("disc channel still open");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), disc_rx.recv())
+            .await
+            .expect("disconnect emission within 2s")
+            .expect("disc channel still open");
         assert_eq!(received, cookie);
     }
 
@@ -3295,13 +3293,10 @@ bind = "127.0.0.1"
             }
         });
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            hb_rx.recv(),
-        )
-        .await
-        .expect("heartbeat sink emission within 2s")
-        .expect("hb channel still open");
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), hb_rx.recv())
+            .await
+            .expect("heartbeat sink emission within 2s")
+            .expect("hb channel still open");
         assert_eq!(received, cookie);
     }
 

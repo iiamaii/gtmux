@@ -198,13 +198,23 @@ impl Default for AuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CloudConfig {
+    /// Cloud mode 에서 HTTPS/WSS 종단을 요구할지 여부. 생략 시 `true`.
+    /// `false` 는 신뢰된 네트워크에서 평문 HTTP 를 명시적으로 허용하는 escape hatch.
+    #[serde(default = "default_tls_required")]
+    pub tls_required: bool,
     /// PEM 인증서 경로. 파일 존재 + 0600 perm 검증은 lifecycle crate가 수행.
+    #[serde(default)]
     pub tls_cert: PathBuf,
     /// PEM 비밀키 경로.
+    #[serde(default)]
     pub tls_key: PathBuf,
     /// 분당 인증 실패 허용 횟수 (SSoT §1.10). 기본 10 — code-server 대비
     /// 약간 관대하나 grill D22에서 명시 키로 두기로 결정.
     pub rate_limit_auth_failures_per_minute: u32,
+}
+
+fn default_tls_required() -> bool {
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -365,6 +375,8 @@ cors_origins   = []
 host_allowlist = []
 
 # [cloud] — bind가 loopback/unix가 아닐 때만 활성화한다.
+# 기본 true. 신뢰된 네트워크에서 평문 HTTP 로 실행해야 할 때만 false.
+# tls_required = true
 # tls_cert = "/path/to/cert.pem"
 # tls_key  = "/path/to/key.pem"
 # rate_limit_auth_failures_per_minute = 10
@@ -440,8 +452,8 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         ));
     }
 
-    // mode-section 정합. cloud 모드는 cloud 섹션 + 파일 경로가 *명시*되어야
-    // lifecycle crate가 부팅 시 cert/key 검증으로 fail-closed 진입 가능.
+    // mode-section 정합. cloud 모드는 cloud 섹션이 필요하다. TLS 를 요구하는
+    // 기본 경로에서는 cert/key marker 도 명시되어야 lifecycle 검증으로 이어진다.
     let mode = derive_mode(&cfg.server.bind);
     match (mode, &cfg.cloud) {
         (Mode::Cloud, None) => {
@@ -453,9 +465,14 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         (Mode::Cloud, Some(c)) => {
             // 경로 *내용* 검증(존재·perm)은 lifecycle crate. 본 crate는 빈
             // 경로만 거부 — fail-closed marker 누락을 컴파일 너머에서 잡는다.
-            if c.tls_cert.as_os_str().is_empty() || c.tls_key.as_os_str().is_empty() {
+            // `tls_required=false` 는 신뢰된 네트워크에서 평문 HTTP 를 명시적으로
+            // 허용하는 경로이므로 cert/key marker 를 요구하지 않는다.
+            if c.tls_required
+                && (c.tls_cert.as_os_str().is_empty() || c.tls_key.as_os_str().is_empty())
+            {
                 return Err(ConfigError::Validation(
-                    "[cloud].tls_cert and tls_key must be set for cloud mode".to_string(),
+                    "[cloud].tls_cert and tls_key must be set when cloud.tls_required=true"
+                        .to_string(),
                 ));
             }
         }
@@ -476,6 +493,13 @@ impl Config {
     /// `bind` 값에서 추론한 mode.
     pub fn mode(&self) -> Mode {
         derive_mode(&self.server.bind)
+    }
+
+    /// Cloud mode 에서 TLS 보안 속성을 적용해야 하는지 여부.
+    /// Local mode 는 항상 `false`; Cloud mode 는 `[cloud].tls_required` 기본값 `true`.
+    pub fn tls_required(&self) -> bool {
+        matches!(self.mode(), Mode::Cloud)
+            && self.cloud.as_ref().map(|c| c.tls_required).unwrap_or(true)
     }
 
     /// `host_allowlist`가 비어 있으면 bind 호스트를 보강해 반환한다 — SSoT §5
@@ -658,6 +682,7 @@ session = "alpha"
 port = 9001
 bind = "0.0.0.0"
 [cloud]
+tls_required = true
 tls_cert = "/etc/gtmux/cert.pem"
 tls_key  = "/etc/gtmux/key.pem"
 rate_limit_auth_failures_per_minute = 10
@@ -666,7 +691,59 @@ rate_limit_auth_failures_per_minute = 10
             let cfg = load(Some(Path::new("gtmux.toml")), "").unwrap();
             assert_eq!(cfg.mode(), Mode::Cloud);
             let cloud = cfg.cloud.expect("cloud section present");
+            assert!(cloud.tls_required);
             assert_eq!(cloud.rate_limit_auth_failures_per_minute, 10);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cloud_tls_required_false_allows_missing_cert_paths() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "gtmux.toml",
+                r#"schema_version = 1
+[server]
+session = "alpha"
+port = 9001
+bind = "0.0.0.0"
+[cloud]
+tls_required = false
+rate_limit_auth_failures_per_minute = 10
+"#,
+            )?;
+            let cfg = load(Some(Path::new("gtmux.toml")), "").unwrap();
+            assert_eq!(cfg.mode(), Mode::Cloud);
+            assert!(!cfg.tls_required());
+            let cloud = cfg.cloud.expect("cloud section present");
+            assert!(!cloud.tls_required);
+            assert!(cloud.tls_cert.as_os_str().is_empty());
+            assert!(cloud.tls_key.as_os_str().is_empty());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cloud_tls_required_defaults_true_and_requires_cert_paths() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "gtmux.toml",
+                r#"schema_version = 1
+[server]
+session = "alpha"
+port = 9001
+bind = "0.0.0.0"
+[cloud]
+rate_limit_auth_failures_per_minute = 10
+"#,
+            )?;
+            let err = load(Some(Path::new("gtmux.toml")), "").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Validation(_)),
+                "expected Validation, got {err:?}"
+            );
             Ok(())
         });
     }

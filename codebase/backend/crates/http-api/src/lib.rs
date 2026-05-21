@@ -921,10 +921,8 @@ fn urlencode_query(s: &str) -> String {
 }
 
 /// Stamp the standard security headers (ADR-0003 §1) on `headers`.
-/// Used by the auth + bootstrap responses; the routes that go through
-/// `tower-http`'s `set-header` layer already include these. `Mode::Cloud`
-/// additionally adds `Strict-Transport-Security` — local mode omits it
-/// because plain HTTP would silently drop the directive.
+/// `Mode::Cloud` additionally adds `Strict-Transport-Security`; local mode
+/// omits it because plain HTTP would silently drop the directive.
 pub(crate) fn apply_security_headers(headers: &mut HeaderMap, mode: Mode) {
     static NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
     static REFERRER: HeaderValue = HeaderValue::from_static("no-referrer");
@@ -940,6 +938,27 @@ pub(crate) fn apply_security_headers(headers: &mut HeaderMap, mode: Mode) {
     headers.insert("cross-origin-resource-policy", CORP.clone());
     headers.insert("permissions-policy", PERMS.clone());
     if matches!(mode, Mode::Cloud) {
+        headers.insert(header::STRICT_TRANSPORT_SECURITY, HSTS.clone());
+    }
+}
+
+/// Config-aware variant for auth flows. Explicit non-TLS cloud mode keeps the
+/// hardening headers that are safe over HTTP, but does not emit HSTS.
+pub(crate) fn apply_security_headers_for_config(headers: &mut HeaderMap, config: &Config) {
+    static NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
+    static REFERRER: HeaderValue = HeaderValue::from_static("no-referrer");
+    static COOP: HeaderValue = HeaderValue::from_static("same-origin");
+    static CORP: HeaderValue = HeaderValue::from_static("same-origin");
+    static PERMS: HeaderValue =
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), interest-cohort=()");
+    static HSTS: HeaderValue = HeaderValue::from_static("max-age=31536000; includeSubDomains");
+
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF.clone());
+    headers.insert(header::REFERRER_POLICY, REFERRER.clone());
+    headers.insert("cross-origin-opener-policy", COOP.clone());
+    headers.insert("cross-origin-resource-policy", CORP.clone());
+    headers.insert("permissions-policy", PERMS.clone());
+    if config.tls_required() {
         headers.insert(header::STRICT_TRANSPORT_SECURITY, HSTS.clone());
     }
 }
@@ -997,7 +1016,7 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request as HttpRequest;
     use gtmux_auth::issue_token;
-    use gtmux_config::{Config, RuntimeConfig, SecurityConfig, ServerConfig};
+    use gtmux_config::{CloudConfig, Config, RuntimeConfig, SecurityConfig, ServerConfig};
     use tower::ServiceExt; // for `oneshot`
 
     const TEST_HOST: &str = "127.0.0.1:9001";
@@ -1020,6 +1039,22 @@ mod tests {
             frontend_dist: None,
             workspace_path: None,
             auth: gtmux_config::AuthConfig::default(),
+        }
+    }
+
+    fn cloud_test_config(tls_required: bool) -> Config {
+        Config {
+            server: ServerConfig {
+                bind: "0.0.0.0".to_string(),
+                ..test_config().server
+            },
+            cloud: Some(CloudConfig {
+                tls_required,
+                tls_cert: std::path::PathBuf::from("/dev/null"),
+                tls_key: std::path::PathBuf::from("/dev/null"),
+                rate_limit_auth_failures_per_minute: 10,
+            }),
+            ..test_config()
         }
     }
 
@@ -1295,6 +1330,74 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn auth_login_cloud_tls_required_sets_secure_cookie_and_hsts() {
+        let token = issue_token().expect("token");
+        let cfg = cloud_test_config(true);
+        let app = router(&cfg, &token);
+        let body = serde_json::to_vec(&json!({ "token": token.0 })).unwrap();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/login")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("Secure"),
+            "cookie expected Secure: {set_cookie}"
+        );
+        assert!(resp
+            .headers()
+            .contains_key(header::STRICT_TRANSPORT_SECURITY));
+    }
+
+    #[tokio::test]
+    async fn auth_login_cloud_tls_disabled_omits_secure_cookie_and_hsts() {
+        let token = issue_token().expect("token");
+        let cfg = cloud_test_config(false);
+        let app = router(&cfg, &token);
+        let body = serde_json::to_vec(&json!({ "token": token.0 })).unwrap();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/login")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            !set_cookie.contains("Secure"),
+            "cookie should work over explicit non-TLS cloud HTTP: {set_cookie}"
+        );
+        assert!(!resp
+            .headers()
+            .contains_key(header::STRICT_TRANSPORT_SECURITY));
     }
 
     #[tokio::test]

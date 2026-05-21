@@ -42,8 +42,8 @@ use gtmux_config::{derive_mode, load_with_overrides as load_config, Config, Mode
 use gtmux_pty_backend::PtyBackend;
 use gtmux_ws_server::Hub;
 use state_files::{
-    check_pidfile_liveness, pidfile_path_for, stop_server, write_pidfile,
-    PidLiveness, StateFileError, StopOutcome, TeardownOpts, TeardownReport,
+    check_pidfile_liveness, pidfile_path_for, stop_server, write_pidfile, PidLiveness,
+    StateFileError, StopOutcome, TeardownOpts, TeardownReport,
 };
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -394,8 +394,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //     "password"` so a missing file fails fast at boot rather than at
     //     first login attempt. In token mode we leave it unset.
     let password_hash: Option<String> = if config.auth.mode == "password" {
-        let path = gtmux_http_api::default_password_hash_path()
-            .context("resolving password hash path")?;
+        let path =
+            gtmux_http_api::default_password_hash_path().context("resolving password hash path")?;
         match gtmux_http_api::load_password_hash(&path) {
             Ok(h) => {
                 info!(path = %path.display(), "auth: loaded password hash");
@@ -434,13 +434,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     hub.set_disconnect_sink(disconnect_tx);
     hub.set_heartbeat_sink(heartbeat_tx);
 
-    let app_state = build_app_state(
-        &config,
-        &token,
-        hub.clone(),
-        workspace,
-        password_hash,
-    );
+    let app_state = build_app_state(&config, &token, hub.clone(), workspace, password_hash);
 
     // Stage 5 D10 α: register the cookie validator so the WS handshake
     // accepts cookie auth as an alternative to the subprotocol bearer
@@ -465,13 +459,17 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let state_for_disconnect = app_state.clone();
     let _disconnect_task = tokio::spawn(async move {
         while let Some(owner_key) = disconnect_rx.recv().await {
-            state_for_disconnect.release_lock_for_owner(&owner_key).await;
+            state_for_disconnect
+                .release_lock_for_owner(&owner_key)
+                .await;
         }
     });
     let state_for_heartbeat = app_state.clone();
     let _heartbeat_task = tokio::spawn(async move {
         while let Some(owner_key) = heartbeat_rx.recv().await {
-            state_for_heartbeat.refresh_lease_for_owner(&owner_key).await;
+            state_for_heartbeat
+                .refresh_lease_for_owner(&owner_key)
+                .await;
         }
     });
 
@@ -599,8 +597,12 @@ fn build_app_state(
     //
     // Legacy `/api/layout` v1 + `LayoutStore` were removed in the Stage 6
     // cleanup (handover §5.3.3); v2 is the only `/layout` surface.
-    let mut app_state =
-        gtmux_http_api::AppState::with_hub_and_workspace(config.clone(), token.clone(), hub, workspace);
+    let mut app_state = gtmux_http_api::AppState::with_hub_and_workspace(
+        config.clone(),
+        token.clone(),
+        hub,
+        workspace,
+    );
     if let Some(h) = password_hash {
         app_state = app_state.with_password_hash(h);
     }
