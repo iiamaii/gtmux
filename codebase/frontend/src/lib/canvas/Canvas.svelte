@@ -1084,7 +1084,15 @@
           const item = createCanvasItem('file_path', pos);
           const withPath = { ...item, path, kind: 'file' as const };
           void commitNewItem(withPath)
-            .then(() => toolStore.consume())
+            .then(() => {
+              toolStore.consume();
+              // ★ 2026-05-22 사용자 보고 (#upload-canvas-desync) — async
+              // commit-after layout refetch. applyMutation 의 PUT 응답 +
+              // loadLayout 흐름이 *드물게* race 로 신규 item 미반영의
+              // workaround. silent best-effort (실패해도 functional —
+              // root cause 의 별 trace 작업).
+              void sessionStore.reloadActiveLayout();
+            })
             .catch(onSpawnError);
         });
         return;
@@ -1105,6 +1113,9 @@
             };
             await commitNewItem(item);
             toolStore.consume();
+            // ★ 2026-05-22 사용자 보고 (#upload-canvas-desync) — async
+            // commit-after layout refetch (defensive, silent best-effort).
+            void sessionStore.reloadActiveLayout();
           } catch (err) {
             onAssetUploadError(err);
           }
@@ -1128,6 +1139,9 @@
             };
             await commitNewItem(item);
             toolStore.consume();
+            // ★ 2026-05-22 사용자 보고 (#upload-canvas-desync) — async
+            // commit-after layout refetch (defensive, silent best-effort).
+            void sessionStore.reloadActiveLayout();
           } catch (err) {
             onAssetUploadError(err);
           }

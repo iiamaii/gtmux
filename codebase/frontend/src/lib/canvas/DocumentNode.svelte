@@ -62,6 +62,7 @@
   let {
     data,
     selected = false,
+    dragging = false,
   }: {
     data: DocumentNodeData;
     selected?: boolean;
@@ -72,6 +73,10 @@
     dragHandle?: string;
     sourcePosition?: unknown;
     targetPosition?: unknown;
+    /** Svelte Flow 가 drag 중에만 true 로 set. iframe pointer-events 차단의
+     *  reactive 신호 — drag 중 mouse 가 PDF / interactive iframe 위로 들어가
+     *  iframe 의 plugin / sandbox 가 event capture → 부모 drag mousemove/up
+     *  미도달 회귀 회피 (2026-05-22 사용자 보고, PDF 주로). */
     dragging?: boolean;
     zIndex?: number;
     selectable?: boolean;
@@ -209,6 +214,19 @@
     const mime = (data.mime ?? '').toLowerCase();
     return mime.startsWith('text/') || mime === 'application/json';
   });
+  /** ADR-0018 D10 amend ⑦ — PDF asset 은 browser-native PDF viewer 로 iframe
+   *  렌더. ADR-0037 의 sandbox-격리 HTML interactive 와 다른 mental model:
+   *  PDF plugin 은 same-origin context 가 필요 (sandbox=allow-scripts 만 주면
+   *  browser internal PDF viewer 미작동). single-user trust + same-origin
+   *  endpoint 라 안전. text fetch 안 함 (binary). */
+  const isPdfAsset = $derived(
+    !isInline
+    && fileTypeLabel === 'pdf'
+    && (data.asset_id ?? '').length > 0,
+  );
+  const pdfAssetSrc = $derived(
+    isPdfAsset ? `/api/assets/${data.asset_id}` : '',
+  );
 
   // svelte-flow 가 selection 변경 시 data prop 의 reactive proxy 를 새 ref 로
   // 갱신 → effect 의 dependency 가 invalidate → fetch 재시작 → "Loading
@@ -690,6 +708,7 @@
           <iframe
             bind:this={iframeRef}
             class="doc-iframe"
+            class:drag-isolated={dragging}
             sandbox={INTERACTIVE_IFRAME_SANDBOX}
             referrerpolicy="no-referrer"
             loading="lazy"
@@ -699,6 +718,21 @@
         {:else}
           <div class="doc-md">{@html inlineHtml}</div>
         {/if}
+      {:else if isPdfAsset}
+        <!-- ADR-0018 D10 amend ⑦ — PDF iframe via browser-native plugin.
+             sandbox 미지정 (PDF plugin 의 same-origin 요구). same-origin
+             endpoint 라 trust safe. eyebrow 숨김 — :has(.doc-pdf) CSS.
+             drag 중 pointer-events:none — iframe 의 PDF plugin 이 mouse
+             event 를 capture 해 부모 drag 가 멈추는 회귀 차단. -->
+        <!-- svelte-ignore a11y_missing_attribute -->
+        <iframe
+          class="doc-pdf"
+          class:drag-isolated={dragging}
+          src={pdfAssetSrc}
+          title={data.file_name}
+          referrerpolicy="no-referrer"
+          loading="lazy"
+        ></iframe>
       {:else}
         <div class="eyebrow">Document file</div>
         {#if assetPreviewLoading}
@@ -711,6 +745,7 @@
             <iframe
               bind:this={iframeRef}
               class="doc-iframe"
+              class:drag-isolated={dragging}
               sandbox={INTERACTIVE_IFRAME_SANDBOX}
               referrerpolicy="no-referrer"
               loading="lazy"
@@ -989,6 +1024,38 @@
   }
   .doc-body:has(.doc-iframe) .eyebrow {
     display: none;
+  }
+
+  /* ADR-0018 D10 amend ⑦ (2026-05-22) — PDF iframe (browser-native viewer).
+     interactive HTML iframe (ADR-0037) 와 달리 height auto-fit 안 함:
+     PDF plugin 이 자체 internal scroll + multi-page navigation 제공 →
+     host 영역 100% 채우고 PDF viewer 가 scroll 책임. host overflow 는
+     hidden (외부 scroll 미발생). */
+  .doc-pdf {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: #ffffff;
+  }
+  .doc-body:has(.doc-pdf) {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ADR-0018 D10 amend ⑧ (2026-05-22, 사용자 보고 #drag-iframe-capture) —
+     drag 중 iframe pointer-events 차단. iframe (PDF plugin / sandbox 안의
+     interactive HTML) 은 자체 browsing context 라 부모의 mouse event 와
+     분리. drag 중 mouse 가 iframe 위로 들어가면 iframe 이 event capture →
+     부모 (xyflow) 의 drag mousemove/mouseup 미도달 → drag 가 멈춰버림.
+     `dragging` prop 이 true 인 동안 iframe 의 pointer-events 만 차단 →
+     mouse event 가 iframe 통과해 부모 wrapper 가 catch. drag 종료 후 즉시
+     복원. PDF / interactive HTML 양쪽 동일 fix. */
+  .doc-pdf.drag-isolated,
+  .doc-iframe.drag-isolated {
+    pointer-events: none;
   }
 
   /* ADR-0018 D10 amend ④ — source view (raw markdown / html source code). */
