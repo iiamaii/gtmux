@@ -9,7 +9,7 @@
    *   - Item activation closes the menu and dispatches the action
    *
    * Item set (v0):
-   *   - Copy pane_id (clipboard, falls back to selectAll if clipboard API
+   *   - Copy panel id (clipboard, falls back to selectAll if clipboard API
    *     unavailable)
    *   - Close pane (CTRL kill-pane — disabled when paneId missing)
    *   - (separator)
@@ -53,6 +53,7 @@
   let clickPos = $state<{ x: number; y: number }>({ x: 0, y: 0 });
   let paneIdStr = $state<string | null>(null);
   let panelIdStr = $state<string | null>(null);
+  let hidePaste = $state(false);
   let menuEl: HTMLDivElement | undefined = $state();
   /** Add ▸ sub-menu hover state (empty-area branch only). */
   let addSubmenuOpen = $state(false);
@@ -64,9 +65,11 @@
     clientY: number;
     paneId?: string | null;
     panelId?: string | null;
+    hidePaste?: boolean;
   }): void {
     paneIdStr = args.paneId ?? null;
     panelIdStr = args.panelId ?? null;
+    hidePaste = args.hidePaste === true;
     open = true;
     // Initial position; clamped after the menu lays out (next tick).
     pos = { x: args.clientX, y: args.clientY };
@@ -79,6 +82,7 @@
   function close(): void {
     open = false;
     addSubmenuOpen = false;
+    hidePaste = false;
   }
 
   function clampPos(): void {
@@ -137,7 +141,7 @@
     if (!paneIdStr) return;
     try {
       await navigator.clipboard.writeText(paneIdStr);
-      toastStore.show({ message: `Copied ${paneIdStr} to clipboard`, tone: 'success' });
+      toastStore.show({ message: 'Copied panel id to clipboard', tone: 'success' });
     } catch (e) {
       toastStore.show({ message: `Clipboard failed: ${(e as Error).message ?? e}`, tone: 'error' });
     }
@@ -158,7 +162,7 @@
    *
    * D10: clicked-item ∈ M && M.size ≥ 2 → multi mode.
    *      selectedItems 가 모두 같은 type 이면 commonType, 다르면 null (mixed).
-   *      mixed 시 type-specific 액션 (Change terminal / Copy pane_id / Rename)
+   *      mixed 시 type-specific 액션 (Change terminal / Copy panel id / Rename)
    *      은 모두 hide — *공통 속성만 노출*.
    */
   const isMultiMode = $derived.by(() => {
@@ -466,7 +470,7 @@
   /** Change terminal: terminal common type 일 때 single + multi 모두 노출
    *  가능. 다만 multi 시 일괄 교체 의도 모호 (ADR-0032 D3) → single 만. */
   const canChangeTerminal = $derived(commonType === 'terminal' && !isMultiMode);
-  /** Copy pane_id: single terminal 에서만 의미. */
+  /** Copy panel id: single terminal 에서만 의미. */
   const canCopyPaneId = $derived(paneIdStr !== null && !isMultiMode);
   /** Align/Distribute: M.size ≥ 2 / ≥ 3. */
   const canAlign = $derived(isMultiMode && effectiveItems.length >= 2);
@@ -576,14 +580,13 @@
     {/if}
 
     {#if canCopyPaneId}
-      <div class="ctx-section">Pane</div>
+      <div class="ctx-section">Panel</div>
       <button
         type="button"
         class="ctx-item"
         onclick={onCopyPaneId}
       >
-        <span class="label">Copy pane_id</span>
-        <span class="kbd mono">{paneIdStr}</span>
+        <span class="label">Copy panel id</span>
       </button>
       <div class="ctx-sep"></div>
     {/if}
@@ -598,15 +601,17 @@
         <span class="label">Cut</span>
         <span class="kbd mono">⌘X</span>
       </button>
-      <button
-        type="button"
-        class="ctx-item"
-        disabled={!clipboardStore.hasItems}
-        onclick={() => void onPaste()}
-      >
-        <span class="label">Paste</span>
-        <span class="kbd mono">⌘V</span>
-      </button>
+      {#if !hidePaste}
+        <button
+          type="button"
+          class="ctx-item"
+          disabled={!clipboardStore.hasItems}
+          onclick={() => void onPaste()}
+        >
+          <span class="label">Paste</span>
+          <span class="kbd mono">⌘V</span>
+        </button>
+      {/if}
       <div class="ctx-sep"></div>
 
       <div class="ctx-section">Arrange</div>

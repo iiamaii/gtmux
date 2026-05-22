@@ -15,6 +15,7 @@
   // - tmux state / web state 분리 (#1).
   // - 사용자 입력 escape (#4) — Svelte 자동 HTML escape.
 
+  import { getContext } from 'svelte';
   import { SvelteSet } from 'svelte/reactivity';
   import { muxStore } from '$lib/stores/mux.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
@@ -25,6 +26,18 @@
   import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
   import { zStore } from '$lib/stores/zStore.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
+
+  interface ContextMenuHolder {
+    openAt: (args: {
+      clientX: number;
+      clientY: number;
+      paneId?: string | null;
+      panelId?: string | null;
+      hidePaste?: boolean;
+    }) => void;
+  }
+
+  const contextMenuHolder = getContext<ContextMenuHolder | undefined>('contextMenu');
 
   /** Currently inline-editing group id, or `null`. Component-local. */
   let editingGroupId = $state<string | null>(null);
@@ -343,6 +356,20 @@
     }
     sessionStore.setM([id]);
     selectionAnchor = id;
+  }
+
+  function onPanelContextMenu(id: string, p: PanelData, e: MouseEvent): void {
+    e.preventDefault();
+    e.stopPropagation();
+    sessionStore.setM([id]);
+    selectionAnchor = id;
+    contextMenuHolder?.openAt({
+      clientX: e.clientX,
+      clientY: e.clientY,
+      paneId: p.type === 'terminal' || p.type === 'panel' ? (p.pane_id ?? id) : null,
+      panelId: id,
+      hidePaste: true,
+    });
   }
 
   /**
@@ -843,6 +870,7 @@
           ondragleave={(e: DragEvent) => onRowDragLeave(node.id, e)}
           ondrop={(e: DragEvent) => onRowDrop(node.id, 'panel', e)}
           ondragend={onTreeDragEnd}
+          oncontextmenu={(e: MouseEvent) => onPanelContextMenu(node.id, p, e)}
         >
           <div
             class="row-inner"

@@ -84,11 +84,11 @@
   // descendants (PanelNode's header (…) button) can summon the menu
   // without a callback prop chain through SvelteFlow node data.
   interface ContextMenuHolder {
-    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null }) => void;
+    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null; hidePaste?: boolean }) => void;
   }
   let contextMenuRef: ContextMenuHolder | undefined = $state();
   const contextMenuHolder = {
-    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null }) => {
+    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null; hidePaste?: boolean }) => {
       contextMenuRef?.openAt(args);
     },
   };
@@ -141,6 +141,7 @@
   let unbindEditingShortcuts: (() => void) | null = null;
   let unbindSystemTheme: (() => void) | null = null;
   let unbindVisibility: (() => void) | null = null;
+  let unbindNativeContextMenu: (() => void) | null = null;
 
   /**
    * Phase 2 (plan-0008 §6, Case II) — tab 이 background 에 있다가 다시 활성화
@@ -227,6 +228,17 @@
     // flips between light/dark while the app is open.
     unbindSystemTheme = themeStore.bindSystemListener();
     heartbeatStore.start();
+
+    // App owns right-click UX. Suppress the browser's native context menu
+    // globally while preserving event propagation for Canvas / Layer custom
+    // contextmenu handlers.
+    const onNativeContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+    document.addEventListener('contextmenu', onNativeContextMenu, { capture: true });
+    unbindNativeContextMenu = () => {
+      document.removeEventListener('contextmenu', onNativeContextMenu, { capture: true });
+    };
 
     // Page-unload best-effort attach lock release — ADR-0021 D6 amend ②,
     // 0071 §D-5. `beforeunload` + `pagehide` 둘 다 listen 해 정상 close /
@@ -374,6 +386,10 @@
     if (unbindVisibility !== null) {
       unbindVisibility();
       unbindVisibility = null;
+    }
+    if (unbindNativeContextMenu !== null) {
+      unbindNativeContextMenu();
+      unbindNativeContextMenu = null;
     }
     const client = wsClientHolder.current;
     if (client) {

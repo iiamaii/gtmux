@@ -13,6 +13,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
+  import { documentViewModeStore } from '$lib/stores/documentViewMode.svelte';
   import PanelDanglingOverlay from '$lib/canvas/PanelDanglingOverlay.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
@@ -23,6 +24,8 @@
     getNextViewMode,
     getNextViewModeLabel,
     INTERACTIVE_IFRAME_SANDBOX,
+    IFRAME_HEIGHT_MESSAGE_TAG,
+    buildInteractiveSrcdoc,
     type DocumentViewMode,
   } from '$lib/canvas/documentRender';
   import type { CanvasItem, NoteItem } from '$lib/types/canvas';
@@ -77,36 +80,84 @@
     if (mime.startsWith('text/html')) return 'html';
     return ext;
   });
-  let documentViewMode = $state<DocumentViewMode>('rendered');
+  /** ADR-0018 D10 amend ⑥ — viewMode persist via documentViewModeStore.
+   *  DocumentNode (normal) 와 같은 itemId 구독 → normal↔maximize 전환 시
+   *  reset 없음. */
+  const documentViewMode = $derived.by((): DocumentViewMode => {
+    if (item?.type !== 'document' || itemId === null) return 'rendered';
+    return documentViewModeStore.get(itemId);
+  });
   const documentCanToggleView = $derived(isToggleableFileType(documentFileTypeLabel));
   const documentNextViewModeLabel = $derived(
     getNextViewModeLabel(documentViewMode, documentFileTypeLabel),
   );
   /** ADR-0037 — fileType 가 html 이 아니면 interactive 의미 없음. reset. */
   $effect(() => {
-    if (documentViewMode === 'interactive' && documentFileTypeLabel !== 'html') {
-      documentViewMode = 'rendered';
+    if (
+      documentViewMode === 'interactive'
+      && documentFileTypeLabel !== 'html'
+      && itemId !== null
+    ) {
+      documentViewModeStore.set(itemId, 'rendered');
     }
   });
   const documentHtml = $derived.by(() => {
     if (documentFileTypeLabel === 'html') return renderHtml(documentText);
     return renderMarkdown(documentText);
   });
+
+  /** ADR-0037 R4 (2단계) — iframe height auto-fit via postMessage.
+   *  정본 정합 = DocumentNode 와 동일 패턴. */
+  let documentIframeRef = $state<HTMLIFrameElement | null>(null);
+  let documentIframeHeight = $state<number | null>(null);
+  const documentInteractiveSrcdoc = $derived(buildInteractiveSrcdoc(documentText));
+
+  $effect(() => {
+    function onMessage(e: MessageEvent): void {
+      if (documentIframeRef === null || e.source !== documentIframeRef.contentWindow) return;
+      const data = e.data as Record<string, unknown> | null;
+      if (data === null || typeof data !== 'object') return;
+      const h = data[IFRAME_HEIGHT_MESSAGE_TAG];
+      if (typeof h === 'number' && h > 0 && h < 50000) {
+        documentIframeHeight = h;
+      }
+    }
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  });
+
+  $effect(() => {
+    if (documentViewMode !== 'interactive') {
+      documentIframeHeight = null;
+    }
+  });
+
+  const documentIframeHeightStyle = $derived(
+    documentIframeHeight !== null ? `${documentIframeHeight}px` : '100%',
+  );
   const canPreviewDocumentAsset = $derived.by(() => {
     if (item?.type !== 'document' || !item.asset_id) return false;
     const mime = (item.mime ?? '').toLowerCase();
     return mime.startsWith('text/') || mime === 'application/json';
   });
 
+  // svelte-flow 의 selection 변경이 item prop 의 reactive proxy 를 새 ref 로
+  // 갱신할 때 effect 의 dependency 가 invalidate → fetch 재시작 blink 회피.
+  // 정본 = DocumentNode 의 같은 패턴.
+  const documentFetchId = $derived.by((): string => {
+    if (item?.type !== 'document' || !item.asset_id || !canPreviewDocumentAsset) return '';
+    return item.asset_id;
+  });
+
   $effect(() => {
-    if (item?.type !== 'document' || !item.asset_id || !canPreviewDocumentAsset) {
+    const assetId = documentFetchId;
+    if (assetId.length === 0) {
       documentAssetText = null;
       documentAssetLoading = false;
       documentAssetError = null;
       return;
     }
 
-    const assetId = item.asset_id;
     let cancelled = false;
     documentAssetText = null;
     documentAssetError = null;
@@ -301,7 +352,12 @@
               title={documentNextViewModeLabel}
               onclick={(e: MouseEvent) => {
                 e.stopPropagation();
-                documentViewMode = getNextViewMode(documentViewMode, documentFileTypeLabel);
+                if (itemId !== null) {
+                  documentViewModeStore.set(
+                    itemId,
+                    getNextViewMode(documentViewMode, documentFileTypeLabel),
+                  );
+                }
               }}
             >
               {#if documentViewMode === 'rendered' && documentFileTypeLabel === 'html'}
@@ -411,11 +467,13 @@
               {:else if documentViewMode === 'interactive' && documentFileTypeLabel === 'html'}
                 <!-- svelte-ignore a11y_missing_attribute -->
                 <iframe
+                  bind:this={documentIframeRef}
                   class="document-iframe"
                   sandbox={INTERACTIVE_IFRAME_SANDBOX}
                   referrerpolicy="no-referrer"
                   loading="lazy"
-                  srcdoc={documentText}
+                  srcdoc={documentInteractiveSrcdoc}
+                  style:height={documentIframeHeightStyle}
                 ></iframe>
               {:else}
                 <div class="document-md">{@html documentHtml}</div>
@@ -721,21 +779,20 @@
     overflow-wrap: anywhere;
   }
 
-  /* ADR-0037 D3 — interactive mode (sandboxed iframe). normal 의 DocumentNode
-     와 동일 정책: iframe 가 host 의 padding 영역 가득 + eyebrow 숨김. */
+  /* ADR-0037 D3 + R4 (2단계) — interactive mode (sandboxed iframe). normal 의
+     DocumentNode 와 동일 정책: iframe 가 host 의 padding 영역 가득 + eyebrow
+     숨김. R4: style:height inline 으로 content height 받고 host 가 scroll. */
   .document-iframe {
     display: block;
-    flex: 1 1 auto;
+    flex: 0 0 auto;
     width: 100%;
-    height: 100%;
     min-height: 300px;
     border: 0;
     background: #ffffff;
-    border-radius: var(--radius-sm);
   }
   .document-body-host:has(.document-iframe) {
     padding: 0;
-    overflow: hidden;
+    overflow: auto;
     display: flex;
     flex-direction: column;
   }

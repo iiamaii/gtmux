@@ -22,6 +22,7 @@
 
   import { NodeResizer } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { documentViewModeStore } from '$lib/stores/documentViewMode.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -34,6 +35,8 @@
     getNextViewMode,
     getNextViewModeLabel,
     INTERACTIVE_IFRAME_SANDBOX,
+    IFRAME_HEIGHT_MESSAGE_TAG,
+    buildInteractiveSrcdoc,
     type DocumentViewMode,
   } from './documentRender';
   import type { CanvasItem, DocumentItem } from '$lib/types/canvas';
@@ -134,18 +137,57 @@
     }
   });
 
-  /** ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — markdown/html viewer + 3-mode toggle.
-   *  helper 는 documentRender.ts 에 외부화 — DocumentNode (normal) 와
-   *  MaximizedItemModal (maximize) 가 같은 helper 사용 → rendering + 전이 동기화. */
-  let viewMode = $state<DocumentViewMode>('rendered');
+  /** ADR-0018 D10 amend ③/④/⑤/⑥ + ADR-0037 — markdown/html viewer + 3-mode
+   *  toggle. helper + viewMode store 가 외부화 — DocumentNode (normal) 와
+   *  MaximizedItemModal (maximize) 가 *같은 store* 의 같은 itemId 를 구독해
+   *  rendering + 전이 + persist 동기화. normal↔maximize 전환 + unmount/remount
+   *  도 reset 없음. */
+  const viewMode = $derived(documentViewModeStore.get(data.id));
   const canToggleView = $derived(isToggleableFileType(fileTypeLabel));
   const nextViewModeLabel = $derived(getNextViewModeLabel(viewMode, fileTypeLabel));
   /** 'interactive' 는 fileType=html 일 때만 의미. fileType 가 바뀌면 reset. */
   $effect(() => {
     if (viewMode === 'interactive' && fileTypeLabel !== 'html') {
-      viewMode = 'rendered';
+      documentViewModeStore.set(data.id, 'rendered');
     }
   });
+
+  /** ADR-0037 R4 (2단계) — iframe content height auto-fit via postMessage.
+   *  iframe 안 inline probe script 가 ResizeObserver + load 시점에 parent
+   *  로 height 보내고, parent (본 컴포넌트) 가 받아서 iframe style.height
+   *  에 반영. cap = panel 의 max-height (CSS 의 max-height:100%). */
+  let iframeRef = $state<HTMLIFrameElement | null>(null);
+  let iframeContentHeight = $state<number | null>(null);
+  const interactiveSrcdoc = $derived(buildInteractiveSrcdoc(data.content ?? ''));
+  const interactiveSrcdocAsset = $derived(buildInteractiveSrcdoc(assetPreviewText ?? ''));
+
+  $effect(() => {
+    function onMessage(e: MessageEvent): void {
+      // sandbox 의 unique opaque origin 이라 origin 검사 의미 X. source 검증
+      // 으로 *우리* iframe 의 postMessage 만 accept — 다른 page 의 message
+      // (예: 외부 widget) 차단.
+      if (iframeRef === null || e.source !== iframeRef.contentWindow) return;
+      const data = e.data as Record<string, unknown> | null;
+      if (data === null || typeof data !== 'object') return;
+      const h = data[IFRAME_HEIGHT_MESSAGE_TAG];
+      if (typeof h === 'number' && h > 0 && h < 50000) {
+        iframeContentHeight = h;
+      }
+    }
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  });
+
+  /** viewMode 가 interactive 가 아닐 때 height state reset. */
+  $effect(() => {
+    if (viewMode !== 'interactive') {
+      iframeContentHeight = null;
+    }
+  });
+
+  const iframeHeightStyle = $derived(
+    iframeContentHeight !== null ? `${iframeContentHeight}px` : '100%',
+  );
   // Inline content (data.content) 의 mime 추정은 markdown 으로 기본 — fileTypeLabel
   // 이 'markdown' 이면 marked parse, 'html' 이면 sanitize only.
   function renderContent(raw: string): string {
@@ -168,9 +210,19 @@
     return mime.startsWith('text/') || mime === 'application/json';
   });
 
+  // svelte-flow 가 selection 변경 시 data prop 의 reactive proxy 를 새 ref 로
+  // 갱신 → effect 의 dependency 가 invalidate → fetch 재시작 → "Loading
+  // preview…" blink. 회피: id 를 stable derived 로 wrap — *값* 이 같으면
+  // svelte 의 derived 가 subscriber notify skip → effect re-fire 안 함.
+  const assetFetchId = $derived.by((): string => {
+    if (isInline || !canPreviewAssetText) return '';
+    return data.asset_id ?? '';
+  });
+  const assetFetchAccept = $derived(data.mime ?? 'text/plain');
+
   $effect(() => {
-    const assetId = data.asset_id ?? '';
-    if (isInline || assetId.length === 0 || !canPreviewAssetText) {
+    const id = assetFetchId;
+    if (id.length === 0) {
       assetPreviewText = null;
       assetPreviewLoading = false;
       assetPreviewError = null;
@@ -184,12 +236,12 @@
 
     async function loadPreview(): Promise<void> {
       try {
-        const res = await fetch(`/api/assets/${assetId}`, {
+        const res = await fetch(`/api/assets/${id}`, {
           method: 'GET',
           credentials: 'include',
-          headers: { Accept: data.mime ?? 'text/plain' },
+          headers: { Accept: assetFetchAccept },
         });
-        if (!res.ok) throw new Error(`GET /api/assets/${assetId} returned ${res.status}`);
+        if (!res.ok) throw new Error(`GET /api/assets/${id} returned ${res.status}`);
         const text = await res.text();
         if (!cancelled) assetPreviewText = text;
       } catch (err) {
@@ -513,7 +565,7 @@
               aria-label={nextViewModeLabel}
               onclick={(e: MouseEvent) => {
                 e.stopPropagation();
-                viewMode = getNextViewMode(viewMode, fileTypeLabel);
+                documentViewModeStore.set(data.id, getNextViewMode(viewMode, fileTypeLabel));
               }}
               onmousedown={(e: MouseEvent) => e.stopPropagation()}
             >
@@ -636,11 +688,13 @@
         {:else if viewMode === 'interactive' && fileTypeLabel === 'html'}
           <!-- svelte-ignore a11y_missing_attribute -->
           <iframe
+            bind:this={iframeRef}
             class="doc-iframe"
             sandbox={INTERACTIVE_IFRAME_SANDBOX}
             referrerpolicy="no-referrer"
             loading="lazy"
-            srcdoc={data.content ?? ''}
+            srcdoc={interactiveSrcdoc}
+            style:height={iframeHeightStyle}
           ></iframe>
         {:else}
           <div class="doc-md">{@html inlineHtml}</div>
@@ -655,11 +709,13 @@
           {:else if viewMode === 'interactive' && fileTypeLabel === 'html'}
             <!-- svelte-ignore a11y_missing_attribute -->
             <iframe
+              bind:this={iframeRef}
               class="doc-iframe"
               sandbox={INTERACTIVE_IFRAME_SANDBOX}
               referrerpolicy="no-referrer"
               loading="lazy"
-              srcdoc={assetPreviewText}
+              srcdoc={interactiveSrcdocAsset}
+              style:height={iframeHeightStyle}
             ></iframe>
           {:else}
             <div class="doc-md">{@html assetHtml}</div>
@@ -912,12 +968,14 @@
     overflow-wrap: anywhere;
   }
 
-  /* ADR-0037 D3 — interactive mode (sandboxed iframe). iframe 가 doc-body 의
-     padding 영역 가득 채우고 eyebrow 는 숨김. :has() 로 dedicated branch
-     CSS — markup churn 없이 layout 분기. */
+  /* ADR-0037 D3 + R4 (2단계) — interactive mode (sandboxed iframe). iframe 가
+     doc-body 의 padding 영역 가득 채우고 eyebrow 는 숨김. :has() 로 dedicated
+     branch CSS — markup churn 없이 layout 분기. R4: content height 를
+     style:height inline 으로 받고 max-height 으로 panel 안에서 cap →
+     content 크면 panel 안 scroll, 작으면 content 만큼만 (위 빈 공간 X). */
   .doc-iframe {
     display: block;
-    flex: 1 1 auto;
+    flex: 0 0 auto;
     width: 100%;
     min-height: 200px;
     border: 0;
@@ -925,7 +983,7 @@
   }
   .doc-body:has(.doc-iframe) {
     padding: 0;
-    overflow: hidden;
+    overflow: auto;
     display: flex;
     flex-direction: column;
   }
