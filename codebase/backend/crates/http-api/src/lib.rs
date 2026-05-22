@@ -587,6 +587,14 @@ pub fn router_with_state(state: AppState) -> Router {
 /// `frontend_dist` swaps the catch-all 404 for a `ServeDir` + `ServeFile`
 /// chain so a single port serves both the API and the bundled SPA.
 pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) -> Router {
+    let asset_body_limit = state
+        .config
+        .assets
+        .max_size_bytes
+        .min((usize::MAX - assets::ASSET_MULTIPART_HEADROOM_BYTES) as u64)
+        as usize
+        + assets::ASSET_MULTIPART_HEADROOM_BYTES;
+
     // Authenticated subtree — `/api/*` routes. Bearer middleware is applied
     // here (not on the outer router) so `/healthz` and `/auth/bootstrap`
     // bypass it. Origin/Host checks still run on every request via the outer
@@ -676,14 +684,14 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             axum::routing::post(file_open::open_handler),
         )
         // ADR-0033 / 0080 — content-addressed `image`/`document` asset store.
-        // Body cap is 20 MiB raw + ~1 MiB multipart headroom (boundary +
-        // field overhead). axum 0.8's Multipart applies the limit to the
-        // entire request body, so we add a little slack on top of the file
-        // ceiling rather than 20 MiB exactly.
+        // Body cap is config.assets.max_size_bytes + multipart headroom
+        // (boundary + field overhead). axum 0.8's Multipart applies the limit
+        // to the entire request body, so the handler also recounts raw bytes
+        // against the exact configured ceiling.
         .route(
             "/api/assets",
             axum::routing::post(assets::upload_handler)
-                .layer(DefaultBodyLimit::max(assets::ASSET_MAX_BYTES + 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(asset_body_limit)),
         )
         .route(
             "/api/assets/from-path",
@@ -1039,6 +1047,7 @@ mod tests {
             frontend_dist: None,
             workspace_path: None,
             auth: gtmux_config::AuthConfig::default(),
+            assets: gtmux_config::AssetsConfig::default(),
         }
     }
 
@@ -5412,17 +5421,15 @@ mod tests {
     }
 
     /// 0080 §5 — oversize upload returns 413. We send a body that exceeds
-    /// `ASSET_MAX_BYTES` after the size check inside the handler runs
-    /// (axum's DefaultBodyLimit may also fire — both map to 413).
+    /// configured `assets.max_size_bytes` after the size check inside the
+    /// handler runs (axum's DefaultBodyLimit may also fire — both map to 413).
     #[tokio::test]
     async fn assets_oversize_returns_413() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        // 21 MiB random-ish payload — over the 20 MiB cap. We need to stay
-        // inside the route's DefaultBodyLimit (+ 1 MiB headroom) or axum
-        // short-circuits with 413 before the handler runs; either path is
-        // an acceptable 413 — the goal is "client gets PAYLOAD_TOO_LARGE".
-        let big = vec![0u8; assets::ASSET_MAX_BYTES + 16];
+        // Just over the configured cap. Either handler-level recount or
+        // DefaultBodyLimit may reject it; both paths must surface 413.
+        let big = vec![0u8; gtmux_config::default_asset_max_size_bytes() as usize + 16];
         let mut payload = Vec::with_capacity(big.len() + 16);
         payload.extend_from_slice(b"\x89PNG\r\n\x1a\n");
         payload.extend_from_slice(&big);

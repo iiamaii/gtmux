@@ -47,6 +47,11 @@ cookie_max_age_days = 7
 # Password mode 의 brute-force 방어. 5 시도 / 5분 / IP 초과 시 429 + lockout.
 rate_limit_per_5min = 5
 
+[assets]
+# Asset 1개당 최대 저장 크기. 기본값은 50 MiB.
+# 본 sample 은 운영 여유를 위해 100 MiB 로 설정한다.
+max_size_bytes = 104857600
+
 # [cloud] 섹션 — bind 가 loopback 밖이면 *config validate 통과를 위해 필수*.
 # 기본값은 tls_required=true 이며 Secure cookie + HSTS 를 전제로 한다.
 # Quickstart 는 신뢰된 네트워크의 평문 HTTP 검증 경로이므로 명시적으로 false.

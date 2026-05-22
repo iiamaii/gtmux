@@ -19,7 +19,8 @@
 //! never trusted on its own. SVG falls back to a lightweight text-shape
 //! check (must start with `<?xml` or `<svg`).
 //!
-//! Size cap: 20 MiB (handover §3 MVP). Enforced by a route-scoped
+//! Size cap: configurable via `Config.assets.max_size_bytes` (default 50 MiB).
+//! Enforced by a route-scoped
 //! [`axum::extract::DefaultBodyLimit`] *and* a defensive recount inside the
 //! handler (axum's limit is best-effort against chunked uploads). Over-cap
 //! → 413.
@@ -46,8 +47,8 @@ use tracing::warn;
 
 use crate::{AppState, WorkspaceManager};
 
-/// 20 MiB cap — 0080 §3 MVP. Image + document share the ceiling.
-pub(crate) const ASSET_MAX_BYTES: usize = 20 * 1024 * 1024;
+/// Multipart framing headroom added on top of configured asset byte limit.
+pub(crate) const ASSET_MULTIPART_HEADROOM_BYTES: usize = 1024 * 1024;
 
 /// Stored asset filename = 64 lowercase hex characters of sha256(bytes).
 const ASSET_ID_HEX_LEN: usize = 64;
@@ -90,6 +91,7 @@ pub async fn upload_handler(State(state): State<AppState>, mut multipart: Multip
         )
             .into_response();
     };
+    let max_size_bytes = state.config.assets.max_size_bytes;
 
     let mut file_bytes: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
@@ -125,7 +127,7 @@ pub async fn upload_handler(State(state): State<AppState>, mut multipart: Multip
                 file_name = field.file_name().map(|s| s.to_string());
                 match field.bytes().await {
                     Ok(b) => {
-                        if b.len() > ASSET_MAX_BYTES {
+                        if b.len() as u64 > max_size_bytes {
                             return (
                                 StatusCode::PAYLOAD_TOO_LARGE,
                                 Json(json!({ "error": "payload_too_large" })),
@@ -223,6 +225,7 @@ pub async fn upload_from_path_handler(
         )
             .into_response();
     };
+    let max_size_bytes = state.config.assets.max_size_bytes;
 
     let kind = match req.kind.as_str() {
         "image" => AssetKind::Image,
@@ -292,7 +295,7 @@ pub async fn upload_from_path_handler(
                 .into_response();
         }
     };
-    if meta.len() > ASSET_MAX_BYTES as u64 {
+    if meta.len() > max_size_bytes {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(json!({ "error": "payload_too_large" })),
