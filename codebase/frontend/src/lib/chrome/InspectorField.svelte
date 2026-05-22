@@ -138,11 +138,11 @@
     border-color: var(--color-accent);
   }
 
-  /* Fixed-width — display-row 의 .k 와 동일 (56px). 모든 row 의 value
-   * 시작 x 정렬. */
+  /* Fixed-width — display-row 의 .k 와 동일 (56px). 2-column geometry rows 는
+   * parent 가 --inspector-k-w 를 줄여 numeric value 영역을 확보한다. */
   .inspector-input .k {
-    flex: 0 0 56px;
-    width: 56px;
+    flex: 0 0 var(--inspector-k-w, 56px);
+    width: var(--inspector-k-w, 56px);
     color: var(--color-fg-muted);
     text-transform: uppercase;
     font-size: 10px;
@@ -155,6 +155,7 @@
     min-width: 0;
     width: 100%;
     height: 100%;
+    box-sizing: border-box;
     padding: 0;
     margin: 0;
     background: transparent;
@@ -195,5 +196,6 @@
   .field[type='number'] {
     -moz-appearance: textfield;
     appearance: textfield;
+    font-variant-numeric: tabular-nums;
   }
 </style>

@@ -139,6 +139,7 @@ mod tests {
             frontend_dist: None,
             workspace_path: None,
             auth: gtmux_config::AuthConfig::default(),
+            assets: gtmux_config::AssetsConfig::default(),
         };
         let state = AppState::new(cfg, token.clone());
         (state, token)

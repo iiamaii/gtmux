@@ -42,8 +42,8 @@ use gtmux_config::{derive_mode, load_with_overrides as load_config, Config, Mode
 use gtmux_pty_backend::PtyBackend;
 use gtmux_ws_server::Hub;
 use state_files::{
-    check_pidfile_liveness, pidfile_path_for, stop_server, write_pidfile, PidLiveness,
-    StateFileError, StopOutcome, TeardownOpts, TeardownReport,
+    check_pidfile_liveness, config_path_for, pidfile_path_for, stop_server, write_pidfile,
+    PidLiveness, StateFileError, StopOutcome, TeardownOpts, TeardownReport,
 };
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
@@ -269,8 +269,28 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //    fails when the TOML omits `[server].port` because the sentinel 0 dies
     //    in `validate()` before the CLI ever gets a chance to speak. `bind`
     //    is intentionally not overridable here (security mode D22 flips on it).
-    let config = load_config(args.config_path.as_deref(), &args.session, args.port)
-        .context("loading gtmux config")?;
+    let default_config_path = if args.config_path.is_none() {
+        match config_path_for(&args.session) {
+            Ok(path) if path.exists() => Some(path),
+            Ok(_) => None,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    session = %args.session,
+                    "default config path resolution failed; continuing with CLI/env/default config"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let config_path = args
+        .config_path
+        .as_deref()
+        .or(default_config_path.as_deref());
+    let config =
+        load_config(config_path, &args.session, args.port).context("loading gtmux config")?;
 
     // 2a) pidfile liveness — refuse duplicate server bind on the same session
     //     before we go anywhere near tmux. ADR-0007 D2's 1:1:1 invariant

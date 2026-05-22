@@ -103,6 +103,9 @@ pub struct Config {
     /// `token` mode, 7d rolling, rate limit 5/5min.
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Asset upload/storage limits. 생략 시 default — asset 1개당 50 MiB.
+    #[serde(default)]
+    pub assets: AssetsConfig,
 }
 
 /// `[server]` 섹션 — Server identity 영역.
@@ -190,6 +193,28 @@ impl Default for AuthConfig {
             mode: default_auth_mode(),
             cookie_max_age_days: default_cookie_max_age_days(),
             rate_limit_per_5min: default_rate_limit_per_5min(),
+        }
+    }
+}
+
+/// `[assets]` 섹션 — 서버 측 asset 저장 제한.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetsConfig {
+    /// Asset 1개당 최대 byte 수. Default: 50 MiB.
+    #[serde(default = "default_asset_max_size_bytes")]
+    pub max_size_bytes: u64,
+}
+
+/// Asset 1개당 기본 상한: 50 MiB.
+pub fn default_asset_max_size_bytes() -> u64 {
+    50 * 1024 * 1024
+}
+
+impl Default for AssetsConfig {
+    fn default() -> Self {
+        Self {
+            max_size_bytes: default_asset_max_size_bytes(),
         }
     }
 }
@@ -300,6 +325,7 @@ pub fn load_with_overrides(
         frontend_dist: None,
         workspace_path: None,
         auth: AuthConfig::default(),
+        assets: AssetsConfig::default(),
     };
 
     let mut figment = Figment::from(Serialized::defaults(defaults));
@@ -374,6 +400,10 @@ cors_origins   = []
 # Host 헤더 화이트리스트.
 host_allowlist = []
 
+[assets]
+# Asset 1개당 최대 저장 크기. 기본값은 50 MiB.
+max_size_bytes = 52428800
+
 # [cloud] — bind가 loopback/unix가 아닐 때만 활성화한다.
 # 기본 true. 신뢰된 네트워크에서 평문 HTTP 로 실행해야 할 때만 false.
 # tls_required = true
@@ -399,6 +429,7 @@ struct DefaultsSeed {
     frontend_dist: Option<std::path::PathBuf>,
     workspace_path: Option<std::path::PathBuf>,
     auth: AuthConfig,
+    assets: AssetsConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -449,6 +480,12 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
     if cfg.server.bind.trim().is_empty() {
         return Err(ConfigError::Validation(
             "server.bind must be non-empty".to_string(),
+        ));
+    }
+
+    if cfg.assets.max_size_bytes == 0 {
+        return Err(ConfigError::Validation(
+            "assets.max_size_bytes must be greater than 0".to_string(),
         ));
     }
 

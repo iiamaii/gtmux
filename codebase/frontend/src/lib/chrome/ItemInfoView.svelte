@@ -1616,6 +1616,13 @@
     grid-template-columns: 1fr;
   }
 
+  /* 2-column numeric rows are narrow inside the right inspector. Keep the
+     full 56px label column for full-width rows, but compact X/Y/W/H/X2/Y2
+     labels so negative and large coordinate values retain readable space. */
+  .prop-row:not(.full) > :global(.inspector-input) {
+    --inspector-k-w: 18px;
+  }
+
   /* Read-only display row — InspectorField 의 시각 (.inspector-input) 과 정합. */
   .display-row {
     display: flex;

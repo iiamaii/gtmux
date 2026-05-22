@@ -78,6 +78,7 @@ mod tests {
             frontend_dist: None,
             workspace_path: None,
             auth: gtmux_config::AuthConfig::default(),
+            assets: gtmux_config::AssetsConfig::default(),
         };
         let dir = tempfile::TempDir::new().unwrap();
         let wm = WorkspaceManager::from_path(dir.path().to_path_buf()).unwrap();
