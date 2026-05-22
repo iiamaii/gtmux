@@ -518,12 +518,76 @@
   function onBodyWheel(e: WheelEvent): void {
     e.stopPropagation();
   }
+
+  /**
+   * ADR-0018 D10 amend ⑧ 보강 (2026-05-22) — drag 중 iframe pointer-events
+   * 차단의 *reactive bypass*. 기존 `class:drag-isolated={dragging}` 는 Svelte
+   * 5 reactive 흐름 (dragging=true → effect → DOM attr → repaint) 의 frame
+   * 갭에서 빠른 mousemove 가 iframe 위 도달하면 capture 회귀.
+   *
+   * **Trigger 두 path** (둘 다 같은 `isolateIframes` 호출):
+   * 1. **자체 panel 내부에서 pointerdown** (`onRootPointerDownCapture`):
+   *    self drag (header drag / resize handle 등) 시작 시 즉시 차단.
+   * 2. **다른 source 의 pointerdown** (window-level capture-phase listener):
+   *    다른 component (NoteNode / PanelNode / ShapeNode 등) 의 drag 시작
+   *    시에도 자체 PDF iframe 차단. 다른 panel drag 중 mouse 가 본 PDF
+   *    위 통과 시 PDF plugin 이 mouse capture → 그 다른 panel 의 drag 가
+   *    멈춰버림 의 회귀 (#drag-cross-component-capture) 차단.
+   *
+   * **Early return** (사용자 interact 의도 보호):
+   * - `e.target` 이 iframe 자체 → 사용자가 그 iframe 안 클릭 / scroll / etc.
+   * - self panel 안 pointerdown (window listener 한정) → `onRootPointerDownCapture`
+   *   가 이미 처리, 중복 회피.
+   */
+  function isolateLocalIframes(root: HTMLElement): void {
+    const iframes = root.querySelectorAll<HTMLIFrameElement>(
+      'iframe.doc-iframe, iframe.doc-pdf',
+    );
+    if (iframes.length === 0) return;
+    iframes.forEach((f) => {
+      f.style.pointerEvents = 'none';
+    });
+    function restore(): void {
+      iframes.forEach((f) => {
+        f.style.pointerEvents = '';
+      });
+      window.removeEventListener('pointerup', restore, true);
+      window.removeEventListener('pointercancel', restore, true);
+    }
+    window.addEventListener('pointerup', restore, { capture: true, once: true });
+    window.addEventListener('pointercancel', restore, { capture: true, once: true });
+  }
+
+  let rootEl = $state<HTMLDivElement | null>(null);
+
+  function onRootPointerDownCapture(e: PointerEvent): void {
+    if (e.target instanceof HTMLIFrameElement) return;
+    isolateLocalIframes(e.currentTarget as HTMLElement);
+  }
+
+  /** 다른 component 의 drag 가 시작될 때도 자체 iframe 차단 — window
+   *  capture-phase listener. self panel 안 pointerdown 은 root.contains 으로
+   *  early return (자체 onpointerdowncapture 가 처리, 중복 회피). */
+  $effect(() => {
+    if (rootEl === null) return;
+    const root = rootEl;
+    function onWindowPointerDown(e: PointerEvent): void {
+      if (e.target instanceof Node && root.contains(e.target)) return;
+      if (e.target instanceof HTMLIFrameElement) return;
+      isolateLocalIframes(root);
+    }
+    window.addEventListener('pointerdown', onWindowPointerDown, { capture: true });
+    return () => {
+      window.removeEventListener('pointerdown', onWindowPointerDown, true);
+    };
+  });
 </script>
 
 {#if isVisible}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
+    bind:this={rootEl}
     class="document-node shape-document"
     class:m-single={isSingleM}
     class:m-multi={isMultiM}
@@ -534,6 +598,7 @@
     role="article"
     aria-label={`Document ${documentTitle}`}
     onclick={data.minimized !== true && isEmpty ? onRootClick : undefined}
+    onpointerdowncapture={onRootPointerDownCapture}
   >
     <NodeResizer
       nodeId={data.id}
