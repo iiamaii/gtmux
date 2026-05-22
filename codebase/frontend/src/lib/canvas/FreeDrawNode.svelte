@@ -81,6 +81,9 @@
       preserveAspectRatio="none"
       aria-hidden="true"
     >
+      <!-- ADR-0005 D10 — vector-effect=non-scaling-stroke. drag-resize 중
+           viewBox stale 의 stroke stretch 회피 (free_draw 는 현 단계 resize
+           미지원이라 즉시 효과 없지만, 후속 P2 resize 도입 시 미리 정합). -->
       <path
         d={localPath}
         fill="none"
@@ -88,6 +91,7 @@
         stroke-width={data.stroke_width}
         stroke-linecap="round"
         stroke-linejoin="round"
+        vector-effect="non-scaling-stroke"
       />
     </svg>
   </div>

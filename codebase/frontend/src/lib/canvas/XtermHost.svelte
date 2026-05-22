@@ -64,6 +64,28 @@
   const synthSet = new WeakSet<Event>();
   const MOUSE_TYPES = ['mousedown', 'mousemove', 'mouseup', 'click', 'contextmenu', 'dblclick'] as const;
 
+  function isTerminalCopyShortcut(e: KeyboardEvent): boolean {
+    return (e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'c';
+  }
+
+  async function copyTextToClipboard(text: string): Promise<void> {
+    if (text.length === 0) return;
+    if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+      return;
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', 'true');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    textarea.remove();
+  }
+
   function relayMouse(e: MouseEvent): void {
     if (synthSet.has(e)) return;
     if (!containerEl) return;
@@ -160,6 +182,23 @@
     for (const type of MOUSE_TYPES) {
       containerEl.addEventListener(type, relayMouse, { capture: true });
     }
+
+    function onTerminalKeyDown(e: KeyboardEvent): void {
+      if (!isTerminalCopyShortcut(e)) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const selectedText = term.getSelection();
+      if (selectedText.length > 0) {
+        void copyTextToClipboard(selectedText).catch((err) => {
+          console.debug('[gtmux] terminal copy failed', err);
+        });
+      }
+    }
+
+    // Ctrl/Cmd+Shift+C conflicts with browser DevTools inspect shortcuts.
+    // Scope the interception to xterm only, then copy xterm's internal
+    // selection instead of letting the browser default action run.
+    containerEl.addEventListener('keydown', onTerminalKeyDown, { capture: true });
 
     // PaneOut 등록 — WS dispatcher 가 이 paneId 로 도착한 PANE_OUT(0x02) 을 본
     // 핸들러로 라우팅. `cb` 는 R2 F4 백프레셔 watermark 갱신 콜백 (term.write 가
@@ -284,6 +323,7 @@
         for (const type of MOUSE_TYPES) {
           containerEl.removeEventListener(type, relayMouse, { capture: true });
         }
+        containerEl.removeEventListener('keydown', onTerminalKeyDown, { capture: true });
       }
       termRef = null;
       term.dispose();

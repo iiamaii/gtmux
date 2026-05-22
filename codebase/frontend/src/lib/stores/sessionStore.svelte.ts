@@ -204,6 +204,41 @@ class SessionStore {
   }
 
   /**
+   * Active session 의 layout 을 BE 에서 fresh GET 으로 다시 받아 store 동기.
+   *
+   * 용도 (2026-05-22, 사용자 보고 #upload-canvas-desync) — image/document
+   * upload 후 *드물게* canvas 에 신규 item 이 안 보이는 회귀 (browser refresh
+   * 시 보임). applyMutation 의 PUT 응답 + loadLayout 흐름이 어떤 race 로
+   * store 에 미반영. 본 helper 가 caller 가 명시적으로 호출하면 *narrow
+   * equivalent of browser refresh* — WS / 다른 ephemeral state 보존하면서
+   * layout 만 fresh sync. workaround layer (root cause trace 는 별 작업).
+   *
+   * 정책 = *silent best-effort*: 실패 시 toast 안 띄움 (caller 의 본 호출이
+   * defensive 라 실패해도 functional). 호출 시점에 active === null 이면 noop.
+   * Returns true on success, false otherwise.
+   */
+  async reloadActiveLayout(): Promise<boolean> {
+    const active = this.active;
+    if (active === null) return false;
+    try {
+      const res = await fetch(
+        `/api/sessions/${encodeURIComponent(active.name)}/layout`,
+        {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          credentials: 'include',
+        },
+      );
+      if (!res.ok) return false;
+      const layout = (await res.json()) as CanvasLayout;
+      this.loadLayout(layout);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Session attach 진입. Stage 2~3 의 attach handler 가 호출 — 본 skeleton
    * 은 state set 만 (실 HTTP/WS 통합은 후속).
    *

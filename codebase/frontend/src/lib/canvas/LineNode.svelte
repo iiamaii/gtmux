@@ -228,7 +228,9 @@
       preserveAspectRatio="none"
       aria-hidden="true"
     >
-      <!-- Visible stroke — pointer-events:none, hit-target line 이 catch. -->
+      <!-- Visible stroke — pointer-events:none, hit-target line 이 catch.
+           ADR-0005 D10 — vector-effect=non-scaling-stroke. drag-resize 중
+           viewBox stale 의 stroke stretch 회피. -->
       <line
         x1={startX}
         y1={startY}
@@ -238,12 +240,15 @@
         stroke-width={data.stroke_width}
         stroke-dasharray={svgDashArray}
         stroke-linecap="round"
+        vector-effect="non-scaling-stroke"
         pointer-events="none"
       />
       <!--
         Invisible hit-target — line 근처에서만 click / cursor 변경. SVG
         `pointer-events="stroke"` 는 paint 의 가시 여부와 무관하게 stroke
-        geometry 안의 hit 를 catch. transparent paint 라 시각 없음.
+        geometry 안의 hit 를 catch. transparent paint 라 시각 없음. hit zone
+        의 user-units 안정 보장 위해 non-scaling-stroke 적용 (drag 중에도
+        24px hit band 유지).
       -->
       <line
         x1={startX}
@@ -253,6 +258,7 @@
         stroke="transparent"
         stroke-width={hitStrokeWidth}
         stroke-linecap="round"
+        vector-effect="non-scaling-stroke"
         pointer-events="stroke"
         class="line-hit"
       />

@@ -1,6 +1,6 @@
 <script lang="ts">
-  // MaximizedItemModal — workspace 전체 (canvas + side panels + ViewportCtrl) 를
-  // 덮는 modal overlay. sessionStore.maximizedItemId 가 null 이면 렌더링 X.
+  // MaximizedItemModal — workspace 전체를 최상단에서 덮는 modal overlay.
+  // sessionStore.maximizedItemId 가 null 이면 렌더링 X.
   //
   // 설계 정합:
   // - in-flow PanelNode / NoteNode / DocumentNode 는 그대로 마운트 유지. modal 의 XtermHost 는
@@ -140,6 +140,15 @@
     const mime = (item.mime ?? '').toLowerCase();
     return mime.startsWith('text/') || mime === 'application/json';
   });
+  /** ADR-0018 D10 amend ⑦ — PDF asset 은 browser-native PDF viewer iframe. */
+  const isDocumentPdf = $derived(
+    item?.type === 'document'
+    && documentFileTypeLabel === 'pdf'
+    && (item.asset_id ?? '').length > 0,
+  );
+  const documentPdfSrc = $derived(
+    isDocumentPdf && item?.type === 'document' ? `/api/assets/${item.asset_id}` : '',
+  );
 
   // svelte-flow 의 selection 변경이 item prop 의 reactive proxy 를 새 ref 로
   // 갱신할 때 effect 의 dependency 가 invalidate → fetch 재시작 blink 회피.
@@ -234,9 +243,10 @@
     sessionStore.unmaximize();
   }
 
-  function onBackdropClick(e: MouseEvent): void {
+  function blockBackdropEvent(e: Event): void {
     if (e.target !== e.currentTarget) return;
-    sessionStore.unmaximize();
+    e.preventDefault();
+    e.stopPropagation();
   }
 
   function onKeyDown(e: KeyboardEvent): void {
@@ -286,7 +296,14 @@
     aria-modal="true"
     aria-label="Maximized item"
     tabindex="-1"
-    onclick={onBackdropClick}
+    onpointerdown={blockBackdropEvent}
+    onpointerup={blockBackdropEvent}
+    onmousedown={blockBackdropEvent}
+    onmouseup={blockBackdropEvent}
+    onclick={blockBackdropEvent}
+    ondblclick={blockBackdropEvent}
+    oncontextmenu={blockBackdropEvent}
+    onwheel={blockBackdropEvent}
   >
     <div
       class="max-card"
@@ -442,7 +459,18 @@
           </div>
         {:else if isDocument && item.type === 'document'}
           <article class="document-body-host nowheel" onwheel={(e) => e.stopPropagation()}>
-            {#if item.asset_id && documentAssetLoading}
+            {#if isDocumentPdf}
+              <!-- ADR-0018 D10 amend ⑦ — PDF iframe (browser-native viewer).
+                   sandbox 미지정: PDF plugin 의 same-origin 요구. -->
+              <!-- svelte-ignore a11y_missing_attribute -->
+              <iframe
+                class="document-pdf"
+                src={documentPdfSrc}
+                title={item.file_name}
+                referrerpolicy="no-referrer"
+                loading="lazy"
+              ></iframe>
+            {:else if item.asset_id && documentAssetLoading}
               <div class="document-empty">Loading preview…</div>
             {:else if item.asset_id && !canPreviewDocumentAsset}
               <div class="document-asset-summary">
@@ -798,6 +826,23 @@
   }
   .document-body-host:has(.document-iframe) .document-eyebrow {
     display: none;
+  }
+
+  /* ADR-0018 D10 amend ⑦ (2026-05-22) — PDF iframe (browser-native viewer).
+     interactive HTML iframe 과 달리 height auto-fit 안 함 — PDF plugin 의
+     internal scroll + multi-page nav 사용. host 100% 채우고 padding 제거. */
+  .document-pdf {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: #ffffff;
+  }
+  .document-body-host:has(.document-pdf) {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
 
   .document-asset-summary h1 {

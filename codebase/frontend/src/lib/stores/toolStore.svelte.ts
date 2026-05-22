@@ -58,6 +58,12 @@ class ToolStore {
    * Locked 또는 sticky mode 면 no-op.
    * Stage 5 의 creation gesture 종료 시 (panel mount / shape commit / text
    * commit 등) caller 가 호출.
+   *
+   * **Async creation 의 timing** (2026-05-22): file picker / uploadAsset 등
+   * long-running async 의 creation 분기는 await *완료 후* consume 한다 —
+   * tool 의 활성 상태가 사용자에게 *시각 단서* 로 유지되어야 한다는 UX
+   * 정합 (toolbar 의 활성 아이콘 = "지금 입력 중") 때문. picker 중복 open
+   * 의 회귀는 `lib/files/localFilePicker.ts` 의 reentrant guard 가 책임.
    */
   consume(): void {
     if (this.locked) return;

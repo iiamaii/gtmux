@@ -17,6 +17,14 @@
   // 2026-05-20 figure UX 정리: rect/ellipse/line/free 는 canvas X 버튼 미제공
   // (Backspace / Cmd+Delete / ContextMenu 의 Delete 로만 제거 — sketching 도구
   // 의 일관된 axis-aligned 시각).
+  //
+  // ADR-0005 D10 (2026-05-22) — `vector-effect="non-scaling-stroke"` 필수.
+  // 이유: drag-resize 중 svelte state (`data.w`/`data.h`) 는 onResizeEnd 까지
+  // 갱신 X — viewBox 는 stale + SVG element 는 wrapper 의 새 크기 채움 +
+  // preserveAspectRatio="none" → viewBox 내용물이 stretch → stroke 가 비례
+  // 따라 두꺼워짐/얇아짐. non-scaling-stroke 가 stroke 의 paint width 를
+  // viewport / transform 무관하게 user units 고정 → drag 중에도 안정. dash
+  // pattern 도 stretch 안 됨 (부수 개선).
 
   import { NodeResizer } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
@@ -193,6 +201,7 @@
           stroke={svgStroke}
           stroke-width={svgStrokeWidth}
           stroke-dasharray={svgDashArray}
+          vector-effect="non-scaling-stroke"
           pointer-events={svgPointerEvents}
         />
         {#if needsBorderHitTarget}
@@ -205,6 +214,7 @@
             fill="none"
             stroke="transparent"
             stroke-width={hitStrokeWidth}
+            vector-effect="non-scaling-stroke"
             pointer-events="stroke"
             class="shape-hit"
           />
@@ -221,6 +231,7 @@
           stroke={svgStroke}
           stroke-width={svgStrokeWidth}
           stroke-dasharray={svgDashArray}
+          vector-effect="non-scaling-stroke"
           pointer-events={svgPointerEvents}
         />
         {#if needsBorderHitTarget}
@@ -235,6 +246,7 @@
             fill="none"
             stroke="transparent"
             stroke-width={hitStrokeWidth}
+            vector-effect="non-scaling-stroke"
             pointer-events="stroke"
             class="shape-hit"
           />
