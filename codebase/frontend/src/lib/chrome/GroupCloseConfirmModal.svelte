@@ -155,8 +155,11 @@
     const mirroredCount = mirroredTerminals.length;
     committing = true;
     try {
-      // Kill terminals first — fan out, swallow individual failures so
-      // a single 404 (already dead) doesn't block the rest.
+      const ok = await pruneLayout();
+      if (!ok) return;
+
+      // Kill terminals after pruning the canvas layout so the visual removal is
+      // immediate; terminal pool refresh follows once process cleanup settles.
       const results = await Promise.allSettled(killIds.map((id) => killTerminal(id)));
       const rejected = results.filter((r) => r.status === 'rejected');
       if (rejected.length > 0) {
@@ -169,9 +172,6 @@
           return;
         }
       }
-
-      const ok = await pruneLayout();
-      if (!ok) return;
 
       // PanelNode.performClose 와 동일 — kill 결과를 toast 전에 await 으로 반영해
       // sidebar 의 stale row 노출 회피.

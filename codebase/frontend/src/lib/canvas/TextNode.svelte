@@ -208,6 +208,7 @@
             rows={1}
             selectOnFocus={data.text.length === 0}
             textAlign={textAlign}
+            commitOnEnter={true}
             onCommit={(next: string) => void onCommit(next)}
             onCancel={() => (editing = false)}
           />
