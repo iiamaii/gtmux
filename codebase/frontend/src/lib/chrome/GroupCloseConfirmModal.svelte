@@ -28,6 +28,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
+  import { settingsStore } from '$lib/stores/settings.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { killTerminal } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -35,6 +36,7 @@
   import { pruneEmptyGroups } from '$lib/types/group';
 
   let committing = $state(false);
+  let autoCommittedGroupId = $state<string | null>(null);
 
   const open = $derived(groupCloseDialog.open);
   const groupId = $derived(groupCloseDialog.groupId);
@@ -210,6 +212,18 @@
     if (!open) return;
     window.addEventListener('keydown', onWindowKey);
     return () => window.removeEventListener('keydown', onWindowKey);
+  });
+
+  $effect(() => {
+    if (!open || groupId === null) {
+      autoCommittedGroupId = null;
+      return;
+    }
+    if (!settingsStore.behavior.auto_kill_terminal_on_panel_close) return;
+    if (terminalDescendants.length === 0) return;
+    if (autoCommittedGroupId === groupId) return;
+    autoCommittedGroupId = groupId;
+    void commitWithTerminals();
   });
 
   const groupLabel = $derived(group?.label ?? (groupId !== null ? groupId.slice(0, 8) : ''));

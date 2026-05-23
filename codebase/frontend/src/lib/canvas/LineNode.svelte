@@ -323,13 +323,14 @@
 
   .endpoint {
     position: absolute;
-    width: calc(10px / var(--canvas-zoom, 1));
-    height: calc(10px / var(--canvas-zoom, 1));
+    width: var(--canvas-scaler-size, 10px);
+    height: var(--canvas-scaler-size, 10px);
     padding: 0;
-    border: calc(1.5px / var(--canvas-zoom, 1)) solid var(--color-accent);
+    border: var(--canvas-scaler-border, 1.5px) solid var(--color-accent);
     border-radius: 999px;
     background: var(--color-surface);
-    transform: translate(-50%, -50%);
+    transform: translate(-50%, -50%) scale(calc(1 / var(--canvas-zoom, 1)));
+    transform-origin: center;
     cursor: crosshair;
     pointer-events: auto;
   }
@@ -337,7 +338,7 @@
   .endpoint::before {
     content: '';
     position: absolute;
-    inset: calc(-6px / var(--canvas-zoom, 1));
+    inset: -4px;
     border-radius: 999px;
   }
 

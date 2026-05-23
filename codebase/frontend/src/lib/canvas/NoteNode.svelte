@@ -203,18 +203,8 @@
 {#if isVisible}
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div
-    class="note-node"
-    class:m-single={isInM}
-    class:locked={isLocked}
-    class:is-min={isMinimized}
+    class="note-node-shell"
     style="width: 100%; height: 100%; --note-accent: {data.color};"
-    role={isMinimized ? 'button' : 'group'}
-    aria-label={isMinimized ? `Restore note ${data.title || 'Untitled'}` : `Note ${data.title || 'Untitled'}`}
-    onclick={isMinimized ? onChipClick : undefined}
-    onkeydown={isMinimized ? (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') onChipClick(e as unknown as MouseEvent); } : undefined}
-    ondblclick={isMinimized ? undefined : onContentDblClick}
-    tabindex={isMinimized ? 0 : -1}
-    title={isMinimized ? `${data.title || 'Untitled'} — click to restore` : undefined}
   >
     <NodeResizer
       nodeId={data.id}
@@ -227,7 +217,21 @@
       {onResizeEnd}
     />
 
-    <div class="note-head">
+    <div
+      class="note-node"
+      class:m-single={isInM}
+      class:locked={isLocked}
+      class:is-min={isMinimized}
+      style="width: 100%; height: 100%;"
+      role={isMinimized ? 'button' : 'group'}
+      aria-label={isMinimized ? `Restore note ${data.title || 'Untitled'}` : `Note ${data.title || 'Untitled'}`}
+      onclick={isMinimized ? onChipClick : undefined}
+      onkeydown={isMinimized ? (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') onChipClick(e as unknown as MouseEvent); } : undefined}
+      ondblclick={isMinimized ? undefined : onContentDblClick}
+      tabindex={isMinimized ? 0 : -1}
+      title={isMinimized ? `${data.title || 'Untitled'} — click to restore` : undefined}
+    >
+      <div class="note-head">
       <svg class="note-glyph" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
         <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
         <path d="M3.6 5.2h4.8"/>
@@ -302,7 +306,7 @@
       {/if}
     </div>
 
-    <div class="note-body-wrap" role="presentation">
+      <div class="note-body-wrap" role="presentation">
       {#if bodyEditing}
         <InlineEditTextarea
           value={data.body}
@@ -319,21 +323,26 @@
       {:else}
         <pre class="note-body">{data.body}</pre>
       {/if}
-    </div>
+      </div>
 
-    <!-- 32×32 chip 모드 시 표시되는 speech-bubble glyph (note-head/body 는 hide). -->
-    <svg class="note-chip" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-      <path d="M2 3h10v6.4H7L4.5 12V9.4H2z"/>
-      <path d="M4.4 6h5.2"/>
-    </svg>
+      <!-- 32×32 chip 모드 시 표시되는 speech-bubble glyph (note-head/body 는 hide). -->
+      <svg class="note-chip" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+        <path d="M2 3h10v6.4H7L4.5 12V9.4H2z"/>
+        <path d="M4.4 6h5.2"/>
+      </svg>
+    </div>
   </div>
 {/if}
 
 <style>
-  /* ref/frontend-design/components-v5 §01 — Note.
-     overflow: visible — NodeResizer 의 corner handle 이 .note-node 의 edge 를
-     negative offset 으로 넘어가도 clip 되지 않게. content 의 corner-radius
-     clip 은 .note-card 내부 wrapper 가 책임. */
+  .note-node-shell {
+    box-sizing: border-box;
+    position: relative;
+    overflow: visible;
+  }
+
+  /* ref/frontend-design/components-v5 §01 — Note. NodeResizer 는 padding/border 가
+     있는 visual node 밖 shell 에 위치시켜 bbox corner 와 scaler 기준점을 일치. */
   .note-node {
     box-sizing: border-box;
     background: var(--color-surface);

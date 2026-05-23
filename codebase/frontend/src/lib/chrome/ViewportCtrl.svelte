@@ -12,7 +12,7 @@
    *   - 100%  / current zoom label (click → reset to 1.0)
    *   - + Zoom in
    *   - ⊟ Fit (fitView)
-   *   - ⊙ Focus selection — 선택된 item(들) 의 union BBox 로 viewport 이동.
+   *   - ⊙ Focus selection — 선택된 item/group 의 union BBox 로 viewport 이동.
    *     M.size === 0 일 때 disabled.
    *   - M:N  current Manipulation Selection count badge (live)
    */
@@ -72,8 +72,8 @@
   <button
     type="button"
     class="vp-btn"
-    aria-label={mCount > 1 ? `Focus ${mCount} selected items` : 'Focus selected item'}
-    title={mCount === 0 ? 'Focus selection (select item first)' : mCount > 1 ? `Focus ${mCount} selected — viewport fits all` : 'Focus selected — viewport fits item'}
+    aria-label={mCount > 1 ? `Focus ${mCount} selected elements` : 'Focus selected element'}
+    title={mCount === 0 ? 'Focus selection (select item or group first)' : mCount > 1 ? `Focus ${mCount} selected — viewport fits all` : 'Focus selected — viewport fits selection'}
     disabled={mCount === 0}
     onclick={onFocusSelection}
   >

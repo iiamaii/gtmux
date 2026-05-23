@@ -51,6 +51,8 @@
 
   let {
     data,
+    width,
+    height,
   }: {
     data: ShapeNodeData;
     id?: string;
@@ -72,6 +74,8 @@
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const isEllipse = $derived(data.type === 'ellipse');
+  const liveW = $derived(width ?? data.w);
+  const liveH = $derived(height ?? data.h);
 
   // ADR-0018 D4 amend ① — fill/stroke on-off + dash.
   const fillEnabled = $derived(data.fill_enabled !== false);
@@ -101,7 +105,7 @@
   // ellipse 는 SVG <ellipse> 가 native 라 corner_radius 무관.
   const cornerRadius = $derived.by(() => {
     if (data.type !== 'rect' || data.corner_rounded !== true) return 0;
-    const base = Math.min(data.w, data.h) * 0.15;
+    const base = Math.min(liveW, liveH) * 0.15;
     return Math.max(4, Math.min(16, base));
   });
 
@@ -187,16 +191,16 @@
       class="shape-svg"
       width="100%"
       height="100%"
-      viewBox={`0 0 ${data.w} ${data.h}`}
+      viewBox={`0 0 ${liveW} ${liveH}`}
       preserveAspectRatio="none"
       aria-hidden="true"
     >
       {#if isEllipse}
         <ellipse
-          cx={data.w / 2}
-          cy={data.h / 2}
-          rx={Math.max(0, data.w / 2 - inset)}
-          ry={Math.max(0, data.h / 2 - inset)}
+          cx={liveW / 2}
+          cy={liveH / 2}
+          rx={Math.max(0, liveW / 2 - inset)}
+          ry={Math.max(0, liveH / 2 - inset)}
           fill={svgFill}
           stroke={svgStroke}
           stroke-width={svgStrokeWidth}
@@ -207,10 +211,10 @@
         {#if needsBorderHitTarget}
           <!-- Invisible thick hit-target — fill-off ellipse 의 border 클릭 영역 확대. -->
           <ellipse
-            cx={data.w / 2}
-            cy={data.h / 2}
-            rx={Math.max(0, data.w / 2 - inset)}
-            ry={Math.max(0, data.h / 2 - inset)}
+            cx={liveW / 2}
+            cy={liveH / 2}
+            rx={Math.max(0, liveW / 2 - inset)}
+            ry={Math.max(0, liveH / 2 - inset)}
             fill="none"
             stroke="transparent"
             stroke-width={hitStrokeWidth}
@@ -223,8 +227,8 @@
         <rect
           x={inset}
           y={inset}
-          width={Math.max(0, data.w - inset * 2)}
-          height={Math.max(0, data.h - inset * 2)}
+          width={Math.max(0, liveW - inset * 2)}
+          height={Math.max(0, liveH - inset * 2)}
           rx={cornerRadius}
           ry={cornerRadius}
           fill={svgFill}
@@ -239,8 +243,8 @@
           <rect
             x={inset}
             y={inset}
-            width={Math.max(0, data.w - inset * 2)}
-            height={Math.max(0, data.h - inset * 2)}
+            width={Math.max(0, liveW - inset * 2)}
+            height={Math.max(0, liveH - inset * 2)}
             rx={cornerRadius}
             ry={cornerRadius}
             fill="none"
