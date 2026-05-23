@@ -843,8 +843,10 @@
      line 은 wrapper selection 의 box-shadow (1.5px accent) 와 시각 중복 — 비활성.
      edge resize 는 cursor 만 표시되고 line 은 그리지 않음. */
   :global(.panel-resize-handle) {
-    background: var(--color-bg) !important;
-    border: 1.5px solid var(--color-accent) !important;
+    background: transparent !important;
+    border-color: transparent !important;
+    border-width: 1.5px !important;
+    border-style: solid !important;
     width: 7px !important;
     height: 7px !important;
     border-radius: 1px !important;
@@ -852,6 +854,21 @@
        context 안에서 handle 위로 그려져 하단 corner 가 가려지던 회귀
        (2026-05-17 사용자 보고). 명시 z-index 로 handle 을 항상 위에. */
     z-index: 10 !important;
+  }
+  :global(.panel-resize-handle::after) {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: var(--canvas-scaler-size, 10px);
+    height: var(--canvas-scaler-size, 10px);
+    box-sizing: border-box;
+    background: var(--color-bg);
+    border: var(--canvas-scaler-border, 1.5px) solid var(--color-accent);
+    border-radius: 1px;
+    pointer-events: none;
+    transform: translate(-50%, -50%) scale(min(1, calc(1 / var(--canvas-zoom, 1))));
+    transform-origin: center;
   }
   :global(.panel-resize-line) {
     border-color: transparent !important;

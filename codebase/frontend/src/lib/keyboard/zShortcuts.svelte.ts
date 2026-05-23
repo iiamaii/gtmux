@@ -1,10 +1,10 @@
 // zShortcuts — Z-index keyboard shortcuts (ADR-0024 D2).
 //
 // Matrix (Figma / 일반 디자인 툴 컨벤션):
-//   [          → bringForward     (z 한 칸 위)
-//   ]          → sendBackward     (z 한 칸 아래)
-//   Shift + [  → bringToFront     (z = max + 1)
-//   Shift + ]  → sendToBack       (z = min - 1)
+//   ]          → bringForward     (z 한 칸 위)
+//   [          → sendBackward     (z 한 칸 아래)
+//   Shift + ]  → bringToFront     (z = max + 1)
+//   Shift + [  → sendToBack       (z = min - 1)
 //
 // 동작 조건:
 //   - sessionStore.M.size >= 1 (single + multi 모두 — ADR-0024 D9 atomic block batch).
@@ -45,7 +45,7 @@ export function bindZShortcuts(): () => void {
   // 내부적으로도 noop 보장.
   unsubs.push(
     shortcutRegistry.register({
-      key: '[',
+      key: ']',
       description: 'Bring forward (z +1)',
       category: 'Z',
       handler: () =>
@@ -56,7 +56,7 @@ export function bindZShortcuts(): () => void {
   );
   unsubs.push(
     shortcutRegistry.register({
-      key: ']',
+      key: '[',
       description: 'Send backward (z −1)',
       category: 'Z',
       handler: () =>
@@ -67,7 +67,7 @@ export function bindZShortcuts(): () => void {
   );
   unsubs.push(
     shortcutRegistry.register({
-      key: '{',
+      key: '}',
       shift: true,
       description: 'Bring to front',
       category: 'Z',
@@ -79,7 +79,7 @@ export function bindZShortcuts(): () => void {
   );
   unsubs.push(
     shortcutRegistry.register({
-      key: '}',
+      key: '{',
       shift: true,
       description: 'Send to back',
       category: 'Z',

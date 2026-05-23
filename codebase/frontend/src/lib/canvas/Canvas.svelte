@@ -532,7 +532,18 @@
     hoveredCanvasGroupId = null;
   }
 
+  function isCanvasControlSurface(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    return (
+      target.closest('.svelte-flow__resize-control') !== null ||
+      target.closest('.nodrag') !== null ||
+      target.closest('.endpoint') !== null
+    );
+  }
+
   function onCanvasPointerDown(e: PointerEvent) {
+    if (isCanvasControlSurface(e.target)) return;
+
     if (e.button === 0 && isSelectMode && !isDragTool && !isSpacePressed && !isHandTool) {
       const isModifierClick = e.metaKey || e.ctrlKey;
       if (isModifierClick) {
@@ -1414,9 +1425,12 @@
    * 차지한 영역 제외) 중앙 + 가득 채움 으로 setViewport. 처리 후 1-shot clear.
    *
    * BBox: item.x/y/w/h 의 union. line 은 (x,y)~(x2,y2) 의 BBox 사용.
+   * group id 는 visible descendant item BBox union + group overlay padding.
    * padding = 12% (88% 채움). zoom 은 visible 가로/세로 중 더 작은 비율 채택,
    * [0.05, 3] clamp.
    */
+  const GROUP_FOCUS_PADDING = 8;
+
   function computeVisibleCanvas(): { x: number; y: number; w: number; h: number } {
     const root = document.querySelector('.canvas-root') as HTMLElement | null;
     if (root === null) {
@@ -1457,9 +1471,7 @@
       let maxX = -Infinity;
       let maxY = -Infinity;
       let found = 0;
-      for (const id of ids) {
-        const item = sessionStore.items.get(id);
-        if (item === undefined) continue;
+      const includeItemBox = (item: CanvasItem, padding = 0): void => {
         let bx = item.x;
         let by = item.y;
         let bw = item.w;
@@ -1472,11 +1484,34 @@
           bw = Math.abs(x2 - item.x) || 1;
           bh = Math.abs(y2 - item.y) || 1;
         }
+        bx -= padding;
+        by -= padding;
+        bw += padding * 2;
+        bh += padding * 2;
         if (bx < minX) minX = bx;
         if (by < minY) minY = by;
         if (bx + bw > maxX) maxX = bx + bw;
         if (by + bh > maxY) maxY = by + bh;
         found += 1;
+      };
+      for (const id of ids) {
+        const item = sessionStore.items.get(id);
+        if (item !== undefined) {
+          includeItemBox(item);
+          continue;
+        }
+        if (sessionStore.groups.has(id)) {
+          const groupsById = sessionGroupsById;
+          const descendants = descendantItems(
+            id,
+            [...sessionStore.groups.values()],
+            [...sessionStore.items.values()],
+          );
+          for (const descendant of descendants) {
+            if (!effectiveVisibility(descendant.visibility, descendant.parent_id, groupsById)) continue;
+            includeItemBox(descendant, GROUP_FOCUS_PADDING);
+          }
+        }
       }
       if (found === 0) {
         sessionStore.clearPendingZoom();
@@ -2392,6 +2427,8 @@
     min-height: 0;
     position: relative;
     background: var(--canvas-bg);
+    --canvas-scaler-size: 10px;
+    --canvas-scaler-border: 1.5px;
   }
 
   /* SvelteFlow 의 컨트롤 / 미니맵 / 백그라운드의 default color 를 토큰으로 override.
@@ -2426,6 +2463,37 @@
 
   .canvas-root :global(.svelte-flow__node.m-selected) {
     box-shadow: 0 0 0 calc(1.5px / var(--canvas-zoom, 1)) var(--color-accent);
+  }
+
+  .canvas-root :global(.panel-resize-handle) {
+    background: transparent !important;
+    border-color: transparent !important;
+    width: 7px !important;
+    height: 7px !important;
+    border-width: 1.5px !important;
+    border-style: solid !important;
+    border-radius: 1px !important;
+    z-index: 10 !important;
+  }
+
+  .canvas-root :global(.panel-resize-handle::after) {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: var(--canvas-scaler-size);
+    height: var(--canvas-scaler-size);
+    box-sizing: border-box;
+    background: var(--color-bg);
+    border: var(--canvas-scaler-border) solid var(--color-accent);
+    border-radius: 1px;
+    pointer-events: none;
+    transform: translate(-50%, -50%) scale(min(1, calc(1 / var(--canvas-zoom, 1))));
+    transform-origin: center;
+  }
+
+  .canvas-root :global(.panel-resize-line) {
+    border-color: transparent !important;
   }
 
   .canvas-root :global(.svelte-flow__node.is-minimized.m-selected) {

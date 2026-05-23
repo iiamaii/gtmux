@@ -820,6 +820,7 @@
     stopRowAction(e);
     const item = sessionStore.items.get(id);
     if (item === undefined) return;
+    if (inheritedHiddenFrom(item.parent_id ?? null) !== null) return;
     const nextVisibility = item.visibility === 'visible' ? 'hidden' : 'visible';
     void mutateActiveLayout((cur) => ({
       ...cur,
@@ -833,6 +834,7 @@
     stopRowAction(e);
     const item = sessionStore.items.get(id);
     if (item === undefined) return;
+    if (inheritedLockedFrom(item.parent_id ?? null) !== null) return;
     const nextLocked = item.locked !== true;
     void mutateActiveLayout((cur) => ({
       ...cur,
@@ -851,6 +853,7 @@
     stopRowAction(e);
     const group = sessionStore.groups.get(id);
     if (group === undefined) return;
+    if (inheritedHiddenFrom(group.parent_id ?? null) !== null) return;
     const nextVisibility = group.visibility === 'visible' ? 'hidden' : 'visible';
     void mutateActiveLayout((cur) => ({
       ...cur,
@@ -864,6 +867,7 @@
     stopRowAction(e);
     const group = sessionStore.groups.get(id);
     if (group === undefined) return;
+    if (inheritedLockedFrom(group.parent_id ?? null) !== null) return;
     const nextLocked = group.locked !== true;
     void mutateActiveLayout((cur) => ({
       ...cur,
@@ -950,7 +954,7 @@
               </button>
             {/if}
             {#snippet groupIcons()}
-              {@const groupInheritedHidden = g.visibility !== false ? inheritedHiddenFrom(g.parent_id ?? null) : null}
+              {@const groupInheritedHidden = inheritedHiddenFrom(g.parent_id ?? null)}
               {@const groupInheritedLocked = g.locked !== true ? inheritedLockedFrom(g.parent_id ?? null) : null}
               <span class="icons" class:has-active={g.visibility === false || g.locked === true || groupInheritedHidden !== null || groupInheritedLocked !== null}>
               <button
@@ -958,10 +962,13 @@
                 class="icon"
                 class:on={g.visibility === false}
                 class:inherited={groupInheritedHidden !== null}
+                disabled={groupInheritedHidden !== null}
                 title={groupInheritedHidden !== null
-                  ? `Hidden by ${inheritedSourceLabel(groupInheritedHidden)}`
+                  ? `Hidden by ${inheritedSourceLabel(groupInheritedHidden)}; show that group first`
                   : g.visibility === false ? 'Show group' : 'Hide group'}
-                aria-label={g.visibility === false ? 'Show group' : 'Hide group'}
+                aria-label={groupInheritedHidden !== null
+                  ? 'Hidden by ancestor group'
+                  : g.visibility === false ? 'Show group' : 'Hide group'}
                 onclick={(e: MouseEvent) => toggleGroupVisibility(node.id, e)}
               >
                 {#if g.visibility === false}
@@ -985,10 +992,13 @@
                 class="icon"
                 class:on={g.locked === true}
                 class:inherited={groupInheritedLocked !== null}
+                disabled={groupInheritedLocked !== null}
                 title={groupInheritedLocked !== null
-                  ? `Locked by ${inheritedSourceLabel(groupInheritedLocked)}`
+                  ? `Locked by ${inheritedSourceLabel(groupInheritedLocked)}; unlock that group first`
                   : g.locked === true ? 'Unlock group' : 'Lock group'}
-                aria-label={g.locked === true ? 'Unlock group' : 'Lock group'}
+                aria-label={groupInheritedLocked !== null
+                  ? 'Locked by ancestor group'
+                  : g.locked === true ? 'Unlock group' : 'Lock group'}
                 onclick={(e: MouseEvent) => toggleGroupLock(node.id, e)}
               >
                 {#if g.locked === true}
@@ -1079,7 +1089,7 @@
               </button>
             {/if}
             {#snippet panelIcons()}
-              {@const panelInheritedHidden = p.visibility !== false ? inheritedHiddenFrom(p.parent_id ?? null) : null}
+              {@const panelInheritedHidden = inheritedHiddenFrom(p.parent_id ?? null)}
               {@const panelInheritedLocked = p.locked !== true ? inheritedLockedFrom(p.parent_id ?? null) : null}
               <span class="icons" class:has-active={p.visibility === false || p.locked === true || panelInheritedHidden !== null || panelInheritedLocked !== null}>
               <button
@@ -1087,10 +1097,13 @@
                 class="icon"
                 class:on={p.visibility === false}
                 class:inherited={panelInheritedHidden !== null}
+                disabled={panelInheritedHidden !== null}
                 title={panelInheritedHidden !== null
-                  ? `Hidden by ${inheritedSourceLabel(panelInheritedHidden)}`
+                  ? `Hidden by ${inheritedSourceLabel(panelInheritedHidden)}; show that group first`
                   : p.visibility === false ? 'Show item' : 'Hide item'}
-                aria-label={p.visibility === false ? 'Show item' : 'Hide item'}
+                aria-label={panelInheritedHidden !== null
+                  ? 'Hidden by ancestor group'
+                  : p.visibility === false ? 'Show item' : 'Hide item'}
                 onclick={(e: MouseEvent) => togglePanelVisibility(node.id, e)}
               >
                 {#if p.visibility === false}
@@ -1112,10 +1125,13 @@
                 class="icon"
                 class:on={p.locked === true}
                 class:inherited={panelInheritedLocked !== null}
+                disabled={panelInheritedLocked !== null}
                 title={panelInheritedLocked !== null
-                  ? `Locked by ${inheritedSourceLabel(panelInheritedLocked)}`
+                  ? `Locked by ${inheritedSourceLabel(panelInheritedLocked)}; unlock that group first`
                   : p.locked === true ? 'Unlock item' : 'Lock item'}
-                aria-label={p.locked === true ? 'Unlock item' : 'Lock item'}
+                aria-label={panelInheritedLocked !== null
+                  ? 'Locked by ancestor group'
+                  : p.locked === true ? 'Unlock item' : 'Lock item'}
                 onclick={(e: MouseEvent) => togglePanelLock(node.id, e)}
               >
                 {#if p.locked === true}
@@ -1382,6 +1398,15 @@
   .icon:hover {
     background: var(--color-glass-2);
     color: var(--color-fg);
+  }
+
+  .icon:disabled {
+    cursor: not-allowed;
+  }
+
+  .icon:disabled:hover {
+    background: transparent;
+    color: var(--color-fg-subtle);
   }
 
   /* `.on` 상태 (visibility=false / locked=true) 강조. */

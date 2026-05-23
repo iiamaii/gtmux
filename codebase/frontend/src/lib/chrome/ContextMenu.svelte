@@ -340,6 +340,15 @@
     close();
   }
 
+  type ZBoundaryAction = 'front' | 'forward' | 'backward' | 'back';
+
+  function zBoundaryTitle(action: ZBoundaryAction): string {
+    const subject =
+      ctxMode === 'groupEntity' ? 'Group' : ctxMode === 'multi' ? 'Selection' : 'Item';
+    const direction = action === 'front' || action === 'forward' ? 'forward' : 'backward';
+    return `${subject} cannot move further ${direction} in this parent.`;
+  }
+
   /** ADR-0010 D14 + plan-0012 §3.4 D.5 — [Group] entry handler (single/multi). */
   async function onGroup(): Promise<void> {
     if (sessionStore.active === null) return;
@@ -694,6 +703,7 @@
         type="button"
         class="ctx-item"
         disabled={!zStore.canBringToFront(zTargetIds)}
+        title={!zStore.canBringToFront(zTargetIds) ? zBoundaryTitle('front') : undefined}
         onclick={onBringToFront}
       >
         <span class="label">Bring {zPrefix}to front</span>
@@ -703,6 +713,7 @@
         type="button"
         class="ctx-item"
         disabled={!zStore.canBringForward(zTargetIds)}
+        title={!zStore.canBringForward(zTargetIds) ? zBoundaryTitle('forward') : undefined}
         onclick={onBringForward}
       >
         <span class="label">Bring {zPrefix}forward</span>
@@ -712,6 +723,7 @@
         type="button"
         class="ctx-item"
         disabled={!zStore.canSendBackward(zTargetIds)}
+        title={!zStore.canSendBackward(zTargetIds) ? zBoundaryTitle('backward') : undefined}
         onclick={onSendBackward}
       >
         <span class="label">Send {zPrefix}backward</span>
@@ -721,6 +733,7 @@
         type="button"
         class="ctx-item"
         disabled={!zStore.canSendToBack(zTargetIds)}
+        title={!zStore.canSendToBack(zTargetIds) ? zBoundaryTitle('back') : undefined}
         onclick={onSendToBack}
       >
         <span class="label">Send {zPrefix}to back</span>
@@ -776,6 +789,7 @@
         type="button"
         class="ctx-item"
         disabled={!zStore.canBringToFront(zTargetIds)}
+        title={!zStore.canBringToFront(zTargetIds) ? zBoundaryTitle('front') : undefined}
         onclick={onBringToFront}
       >
         <span class="label">Bring to front</span>
@@ -785,6 +799,7 @@
         type="button"
         class="ctx-item"
         disabled={!zStore.canBringForward(zTargetIds)}
+        title={!zStore.canBringForward(zTargetIds) ? zBoundaryTitle('forward') : undefined}
         onclick={onBringForward}
       >
         <span class="label">Bring forward</span>
@@ -794,6 +809,7 @@
         type="button"
         class="ctx-item"
         disabled={!zStore.canSendBackward(zTargetIds)}
+        title={!zStore.canSendBackward(zTargetIds) ? zBoundaryTitle('backward') : undefined}
         onclick={onSendBackward}
       >
         <span class="label">Send backward</span>
@@ -803,6 +819,7 @@
         type="button"
         class="ctx-item"
         disabled={!zStore.canSendToBack(zTargetIds)}
+        title={!zStore.canSendToBack(zTargetIds) ? zBoundaryTitle('back') : undefined}
         onclick={onSendToBack}
       >
         <span class="label">Send to back</span>

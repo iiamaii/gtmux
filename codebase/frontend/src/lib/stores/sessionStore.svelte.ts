@@ -770,10 +770,10 @@ class SessionStore {
   /**
    * Pending zoom-to-selection signal. ViewportCtrl 의 focus 버튼 클릭 시 set.
    * Canvas 의 $effect 가 본 field 를 watch — SvelteFlow `setViewport` 으로
-   * 해당 item(s) 의 union BBox 를 viewport 중앙에 + 가득 채움. 처리 후 Canvas
+   * 해당 item/group selection 의 union BBox 를 viewport 중앙에 + 가득 채움. 처리 후 Canvas
    * 가 null 로 복귀 (1-shot signal).
    *
-   * 단일 선택: [id]. 다중 선택: 모든 ids — union BBox.
+   * 단일 선택: [id]. 다중 선택: 모든 ids — item 과 group 모두 허용.
    */
   pendingZoomToIds = $state<string[] | null>(null);
 
