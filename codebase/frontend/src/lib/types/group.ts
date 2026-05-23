@@ -11,7 +11,7 @@
 // - Group = 자식들 묶음 (트리). 자체 상태 = label/color/visibility/locked/order.
 // - effective state = self + ancestor 전파 결과.
 
-import type { CanvasItem, Visibility } from './canvas';
+import type { CanvasItem, CanvasLayout, Visibility } from './canvas';
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* Group entity (ADR-0010 SSoT)                                                */
@@ -205,4 +205,195 @@ export function descendantGroups(
     }
   }
   return result;
+}
+
+/**
+ * Remove groups that no longer contain any descendant item.
+ *
+ * Semantics: a group is kept only if at least one item remains somewhere under
+ * its subtree. This recursively removes empty nested groups and ancestors that
+ * became empty after item deletion.
+ */
+export function pruneEmptyGroups(layout: CanvasLayout): CanvasLayout {
+  if (layout.groups.length === 0) return layout;
+  const keep = new Set<string>();
+  const groupsById = new Map(layout.groups.map((g) => [g.id, g] as const));
+  for (const it of layout.items) {
+    let parentId = it.parent_id;
+    const seen = new Set<string>();
+    while (parentId !== null && !seen.has(parentId)) {
+      seen.add(parentId);
+      keep.add(parentId);
+      const g = groupsById.get(parentId);
+      parentId = g?.parent_id ?? null;
+    }
+  }
+  if (keep.size === layout.groups.length) return layout;
+  return {
+    ...layout,
+    groups: layout.groups.filter((g) => keep.has(g.id)),
+  };
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* Drill-in helpers (ADR-0010 D21 + plan-0013 §3.1)                          */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Item / group 의 *가장 root 쪽* ancestor group id.
+ *
+ * Walk: id.parent_id → parent.parent_id → ... 중 마지막 non-null group id.
+ * - id 가 root 직속 (parent_id === null) → `null` 반환 (drill-in 의미 없음, root level).
+ * - id 가 layout 에 없으면 → `null`.
+ *
+ * Legacy helper for root-scope grouping decisions. Canvas hit testing should use
+ * `targetAtDrillLevel` so drill scope and selection stay separate.
+ */
+export function outermostGroupAncestor(
+  id: string,
+  items: ReadonlyMap<string, CanvasItem>,
+  groups: ReadonlyMap<string, Group>,
+): string | null {
+  const item = items.get(id);
+  let parentId: string | null;
+  if (item !== undefined) {
+    parentId = item.parent_id;
+  } else {
+    const g = groups.get(id);
+    if (g === undefined) return null;
+    parentId = g.parent_id;
+  }
+  let cur = parentId;
+  let outermost: string | null = null;
+  while (cur !== null) {
+    outermost = cur;
+    const g = groups.get(cur);
+    if (g === undefined) break;
+    cur = g.parent_id;
+  }
+  return outermost;
+}
+
+/**
+ * Drill-in 한 단계 inner — 현 M (= `currentSelectionId`) 의 자손 chain 중 *clicked
+ * target* 의 ancestor chain 위 한 단계 inner 를 반환.
+ *
+ * 예 (P ∈ B ∈ A):
+ * - currentSelection = A, clicked = P → B (한 단계 inner).
+ * - currentSelection = B, clicked = P → P (leaf).
+ * - currentSelection = P (leaf) → null (이미 가장 inner).
+ * - clicked 가 currentSelection 안 아닌 chain → null.
+ */
+export function innerGroupOrSelf(
+  clickedTargetId: string,
+  currentSelectionId: string,
+  items: ReadonlyMap<string, CanvasItem>,
+  groups: ReadonlyMap<string, Group>,
+): string | null {
+  // Walk clickedTargetId 의 ancestor chain. cur 이 currentSelectionId 에 도달 직전
+  // 의 ancestor 가 정답.
+  let cur: string | null = clickedTargetId;
+  let prev: string | null = null;
+  while (cur !== null && cur !== currentSelectionId) {
+    prev = cur;
+    const item = items.get(cur);
+    const g = groups.get(cur);
+    cur = item?.parent_id ?? g?.parent_id ?? null;
+  }
+  if (cur !== currentSelectionId) return null;
+  return prev;
+}
+
+function parentIdOf(
+  id: string,
+  items: ReadonlyMap<string, CanvasItem>,
+  groups: ReadonlyMap<string, Group>,
+): string | null | undefined {
+  const item = items.get(id);
+  if (item !== undefined) return item.parent_id;
+  const group = groups.get(id);
+  if (group !== undefined) return group.parent_id;
+  return undefined;
+}
+
+/**
+ * Canvas hit target at the current drill level.
+ *
+ * Root scope (`drillRootId === null`) treats the outermost containing group as
+ * atomic. Inside a drill root, the hit resolves to the direct child of that
+ * group on the clicked element's ancestor chain. This keeps canvas click, drag,
+ * and right-click priority aligned with the visible drill level while preserving
+ * leaf selection for non-canvas surfaces such as the layer tree.
+ */
+export function targetAtDrillLevel(
+  clickedTargetId: string,
+  drillRootId: string | null,
+  items: ReadonlyMap<string, CanvasItem>,
+  groups: ReadonlyMap<string, Group>,
+): string {
+  if (drillRootId === null) {
+    if (groups.has(clickedTargetId)) return clickedTargetId;
+    return outermostGroupAncestor(clickedTargetId, items, groups) ?? clickedTargetId;
+  }
+
+  if (clickedTargetId === drillRootId) return drillRootId;
+
+  let cur: string | null = clickedTargetId;
+  while (cur !== null) {
+    const parentId = parentIdOf(cur, items, groups);
+    if (parentId === undefined) break;
+    if (parentId === drillRootId) return cur;
+    cur = parentId;
+  }
+
+  // The click is outside the active drill root. Resolve it as a root-level hit;
+  // callers may clear/switch the drill root before applying the selection.
+  return outermostGroupAncestor(clickedTargetId, items, groups) ?? clickedTargetId;
+}
+
+/**
+ * Nearest parent group id for an item or group. Used by non-canvas tree
+ * selection to enter the containing drill scope while selecting the exact row.
+ */
+export function directParentGroupId(
+  id: string,
+  items: ReadonlyMap<string, CanvasItem>,
+  groups: ReadonlyMap<string, Group>,
+): string | null {
+  return parentIdOf(id, items, groups) ?? null;
+}
+
+/**
+ * id 의 ancestor group chain — root 가까운 ancestor 부터 leaf parent 까지.
+ *
+ * 예 (P ∈ B ∈ A, A.parent=null):
+ * - id=P → [A, B]
+ * - id=B → [A]
+ * - id=A → []
+ *
+ * Inspector breadcrumb (D22.7) + Esc drill-out 의 계산 baseline.
+ */
+export function ancestorChain(
+  id: string,
+  items: ReadonlyMap<string, CanvasItem>,
+  groups: ReadonlyMap<string, Group>,
+): Group[] {
+  const item = items.get(id);
+  let parentId: string | null;
+  if (item !== undefined) {
+    parentId = item.parent_id;
+  } else {
+    const g = groups.get(id);
+    if (g === undefined) return [];
+    parentId = g.parent_id;
+  }
+  const chain: Group[] = [];
+  let cur = parentId;
+  while (cur !== null) {
+    const g = groups.get(cur);
+    if (g === undefined) break;
+    chain.unshift(g); // root 가까운 쪽 first.
+    cur = g.parent_id;
+  }
+  return chain;
 }

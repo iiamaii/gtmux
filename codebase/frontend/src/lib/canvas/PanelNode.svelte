@@ -7,7 +7,7 @@
   // - 헤더 바 = drag handle. label + badges (L/M/Min/I).
   // - 본문 = XtermHost.
   // - 선택 시각 (M):
-  //     * outline 은 wrapper (.svelte-flow__node.selected) 가 단일 source —
+  //     * outline 은 wrapper (.svelte-flow__node.m-selected) 가 단일 source —
   //       1.5px accent box-shadow ring (Canvas.svelte §05 shared rules B).
   //     * single (.m-single) / multi (.m-multi) 는 *비-outline* 시각 단서:
   //       header 색조 변화 (.m-single .panel-header / .m-multi .panel-header).
@@ -58,14 +58,14 @@
     label?: string | null;
     /** Canvas.svelte 가 주입 — 현재 M 선택 개수가 2 이상이면 true. */
     m_multi?: boolean;
+    /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
+    group_selected?: boolean;
   }
 
   let {
     data,
-    selected = false
   }: {
     data: PanelData;
-    selected?: boolean;
     id?: string;
     type?: string;
     width?: number;
@@ -97,7 +97,7 @@
     terminalPool.byId(data.id)?.label?.trim() || data.label || data.pane_id || data.id,
   );
 
-  const isInM = $derived(selected || sessionStore.M.has(data.id));
+  const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const isMultiM = $derived(isInM && data.m_multi === true);
   const isSingleM = $derived(isInM && data.m_multi !== true);
 
@@ -802,7 +802,7 @@
   .panel.minimized.m-single .panel-header,
   .panel.minimized.m-multi .panel-header {
     border-color: var(--color-accent);
-    border-width: 1.5px;
+    border-width: calc(1.5px / var(--canvas-zoom, 1));
   }
 
   .panel-pending {

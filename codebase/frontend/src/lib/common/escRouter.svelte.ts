@@ -10,7 +10,7 @@
 //   3. unmaximize               (sessionStore.maximizedItemId !== null)
 //   4. tool lock 해제           (toolStore.locked)
 //   5. Select 복귀              (toolStore.current !== 'select'/'hand')
-//   6. selection clear          (sessionStore.M.size > 0)
+//   6. drill/selection clear    (drillRootId !== null || sessionStore.M.size > 0)
 //   7. no-op
 //
 // Usage:
@@ -81,6 +81,12 @@ class EscRouter {
       return;
     }
     if (toolStore.handleEsc()) {
+      event.preventDefault();
+      return;
+    }
+    if (sessionStore.drillRootId !== null) {
+      sessionStore.clearDrill();
+      sessionStore.clearM();
       event.preventDefault();
       return;
     }

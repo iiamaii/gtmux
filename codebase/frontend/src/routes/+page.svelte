@@ -36,6 +36,7 @@
   import { login } from '$lib/http/auth';
   import { bindZShortcuts } from '$lib/keyboard/zShortcuts.svelte';
   import { bindChromeShortcuts } from '$lib/keyboard/chromeShortcuts.svelte';
+  import { bindGroupShortcuts } from '$lib/keyboard/groupShortcuts.svelte';
   import { bindClipboardShortcuts } from '$lib/keyboard/clipboardShortcuts.svelte';
   import { bindEditingShortcuts } from '$lib/keyboard/editingShortcuts.svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
@@ -84,11 +85,11 @@
   // descendants (PanelNode's header (…) button) can summon the menu
   // without a callback prop chain through SvelteFlow node data.
   interface ContextMenuHolder {
-    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null; hidePaste?: boolean }) => void;
+    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null; groupId?: string | null; hidePaste?: boolean }) => void;
   }
   let contextMenuRef: ContextMenuHolder | undefined = $state();
   const contextMenuHolder = {
-    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null; hidePaste?: boolean }) => {
+    openAt: (args: { clientX: number; clientY: number; paneId?: string | null; panelId?: string | null; groupId?: string | null; hidePaste?: boolean }) => {
       contextMenuRef?.openAt(args);
     },
   };
@@ -137,6 +138,7 @@
 
   let unbindZShortcuts: (() => void) | null = null;
   let unbindChromeShortcuts: (() => void) | null = null;
+  let unbindGroupShortcuts: (() => void) | null = null;
   let unbindClipboardShortcuts: (() => void) | null = null;
   let unbindEditingShortcuts: (() => void) | null = null;
   let unbindSystemTheme: (() => void) | null = null;
@@ -258,6 +260,8 @@
     unbindZShortcuts = bindZShortcuts();
     // Chrome shortcuts (Cmd+Shift+L / Cmd+Shift+I) — frontend-handover-v2 G26 P1.
     unbindChromeShortcuts = bindChromeShortcuts();
+    // Group lifecycle shortcuts (Cmd+G / Cmd+Shift+G) — ADR-0010 D17.
+    unbindGroupShortcuts = bindGroupShortcuts();
     // Clipboard shortcuts (Cmd+C / Cmd+X / Cmd+V) — ADR-0030 D5/D7 + ADR-0017 D6 amend ⑤ (b).
     unbindClipboardShortcuts = bindClipboardShortcuts();
     // Editing shortcuts (Cmd+A select-all) — ADR-0017 D6 amend ⑤ (a) / amend ⑦.
@@ -403,6 +407,10 @@
     if (unbindChromeShortcuts !== null) {
       unbindChromeShortcuts();
       unbindChromeShortcuts = null;
+    }
+    if (unbindGroupShortcuts !== null) {
+      unbindGroupShortcuts();
+      unbindGroupShortcuts = null;
     }
     if (unbindClipboardShortcuts !== null) {
       unbindClipboardShortcuts();

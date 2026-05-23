@@ -38,6 +38,8 @@
     underline?: boolean;
     /** batch-5 R3 — strikethrough toggle. default false. */
     strikethrough?: boolean;
+    /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
+    group_selected?: boolean;
   }
 
   // R7 (batch-5 Grill #18) — label auto-derive 알고리즘. 첫 줄만 + trim +
@@ -51,10 +53,8 @@
 
   let {
     data,
-    selected = false,
   }: {
     data: TextNodeData;
-    selected?: boolean;
     id?: string;
     type?: string;
     width?: number;
@@ -72,7 +72,7 @@
 
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
-  const isInM = $derived(selected || sessionStore.M.has(data.id));
+  const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const textAlign = $derived(data.text_align ?? 'center');
   const textVerticalAlign = $derived(data.text_vertical_align ?? 'middle');
 

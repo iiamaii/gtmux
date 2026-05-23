@@ -40,14 +40,14 @@
     /** Canvas itemToNode 가 주입 — box-local 끝점. */
     _boxX2: number;
     _boxY2: number;
+    /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
+    group_selected?: boolean;
   }
 
   let {
     data,
-    selected = false,
   }: {
     data: LineNodeData;
-    selected?: boolean;
     id?: string;
     type?: string;
     width?: number;
@@ -66,7 +66,7 @@
   const { screenToFlowPosition } = useSvelteFlow();
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
-  const isInM = $derived(selected || sessionStore.M.has(data.id));
+  const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   type Endpoint = 'start' | 'end';
   type DraftLine = { x: number; y: number; x2: number; y2: number };
   let draft = $state<DraftLine | null>(null);

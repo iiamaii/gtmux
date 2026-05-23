@@ -22,10 +22,18 @@
   import { toolStore } from '$lib/stores/toolStore.svelte';
   import { attachConfirm, UnauthorizedError } from '$lib/http/sessions';
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
-  import type { CanvasItem } from '$lib/types/canvas';
-  import { effectiveLocked, effectiveVisibility } from '$lib/types/group';
+  import type { CanvasItem, CanvasLayout } from '$lib/types/canvas';
+  import {
+    descendantGroups,
+    descendantItems,
+    effectiveLocked,
+    effectiveVisibility,
+    pruneEmptyGroups,
+    targetAtDrillLevel,
+  } from '$lib/types/group';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
+  import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
   import FilePickerModal from '$lib/chrome/FilePickerModal.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import { pickLocalFile } from '$lib/files/localFilePicker';
@@ -38,6 +46,8 @@
   import ImageNode from './ImageNode.svelte';
   import DocumentNode from './DocumentNode.svelte';
   import FreeDrawNode from './FreeDrawNode.svelte';
+  import GroupOverlay from './GroupOverlay.svelte';
+  import { groupHover } from '$lib/stores/groupHover.svelte';
   import {
     commitNewItem,
     createCanvasItem,
@@ -65,6 +75,8 @@
       clientY: number;
       paneId?: string | null;
       panelId?: string | null;
+      /** ADR-0010 D16 + plan-0012 §3.4 D.6 — group entity ContextMenu 진입. */
+      groupId?: string | null;
     }) => void;
   }
 
@@ -86,6 +98,21 @@
     currentLocal: { x: number; y: number };
   }
   let dragState = $state<DragState | null>(null);
+  interface GroupDragState {
+    startFlow: { x: number; y: number };
+    currentFlow: { x: number; y: number };
+    originals: Map<string, CanvasItem>;
+    priorSnapshot: CanvasLayout;
+    moved: boolean;
+  }
+  let groupDragState = $state<GroupDragState | null>(null);
+  interface LassoState {
+    startFlow: { x: number; y: number };
+    currentFlow: { x: number; y: number };
+    startLocal: { x: number; y: number };
+    currentLocal: { x: number; y: number };
+  }
+  let lassoState = $state<LassoState | null>(null);
 
   /** ADR-0018 D4 — free_draw point cap (저장 상한). */
   const FREE_DRAW_MAX_POINTS = 5000;
@@ -255,6 +282,53 @@
   async function deleteSelected(): Promise<void> {
     const ids = Array.from(sessionStore.M);
     if (ids.length === 0) return;
+    const groupIds = ids.filter((id) => sessionStore.groups.has(id));
+    if (groupIds.length > 0) {
+      if (ids.length === 1) {
+        const groupId = groupIds[0]!;
+        const groupsArr = [...sessionStore.groups.values()];
+        const itemsArr = [...sessionStore.items.values()];
+        const descendants = descendantItems(groupId, groupsArr, itemsArr);
+        const hasTerminal = descendants.some((it) => it.type === 'terminal');
+        if (hasTerminal) {
+          groupCloseDialog.show(groupId);
+          return;
+        }
+        const deletedGroupIds = new Set([
+          groupId,
+          ...descendantGroups(groupId, groupsArr).map((g) => g.id),
+        ]);
+        const deletedItemIds = new Set(descendants.map((it) => it.id));
+        const result = await sessionStore.applyMutation(
+          (cur) =>
+            pruneEmptyGroups({
+              ...cur,
+              groups: cur.groups.filter((g) => !deletedGroupIds.has(g.id)),
+              items: cur.items.filter((it) => !deletedItemIds.has(it.id)),
+            }),
+          { failMessage: 'Delete group items failed' },
+        );
+        if (result.ok) {
+          if (
+            sessionStore.drillRootId !== null &&
+            deletedGroupIds.has(sessionStore.drillRootId)
+          ) {
+            sessionStore.clearDrill();
+          }
+          sessionStore.clearM();
+          toastStore.show({
+            message: `Removed group + ${deletedItemIds.size} item${deletedItemIds.size === 1 ? '' : 's'}.`,
+            tone: 'success',
+          });
+        }
+      } else {
+        toastStore.show({
+          message: 'Delete one selected group at a time, or use the context menu.',
+          tone: 'error',
+        });
+      }
+      return;
+    }
     const items = ids
       .map((id) => sessionStore.items.get(id))
       .filter((it): it is NonNullable<typeof it> => it !== undefined);
@@ -388,6 +462,20 @@
     };
   });
 
+  const lassoPreview = $derived.by(() => {
+    if (lassoState === null) return null;
+    const sx = lassoState.startLocal.x;
+    const sy = lassoState.startLocal.y;
+    const cx = lassoState.currentLocal.x;
+    const cy = lassoState.currentLocal.y;
+    return {
+      left: Math.min(sx, cx),
+      top: Math.min(sy, cy),
+      width: Math.max(Math.abs(cx - sx), 1),
+      height: Math.max(Math.abs(cy - sy), 1),
+    };
+  });
+
   /** Drag 가 click 으로 취급되는 임계 — flow 좌표 기준 8px. */
   const DRAG_CLICK_THRESHOLD = 8;
 
@@ -404,14 +492,122 @@
   // 시 SvelteFlow 가 reset). 단 lasso 는 one-shot → 즉시 right-click 패턴이
   // 더 빈번해서 사용자 체감이 큼.
   let rightClickMSnapshot: Set<string> | null = null;
+  let hoveredCanvasGroupId: string | null = null;
+  const GROUP_OVERLAY_PREFIX = '__group-overlay-';
+  const GROUP_HITBOX_PREFIX = '__group-hitbox-';
+
+  function updateCanvasGroupHover(e: PointerEvent): void {
+    const target = e.target as HTMLElement | null;
+    const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
+    const nodeId = nodeEl?.dataset.id ?? null;
+    let nextGroupId: string | null = null;
+    if (nodeId !== null && !nodeId.startsWith(GROUP_OVERLAY_PREFIX)) {
+      const hitTarget = canvasTargetFor(nodeId);
+      if (sessionStore.groups.has(hitTarget)) {
+        nextGroupId = hitTarget;
+      }
+    }
+    if (nextGroupId === hoveredCanvasGroupId) return;
+    if (hoveredCanvasGroupId !== null) groupHover.clearIf(hoveredCanvasGroupId);
+    hoveredCanvasGroupId = nextGroupId;
+    if (nextGroupId !== null) groupHover.set(nextGroupId);
+  }
+
+  function clearCanvasGroupHover(): void {
+    if (hoveredCanvasGroupId !== null) groupHover.clearIf(hoveredCanvasGroupId);
+    hoveredCanvasGroupId = null;
+  }
 
   function onCanvasPointerDown(e: PointerEvent) {
+    if (e.button === 0 && isSelectMode && !isDragTool && !isSpacePressed && !isHandTool) {
+      const isModifierClick = e.metaKey || e.ctrlKey;
+      if (isModifierClick) {
+        const target = e.target as HTMLElement | null;
+        const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
+        const nodeId = nodeEl?.dataset.id ?? nodeIdAtPoint(e.clientX, e.clientY);
+        if (nodeId !== null) {
+          const hitTarget = groupIdFromOverlayNode(nodeId) ?? canvasTargetFor(nodeId);
+          if (!targetIsInsideDrill(hitTarget)) sessionStore.clearDrill();
+          sessionStore.toggleM(hitTarget);
+          resetDoubleClickTracker();
+          // Keep xyflow from toggling the leaf node internally. In drill scope,
+          // multi-select must operate on the current drill-level target, not the
+          // lowest descendant DOM node that received pointerdown.
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+      }
+    }
+
+    if (e.button === 0 && isSelectMode && !isDragTool && !isSpacePressed && !isHandTool) {
+      const target = e.target as HTMLElement | null;
+      const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
+      const nodeId = nodeEl?.dataset.id ?? null;
+      if (nodeId !== null) {
+        const overlayGroupId = groupIdFromOverlayNode(nodeId);
+        const hitTarget = overlayGroupId ?? canvasTargetFor(nodeId);
+        if (!targetIsInsideDrill(hitTarget)) sessionStore.clearDrill();
+        if (sessionStore.groups.has(hitTarget)) {
+          if (!(e.metaKey || e.ctrlKey || e.shiftKey)) {
+            const now = Date.now();
+            const isDblClick =
+              lastClickId === nodeId && now - lastClickAt < DOUBLE_CLICK_MS;
+            lastClickId = nodeId;
+            lastClickAt = now;
+            if (isDblClick) {
+              resetDoubleClickTracker();
+              sessionStore.setDrillRoot(hitTarget);
+              const nextSelected =
+                overlayGroupId ?? targetAtDrillLevel(nodeId, hitTarget, sessionStore.items, sessionStore.groups);
+              sessionStore.setM([nextSelected]);
+              e.preventDefault();
+              e.stopPropagation();
+              return;
+            }
+          }
+          // Capture-phase preselection runs before SvelteFlow starts native drag.
+          // Without this, dragging a nested descendant inside a drill scope can
+          // move the leaf item before the click handler projects selection to
+          // the current drill-level group.
+          if (!(e.metaKey || e.ctrlKey || e.shiftKey)) {
+            sessionStore.setM([hitTarget]);
+            beginSelectionDrag([hitTarget], e);
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+          }
+        } else if (
+          !(e.metaKey || e.ctrlKey || e.shiftKey) &&
+          sessionStore.M.size > 1 &&
+          sessionStore.M.has(hitTarget)
+        ) {
+          beginSelectionDrag([...sessionStore.M], e);
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        } else if (!(e.metaKey || e.ctrlKey || e.shiftKey)) {
+          // Make the app selection store authoritative immediately on down.
+          // SvelteFlow click/drag events may still follow, but selection UI no
+          // longer waits for its internal selected state or mousemove effects.
+          sessionStore.setM([hitTarget]);
+        }
+      }
+      if (nodeId === null && !(e.metaKey || e.ctrlKey || e.shiftKey)) {
+        beginLasso(e);
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+    }
+
     // Right-button on canvas: snapshot M for context menu restore (button=2).
     if (e.button === 2 && isSelectMode) {
       const target = e.target as HTMLElement | null;
       const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
       const nodeId = nodeEl?.dataset.id ?? null;
-      if (nodeId !== null && sessionStore.M.has(nodeId) && sessionStore.M.size >= 2) {
+      const targetId = nodeId !== null ? canvasTargetFor(nodeId) : null;
+      if (targetId !== null && sessionStore.M.has(targetId) && sessionStore.M.size >= 2) {
         rightClickMSnapshot = new Set(sessionStore.M);
       } else {
         rightClickMSnapshot = null;
@@ -455,6 +651,192 @@
     root.setPointerCapture(e.pointerId);
   }
 
+  function translateCanvasItem(item: CanvasItem, dx: number, dy: number): CanvasItem {
+    if (item.type === 'line') {
+      const nextP1 = { x: item.x + dx, y: item.y + dy };
+      const nextP2 = { x: item.x2 + dx, y: item.y2 + dy };
+      const nextBox = lineBoxFromEndpoints(nextP1, nextP2);
+      return {
+        ...item,
+        x: nextP1.x,
+        y: nextP1.y,
+        x2: nextP2.x,
+        y2: nextP2.y,
+        w: nextBox.w,
+        h: nextBox.h,
+      };
+    }
+    if (item.type === 'free_draw') {
+      return {
+        ...item,
+        x: item.x + dx,
+        y: item.y + dy,
+        points: item.points.map((p) => ({ x: p.x + dx, y: p.y + dy })),
+      };
+    }
+    return { ...item, x: item.x + dx, y: item.y + dy };
+  }
+
+  function beginSelectionDrag(selectionIds: Iterable<string>, e: PointerEvent): void {
+    const groupsArr = [...sessionStore.groups.values()];
+    const itemsArr = [...sessionStore.items.values()];
+    const originals = new Map<string, CanvasItem>();
+    for (const id of selectionIds) {
+      const item = sessionStore.items.get(id);
+      if (item !== undefined) {
+        if (!effectiveLocked(item.locked, item.parent_id, sessionGroupsById)) {
+          originals.set(item.id, item);
+        }
+        continue;
+      }
+      if (!sessionStore.groups.has(id)) continue;
+      for (const descendant of descendantItems(id, groupsArr, itemsArr)) {
+        if (effectiveLocked(descendant.locked, descendant.parent_id, sessionGroupsById)) continue;
+        originals.set(descendant.id, descendant);
+      }
+    }
+    if (originals.size === 0) return;
+    const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    groupDragState = {
+      startFlow: flow,
+      currentFlow: flow,
+      originals,
+      priorSnapshot: sessionStore.layoutSnapshot(),
+      moved: false,
+    };
+    const root = e.currentTarget as HTMLElement;
+    root.setPointerCapture(e.pointerId);
+  }
+
+  function beginLasso(e: PointerEvent): void {
+    const root = e.currentTarget as HTMLElement;
+    const rect = root.getBoundingClientRect();
+    const local = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    lassoState = {
+      startFlow: flow,
+      currentFlow: flow,
+      startLocal: local,
+      currentLocal: local,
+    };
+    root.setPointerCapture(e.pointerId);
+  }
+
+  function updateLasso(e: PointerEvent): void {
+    const state = lassoState;
+    if (state === null) return;
+    const root = e.currentTarget as HTMLElement;
+    const rect = root.getBoundingClientRect();
+    lassoState = {
+      ...state,
+      currentFlow: screenToFlowPosition({ x: e.clientX, y: e.clientY }),
+      currentLocal: { x: e.clientX - rect.left, y: e.clientY - rect.top },
+    };
+  }
+
+  function itemSelectionBox(item: CanvasItem): { x: number; y: number; w: number; h: number } {
+    if (item.type === 'line') {
+      const box = lineBoxFromEndpoints(
+        { x: item.x, y: item.y },
+        { x: item.x2, y: item.y2 },
+      );
+      return { x: box.x, y: box.y, w: box.w, h: box.h };
+    }
+    return { x: item.x, y: item.y, w: item.w, h: item.h };
+  }
+
+  function rectsIntersect(
+    a: { x: number; y: number; w: number; h: number },
+    b: { x: number; y: number; w: number; h: number },
+  ): boolean {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function projectSelectionIds(ids: Iterable<string>): string[] {
+    const targets = new Set<string>();
+    for (const id of ids) {
+      targets.add(groupIdFromOverlayNode(id) ?? canvasTargetFor(id));
+    }
+    const selectedGroups = [...targets].filter((id) => sessionStore.groups.has(id));
+    if (selectedGroups.length === 0) return [...targets];
+    return [...targets].filter((id) => {
+      if (selectedGroups.includes(id)) return true;
+      return !selectedGroups.some((groupId) => isDescendantOfGroup(id, groupId));
+    });
+  }
+
+  function finishLasso(e: PointerEvent): void {
+    const state = lassoState;
+    if (state === null) return;
+    lassoState = null;
+    const endFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    const dx = endFlow.x - state.startFlow.x;
+    const dy = endFlow.y - state.startFlow.y;
+    if (Math.hypot(dx, dy) < DRAG_CLICK_THRESHOLD) {
+      clearCanvasDrillAndSelection();
+      return;
+    }
+    const rect = {
+      x: Math.min(state.startFlow.x, endFlow.x),
+      y: Math.min(state.startFlow.y, endFlow.y),
+      w: Math.abs(dx),
+      h: Math.abs(dy),
+    };
+    const rawIds: string[] = [];
+    for (const item of sessionStore.items.values()) {
+      if (!effectiveVisibility(item.visibility, item.parent_id, sessionGroupsById)) continue;
+      if (rectsIntersect(rect, itemSelectionBox(item))) rawIds.push(item.id);
+    }
+    const ids = projectSelectionIds(rawIds);
+    if (ids.length === 0) {
+      clearCanvasDrillAndSelection();
+      return;
+    }
+    sessionStore.setM(ids);
+  }
+
+  function updateGroupDrag(e: PointerEvent): void {
+    const state = groupDragState;
+    if (state === null) return;
+    const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    const dx = flow.x - state.startFlow.x;
+    const dy = flow.y - state.startFlow.y;
+    const moved = state.moved || Math.hypot(dx, dy) >= DRAG_CLICK_THRESHOLD;
+    groupDragState = { ...state, currentFlow: flow, moved };
+    if (!moved) return;
+    for (const [id, original] of state.originals) {
+      sessionStore.items.set(id, translateCanvasItem(original, dx, dy));
+    }
+  }
+
+  function finishGroupDrag(e: PointerEvent): void {
+    const state = groupDragState;
+    if (state === null) return;
+    groupDragState = null;
+    if (!state.moved) return;
+    const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    const dx = flow.x - state.startFlow.x;
+    const dy = flow.y - state.startFlow.y;
+    const movedById = new Map<string, CanvasItem>();
+    for (const [id, original] of state.originals) {
+      movedById.set(id, translateCanvasItem(original, dx, dy));
+    }
+    for (const [id, next] of movedById) {
+      sessionStore.items.set(id, next);
+    }
+    void sessionStore.applyMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it) => movedById.get(it.id) ?? it),
+      }),
+      {
+        abortMessage: 'Group drag aborted — session reconnect failed.',
+        failMessage: 'Group drag failed — reverted to previous position.',
+        priorSnapshot: state.priorSnapshot,
+      },
+    );
+  }
+
   function onCanvasPointerMove(e: PointerEvent) {
     // Always track hover screen position — terminal ghost preview 의 입력.
     const rootEl = e.currentTarget as HTMLElement;
@@ -463,6 +845,19 @@
       x: e.clientX - rootRect.left,
       y: e.clientY - rootRect.top,
     };
+    updateCanvasGroupHover(e);
+    if (lassoState !== null) {
+      e.preventDefault();
+      e.stopPropagation();
+      updateLasso(e);
+      return;
+    }
+    if (groupDragState !== null) {
+      e.preventDefault();
+      e.stopPropagation();
+      updateGroupDrag(e);
+      return;
+    }
     if (dragState === null) return;
     const root = e.currentTarget as HTMLElement;
     const rect = root.getBoundingClientRect();
@@ -495,6 +890,18 @@
   }
 
   function onCanvasPointerUp(e: PointerEvent) {
+    if (lassoState !== null) {
+      e.preventDefault();
+      e.stopPropagation();
+      finishLasso(e);
+      return;
+    }
+    if (groupDragState !== null) {
+      e.preventDefault();
+      e.stopPropagation();
+      finishGroupDrag(e);
+      return;
+    }
     if (dragState === null) return;
     e.stopPropagation();
     const state = dragState;
@@ -551,6 +958,8 @@
   }
 
   function onCanvasPointerCancel(_e: PointerEvent) {
+    groupDragState = null;
+    lassoState = null;
     // OS 가 capture 를 빼앗는 경우 (다른 modal 등) drag state 청소.
     dragState = null;
     // 0065 FE-1 — pending rAF + buffer 정리 (다음 stroke 의 init 에서도
@@ -583,6 +992,8 @@
     image: ImageNode,
     document: DocumentNode,
     free_draw: FreeDrawNode,
+    // ADR-0010 D15 — group entity overlay (dotted BBox outline).
+    'gtmux-group': GroupOverlay,
   };
 
   // M cardinality — PanelNode 가 single/multi 분기를 위해 참조.
@@ -636,6 +1047,8 @@
     effVisible: boolean,
     effLocked: boolean,
     selected: boolean,
+    selectedByGroup: boolean,
+    groupHitTarget: boolean,
     mMulti: boolean,
   ): string {
     // Common fields (all CanvasItem)
@@ -681,7 +1094,7 @@
         payload = `|${item.asset_id ?? ''}|${item.mime}|${item.file_name}|${item.size_bytes}|${item.content ?? ''}`;
         break;
     }
-    return `${effVisible ? 1 : 0}|${effLocked ? 1 : 0}|${selected ? 1 : 0}|${mMulti ? 1 : 0}|${common}${payload}`;
+    return `${effVisible ? 1 : 0}|${effLocked ? 1 : 0}|${selected ? 1 : 0}|${selectedByGroup ? 1 : 0}|${groupHitTarget ? 1 : 0}|${mMulti ? 1 : 0}|${common}${payload}`;
   }
 
   /**
@@ -702,6 +1115,11 @@
     // 로 그대로 hit 가능 (pointer-events 는 CSS 비상속).
     const classes: string[] = [];
     if (item.minimized) classes.push('is-minimized');
+    const selectedByGroup = isSelectedByGroup(item.id);
+    if (selectedByGroup) classes.push('group-selected');
+    const groupHitTarget = isGroupHitTarget(item.id);
+    if (groupHitTarget) classes.push('group-hit-target');
+    if (sessionStore.M.has(item.id)) classes.push('m-selected');
     if (
       (item.type === 'rect' || item.type === 'ellipse') &&
       item.fill_enabled === false
@@ -711,8 +1129,9 @@
     const common = {
       id: item.id,
       position: { x: item.x, y: item.y },
-      draggable: !locked,
-      selected: sessionStore.M.has(item.id),
+      draggable: !locked && !groupHitTarget,
+      selectable: true,
+      selected: false,
       zIndex: item.z,
       width: item.w,
       height: item.h,
@@ -738,6 +1157,7 @@
           locked,
           label: item.label ?? null,
           m_multi: isMultiSelection,
+          group_selected: selectedByGroup,
         },
       };
     }
@@ -759,6 +1179,7 @@
           ...(item as unknown as Record<string, unknown>),
           visibility: visible,
           locked,
+          group_selected: selectedByGroup,
           w: box.w,
           h: box.h,
           _boxX1: item.x - box.x,
@@ -778,6 +1199,7 @@
         ...(item as unknown as Record<string, unknown>),
         visibility: visible,
         locked,
+        group_selected: selectedByGroup,
       },
     };
   }
@@ -806,8 +1228,10 @@
     for (const item of items.values()) {
       const visible = effectiveVisibility(item.visibility, item.parent_id, groupsById);
       const locked = effectiveLocked(item.locked, item.parent_id, groupsById);
-      const selected = sessionStore.M.has(item.id);
-      const sig = makeSignature(item, visible, locked, selected, mMulti);
+      const selected = isFlowSelected(item.id);
+      const selectedByGroup = isSelectedByGroup(item.id);
+      const groupHitTarget = isGroupHitTarget(item.id);
+      const sig = makeSignature(item, visible, locked, selected, selectedByGroup, groupHitTarget, mMulti);
       const cached = nodeCache.get(item.id);
       seen.add(item.id);
       if (cached !== undefined && cached.sig === sig) {
@@ -827,6 +1251,97 @@
       for (const id of nodeCache.keys()) {
         if (!seen.has(id)) nodeCache.delete(id);
       }
+    }
+    // ADR-0010 D15 + D22.8 — Group entity overlay 노드 합성.
+    // 3 mode 우선순위:
+    //   selected (M.has)  > outer-dim (drillRoot/ancestor) > hover (groupHover)
+    // 빈 BBox (자손 모두 hidden 또는 0개) 는 skip — 시각 noise 회피.
+    const groupsArr = [...sessionStore.groups.values()];
+    const itemsArr = [...items.values()];
+    const PADDING = 8;
+    const OVERLAY_Z = 1_000_000; // 항상 자손 panel 위 (자손 z 는 보통 < 1000).
+
+    // Drill scope + selected descendants ancestor chain.
+    const outerAncestorIds = new Set<string>();
+    if (sessionStore.drillRootId !== null) outerAncestorIds.add(sessionStore.drillRootId);
+    if (sessionStore.M.size === 1) {
+      const sole = [...sessionStore.M][0];
+      if (sole !== undefined) {
+        const item = sessionStore.items.get(sole);
+        const g = sessionStore.groups.get(sole);
+        let parentId = item?.parent_id ?? g?.parent_id ?? null;
+        while (parentId !== null) {
+          outerAncestorIds.add(parentId);
+          const pg = sessionStore.groups.get(parentId);
+          parentId = pg?.parent_id ?? null;
+        }
+      }
+    }
+
+    for (const g of groupsArr) {
+      const isSelected = sessionStore.M.has(g.id);
+      const isOuterDim = !isSelected && outerAncestorIds.has(g.id);
+      const isHover = !isSelected && !isOuterDim && groupHover.id === g.id;
+      const needsSelectionProxy = g.parent_id === (sessionStore.drillRootId ?? null);
+      const needsVisibleOverlay = isSelected || isOuterDim || isHover;
+      if (!needsVisibleOverlay && !needsSelectionProxy) continue;
+      const visibleDescendants = descendantItems(g.id, groupsArr, itemsArr).filter(
+        (it) =>
+          effectiveVisibility(it.visibility, it.parent_id, groupsById),
+      );
+      if (visibleDescendants.length === 0) continue;
+      let minX = Number.POSITIVE_INFINITY;
+      let minY = Number.POSITIVE_INFINITY;
+      let maxX = Number.NEGATIVE_INFINITY;
+      let maxY = Number.NEGATIVE_INFINITY;
+      for (const it of visibleDescendants) {
+        if (it.x < minX) minX = it.x;
+        if (it.y < minY) minY = it.y;
+        if (it.x + it.w > maxX) maxX = it.x + it.w;
+        if (it.y + it.h > maxY) maxY = it.y + it.h;
+      }
+      if (!Number.isFinite(minX)) continue;
+      const overlayBase = {
+        type: 'gtmux-group',
+        position: { x: minX - PADDING, y: minY - PADDING },
+        width: maxX - minX + 2 * PADDING,
+        height: maxY - minY + 2 * PADDING,
+        draggable: false,
+        class: 'gtmux-group',
+      } satisfies Partial<Node>;
+      if (needsSelectionProxy) {
+        out.push({
+          ...overlayBase,
+          id: `${GROUP_HITBOX_PREFIX}${g.id}`,
+          selectable: true,
+          selected: false,
+          zIndex: OVERLAY_Z - 1,
+          data: {
+            groupId: g.id,
+            mode: 'hitbox',
+            color: 'var(--color-accent)',
+          },
+        });
+      }
+      if (!needsVisibleOverlay) continue;
+      const mode: 'selected' | 'outer-dim' | 'hover' = isSelected
+        ? 'selected'
+        : isOuterDim
+          ? 'outer-dim'
+          : 'hover';
+      out.push({
+        ...overlayBase,
+        id: `${GROUP_OVERLAY_PREFIX}${g.id}`,
+        selectable: false,
+        selected: false,
+        // selected = 가장 위, outer-dim = 가운데, hover = 가장 아래 (선택 시각 우선).
+        zIndex: OVERLAY_Z + (isSelected ? 2 : isOuterDim ? 1 : 0),
+        data: {
+          groupId: g.id,
+          mode,
+          color: 'var(--color-accent)',
+        },
+      });
     }
     return out;
   });
@@ -985,17 +1500,138 @@
   // 기존 node 위 click 도 onpaneclick 의 spawn 로직으로 forward — 사용자가
   // *다른 panel 위에 새 item 만들고 싶음* 의도 허용. drag-spawn tool 은 별
   // pointer handler 가 처리해 onnodeclick 까지 안 옴.
+  /**
+   * Drill-level canvas selection.
+   *
+   * - Root scope: grouped descendants resolve to the outermost group.
+   * - Drill scope: descendants resolve to the direct child under the drill root.
+   * - Double click on a group enters that group as a separate drill scope.
+   *
+   * xyflow `onnodeclick` 만 노출 — dblclick detect 는 click count + timestamp
+   * tracking 으로 (xyflow svelte 가 `onnodedoubleclick` 미제공).
+   */
+  const DOUBLE_CLICK_MS = 350;
+  let lastClickId: string | null = null;
+  let lastClickAt = 0;
+
+  function resetDoubleClickTracker(): void {
+    lastClickId = null;
+    lastClickAt = 0;
+  }
+
+  function blurActiveCanvasElement(): void {
+    if (typeof document === 'undefined') return;
+    const active = document.activeElement as HTMLElement | null;
+    active?.blur?.();
+  }
+
+  function canvasTargetFor(id: string): string {
+    return targetAtDrillLevel(
+      id,
+      sessionStore.drillRootId,
+      sessionStore.items,
+      sessionStore.groups,
+    );
+  }
+
+  function targetIsInsideDrill(targetId: string): boolean {
+    const root = sessionStore.drillRootId;
+    if (root === null) return true;
+    if (targetId === root) return true;
+    const item = sessionStore.items.get(targetId);
+    const group = sessionStore.groups.get(targetId);
+    let parentId = item?.parent_id ?? group?.parent_id ?? null;
+    while (parentId !== null) {
+      if (parentId === root) return true;
+      const parent = sessionStore.groups.get(parentId);
+      parentId = parent?.parent_id ?? null;
+    }
+    return false;
+  }
+
+  function clearCanvasDrillAndSelection(): void {
+    sessionStore.clearDrill();
+    sessionStore.clearM();
+  }
+
+  function isSelectedByGroup(itemId: string): boolean {
+    const item = sessionStore.items.get(itemId);
+    let parentId = item?.parent_id ?? null;
+    while (parentId !== null) {
+      if (sessionStore.M.has(parentId)) return true;
+      const parent = sessionStore.groups.get(parentId);
+      parentId = parent?.parent_id ?? null;
+    }
+    return false;
+  }
+
+  function isGroupHitTarget(itemId: string): boolean {
+    const target = canvasTargetFor(itemId);
+    return target !== itemId && sessionStore.groups.has(target);
+  }
+
+  function isFlowSelected(itemId: string): boolean {
+    return sessionStore.M.has(itemId);
+  }
+
+  function groupIdFromOverlayNode(id: string): string | null {
+    const prefix = id.startsWith(GROUP_HITBOX_PREFIX)
+      ? GROUP_HITBOX_PREFIX
+      : id.startsWith(GROUP_OVERLAY_PREFIX)
+        ? GROUP_OVERLAY_PREFIX
+        : null;
+    if (prefix === null) return null;
+    const groupId = id.slice(prefix.length);
+    return sessionStore.groups.has(groupId) ? groupId : null;
+  }
+
+  function isDescendantOfGroup(targetId: string, groupId: string): boolean {
+    let parentId =
+      sessionStore.items.get(targetId)?.parent_id ??
+      sessionStore.groups.get(targetId)?.parent_id ??
+      null;
+    while (parentId !== null) {
+      if (parentId === groupId) return true;
+      parentId = sessionStore.groups.get(parentId)?.parent_id ?? null;
+    }
+    return false;
+  }
+
   function onnodeclick({ node, event }: { node: Node; event: MouseEvent | TouchEvent }) {
     if (isSelectMode) {
       const id = node.id;
-      const isModifierClick =
-        event instanceof MouseEvent &&
-        (event.metaKey || event.ctrlKey);
+      const overlayGroupId = groupIdFromOverlayNode(id);
+      const target = overlayGroupId ?? canvasTargetFor(id);
+      const isMouseEvt = event instanceof MouseEvent;
+      const isModifierClick = isMouseEvt && (event.metaKey || event.ctrlKey);
+      // D22.5 — Cmd/Ctrl click 도 drill-in 일관.
       if (isModifierClick) {
-        sessionStore.toggleM(id);
-      } else {
-        sessionStore.setM([id]);
+        // Modifier-click selection is owned by capture-phase pointerdown. Letting
+        // nodeclick toggle again reverts M on mouseup/click.
+        resetDoubleClickTracker();
+        return;
       }
+      // Detect double-click (same id within window) — drill-down 한 단계.
+      const now = isMouseEvt ? Date.now() : 0;
+      const isDblClick =
+        isMouseEvt && lastClickId === id && now - lastClickAt < DOUBLE_CLICK_MS;
+      lastClickId = id;
+      lastClickAt = now;
+      if (isDblClick) {
+        resetDoubleClickTracker();
+        if (sessionStore.groups.has(target)) {
+          sessionStore.setDrillRoot(target);
+          const nextSelected =
+            overlayGroupId ?? targetAtDrillLevel(id, target, sessionStore.items, sessionStore.groups);
+          sessionStore.setM([nextSelected]);
+        } else {
+          sessionStore.setM([target]);
+        }
+        blurActiveCanvasElement();
+        return;
+      }
+      if (!targetIsInsideDrill(target)) sessionStore.clearDrill();
+      sessionStore.setM([target]);
       return;
     }
     if (event instanceof MouseEvent) {
@@ -1043,6 +1679,12 @@
   function onpaneclick({ event }: { event: MouseEvent | TouchEvent }) {
     // Hand tool — exploration only, click no-op (Figma).
     if (isHandTool) return;
+    if (
+      event instanceof MouseEvent &&
+      (event.metaKey || event.ctrlKey || event.shiftKey)
+    ) {
+      return;
+    }
     // ── Tool-driven creation ───────────────────────────────────────────
     //
     // 점-spawn 도구 (text/note/file_path/terminal) 가 active 인 동안 빈 캔버스
@@ -1149,7 +1791,7 @@
         return;
       }
     }
-    sessionStore.clearM();
+    clearCanvasDrillAndSelection();
   }
 
   /**
@@ -1227,17 +1869,14 @@
    * 처리: nodes array 만 확인. line 은 endpoint delta 처리. 일괄
    * mutateLayout(callback) 으로 BE PUT 1회.
    */
-  function onnodedragstop({
-    nodes,
-  }: { targetNode: Node | null; nodes: Node[] }) {
-    if (nodes.length === 0) return;
-    if (sessionStore.active === null) return;
+  let nodeDragPriorSnapshot: CanvasLayout | null = null;
 
-    // id → moved item map. 단일 drag 시 nodes.length === 1.
+  function movedItemsFromNodes(nodes: Node[]): Map<string, CanvasItem> {
     const movedById = new Map<string, CanvasItem>();
     for (const n of nodes) {
       const cur = sessionStore.items.get(n.id);
       if (cur === undefined) continue;
+      if (effectiveLocked(cur.locked, cur.parent_id, sessionGroupsById)) continue;
       const pos = n.position;
       let next: CanvasItem;
       if (cur.type === 'line') {
@@ -1277,12 +1916,41 @@
       }
       movedById.set(n.id, next);
     }
+    return movedById;
+  }
+
+  function onnodedrag({ nodes }: { targetNode: Node | null; nodes: Node[] }) {
+    if (nodes.length === 0) return;
+    if (sessionStore.active === null) return;
+    const movedById = movedItemsFromNodes(nodes);
     if (movedById.size === 0) return;
+    if (nodeDragPriorSnapshot === null) {
+      nodeDragPriorSnapshot = sessionStore.layoutSnapshot();
+    }
+    // Live store update keeps derived group bboxes in sync while dragging.
+    for (const [id, next] of movedById) {
+      sessionStore.items.set(id, next);
+    }
+  }
+
+  function onnodedragstop({
+    nodes,
+  }: { targetNode: Node | null; nodes: Node[] }) {
+    if (nodes.length === 0) return;
+    if (sessionStore.active === null) return;
+
+    // id → moved item map. 단일 drag 시 nodes.length === 1.
+    const movedById = movedItemsFromNodes(nodes);
+    if (movedById.size === 0) {
+      nodeDragPriorSnapshot = null;
+      return;
+    }
 
     // PRE-state snapshot — optimistic update 직전에 잡아 history capture 의
     // 입력으로 명시 (ADR-0028 D7). 그렇지 않으면 layoutSnapshot() 이 이미
     // 새 position 으로 갱신된 후 호출되어 PRE === POST → Cmd+Z 가 no-op.
-    const priorSnapshot = sessionStore.layoutSnapshot();
+    const priorSnapshot = nodeDragPriorSnapshot ?? sessionStore.layoutSnapshot();
+    nodeDragPriorSnapshot = null;
     // Optimistic store update — bind:nodes 양방향 sync 의 idempotent 결과.
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
@@ -1314,7 +1982,7 @@
     event.preventDefault();
     // Amend ⑤ — outside-wrapper 우 클릭 = Figma 의 deselect + empty menu.
     rightClickMSnapshot = null;
-    sessionStore.clearM();
+    clearCanvasDrillAndSelection();
     onContextMenuRequest?.({
       clientX: event.clientX,
       clientY: event.clientY,
@@ -1360,11 +2028,39 @@
     const nodeId = nodeEl?.dataset.id ?? null;
     e.preventDefault();
     if (nodeId !== null) {
-      // Node 우 클릭 — onnodecontextmenu 와 동일 로직 (D9 snapshot restore).
-      if (rightClickMSnapshot !== null && rightClickMSnapshot.has(nodeId)) {
+      // ADR-0010 D22.4 (plan-0013 §3.7 H.3) — drill-aware right-click.
+      // grouped item right-click 도 left click 과 동일: M = ancestor +
+      // groupEntity ContextMenu open.
+      const drillTarget = canvasTargetFor(nodeId);
+      if (!targetIsInsideDrill(drillTarget)) sessionStore.clearDrill();
+      if (sessionStore.M.size >= 2 && sessionStore.M.has(drillTarget)) {
+        rightClickMSnapshot = null;
+        onContextMenuRequest?.({
+          clientX: e.clientX,
+          clientY: e.clientY,
+          paneId: null,
+          panelId: drillTarget,
+        });
+        return;
+      }
+      const isDrillToGroup = drillTarget !== nodeId && sessionStore.groups.has(drillTarget);
+      if (isDrillToGroup) {
+        sessionStore.setM([drillTarget]);
+        rightClickMSnapshot = null;
+        onContextMenuRequest?.({
+          clientX: e.clientX,
+          clientY: e.clientY,
+          paneId: null,
+          panelId: null,
+          groupId: drillTarget,
+        });
+        return;
+      }
+      // Root level item — 기존 onnodecontextmenu 와 동일 로직 (D9 snapshot restore).
+      if (rightClickMSnapshot !== null && rightClickMSnapshot.has(drillTarget)) {
         sessionStore.setM([...rightClickMSnapshot]);
-      } else if (!sessionStore.M.has(nodeId)) {
-        sessionStore.setM([nodeId]);
+      } else if (!sessionStore.M.has(drillTarget)) {
+        sessionStore.setM([drillTarget]);
       }
       rightClickMSnapshot = null;
       // pane_id (terminal item id = backend pane_id, ADR-0018 D2)
@@ -1374,7 +2070,7 @@
         clientX: e.clientX,
         clientY: e.clientY,
         paneId,
-        panelId: nodeId,
+        panelId: drillTarget,
       });
       return;
     }
@@ -1400,7 +2096,7 @@
         return;
       }
       // Empty under wrapper — Amend ⑤: clearM + empty menu.
-      sessionStore.clearM();
+      clearCanvasDrillAndSelection();
       onContextMenuRequest?.({
         clientX: e.clientX,
         clientY: e.clientY,
@@ -1412,7 +2108,7 @@
     // Pane / 기타 — empty-area menu + clearM (Amend ⑤: outside-wrapper 우
     // 클릭 = Figma 의 deselect + empty menu. Scope-A 의 'M 보존' 정책은 폐기.).
     rightClickMSnapshot = null;
-    sessionStore.clearM();
+    clearCanvasDrillAndSelection();
     onContextMenuRequest?.({
       clientX: e.clientX,
       clientY: e.clientY,
@@ -1421,35 +2117,9 @@
     });
   }
 
-  /**
-   * Selection box (lasso) 변화 sync — Cmd/Ctrl click 의 toggle 과 동등 취급.
-   * Layer panel 등 sessionStore.M 의 모든 consumer 가 자동 갱신.
-   *
-   * `selectionOnDrag={true}` 로 left-drag 이 selection box. 사용자가 한 번
-   * 드래그하면 SvelteFlow internal 이 영역 안 node 들의 `selected` 를 set 후
-   * 본 callback fire — 우리는 그 결과를 store M 으로 sync.
-   *
-   * 단일 click (onnodeclick) 흐름과 충돌 우려: onnodeclick 이 먼저 fire 후
-   * onselectionchange 가 *같은 단일 id* set — 동일 결과 (no-op). modifier
-   * click 의 toggleM 도 그 후 store 와 internal 이 동기적.
-   */
-  function onselectionchange({ nodes }: { nodes: Node[]; edges: unknown[] }) {
-    // Select mode 외에는 selection sync 안 함 — elementsSelectable={false} 가
-    // SvelteFlow internal 의 selection 자체를 막지만 defensive guard 유지.
-    if (!isSelectMode) return;
-    const ids = nodes.map((n) => n.id);
-    // Fast no-op — 동일 set 이면 skip (callback frequency 높음, drag 중 매 frame).
-    if (ids.length === sessionStore.M.size) {
-      let same = true;
-      for (const id of ids) {
-        if (!sessionStore.M.has(id)) {
-          same = false;
-          break;
-        }
-      }
-      if (same) return;
-    }
-    sessionStore.setM(ids);
+  function onselectionchange({ nodes, edges }: { nodes: Node[]; edges: unknown[] }) {
+    void nodes;
+    void edges;
   }
 
   // ADR-0032 Amend ② D15 + Amend ⑤ — Selection-wrapper right-click.
@@ -1471,7 +2141,7 @@
     const nodeUnder = nodeIdAtPoint(event.clientX, event.clientY);
     if (nodeUnder === null) {
       // Empty under wrapper — Amend ⑤: clearM + empty menu.
-      sessionStore.clearM();
+      clearCanvasDrillAndSelection();
       onContextMenuRequest?.({
         clientX: event.clientX,
         clientY: event.clientY,
@@ -1480,7 +2150,7 @@
       });
       return;
     }
-    const anyId = nodes[0]?.id ?? [...sessionStore.M][0];
+    const anyId = nodes[0] !== undefined ? canvasTargetFor(nodes[0].id) : [...sessionStore.M][0];
     if (anyId === undefined) return;
     onContextMenuRequest?.({
       clientX: event.clientX,
@@ -1501,9 +2171,10 @@
   }) {
     if (!(event instanceof MouseEvent)) return;
     if (isHandTool) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey) return;
     const nodeUnder = nodeIdAtPoint(event.clientX, event.clientY);
     if (nodeUnder !== null) return;
-    sessionStore.clearM();
+    clearCanvasDrillAndSelection();
   }
 
   function onnodecontextmenu({ event, node }: { event: MouseEvent | TouchEvent; node: Node }) {
@@ -1515,8 +2186,23 @@
     // (SvelteFlow internal 의 click-to-single reset 회귀 차단). clicked ∉
     // pre-reset M 이면 ADR-0032 D9 의 "M = {clicked} replace" — 명시 setM
     // (SvelteFlow 가 이미 reset 했더라도 idempotent).
-    if (rightClickMSnapshot !== null && rightClickMSnapshot.has(node.id)) {
+    const drillTarget = canvasTargetFor(node.id);
+    if (!targetIsInsideDrill(drillTarget)) sessionStore.clearDrill();
+    if (rightClickMSnapshot !== null && rightClickMSnapshot.has(drillTarget)) {
       sessionStore.setM([...rightClickMSnapshot]);
+    } else if (sessionStore.M.size >= 2 && sessionStore.M.has(drillTarget)) {
+      // Preserve existing multi-selection.
+    } else if (drillTarget !== node.id && sessionStore.groups.has(drillTarget)) {
+      sessionStore.setM([drillTarget]);
+      rightClickMSnapshot = null;
+      onContextMenuRequest?.({
+        clientX: event.clientX,
+        clientY: event.clientY,
+        paneId: null,
+        panelId: null,
+        groupId: drillTarget,
+      });
+      return;
     } else if (!sessionStore.M.has(node.id)) {
       sessionStore.setM([node.id]);
     }
@@ -1527,9 +2213,10 @@
       clientX: event.clientX,
       clientY: event.clientY,
       paneId,
-      panelId: node.id,
+      panelId: drillTarget,
     });
   }
+
 </script>
 
 <!-- capture-phase pointer handlers: SvelteFlow 의 selection box 보다 먼저 받음.
@@ -1544,11 +2231,15 @@
   class:text-cursor={isTextTool && !isSpacePressed && !isHandTool}
   class:pan-cursor={isSpacePressed || isHandTool}
   class:hand-mode={isHandTool}
+  style:--canvas-zoom={sessionStore.viewport.zoom}
   onpointerdowncapture={onCanvasPointerDown}
   onpointermovecapture={onCanvasPointerMove}
   onpointerupcapture={onCanvasPointerUp}
   onpointercancelcapture={onCanvasPointerCancel}
-  onpointerleave={() => (hoverScreen = null)}
+  onpointerleave={() => {
+    hoverScreen = null;
+    clearCanvasGroupHover();
+  }}
   oncontextmenucapture={onCanvasContextMenu}
 >
   <!-- NewPanelButton overlay 제거 — 기능은 Toolbar2 의 terminal 도구로 마이그레이션.
@@ -1560,6 +2251,7 @@
     {nodeTypes}
     {onnodeclick}
     {onpaneclick}
+    {onnodedrag}
     {onnodedragstop}
     {onmove}
     {onpanecontextmenu}
@@ -1572,15 +2264,15 @@
     zoomOnScroll={!isMaximizedActive}
     zoomOnPinch={!isMaximizedActive}
     zoomOnDoubleClick={!isMaximizedActive}
-    selectionOnDrag={isSelectMode && !isSpacePressed && !isMaximizedActive}
+    selectionOnDrag={false}
     nodesDraggable={isSelectMode && !isMaximizedActive}
-    elementsSelectable={isSelectMode && !isMaximizedActive}
+    elementsSelectable={false}
     selectionKey={null}
-    multiSelectionKey={['Meta', 'Control']}
+    multiSelectionKey={null}
     minZoom={0.05}
     maxZoom={3}
     fitView={false}
-    elevateNodesOnSelect={true}
+    elevateNodesOnSelect={false}
     onlyRenderVisibleElements={false}
     deleteKey={null}
     proOptions={SVELTE_FLOW_PRO_OPTIONS}
@@ -1637,6 +2329,14 @@
         </svg>
       {/if}
     </div>
+  {/if}
+
+  {#if lassoPreview !== null}
+    <div
+      class="selection-marquee"
+      style="left: {lassoPreview.left}px; top: {lassoPreview.top}px; width: {lassoPreview.width}px; height: {lassoPreview.height}px;"
+      aria-hidden="true"
+    ></div>
   {/if}
 
   {#if pointSpawnGhost !== null && dragState === null}
@@ -1696,19 +2396,34 @@
   }
 
   .canvas-root :global(.svelte-flow__node:hover) {
-    box-shadow: 0 0 0 1px var(--color-border-strong);
+    box-shadow: 0 0 0 calc(1px / var(--canvas-zoom, 1)) var(--color-border-strong);
   }
 
-  .canvas-root :global(.svelte-flow__node.selected),
-  .canvas-root :global(.svelte-flow__node:focus),
-  .canvas-root :global(.svelte-flow__node:focus-visible) {
-    box-shadow: 0 0 0 1.5px var(--color-accent);
+  .canvas-root :global(.svelte-flow__node.m-selected) {
+    box-shadow: 0 0 0 calc(1.5px / var(--canvas-zoom, 1)) var(--color-accent);
   }
 
-  .canvas-root :global(.svelte-flow__node.is-minimized.selected),
-  .canvas-root :global(.svelte-flow__node.is-minimized:focus),
-  .canvas-root :global(.svelte-flow__node.is-minimized:focus-visible) {
+  .canvas-root :global(.svelte-flow__node.is-minimized.m-selected) {
     box-shadow: none;
+  }
+
+  .canvas-root :global(.svelte-flow__node.group-selected),
+  .canvas-root :global(.svelte-flow__node.group-selected:hover),
+  .canvas-root :global(.svelte-flow__node.group-selected.m-selected) {
+    box-shadow: none;
+  }
+
+  .canvas-root :global(.svelte-flow__node.group-hit-target:hover),
+  .canvas-root :global(.svelte-flow__node.group-hit-target.m-selected) {
+    box-shadow: none;
+  }
+
+  .canvas-root :global(.svelte-flow__node.group-selected .svelte-flow__resize-control),
+  .canvas-root :global(.svelte-flow__node.group-hit-target .svelte-flow__resize-control),
+  .canvas-root :global(.svelte-flow__node.group-hit-target .endpoint),
+  .canvas-root :global(.svelte-flow__node.group-selected .endpoint) {
+    display: none !important;
+    pointer-events: none !important;
   }
 
   /* line 같은 *대각선 line-art* 의 bounding-box 는 ring 으로 표시하면 회귀
@@ -1717,9 +2432,7 @@
    * 시각은 LineNode 의 endpoint button 이 담당. */
   .canvas-root :global(.svelte-flow__node-line),
   .canvas-root :global(.svelte-flow__node-line:hover),
-  .canvas-root :global(.svelte-flow__node-line.selected),
-  .canvas-root :global(.svelte-flow__node-line:focus),
-  .canvas-root :global(.svelte-flow__node-line:focus-visible) {
+  .canvas-root :global(.svelte-flow__node-line.m-selected) {
     box-shadow: none;
   }
 
@@ -1740,8 +2453,19 @@
    * 활성). resize / drag 기능 회귀 0.
    */
   .canvas-root :global(.svelte-flow__node-line),
-  .canvas-root :global(.svelte-flow__node.fill-off) {
+  .canvas-root :global(.svelte-flow__node.fill-off),
+  .canvas-root :global(.svelte-flow__node.gtmux-group) {
     pointer-events: none;
+  }
+
+  /* ADR-0010 D15 — Group overlay wrapper 는 selection ring / hover halo 도 비활성.
+     overlay 자체가 dotted outline 의 자체 시각 만 — SvelteFlow 의 default
+     selected/hover box-shadow 가 겹치면 시각 혼란. */
+  .canvas-root :global(.svelte-flow__node.gtmux-group),
+  .canvas-root :global(.svelte-flow__node.gtmux-group:hover),
+  .canvas-root :global(.svelte-flow__node.gtmux-group.m-selected) {
+    box-shadow: none !important;
+    background: transparent !important;
   }
 
   /* Hand tool is viewport-only. Make every node wrapper transparent to pointer
@@ -1795,6 +2519,15 @@
        위로 ghost 가 표시되지 않음. */
     z-index: var(--z-canvas-overlay);
     border-radius: var(--radius-sm);
+  }
+
+  .selection-marquee {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1px solid var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+    pointer-events: none;
+    z-index: var(--z-canvas-overlay);
   }
 
   /* Live preview during drag — container-local screen coords. */

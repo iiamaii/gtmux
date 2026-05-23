@@ -29,6 +29,7 @@
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
+  import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import {
     commitNewItem,
@@ -46,6 +47,7 @@
     type AlignMode,
     type DistributeMode,
   } from '$lib/canvas/alignment';
+  import { descendantGroups, descendantItems, pruneEmptyGroups } from '$lib/types/group';
 
   let open = $state(false);
   let pos = $state<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -53,6 +55,9 @@
   let clickPos = $state<{ x: number; y: number }>({ x: 0, y: 0 });
   let paneIdStr = $state<string | null>(null);
   let panelIdStr = $state<string | null>(null);
+  /** ADR-0010 D16 + plan-0012 §3.4 — group entity 진입 (rail right-click).
+   *  Slice D 에서 mode='groupEntity' 분기로 entry text + [Ungroup] 활성. */
+  let groupIdStr = $state<string | null>(null);
   let hidePaste = $state(false);
   let menuEl: HTMLDivElement | undefined = $state();
   /** Add ▸ sub-menu hover state (empty-area branch only). */
@@ -65,10 +70,12 @@
     clientY: number;
     paneId?: string | null;
     panelId?: string | null;
+    groupId?: string | null;
     hidePaste?: boolean;
   }): void {
     paneIdStr = args.paneId ?? null;
     panelIdStr = args.panelId ?? null;
+    groupIdStr = args.groupId ?? null;
     hidePaste = args.hidePaste === true;
     open = true;
     // Initial position; clamped after the menu lays out (next tick).
@@ -83,6 +90,7 @@
     open = false;
     addSubmenuOpen = false;
     hidePaste = false;
+    groupIdStr = null;
   }
 
   function clampPos(): void {
@@ -148,14 +156,22 @@
     close();
   }
 
-  /** ADR-0017 D6 amend ⑨ — Hide / Lock toggle (selection batch). clicked-item 이
-   *  M ∈ 이면 M 전체, M ∉ 이면 그 single item. */
+  /** ADR-0017 D6 amend ⑨ + plan-0013 D22 — Hide / Lock toggle (selection batch).
+   *  M = item + group mixed 도 허용. groupEntity mode 면 [groupId] 단독. */
   function effectiveToggleIds(): string[] {
+    if (ctxMode === 'groupEntity') {
+      return groupIdStr !== null ? [groupIdStr] : [];
+    }
     if (panelIdStr === null) return [];
     if (sessionStore.M.has(panelIdStr) && sessionStore.M.size > 0) {
-      return [...sessionStore.M].filter((id) => sessionStore.items.has(id));
+      return [...sessionStore.M].filter(
+        (id) => sessionStore.items.has(id) || sessionStore.groups.has(id),
+      );
     }
-    return sessionStore.items.has(panelIdStr) ? [panelIdStr] : [];
+    if (sessionStore.items.has(panelIdStr) || sessionStore.groups.has(panelIdStr)) {
+      return [panelIdStr];
+    }
+    return [];
   }
 
   /* ── ADR-0032 amend ① (2026-05-21) — Multi-select mode + type intersection.
@@ -169,6 +185,31 @@
     if (panelIdStr === null) return false;
     return sessionStore.M.has(panelIdStr) && sessionStore.M.size >= 2;
   });
+  /** ADR-0032 D25~D28 + plan-0012 §3.4 D.1 — ContextMenu 의 4 mode. */
+  type CtxMode = 'empty' | 'single' | 'multi' | 'groupEntity';
+  const ctxMode = $derived.by((): CtxMode => {
+    if (groupIdStr !== null) return 'groupEntity';
+    if (isMultiMode) return 'multi';
+    if (panelIdStr !== null) return 'single';
+    return 'empty';
+  });
+  /** ADR-0024 D9 / D14 + plan-0012 §3.4 D.3 — Z 액션의 effective target.
+   *  groupEntity → [groupId], multi → M (group/item mixed 허용),
+   *  single → [panelIdStr], empty → []. */
+  const zTargetIds = $derived.by((): string[] => {
+    if (ctxMode === 'groupEntity') return groupIdStr !== null ? [groupIdStr] : [];
+    if (ctxMode === 'multi') {
+      const out: string[] = [];
+      for (const id of sessionStore.M) {
+        if (sessionStore.items.has(id) || sessionStore.groups.has(id)) out.push(id);
+      }
+      return out;
+    }
+    if (ctxMode === 'single') return panelIdStr !== null ? [panelIdStr] : [];
+    return [];
+  });
+  /** Slice E 의 entry text prefix — groupEntity 에서만 "group " (ADR-0010 D16). */
+  const zPrefix = $derived(ctxMode === 'groupEntity' ? 'group ' : '');
   const effectiveItems = $derived.by((): CanvasItem[] => {
     if (panelIdStr === null) return [];
     if (isMultiMode) {
@@ -276,23 +317,78 @@
   /* ── ARRANGE 4 z actions (ADR-0024 D2 / ADR-0032 D11) — multi 시 batch. ── */
 
   function onBringToFront(): void {
-    for (const id of targetIds) zStore.bringToFront(id);
+    if (!zStore.canBringToFront(zTargetIds)) return;
+    zStore.bringToFront(zTargetIds);
     close();
   }
 
   function onSendToBack(): void {
-    for (const id of targetIds) zStore.sendToBack(id);
+    if (!zStore.canSendToBack(zTargetIds)) return;
+    zStore.sendToBack(zTargetIds);
     close();
   }
 
   function onBringForward(): void {
-    for (const id of targetIds) zStore.bringForward(id);
+    if (!zStore.canBringForward(zTargetIds)) return;
+    zStore.bringForward(zTargetIds);
     close();
   }
 
   function onSendBackward(): void {
-    for (const id of targetIds) zStore.sendBackward(id);
+    if (!zStore.canSendBackward(zTargetIds)) return;
+    zStore.sendBackward(zTargetIds);
     close();
+  }
+
+  /** ADR-0010 D14 + plan-0012 §3.4 D.5 — [Group] entry handler (single/multi). */
+  async function onGroup(): Promise<void> {
+    if (sessionStore.active === null) return;
+    // single 모드는 단일 id 그룹화 (D14 single-element group 허용).
+    // multi 모드는 M 전체 그룹화. 둘 다 zTargetIds 가 정합.
+    const ids = ctxMode === 'multi' ? [...sessionStore.M] : zTargetIds;
+    if (ids.length === 0) return;
+    close();
+    await sessionStore.createGroup(ids);
+  }
+
+  /** ADR-0010 D12 + plan-0012 §3.4 D.5 — [Ungroup] entry handler (groupEntity). */
+  async function onUngroup(): Promise<void> {
+    if (sessionStore.active === null || groupIdStr === null) return;
+    const gid = groupIdStr;
+    close();
+    await sessionStore.ungroup(gid);
+  }
+
+  /** ADR-0032 D29 — groupEntity [Delete all items]. */
+  async function onDeleteGroupAll(): Promise<void> {
+    if (sessionStore.active === null || groupIdStr === null) return;
+    const gid = groupIdStr;
+    const groupsArr = [...sessionStore.groups.values()];
+    const itemsArr = [...sessionStore.items.values()];
+    const items = descendantItems(gid, groupsArr, itemsArr);
+    const terminalCount = items.filter((it) => it.type === 'terminal').length;
+    close();
+    if (terminalCount > 0) {
+      groupCloseDialog.show(gid);
+      return;
+    }
+    const groupIds = new Set([gid, ...descendantGroups(gid, groupsArr).map((g) => g.id)]);
+    const itemIds = new Set(items.map((it) => it.id));
+    const result = await sessionStore.applyMutation(
+      (cur) =>
+        pruneEmptyGroups({
+          ...cur,
+          groups: cur.groups.filter((g) => !groupIds.has(g.id)),
+          items: cur.items.filter((it) => !itemIds.has(it.id)),
+        }),
+      { failMessage: 'Delete group items failed' },
+    );
+    if (result.ok) {
+      if (sessionStore.drillRootId !== null && groupIds.has(sessionStore.drillRootId)) {
+        sessionStore.clearDrill();
+      }
+      sessionStore.clearM();
+    }
   }
 
   /* ── ALIGN / DISTRIBUTE (ADR-0027 / ADR-0032 D13) ──────────────────── */
@@ -591,6 +687,67 @@
       <div class="ctx-sep"></div>
     {/if}
 
+    {#if ctxMode === 'groupEntity'}
+      <!-- ADR-0032 D25~D28 + plan-0012 §3.4 D — Group entity mode. -->
+      <div class="ctx-section">Arrange</div>
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!zStore.canBringToFront(zTargetIds)}
+        onclick={onBringToFront}
+      >
+        <span class="label">Bring {zPrefix}to front</span>
+        <span class="kbd mono">⇧]</span>
+      </button>
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!zStore.canBringForward(zTargetIds)}
+        onclick={onBringForward}
+      >
+        <span class="label">Bring {zPrefix}forward</span>
+        <span class="kbd mono">]</span>
+      </button>
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!zStore.canSendBackward(zTargetIds)}
+        onclick={onSendBackward}
+      >
+        <span class="label">Send {zPrefix}backward</span>
+        <span class="kbd mono">[</span>
+      </button>
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!zStore.canSendToBack(zTargetIds)}
+        onclick={onSendToBack}
+      >
+        <span class="label">Send {zPrefix}to back</span>
+        <span class="kbd mono">⇧[</span>
+      </button>
+      <div class="ctx-sep"></div>
+      <!-- Group visibility / lock toggle — ADR-0010 D6 의 self-state 갱신.
+           descendant effective state 는 AND (visibility) / OR (lock) 으로 자연 전파. -->
+      <div class="ctx-section">Visibility</div>
+      <button type="button" class="ctx-item" onclick={onHide}>
+        <span class="label">Hide / Show group</span>
+        <span class="kbd mono">⇧⌘H</span>
+      </button>
+      <button type="button" class="ctx-item" onclick={onLock}>
+        <span class="label">Lock / Unlock group</span>
+        <span class="kbd mono">⌘L</span>
+      </button>
+      <div class="ctx-sep"></div>
+      <button type="button" class="ctx-item" onclick={() => void onUngroup()}>
+        <span class="label">Ungroup</span>
+        <span class="kbd mono">⇧⌘G</span>
+      </button>
+      <button type="button" class="ctx-item danger" onclick={() => void onDeleteGroupAll()}>
+        <span class="label">Delete all items</span>
+      </button>
+    {/if}
+
     {#if panelIdStr}
       <div class="ctx-section">Edit</div>
       <button type="button" class="ctx-item" onclick={onCopy}>
@@ -615,21 +772,51 @@
       <div class="ctx-sep"></div>
 
       <div class="ctx-section">Arrange</div>
-      <button type="button" class="ctx-item" onclick={onBringToFront}>
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!zStore.canBringToFront(zTargetIds)}
+        onclick={onBringToFront}
+      >
         <span class="label">Bring to front</span>
         <span class="kbd mono">⇧]</span>
       </button>
-      <button type="button" class="ctx-item" onclick={onBringForward}>
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!zStore.canBringForward(zTargetIds)}
+        onclick={onBringForward}
+      >
         <span class="label">Bring forward</span>
         <span class="kbd mono">]</span>
       </button>
-      <button type="button" class="ctx-item" onclick={onSendBackward}>
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!zStore.canSendBackward(zTargetIds)}
+        onclick={onSendBackward}
+      >
         <span class="label">Send backward</span>
         <span class="kbd mono">[</span>
       </button>
-      <button type="button" class="ctx-item" onclick={onSendToBack}>
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={!zStore.canSendToBack(zTargetIds)}
+        onclick={onSendToBack}
+      >
         <span class="label">Send to back</span>
         <span class="kbd mono">⇧[</span>
+      </button>
+      <!-- ADR-0010 D14 — [Group] entry (single/multi). zTargetIds 가 비어있지 않은 한 가능. -->
+      <button
+        type="button"
+        class="ctx-item"
+        disabled={zTargetIds.length === 0}
+        onclick={() => void onGroup()}
+      >
+        <span class="label">Group{isMultiMode ? ' (batch)' : ''}</span>
+        <span class="kbd mono">⌘G</span>
       </button>
       <div class="ctx-sep"></div>
 

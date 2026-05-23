@@ -36,7 +36,9 @@ import {
   type CanvasLayout,
   type Viewport,
 } from '$lib/types/canvas';
-import type { Group } from '$lib/types/group';
+import { descendantGroups, descendantItems, pruneEmptyGroups, type Group } from '$lib/types/group';
+import { generateUuidV4 } from '$lib/uuid';
+import { normalizeLayout } from '$lib/stores/zSpace';
 import type { AttachConfirmSummary } from '$lib/types/sessions';
 
 /** Active session 의 식별 정보. attach 성공 시 set, detach 시 null. */
@@ -76,6 +78,18 @@ function makeWsConnId(): string {
   return getWebpageId();
 }
 
+/**
+ * Group id 발급 — 표준 UUID v4 (8-4-4-4-12 lowercase hex).
+ *
+ * BE 정합: `crates/http-api/src/schema.rs:843` 의 `is_uuid_shape()` 가 hex-only
+ * 검증 — `'g'` 등 비-hex prefix 사용 시 `BadGroupId` reject. group 과 item id 가
+ * 같은 UUID format 을 공유 (구분은 `sessionStore.groups.has(id)` map lookup).
+ * 출처: plan-0012 §3.1 A.1 + handover-2026-05-22 §A.1 amend.
+ */
+function freshGroupId(): string {
+  return generateUuidV4();
+}
+
 function normalizeLoadedItem(item: CanvasItem): CanvasItem {
   if (
     item.type === 'terminal' &&
@@ -111,6 +125,15 @@ class SessionStore {
    * 한 session 안 unique. CONTEXT.md 정의.
    */
   I = $state<string | null>(null);
+
+  /**
+   * FE-only drill scope. `null` means canvas root; a group id means canvas hit
+   * testing resolves selection to that group's direct children.
+   *
+   * This is deliberately separate from M: layer tree can select an exact child
+   * while the canvas still operates at the containing drill level.
+   */
+  drillRootId = $state<string | null>(null);
 
   /**
    * FE-only ephemeral. Maximize 된 item 의 id — MaximizedItemModal 이 본 값
@@ -191,16 +214,21 @@ class SessionStore {
    */
   loadLayout(layout: CanvasLayout): void {
     debugCount('sessionStore.loadLayout');
+    // plan-0012 §6 / ADR-0024 신 D3' — boot 시점 consecutive z normalize.
+    // 옛 layout (gap 있는 z) 가 fresh attach / LAYOUT_CHANGED 으로 들어와도 store
+    // entry 시점에 *FE 측 invariant* 정합. Idempotent — 이미 정합인 layout 은
+    // z 값 변경 0건. 다음 mutation PUT 시 normalized z 가 BE 로 자연 commit.
+    const normalized = normalizeLayout(layout);
     this.items.clear();
-    for (const it of layout.items) {
+    for (const it of normalized.items) {
       const item = normalizeLoadedItem(it);
       this.items.set(item.id, item);
     }
     this.groups.clear();
-    for (const g of layout.groups) {
+    for (const g of normalized.groups) {
       this.groups.set(g.id, g);
     }
-    this.viewport = { ...layout.viewport };
+    this.viewport = { ...normalized.viewport };
   }
 
   /**
@@ -252,6 +280,7 @@ class SessionStore {
     this.active = session;
     sessionStorageHint.set(session.name);
     this.M.clear();
+    this.drillRootId = null;
     this.I = null;
     this.maximizedItemId = null;
     this.focusMode = { enabled: false, targetPanelId: null };
@@ -278,6 +307,7 @@ class SessionStore {
     this.groups.clear();
     this.viewport = { ...DEFAULT_VIEWPORT };
     this.M.clear();
+    this.drillRootId = null;
     this.I = null;
     this.maximizedItemId = null;
     this.focusMode = { enabled: false, targetPanelId: null };
@@ -306,10 +336,12 @@ class SessionStore {
   setM(ids: Iterable<string>): void {
     this.M.clear();
     for (const id of ids) this.M.add(id);
+    this.#dedupM();
   }
 
   addToM(id: string): void {
     this.M.add(id);
+    this.#dedupM();
   }
 
   removeFromM(id: string): void {
@@ -319,10 +351,392 @@ class SessionStore {
   toggleM(id: string): void {
     if (this.M.has(id)) this.M.delete(id);
     else this.M.add(id);
+    this.#dedupM();
   }
 
   clearM(): void {
     this.M.clear();
+  }
+
+  setDrillRoot(id: string | null): void {
+    this.drillRootId = id !== null && this.groups.has(id) ? id : null;
+  }
+
+  clearDrill(): void {
+    this.drillRootId = null;
+  }
+
+  /**
+   * ADR-0024 D15 — M 안에 group G + G 의 자손 (item 또는 nested group) 가 동시
+   * 포함되면 *자손 제거* (G 만 남김). Group 이 *atomic 단위* 로 작동하도록.
+   *
+   * ADR-0010 D7 의 "group plain click = 자손 다 M, group 자체는 M 외" 패턴과는
+   * 다른 경로 — 본 dedup 은 group 자체가 명시적으로 M 에 들어온 경우 (canvas
+   * rail click, Cmd-click group row, createGroup 직후 post-M) 에 활성.
+   */
+  #dedupM(): void {
+    if (this.M.size <= 1) return;
+    const groupIds: string[] = [];
+    for (const id of this.M) {
+      if (this.groups.has(id)) groupIds.push(id);
+    }
+    if (groupIds.length === 0) return;
+    const itemsArr = [...this.items.values()];
+    const groupsArr = [...this.groups.values()];
+    for (const gid of groupIds) {
+      for (const it of descendantItems(gid, groupsArr, itemsArr)) {
+        this.M.delete(it.id);
+      }
+      for (const dg of descendantGroups(gid, groupsArr)) {
+        this.M.delete(dg.id);
+      }
+    }
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Group lifecycle — ADR-0010 D14 (createGroup) / D12 (ungroup)           */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  /**
+   * Group id 식별 — `groups` SvelteMap 의 O(1) lookup.
+   *
+   * BE 정합: group + item id 모두 표준 UUID 8-4-4-4-12 hex format 공유 →
+   * prefix-based 구분 불가능. SvelteMap.has() lookup 이 단일 진실.
+   * 출처: plan-0012 §3.1 A.4 + handover-2026-05-22 §A.1 amend.
+   */
+  isGroupId(id: string): boolean {
+    return this.groups.has(id);
+  }
+
+  /**
+   * ADR-0010 D14 — auto label "Group N", N = 살아있는 라벨의 max + 1.
+   * 삭제된 N 는 재사용하지 않음 (사용자 명시 rename 한 group 은 pattern 안 매치).
+   */
+  nextGroupName(): string {
+    let max = 0;
+    for (const g of this.groups.values()) {
+      const m = /^Group (\d+)$/.exec(g.label ?? '');
+      if (m && m[1] !== undefined) {
+        const n = parseInt(m[1], 10);
+        if (n > max) max = n;
+      }
+    }
+    return `Group ${max + 1}`;
+  }
+
+  /**
+   * ADR-0010 D14 — Group 생성.
+   *
+   * 동작:
+   *  1. element ids 의 dedup (group + 자손 동시 포함 → 자손 제거).
+   *  2. Common ancestor 계산 (모든 element 의 ancestor chain 의 가장 깊은 공통
+   *     group, 없으면 null = canvas root).
+   *  3. 새 group entity: id = `g<32-hex>`, parent_id = commonAncestor, label =
+   *     auto, color = null, visibility = 'visible', locked = false, order =
+   *     같은 부모 sibling 의 max order + 1.
+   *  4. Atomic mutation (optimistic + PUT):
+   *     - groups: 새 group 추가, element 가 group 이면 parent_id 갱신.
+   *     - items: element 가 item 이면 parent_id 갱신.
+   *     - z: 새 group 이 부모 z-range 의 *top* 에 배치. 자손 z 는 현 z 순서 보존
+   *       후 consecutive 정합 (normalizeLayout).
+   *  5. Post-M = {newGroupId}. ADR-0010 D14 의 명시.
+   *
+   * 반환: 성공 → 새 group id. 실패 (active null / 빈 input / PUT fail) → null.
+   */
+  async createGroup(elementIds: Iterable<string>): Promise<string | null> {
+    if (this.active === null) return null;
+    // 1. dedup + 존재 검증.
+    const inputIds = [...new Set(elementIds)];
+    const valid = inputIds.filter(
+      (id) => this.items.has(id) || this.groups.has(id),
+    );
+    const deduped = this.#dedupForGrouping(valid);
+    if (deduped.length === 0) return null;
+
+    // 2. Common ancestor (현 store 기준 — transform 안에서 다시 계산하지 않음,
+    //    transform 의 input layout 도 같은 active session 의 snapshot 이라 일치).
+    const priorSnapshot = this.layoutSnapshot();
+    const commonAncestor = this.#commonAncestorOf(priorSnapshot, deduped);
+
+    // 3. 새 group entity 준비.
+    const newGroupId = freshGroupId();
+    const label = this.nextGroupName();
+    const siblingMaxOrder = this.#maxSiblingOrder(priorSnapshot, commonAncestor);
+    const newGroup: Group = {
+      id: newGroupId,
+      parent_id: commonAncestor,
+      label,
+      color: null,
+      visibility: 'visible',
+      locked: false,
+      order: siblingMaxOrder + 1,
+    };
+
+    const dedupedSet = new Set(deduped);
+    const transform = (cur: CanvasLayout): CanvasLayout => {
+      // 4a. element parent_id 갱신.
+      const reparentedItems = cur.items.map((it) =>
+        dedupedSet.has(it.id) ? { ...it, parent_id: newGroupId } : it,
+      );
+      const reparentedGroups = cur.groups.map((g) =>
+        dedupedSet.has(g.id) ? { ...g, parent_id: newGroupId } : g,
+      );
+      // 새 group 이 layout 에 이미 있을 리 없지만 defensive: 중복 X.
+      const groupsWithNew = reparentedGroups.some((g) => g.id === newGroupId)
+        ? reparentedGroups
+        : [...reparentedGroups, newGroup];
+      const interim: CanvasLayout = {
+        ...cur,
+        items: reparentedItems,
+        groups: groupsWithNew,
+      };
+      // 4b. Order overrides — commonAncestor 와 newGroup 두 level.
+      const overrides = new Map<string | null, readonly string[]>();
+      const caCurrent = this.#blockIdsAtParent(interim, commonAncestor).filter(
+        (id) => id !== newGroupId,
+      );
+      overrides.set(commonAncestor, [...caCurrent, newGroupId]);
+      const childOrder = this.#blockIdsAtParent(interim, newGroupId);
+      overrides.set(newGroupId, childOrder);
+      // 4c. Normalize 으로 consecutive z 정합.
+      return normalizeLayout(interim, overrides);
+    };
+
+    // Optimistic update (items + groups 모두 surgical).
+    const optimistic = transform(priorSnapshot);
+    this.#applyLayoutSurgically(optimistic);
+    const priorM = [...this.M];
+    this.setM([newGroupId]);
+
+    const result = await this.applyMutation(transform, { priorSnapshot });
+    if (!result.ok) {
+      // applyMutation 의 priorSnapshot 복원이 items + groups 는 처리. M 은 별도.
+      this.setM(priorM);
+      return null;
+    }
+    return newGroupId;
+  }
+
+  /**
+   * ADR-0010 D12 — Group 해체 (비파괴). Group entity 만 제거 + 자손 보존.
+   *
+   * 동작:
+   *  1. groupId 의 직속 자식 (item + nested group) 의 parent_id = group.parent_id.
+   *  2. group entity 제거.
+   *  3. z 정합 — 자손이 그대로 옛 group 위치에 끼어들도록 commonAncestor level 의
+   *     block order 가 [..., before-group, ...descendants, ...after-group] 형태.
+   *  4. M.clear() + 자손들로 setM (post-M = direct children).
+   *
+   * 반환: true = 성공, false = 실패 (active null / group 미존재 / PUT fail).
+   */
+  async ungroup(groupId: string): Promise<boolean> {
+    if (this.active === null) return false;
+    const group = this.groups.get(groupId);
+    if (!group) return false;
+
+    const priorSnapshot = this.layoutSnapshot();
+    const parentOfG = group.parent_id;
+    const directChildIds = this.#directChildIdsOf(priorSnapshot, groupId);
+    if (directChildIds.length === 0) {
+      // empty group — just remove the group entity.
+    }
+
+    const transform = (cur: CanvasLayout): CanvasLayout => {
+      // 1. 직속 자식 reparent (item + group).
+      const directSet = new Set(directChildIds);
+      const reparentedItems = cur.items.map((it) =>
+        directSet.has(it.id) ? { ...it, parent_id: parentOfG } : it,
+      );
+      const reparentedGroups = cur.groups.map((g) =>
+        directSet.has(g.id) ? { ...g, parent_id: parentOfG } : g,
+      );
+      // 2. group entity 제거.
+      const groupsWithoutG = reparentedGroups.filter((g) => g.id !== groupId);
+      const interim: CanvasLayout = {
+        ...cur,
+        items: reparentedItems,
+        groups: groupsWithoutG,
+      };
+      // 3. parentOfG level 의 order = 옛 [..., G, ...] 에서 G 자리에 자손 (현 z 순서 보존) 삽입.
+      const caCurrent = this.#blockIdsAtParent(cur, parentOfG);
+      const childOrderInG = this.#blockIdsAtParent(cur, groupId);
+      const newOrder: string[] = [];
+      for (const id of caCurrent) {
+        if (id === groupId) {
+          newOrder.push(...childOrderInG);
+        } else {
+          newOrder.push(id);
+        }
+      }
+      const overrides = new Map<string | null, readonly string[]>();
+      overrides.set(parentOfG, newOrder);
+      return normalizeLayout(interim, overrides);
+    };
+
+    const optimistic = transform(priorSnapshot);
+    this.#applyLayoutSurgically(optimistic);
+    const priorM = [...this.M];
+    const priorDrillRootId = this.drillRootId;
+    // Post-M = direct children of G (D12).
+    this.setM(directChildIds);
+    if (this.drillRootId === groupId) this.clearDrill();
+
+    const result = await this.applyMutation(transform, { priorSnapshot });
+    if (!result.ok) {
+      this.setM(priorM);
+      this.setDrillRoot(priorDrillRootId);
+      return false;
+    }
+    return true;
+  }
+
+  /* ────────────────────────────────────────────────────────────────────── */
+  /* Group helpers (internal)                                                */
+  /* ────────────────────────────────────────────────────────────────────── */
+
+  #dedupForGrouping(ids: readonly string[]): string[] {
+    if (ids.length <= 1) return [...ids];
+    const groupsArr = [...this.groups.values()];
+    const itemsArr = [...this.items.values()];
+    const groupSet = new Set(ids.filter((id) => this.groups.has(id)));
+    const removed = new Set<string>();
+    for (const gid of groupSet) {
+      for (const it of descendantItems(gid, groupsArr, itemsArr)) {
+        removed.add(it.id);
+      }
+      for (const dg of descendantGroups(gid, groupsArr)) {
+        removed.add(dg.id);
+      }
+    }
+    return ids.filter((id) => !removed.has(id));
+  }
+
+  #ancestorChainTopDown(layout: CanvasLayout, id: string): (string | null)[] {
+    // Returns [null, gRoot, ..., gParent] — id 의 부모 그룹들의 root→deepest path.
+    // group + item id 가 같은 UUID format 이라 prefix 구분 불가 — 두 array 모두 lookup.
+    let parentId: string | null | undefined;
+    const g = layout.groups.find((g) => g.id === id);
+    if (g !== undefined) {
+      parentId = g.parent_id;
+    } else {
+      parentId = layout.items.find((it) => it.id === id)?.parent_id;
+    }
+    if (parentId === undefined) return [];
+    const chain: (string | null)[] = [];
+    let cur: string | null = parentId;
+    while (cur !== null) {
+      chain.unshift(cur);
+      const g = layout.groups.find((g) => g.id === cur);
+      cur = g?.parent_id ?? null;
+    }
+    chain.unshift(null); // root sentinel
+    return chain;
+  }
+
+  #commonAncestorOf(layout: CanvasLayout, ids: readonly string[]): string | null {
+    if (ids.length === 0) return null;
+    const first = ids[0];
+    if (first === undefined) return null;
+    let common = this.#ancestorChainTopDown(layout, first);
+    for (let i = 1; i < ids.length; i++) {
+      const id = ids[i];
+      if (id === undefined) continue;
+      const c = this.#ancestorChainTopDown(layout, id);
+      let k = 0;
+      const lim = Math.min(common.length, c.length);
+      while (k < lim && common[k] === c[k]) k++;
+      common = common.slice(0, k);
+    }
+    if (common.length === 0) return null;
+    const last = common[common.length - 1];
+    return last === undefined ? null : last;
+  }
+
+  #maxSiblingOrder(layout: CanvasLayout, parentId: string | null): number {
+    let max = 0;
+    for (const g of layout.groups) {
+      if (g.parent_id === parentId && g.order > max) max = g.order;
+    }
+    return max;
+  }
+
+  #blockIdsAtParent(layout: CanvasLayout, parentId: string | null): string[] {
+    // 현 layout 의 atomic block order — group block 의 min z = 자손 item 의 min z.
+    // children-of map 을 만들어 group 의 min z 를 계산.
+    const itemsById = new Map(layout.items.map((it) => [it.id, it] as const));
+    const childrenOf = new Map<string, { id: string; kind: 'item' | 'group' }[]>();
+    for (const g of layout.groups) childrenOf.set(g.id, []);
+    for (const it of layout.items) {
+      if (it.parent_id !== null) {
+        const arr = childrenOf.get(it.parent_id);
+        if (arr) arr.push({ id: it.id, kind: 'item' });
+      }
+    }
+    for (const g of layout.groups) {
+      if (g.parent_id !== null) {
+        const arr = childrenOf.get(g.parent_id);
+        if (arr) arr.push({ id: g.id, kind: 'group' });
+      }
+    }
+    function minZ(blockId: string, kind: 'item' | 'group'): number {
+      if (kind === 'item') return itemsById.get(blockId)?.z ?? 0;
+      let min = Number.POSITIVE_INFINITY;
+      const stack = [blockId];
+      while (stack.length > 0) {
+        const cur = stack.pop() as string;
+        const kids = childrenOf.get(cur) ?? [];
+        for (const k of kids) {
+          if (k.kind === 'item') {
+            const z = itemsById.get(k.id)?.z;
+            if (z !== undefined && z < min) min = z;
+          } else {
+            stack.push(k.id);
+          }
+        }
+      }
+      return Number.isFinite(min) ? min : 0;
+    }
+    const blocks: { id: string; kind: 'item' | 'group'; mz: number }[] = [];
+    for (const it of layout.items) {
+      if (it.parent_id === parentId) {
+        blocks.push({ id: it.id, kind: 'item', mz: it.z });
+      }
+    }
+    for (const g of layout.groups) {
+      if (g.parent_id === parentId) {
+        blocks.push({ id: g.id, kind: 'group', mz: minZ(g.id, 'group') });
+      }
+    }
+    blocks.sort((a, b) => a.mz - b.mz);
+    return blocks.map((b) => b.id);
+  }
+
+  #directChildIdsOf(layout: CanvasLayout, groupId: string): string[] {
+    // Sorted by current min z — ungroup 시 자손 z 순서 보존에 사용.
+    return this.#blockIdsAtParent(layout, groupId);
+  }
+
+  #applyLayoutSurgically(layout: CanvasLayout): void {
+    // optimisticMutation 의 items-only 패턴을 groups 까지 확장. createGroup /
+    // ungroup 처럼 groups[] 도 mutate 하는 path 의 optimistic 진입.
+    const nextItemIds = new Set<string>();
+    for (const it of layout.items) {
+      nextItemIds.add(it.id);
+      const cur = this.items.get(it.id);
+      if (cur !== it) this.items.set(it.id, it);
+    }
+    for (const id of [...this.items.keys()]) {
+      if (!nextItemIds.has(id)) this.items.delete(id);
+    }
+    const nextGroupIds = new Set<string>();
+    for (const g of layout.groups) {
+      nextGroupIds.add(g.id);
+      const cur = this.groups.get(g.id);
+      if (cur !== g) this.groups.set(g.id, g);
+    }
+    for (const id of [...this.groups.keys()]) {
+      if (!nextGroupIds.has(id)) this.groups.delete(id);
+    }
   }
 
   /* ────────────────────────────────────────────────────────────────────── */
@@ -845,6 +1259,22 @@ class SessionStore {
       return { ok, fail };
     }
     if (ok > 0) {
+      const beforePrune = this.layoutSnapshot();
+      const afterPrune = pruneEmptyGroups(beforePrune);
+      if (afterPrune.groups.length !== this.groups.size) {
+        this.#applyLayoutSurgically(afterPrune);
+        await this.applyMutation(() => afterPrune, {
+          captureHistory: false,
+          failMessage: 'Empty group cleanup failed',
+          priorSnapshot: beforePrune,
+        });
+      }
+      for (const id of [...this.M]) {
+        if (!this.items.has(id) && !this.groups.has(id)) this.M.delete(id);
+      }
+      if (this.drillRootId !== null && !this.groups.has(this.drillRootId)) {
+        this.clearDrill();
+      }
       historyStore.capture(active.name, before);
     }
     return { ok, fail };

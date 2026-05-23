@@ -4,7 +4,12 @@
 // - ADR-0017 D6 amend ⑦ (a) — Cmd/Ctrl+A: canvas + LayerTreeView focus 모두
 //   sessionStore.M 에 active session 의 visible items 전체 set. xterm/editable
 //   focus 는 OS default 로 routing (registry skip).
-//   *Group row M* 은 sessionStore.M 이 item-only set 이므로 본 wire 의 범위 밖.
+// - ADR-0010 D14 / D21 / D22.5 + plan-0013 — sessionStore.M 은 **group id 도
+//   포함 가능** (Cmd+G 직후 / drill-in plain click / sidebar grouped item click).
+//   본 wire 의 batch handler 는 item + group 모두 분기 — Lock / Hide toggle 은
+//   group 의 self.locked / self.visibility 도 동일 패턴으로 갱신.
+//   Nudge / Duplicate / Cmd+A 같은 *geometry / item-only payload* 동작은 item
+//   ids 만 처리 (group 은 frame 없음 — descendant 동작은 별 batch).
 // - ADR-0017 D6 amend ⑧ (Arrow nudge) — `↑↓←→` 1px / `Shift+↑↓←→` 8px /
 //   `Cmd|Ctrl+↑↓←→` 64px. M.size ≥ 1, locked 제외, 250ms idle debounce
 //   (nudgeBuffer).
@@ -73,30 +78,50 @@ function doNudge(key: ArrowKey, step: number): boolean {
   return true;
 }
 
-/** Selected items 의 batch toggle 동작 (ADR-0017 D6 amend ⑨ — Lock / Hide). */
+/** Selected items + groups 의 batch toggle 동작 (ADR-0017 D6 amend ⑨ + plan-0013).
+ *  M 에 group + item mixed 시 각자 분기 — items.set 으로 갱신, groups.set 으로 갱신. */
 function selectionIds(): string[] {
   const out: string[] = [];
   for (const id of sessionStore.M) {
-    if (sessionStore.items.has(id)) out.push(id);
+    if (sessionStore.items.has(id) || sessionStore.groups.has(id)) out.push(id);
   }
   return out;
 }
 
+interface LockVisibilityState {
+  locked: boolean;
+  visibility: 'visible' | 'hidden';
+}
+
+function lookupSelfState(id: string): LockVisibilityState | null {
+  const it = sessionStore.items.get(id);
+  if (it !== undefined) return { locked: it.locked, visibility: it.visibility };
+  const g = sessionStore.groups.get(id);
+  if (g !== undefined) return { locked: g.locked, visibility: g.visibility };
+  return null;
+}
+
 /**
- * Lock toggle (batch) — ids 미지정 시 sessionStore.M 의 모든 item.
+ * Lock toggle (batch) — ids 미지정 시 sessionStore.M 의 모든 element (item + group).
  * Figma 패턴: all locked → 모두 unlock, 그 외 (mixed / all unlocked) → 모두 lock.
+ * Group 의 self.locked 갱신은 ADR-0010 D6 의 effective locked 전파 (OR) 자연 적용.
  */
 function doToggleLock(ids?: readonly string[]): boolean {
   if (sessionStore.active === null) return false;
   const effective = ids === undefined ? selectionIds() : ids;
   if (effective.length === 0) return false;
-  const allLocked = effective.every((id) => sessionStore.items.get(id)?.locked === true);
+  const states = effective
+    .map((id) => lookupSelfState(id))
+    .filter((s): s is LockVisibilityState => s !== null);
+  if (states.length === 0) return false;
+  const allLocked = states.every((s) => s.locked === true);
   const nextLocked = !allLocked;
   const idSet = new Set(effective);
   void sessionStore.applyMutation(
     (cur) => ({
       ...cur,
       items: cur.items.map((it) => (idSet.has(it.id) ? { ...it, locked: nextLocked } : it)),
+      groups: cur.groups.map((g) => (idSet.has(g.id) ? { ...g, locked: nextLocked } : g)),
     }),
     { failMessage: 'Lock toggle failed' },
   );
@@ -104,14 +129,19 @@ function doToggleLock(ids?: readonly string[]): boolean {
 }
 
 /**
- * Visibility toggle (batch) — ids 미지정 시 sessionStore.M.
+ * Visibility toggle (batch) — ids 미지정 시 sessionStore.M 의 모든 element.
  * Figma 패턴: all hidden → 모두 visible, 그 외 → 모두 hide.
+ * Group 의 self.visibility 갱신은 ADR-0010 D6 의 effective visibility 전파 (AND) 자연 적용.
  */
 function doToggleVisibility(ids?: readonly string[]): boolean {
   if (sessionStore.active === null) return false;
   const effective = ids === undefined ? selectionIds() : ids;
   if (effective.length === 0) return false;
-  const allHidden = effective.every((id) => sessionStore.items.get(id)?.visibility === 'hidden');
+  const states = effective
+    .map((id) => lookupSelfState(id))
+    .filter((s): s is LockVisibilityState => s !== null);
+  if (states.length === 0) return false;
+  const allHidden = states.every((s) => s.visibility === 'hidden');
   const nextVisibility: 'visible' | 'hidden' = allHidden ? 'visible' : 'hidden';
   const idSet = new Set(effective);
   void sessionStore.applyMutation(
@@ -119,6 +149,9 @@ function doToggleVisibility(ids?: readonly string[]): boolean {
       ...cur,
       items: cur.items.map((it) =>
         idSet.has(it.id) ? { ...it, visibility: nextVisibility } : it,
+      ),
+      groups: cur.groups.map((g) =>
+        idSet.has(g.id) ? { ...g, visibility: nextVisibility } : g,
       ),
     }),
     { failMessage: 'Visibility toggle failed' },
