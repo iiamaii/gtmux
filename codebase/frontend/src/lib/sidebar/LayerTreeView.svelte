@@ -21,10 +21,12 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
+  import { patchTerminalLabel } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, CanvasItemType, CanvasLayout } from '$lib/types/canvas';
-  import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
-  import { zStore } from '$lib/stores/zStore.svelte';
+  import { groupHover } from '$lib/stores/groupHover.svelte';
+  import { buildChildBlocks, normalizeLayout } from '$lib/stores/zSpace';
+  import { directParentGroupId, effectiveLocked } from '$lib/types/group';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
 
   interface ContextMenuHolder {
@@ -33,6 +35,7 @@
       clientY: number;
       paneId?: string | null;
       panelId?: string | null;
+      groupId?: string | null;
       hidePaste?: boolean;
     }) => void;
   }
@@ -41,6 +44,8 @@
 
   /** Currently inline-editing group id, or `null`. Component-local. */
   let editingGroupId = $state<string | null>(null);
+  /** Currently inline-editing item id, or `null`. Component-local. */
+  let editingItemId = $state<string | null>(null);
 
   function onStartRenameGroup(id: string, e: MouseEvent): void {
     e.preventDefault();
@@ -61,6 +66,45 @@
 
   function onCancelRenameGroup(): void {
     editingGroupId = null;
+  }
+
+  function onStartRenameItem(id: string, e: MouseEvent): void {
+    e.preventDefault();
+    e.stopPropagation();
+    editingItemId = id;
+  }
+
+  async function onCommitRenameItem(id: string, next: string): Promise<void> {
+    editingItemId = null;
+    const trimmed = next.trim();
+    const item = sessionStore.items.get(id);
+    if (item === undefined) return;
+    await mutateActiveLayout((cur) => ({
+      ...cur,
+      items: cur.items.map((it) => {
+        if (it.id !== id) return it;
+        if (it.type === 'note') return { ...it, title: trimmed } as CanvasItem;
+        return { ...it, label: trimmed } as CanvasItem;
+      }),
+    }));
+    if (item.type !== 'terminal') return;
+    try {
+      await patchTerminalLabel(id, trimmed);
+      await terminalPool.refresh();
+    } catch (err) {
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Terminal label sync failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+      });
+    }
+  }
+
+  function onCancelRenameItem(): void {
+    editingItemId = null;
   }
 
   /* ── Group propagation 시각화 (ADR-0010 D6) ────────────────────────
@@ -106,11 +150,6 @@
     return src.label != null && src.label.length > 0 ? src.label : src.id.slice(0, 8);
   }
 
-  function openGroupClose(id: string, e: MouseEvent): void {
-    stopRowAction(e);
-    groupCloseDialog.show(id);
-  }
-
   // SSoT (`docs/ssot/canvas-layout-schema.md` §1 `$defs/Group`) 의 부분 view —
   // `codebase/frontend/src/lib/types/canvas-layout.d.ts` 가 codegen 으로 채워지기 전까지의
   // 잠정 타입. Canvas.svelte 의 PanelData 패턴과 동일 (R8 §F3 명시).
@@ -138,18 +177,37 @@
 
   // 트리 노드 union — 사이드바 한 줄에 해당.
   type TreeNode =
-    | { kind: 'group'; id: string; depth: number; group: GroupData; hasChildren: boolean }
+    | {
+        kind: 'group';
+        id: string;
+        depth: number;
+        group: GroupData;
+        hasChildren: boolean;
+      }
     | { kind: 'panel'; id: string; depth: number; panel: PanelData };
 
   // 펼침 상태 — component-local. P1+에서 ephemeralStore 또는 web-store 영속화 검토.
   const expanded = $state(new SvelteSet<string>());
 
-  // ADR-0024 D1 — Tree order ≠ Z. Sidebar 는 두 시점을 toggle:
-  //   - 'tree' : organization (parent_id 트리, 사용자 grouping. drag reorder 영역)
-  //   - 'z'    : rendering stack (z 내림차순 flat. group 미포함 — group 은 z 없음)
-  // P1+: ephemeralStore 영속화. MVP 는 component-local.
-  type LayerMode = 'tree' | 'z';
-  let layerMode = $state<LayerMode>('tree');
+  function expandAncestorsOf(id: string): void {
+    let parentId = directParentGroupId(id, sessionStore.items, sessionStore.groups);
+    const seen = new Set<string>();
+    while (parentId !== null && !seen.has(parentId)) {
+      seen.add(parentId);
+      expanded.add(parentId);
+      parentId = directParentGroupId(parentId, sessionStore.items, sessionStore.groups);
+    }
+  }
+
+  $effect(() => {
+    for (const id of sessionStore.M) {
+      expandAncestorsOf(id);
+    }
+  });
+
+  // ADR-0024 의 2026-05-22 ② amend (Tree=Z): Sidebar 는 *단일 view* (Tree).
+  // 옛 Z tab 의 group atomic row + fold/unfold 는 Tree 가 이미 동일 affordance 제공
+  // → Z tab UI 폐기. z-index 값 표시는 Inspector 로 단일화.
 
   // 트리 평탄화 — Group/Panel 을 parent_id 기준으로 묶어 DFS 순회.
   // 평탄화된 결과를 {each} 로 렌더하면 들여쓰기는 depth * 16 px 로 표현 가능.
@@ -182,17 +240,7 @@
       z: it.z,
     }));
 
-    // Z mode — flat z 내림차순, group 미포함 (ADR-0024 D3). depth=0 일관.
-    if (layerMode === 'z') {
-      const flat = [...panels].sort((a, b) => {
-        const za = (a as PanelData & { z?: number }).z ?? 0;
-        const zb = (b as PanelData & { z?: number }).z ?? 0;
-        return zb - za;
-      });
-      return flat.map((p) => ({ kind: 'panel' as const, id: p.id, depth: 0, panel: p }));
-    }
-
-    // 부모 별 children 인덱스 — null = canvas root.
+    // 부모 별 children 인덱스 — null = canvas root. 두 mode 공용.
     const childGroups = new Map<string | null, GroupData[]>();
     for (const g of groups) {
       const key = g.parent_id ?? null;
@@ -208,28 +256,43 @@
       else childPanels.set(key, [p]);
     }
 
-    // 같은 부모 안에서의 정렬: Group.order 오름차순 → Panel id 오름차순.
-    // SSoT 는 Panel 의 sibling 정렬 키를 별도로 명시하지 않음 — id 정렬은 결정성만 확보.
-    const sortGroups = (xs: GroupData[]): GroupData[] =>
-      [...xs].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-    const sortPanels = (xs: PanelData[]): PanelData[] =>
-      [...xs].sort((a, b) => a.id.localeCompare(b.id));
+    // ADR-0024 2026-05-22 ② amend (Tree=Z): sidebar row order is the z order.
+    // buildChildBlocks returns each parent level in ascending z; visual tree shows
+    // front-most first, so render the list in reverse order at every depth.
+    const layoutForZ: CanvasLayout = {
+      schema_version: 2,
+      items: Array.from(sessionStore.items.values()),
+      groups: Array.from(sessionStore.groups.values()),
+      viewport: sessionStore.viewport,
+    };
+    const zChildren = buildChildBlocks(layoutForZ);
+    const groupById = new Map(groups.map((g) => [g.id, g] as const));
+    const panelById = new Map(panels.map((p) => [p.id, p] as const));
 
     const out: TreeNode[] = [];
     const walk = (parentId: string | null, depth: number): void => {
-      // Groups first, then leaf Panels (Figma convention: 그룹이 위, 단일 leaf 가 아래).
-      const gs = sortGroups(childGroups.get(parentId) ?? []);
-      for (const g of gs) {
-        const ownChildren =
-          (childGroups.get(g.id)?.length ?? 0) + (childPanels.get(g.id)?.length ?? 0);
-        out.push({ kind: 'group', id: g.id, depth, group: g, hasChildren: ownChildren > 0 });
-        if (expanded.has(g.id) && ownChildren > 0) {
-          walk(g.id, depth + 1);
+      const blocks = [...(zChildren.get(parentId) ?? [])].reverse();
+      for (const block of blocks) {
+        if (block.kind === 'group') {
+          const g = groupById.get(block.id);
+          if (g === undefined) continue;
+          const ownChildren =
+            (childGroups.get(g.id)?.length ?? 0) + (childPanels.get(g.id)?.length ?? 0);
+          out.push({
+            kind: 'group',
+            id: g.id,
+            depth,
+            group: g,
+            hasChildren: ownChildren > 0,
+          });
+          if (expanded.has(g.id) && ownChildren > 0) {
+            walk(g.id, depth + 1);
+          }
+        } else {
+          const p = panelById.get(block.id);
+          if (p === undefined) continue;
+          out.push({ kind: 'panel', id: p.id, depth, panel: p });
         }
-      }
-      const ps = sortPanels(childPanels.get(parentId) ?? []);
-      for (const p of ps) {
-        out.push({ kind: 'panel', id: p.id, depth, panel: p });
       }
     };
     walk(null, 0);
@@ -316,6 +379,22 @@
    */
   let selectionAnchor = $state<string | null>(null);
 
+  function applyDrillForTreeSelection(ids: readonly string[]): void {
+    const parentIds = ids.map((rowId) =>
+      directParentGroupId(rowId, sessionStore.items, sessionStore.groups),
+    );
+    const first = parentIds[0] ?? null;
+    if (ids.length === 1) {
+      sessionStore.setDrillRoot(first);
+      return;
+    }
+    if (first !== null && parentIds.every((parentId) => parentId === first)) {
+      sessionStore.setDrillRoot(first);
+      return;
+    }
+    sessionStore.clearDrill();
+  }
+
   /**
    * 선택 동기화 — ADR-0024 의 layer list 1차 가치 "다중 선택 + bulk action".
    *   - plain                : M = [id]. anchor = id.
@@ -331,12 +410,14 @@
         const anchor = selectionAnchor;
         if (anchor === null || anchor === id) {
           sessionStore.toggleM(id);
+          applyDrillForTreeSelection([...sessionStore.M]);
           if (anchor === null) selectionAnchor = id;
           return;
         }
         const ids = visibleRangeIds(anchor, id);
         if (ids.length === 0) {
           sessionStore.toggleM(id);
+          applyDrillForTreeSelection([...sessionStore.M]);
           return;
         }
         // setM 으로 anchor↔target range 만 선택. (multi-select 의 일반 직관 —
@@ -346,28 +427,76 @@
         } else {
           sessionStore.setM(ids);
         }
+        applyDrillForTreeSelection([...sessionStore.M]);
         return;
       }
       if (e.metaKey || e.ctrlKey) {
         sessionStore.toggleM(id);
+        applyDrillForTreeSelection([...sessionStore.M]);
         selectionAnchor = id;
         return;
       }
     }
     sessionStore.setM([id]);
+    applyDrillForTreeSelection([id]);
     selectionAnchor = id;
   }
 
   function onPanelContextMenu(id: string, p: PanelData, e: MouseEvent): void {
     e.preventDefault();
     e.stopPropagation();
-    sessionStore.setM([id]);
-    selectionAnchor = id;
+    const target = id;
+    if (sessionStore.M.size >= 2 && sessionStore.M.has(target)) {
+      selectionAnchor = target;
+      contextMenuHolder?.openAt({
+        clientX: e.clientX,
+        clientY: e.clientY,
+        paneId: null,
+        panelId: target,
+        hidePaste: true,
+      });
+      return;
+    }
+    sessionStore.setM([target]);
+    sessionStore.setDrillRoot(directParentGroupId(id, sessionStore.items, sessionStore.groups));
+    selectionAnchor = target;
     contextMenuHolder?.openAt({
       clientX: e.clientX,
       clientY: e.clientY,
       paneId: p.type === 'terminal' || p.type === 'panel' ? (p.pane_id ?? id) : null,
-      panelId: id,
+      panelId: target,
+      hidePaste: true,
+    });
+  }
+
+  /**
+   * ADR-0010 D16 + plan-0012 §3.3 B / §3.4 D — Sidebar group row right-click →
+   * ContextMenu 의 groupEntity mode. M = {groupId} 로 set 후 broker 경유와 동일하게
+   * `openAt({groupId})`.
+   */
+  function onGroupContextMenu(id: string, e: MouseEvent): void {
+    e.preventDefault();
+    e.stopPropagation();
+    if (sessionStore.M.size >= 2 && sessionStore.M.has(id)) {
+      selectionAnchor = id;
+      contextMenuHolder?.openAt({
+        clientX: e.clientX,
+        clientY: e.clientY,
+        paneId: null,
+        panelId: id,
+        hidePaste: true,
+      });
+      return;
+    }
+    sessionStore.setM([id]);
+    sessionStore.setDrillRoot(directParentGroupId(id, sessionStore.items, sessionStore.groups));
+    selectionAnchor = id;
+    contextMenuHolder?.openAt({
+      clientX: e.clientX,
+      clientY: e.clientY,
+      paneId: null,
+      panelId: null,
+      groupId: id,
       hidePaste: true,
     });
   }
@@ -384,6 +513,14 @@
     if (ia < 0 || ib < 0) return [];
     const [lo, hi] = ia <= ib ? [ia, ib] : [ib, ia];
     return order.slice(lo, hi + 1);
+  }
+
+  function onLayerTreeBackgroundClick(e: MouseEvent): void {
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('.row') !== null) return;
+    sessionStore.clearM();
+    sessionStore.clearDrill();
+    selectionAnchor = null;
   }
 
   // Panel 행이 dead pane 인지 — 회색/취소선 표시 트리거.
@@ -439,17 +576,17 @@
 
   function isItemLocked(id: string): boolean {
     const it = sessionStore.items.get(id);
-    if (it !== undefined) return it.locked === true;
+    if (it !== undefined) {
+      return effectiveLocked(it.locked, it.parent_id, sessionStore.groups);
+    }
     const g = sessionStore.groups.get(id);
-    if (g !== undefined) return g.locked === true;
+    if (g !== undefined) {
+      return effectiveLocked(g.locked, g.parent_id, sessionStore.groups);
+    }
     return false;
   }
 
   function onRowDragStart(id: string, e: DragEvent): void {
-    if (layerMode === 'z') {
-      e.preventDefault();
-      return;
-    }
     if (isItemLocked(id)) {
       e.preventDefault();
       return;
@@ -611,7 +748,48 @@
         return { ...g, order: idx + 1 };
       });
 
-      return { ...cur, items: itemsNext, groups: groupsNext };
+      // 3) ADR-0024 D13 (2026-05-22 amend) — drop indicator 별 z 효과.
+      //    'inside' → moved 가 target group 의 자손 *top* (max z + 1).
+      //    'before' → moved 가 target 의 *higher z* slot (after target in ascending z order).
+      //    'after'  → moved 가 target 의 *lower z* slot (before target).
+      // 변경 후 normalizeLayout 으로 consecutive invariant 정합.
+      const interim: CanvasLayout = { ...cur, items: itemsNext, groups: groupsNext };
+      const childMap = buildChildBlocks(interim);
+      const currentBlocks = (childMap.get(parentTargetId) ?? []).map((b) => b.id);
+      const movedAll = new Set(sourceIds);
+      const movedOrdered = currentBlocks.filter((id) => movedAll.has(id));
+      const otherBlocks = currentBlocks.filter((id) => !movedAll.has(id));
+      let newOrder: string[];
+      if (pos === 'inside') {
+        // moved 가 target group 의 자손 top.
+        newOrder = [...otherBlocks, ...movedOrdered];
+      } else {
+        newOrder = [];
+        let inserted = false;
+        for (const id of otherBlocks) {
+          if (id === targetId) {
+            if (pos === 'after') {
+              // moved → lower z than target.
+              newOrder.push(...movedOrdered);
+              newOrder.push(id);
+            } else {
+              // 'before' → higher z than target.
+              newOrder.push(id);
+              newOrder.push(...movedOrdered);
+            }
+            inserted = true;
+          } else {
+            newOrder.push(id);
+          }
+        }
+        if (!inserted) {
+          // Defensive — target 이 같은 parent 안 없으면 끝에 append.
+          newOrder.push(...movedOrdered);
+        }
+      }
+      const overrides = new Map<string | null, readonly string[]>();
+      overrides.set(parentTargetId, newOrder);
+      return normalizeLayout(interim, overrides);
     });
   }
 
@@ -657,17 +835,8 @@
 
   // Focus 는 ViewportCtrl 로 이동 — Layer row 의 select 후 ViewportCtrl 에서
   // focus 트리거. focusPanel / zoomToItem 호출은 본 file 에서 제거.
-
-  // Z-mode 의 reorder — bringForward / sendBackward 와 동일. List 가 z desc 정렬이므로
-  // 위 = z+ (bringForward), 아래 = z- (sendBackward).
-  function zMoveUp(id: string, e: MouseEvent): void {
-    stopRowAction(e);
-    zStore.bringForward(id);
-  }
-  function zMoveDown(id: string, e: MouseEvent): void {
-    stopRowAction(e);
-    zStore.sendBackward(id);
-  }
+  // ADR-0024 의 2026-05-22 ② amend — Z mode UI 폐기. Tree drag + ContextMenu 가
+  // z mutation 의 진입점이라 본 file 의 zMoveUp/Down 행 버튼은 제거됨.
 
   function toggleGroupVisibility(id: string, e: MouseEvent): void {
     stopRowAction(e);
@@ -695,29 +864,9 @@
 </script>
 
 <div class="layer-tree-view" aria-label="Layer tree">
-  <div class="layer-tree-toolbar">
-    <div class="mode-toggle" role="tablist" aria-label="Layer order mode">
-      <button
-        type="button"
-        role="tab"
-        class="mode-btn"
-        class:active={layerMode === 'tree'}
-        aria-selected={layerMode === 'tree'}
-        title="Organization tree (parent_id grouping)"
-        onclick={() => (layerMode = 'tree')}
-      >Tree</button>
-      <button
-        type="button"
-        role="tab"
-        class="mode-btn"
-        class:active={layerMode === 'z'}
-        aria-selected={layerMode === 'z'}
-        title="Rendering stack (z-index descending, no groups)"
-        onclick={() => (layerMode = 'z')}
-      >Z</button>
-    </div>
-  </div>
-  <ul class="tree" role="tree">
+  <!-- ADR-0024 의 2026-05-22 ② amend (Tree=Z) — Z tab UI 제거. Tree 가 단일 view.
+       z-index 값 표시는 Inspector 로 단일화. -->
+  <ul class="tree" role="tree" onclick={onLayerTreeBackgroundClick} onkeydown={() => {}}>
     {#each tree as node, nodeIdx (node.kind + ':' + node.id)}
       {#if node.kind === 'group'}
         {@const g = node.group}
@@ -733,12 +882,15 @@
           role="treeitem"
           aria-expanded={node.hasChildren ? isOpen : undefined}
           aria-selected={selected}
-          draggable={layerMode === 'tree' && !isItemLocked(node.id)}
+          draggable={!isItemLocked(node.id)}
           ondragstart={(e: DragEvent) => onRowDragStart(node.id, e)}
           ondragover={(e: DragEvent) => onRowDragOver(node.id, 'group', e)}
           ondragleave={(e: DragEvent) => onRowDragLeave(node.id, e)}
           ondrop={(e: DragEvent) => onRowDrop(node.id, 'group', e)}
           ondragend={onTreeDragEnd}
+          onmouseenter={() => groupHover.set(node.id)}
+          onmouseleave={() => groupHover.clearIf(node.id)}
+          oncontextmenu={(e: MouseEvent) => onGroupContextMenu(node.id, e)}
         >
           <div class="row-inner" style:padding-left={`${node.depth * 16 + 4}px`}>
             <!-- caret 은 span (button 중첩 금지) — keyboard 접근은 row-button 의 Enter/Space 가
@@ -775,6 +927,16 @@
                 ondblclick={(e: MouseEvent) => onStartRenameGroup(node.id, e)}
                 title={`${groupDisplayLabel(g)} (double-click to rename)`}
               >
+                <span class="type-icon group-type-icon" aria-hidden="true">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 8V5a1 1 0 0 1 1-1h3"/>
+                    <path d="M16 4h3a1 1 0 0 1 1 1v3"/>
+                    <path d="M20 16v3a1 1 0 0 1-1 1h-3"/>
+                    <path d="M8 20H5a1 1 0 0 1-1-1v-3"/>
+                    <rect x="8" y="8" width="4" height="4" rx="0.8"/>
+                    <rect x="13" y="13" width="3" height="3" rx="0.7"/>
+                  </svg>
+                </span>
                 <span class="label">{groupDisplayLabel(g)}</span>
               </button>
             {/if}
@@ -834,18 +996,6 @@
                   </svg>
                 {/if}
               </button>
-              <button
-                type="button"
-                class="icon icon-close"
-                title="Close group (bulk)"
-                aria-label="Close group"
-                onclick={(e: MouseEvent) => openGroupClose(node.id, e)}
-              >
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <line x1="18" y1="6" x2="6" y2="18"/>
-                  <line x1="6" y1="6" x2="18" y2="18"/>
-                </svg>
-              </button>
             </span>
             {/snippet}
             {@render groupIcons()}
@@ -864,7 +1014,7 @@
           class:dragging={dragState !== null && dragState.sourceIds.includes(node.id)}
           role="treeitem"
           aria-selected={selected}
-          draggable={layerMode === 'tree' && !isItemLocked(node.id)}
+          draggable={!isItemLocked(node.id)}
           ondragstart={(e: DragEvent) => onRowDragStart(node.id, e)}
           ondragover={(e: DragEvent) => onRowDragOver(node.id, 'panel', e)}
           ondragleave={(e: DragEvent) => onRowDragLeave(node.id, e)}
@@ -874,59 +1024,51 @@
         >
           <div
             class="row-inner"
-            style:padding-left={layerMode === 'z' ? '0px' : `${node.depth * 16 + 24}px`}
+            style:padding-left={`${node.depth * 16 + 20}px`}
           >
-            {#if layerMode === 'z'}
-              {@const canMoveUp = nodeIdx > 0}
-              {@const canMoveDown = nodeIdx < tree.length - 1}
-              <div class="z-actions" aria-label="Reorder z-index">
-                <button
-                  type="button"
-                  class="z-btn"
-                  disabled={!canMoveUp}
-                  title="Bring forward — z+1"
-                  aria-label="Bring forward"
-                  onclick={(e: MouseEvent) => zMoveUp(node.id, e)}
-                >
-                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2 6l3-3 3 3"/>
-                  </svg>
-                </button>
-                <button
-                  type="button"
-                  class="z-btn"
-                  disabled={!canMoveDown}
-                  title="Send backward — z−1"
-                  aria-label="Send backward"
-                  onclick={(e: MouseEvent) => zMoveDown(node.id, e)}
-                >
-                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2 4l3 3 3-3"/>
-                  </svg>
-                </button>
-              </div>
-            {/if}
-            <button
-              type="button"
-              class="row-button"
-              onclick={(e: MouseEvent) => selectNode(node.id, e)}
-              title={panelDisplayLabel(p)}
-            >
-              <span class="type-icon" aria-hidden="true">
-                {#if p.type === 'note'}
-                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
-                    <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
-                    <path d="M3.6 5.2h4.8"/>
-                  </svg>
-                {:else}
-                  {panelTypeIcon(p)}
-                {/if}
+            {#if editingItemId === node.id}
+              <span class="row-button row-button-edit">
+                <span class="type-icon" aria-hidden="true">
+                  {#if p.type === 'note'}
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
+                      <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
+                      <path d="M3.6 5.2h4.8"/>
+                    </svg>
+                  {:else}
+                    {panelTypeIcon(p)}
+                  {/if}
+                </span>
+                <InlineEditField
+                  value={panelDisplayLabel(p)}
+                  editing={true}
+                  allowEmpty={true}
+                  placeholder={node.id.slice(0, 8)}
+                  class="item-label-edit"
+                  onCommit={(next: string) => void onCommitRenameItem(node.id, next)}
+                  onCancel={onCancelRenameItem}
+                />
               </span>
-              <span class="label">{panelDisplayLabel(p)}{dead ? ' (Dead)' : ''}</span>
-              {#if layerMode === 'z' && typeof p.z === 'number'}
-                <span class="z-tag mono" title="z-index">z={p.z}</span>
-              {/if}
-            </button>
+            {:else}
+              <button
+                type="button"
+                class="row-button"
+                onclick={(e: MouseEvent) => selectNode(node.id, e)}
+                ondblclick={(e: MouseEvent) => onStartRenameItem(node.id, e)}
+                title={`${panelDisplayLabel(p)} (double-click to rename)`}
+              >
+                <span class="type-icon" aria-hidden="true">
+                  {#if p.type === 'note'}
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
+                      <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
+                      <path d="M3.6 5.2h4.8"/>
+                    </svg>
+                  {:else}
+                    {panelTypeIcon(p)}
+                  {/if}
+                </span>
+                <span class="label">{panelDisplayLabel(p)}{dead ? ' (Dead)' : ''}</span>
+              </button>
+            {/if}
             {#snippet panelIcons()}
               {@const panelInheritedHidden = p.visibility !== false ? inheritedHiddenFrom(p.parent_id ?? null) : null}
               {@const panelInheritedLocked = p.locked !== true ? inheritedLockedFrom(p.parent_id ?? null) : null}
@@ -1004,15 +1146,6 @@
     font-size: var(--text-md);
     line-height: var(--leading-normal);
     user-select: none;
-  }
-
-  .layer-tree-toolbar {
-    display: flex;
-    align-items: center;
-    gap: var(--space-6);
-    padding: var(--space-6) var(--space-12);
-    border-bottom: 1px solid var(--color-border);
-    flex: 0 0 auto;
   }
 
   .tree {
@@ -1123,9 +1256,31 @@
     min-width: 0;
   }
 
-  .row-button-edit :global(.group-label-edit) {
+  .row-button-edit :global(.group-label-edit),
+  .row-button-edit :global(.item-label-edit) {
     flex: 1 1 auto;
     min-width: 0;
+  }
+
+  .row-button-edit :global(.inline-edit-input) {
+    height: 24px;
+    padding: 0 6px;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    color: var(--color-fg);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.2px;
+    transition: border-color var(--motion-fast) var(--motion-easing);
+  }
+
+  .row-button-edit :global(.inline-edit-input:hover) {
+    border-color: var(--color-border-strong);
+  }
+
+  .row-button-edit :global(.inline-edit-input:focus-visible) {
+    outline: 0;
+    border-color: var(--color-accent);
   }
 
   .row.dead .row-button .label {
@@ -1135,35 +1290,6 @@
 
   /* Z-mode reorder buttons — left 24px slot 안에 up/down 두 button 수직 분할.
      tree mode 의 padding-left: 24 와 동일 width 유지. */
-  .z-actions {
-    flex: 0 0 24px;
-    width: 24px;
-    align-self: stretch;
-    display: flex;
-    flex-direction: column;
-  }
-  .z-btn {
-    flex: 1 1 0;
-    display: grid;
-    place-items: center;
-    background: transparent;
-    border: 0;
-    padding: 0;
-    color: var(--color-fg-subtle);
-    cursor: pointer;
-    transition:
-      background var(--motion-fast) var(--motion-easing),
-      color var(--motion-fast) var(--motion-easing),
-      opacity var(--motion-fast) var(--motion-easing);
-  }
-  .z-btn:hover:not(:disabled) {
-    background: var(--color-glass-1);
-    color: var(--color-fg);
-  }
-  .z-btn:disabled {
-    opacity: 0.3;
-    cursor: not-allowed;
-  }
 
   /* Panel rows don't have a caret block — use the same padding-left as group rows so the
      leading edge of the label aligns with group labels. Achieved via inline style:padding-left
@@ -1201,6 +1327,10 @@
     font-family: var(--font-mono);
     font-size: var(--text-base);
     color: var(--color-fg-muted);
+  }
+
+  .group-type-icon {
+    color: var(--color-accent);
   }
 
   /* Icons (visibility / lock) — Figma 컨벤션:
@@ -1250,12 +1380,6 @@
     color: var(--color-fg);
   }
 
-  /* Group close (X) — destructive hover treatment. */
-  .icon.icon-close:hover {
-    background: var(--color-danger);
-    color: white;
-  }
-
   /* Inherited (ADR-0010 D6) — ancestor 가 visibility/lock 을 덮어쓰는 상태.
    * Self 는 정상이지만 effective 값이 다름. 작은 dot overlay + 회색 톤 으로
    * "건드려도 안 바뀜" 시각 단서. tooltip 으로 source group 알림. */
@@ -1282,48 +1406,5 @@
     font-style: italic;
   }
 
-  /* Segmented Tree/Z toggle — ADR-0024 D1. */
-  .mode-toggle {
-    display: inline-flex;
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-sm);
-    overflow: hidden;
-    background: var(--color-surface);
-    flex: 0 0 auto;
-  }
-
-  .mode-btn {
-    padding: 1px var(--space-6);
-    border: 0;
-    background: transparent;
-    color: var(--color-fg-muted);
-    font: inherit;
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-    cursor: pointer;
-    transition: background var(--motion-fast) var(--motion-easing);
-  }
-
-  .mode-btn:hover {
-    background: var(--color-glass-1);
-    color: var(--color-fg);
-  }
-
-  .mode-btn.active {
-    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
-    color: var(--color-accent);
-  }
-
-  .z-tag {
-    flex: 0 0 auto;
-    margin-left: var(--space-4);
-    padding: 0 4px;
-    border-radius: var(--radius-pill);
-    background: var(--color-surface-2);
-    color: var(--color-fg-muted);
-    font-size: var(--text-sm);
-    letter-spacing: 0.2px;
-  }
+  /* Tree/Z toggle CSS 제거됨 — ADR-0024 의 2026-05-22 ② amend (Tree=Z). */
 </style>

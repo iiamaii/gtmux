@@ -57,15 +57,15 @@
     content?: string;
     mime?: string;
     size_bytes?: number;
+    /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
+    group_selected?: boolean;
   }
 
   let {
     data,
-    selected = false,
     dragging = false,
   }: {
     data: DocumentNodeData;
-    selected?: boolean;
     id?: string;
     type?: string;
     width?: number;
@@ -87,7 +87,7 @@
 
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
-  const isInM = $derived(selected || sessionStore.M.has(data.id));
+  const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const isMultiM = $derived(isInM && sessionStore.M.size > 1);
   const isSingleM = $derived(isInM && sessionStore.M.size <= 1);
   const isMaximized = $derived(sessionStore.maximizedItemId === data.id);
@@ -1022,7 +1022,7 @@
   .document-node.is-min.m-single .doc-head,
   .document-node.is-min.m-multi .doc-head {
     border-color: var(--color-accent);
-    border-width: 1.5px;
+    border-width: calc(1.5px / var(--canvas-zoom, 1));
   }
 
   .document-node.is-min .doc-body,

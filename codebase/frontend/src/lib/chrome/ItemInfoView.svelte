@@ -28,6 +28,17 @@
   import { UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import {
+    ancestorChain,
+    descendantGroups,
+    descendantItems,
+    directParentGroupId,
+    effectiveLocked,
+    effectiveVisibility,
+    inheritedColor,
+    inheritedLabel,
+    type Group,
+  } from '$lib/types/group';
+  import {
     alignItems,
     distributeItems,
     type AlignMode,
@@ -77,6 +88,156 @@
   });
   const isMultiMixed = $derived(selectionCount > 1 && commonType === null);
   const isMultiHomogeneous = $derived(selectionCount > 1 && commonType !== null);
+
+  /* ── Group selection (ADR-0010 D19 + plan-0012 §3.6 F.2) ────────────
+   *
+   * M.size === 1 + sole element 가 group id 이면 group inspector view 진입.
+   * mixed M (group + item) 은 본 view 안 진입 — item-level Common section
+   * 그대로. createGroup 직후 post-M = {newGroupId} → 자연스럽게 본 view 표시.
+   */
+  const groupSelection = $derived.by((): Group | null => {
+    if (selectionCount !== 1) return null;
+    const sole = selectedIds[0];
+    if (sole === undefined || !sessionStore.isGroupId(sole)) return null;
+    return sessionStore.groups.get(sole) ?? null;
+  });
+
+  /** 자손 통계 — direct child item 수 / 전체 자손 item 수. */
+  const groupDescendantStats = $derived.by((): { direct: number; total: number } => {
+    if (groupSelection === null) return { direct: 0, total: 0 };
+    const gid = groupSelection.id;
+    const groupsArr = Array.from(sessionStore.groups.values());
+    const itemsArr = Array.from(sessionStore.items.values());
+    const direct =
+      itemsArr.filter((it) => it.parent_id === gid).length +
+      groupsArr.filter((g) => g.parent_id === gid).length;
+    const total = descendantItems(gid, groupsArr, itemsArr).length;
+    return { direct, total };
+  });
+
+  const groupZIndexDisplay = $derived.by((): string => {
+    if (groupSelection === null) return '—';
+    const descendants = descendantItems(
+      groupSelection.id,
+      Array.from(sessionStore.groups.values()),
+      Array.from(sessionStore.items.values()),
+    );
+    if (descendants.length === 0) return '—';
+    let minZ = Number.POSITIVE_INFINITY;
+    let maxZ = Number.NEGATIVE_INFINITY;
+    for (const it of descendants) {
+      if (it.z < minZ) minZ = it.z;
+      if (it.z > maxZ) maxZ = it.z;
+    }
+    if (!Number.isFinite(minZ) || !Number.isFinite(maxZ)) return '—';
+    return minZ === maxZ ? String(minZ) : `${minZ}–${maxZ}`;
+  });
+
+  /** Effective visibility / locked — ancestor 전파 결과. self 가 false 이고 effective
+   *  true 이면 ancestor 가 source. UI 의 disabled tooltip 에 사용. */
+  const groupEffective = $derived.by(() => {
+    if (groupSelection === null) {
+      return { visible: true, locked: false, inheritedHidden: false, inheritedLocked: false };
+    }
+    const g = groupSelection;
+    const groupsMap = sessionStore.groups;
+    const effVisible = effectiveVisibility(g.visibility, g.parent_id, groupsMap);
+    const effLocked = effectiveLocked(g.locked, g.parent_id, groupsMap);
+    // self 가 visible 이지만 effective hidden = ancestor 가 source.
+    const inheritedHidden = g.visibility === 'visible' && !effVisible;
+    const inheritedLocked = !g.locked && effLocked;
+    return { visible: effVisible, locked: effLocked, inheritedHidden, inheritedLocked };
+  });
+
+  /** Inherit hint — self.label/color 가 null 일 때 ancestor 의 효과적 값. */
+  const groupInheritedLabel = $derived.by((): string | null => {
+    if (groupSelection === null) return null;
+    if (groupSelection.label !== null) return null;
+    return inheritedLabel(null, groupSelection.parent_id, sessionStore.groups);
+  });
+  const groupInheritedColor = $derived.by((): string | null => {
+    if (groupSelection === null) return null;
+    if (groupSelection.color !== null) return null;
+    return inheritedColor(null, groupSelection.parent_id, sessionStore.groups);
+  });
+
+  /* ── Drill-state breadcrumb (ADR-0010 D22.7 + plan-0013 §3.7 H.6) ──
+   *
+   * M = leaf item / nested group 일 때 Inspector 상단에 ancestor chain 표시.
+   * 각 segment = drill-out 버튼 (setM([segment.id])).
+   * Root level item / root level group 은 breadcrumb 미표시.
+   */
+  const drillBreadcrumb = $derived.by((): Group[] => {
+    if (selectionCount !== 1) return [];
+    const sole = selectedIds[0];
+    if (sole === undefined) return [];
+    return ancestorChain(sole, sessionStore.items, sessionStore.groups);
+  });
+
+  function onBreadcrumbSegmentClick(groupId: string, event: MouseEvent): void {
+    event.currentTarget instanceof HTMLElement && event.currentTarget.blur();
+    sessionStore.setM([groupId]);
+    sessionStore.setDrillRoot(
+      directParentGroupId(groupId, sessionStore.items, sessionStore.groups),
+    );
+  }
+
+  function selectedDisplayLabel(): string {
+    if (groupSelection !== null) {
+      return groupSelection.label ?? 'Untitled group';
+    }
+    if (selectedPanelId === null) return '';
+    const it = sessionStore.items.get(selectedPanelId);
+    return it !== undefined ? displayLabel(it) : '';
+  }
+
+  /** Group entity mutation — sessionStore.applyMutation 직접 호출 (groups[] 갱신).
+   *  optimisticMutation 은 items 전용이라 사용 불가. */
+  async function applyGroupMutation(
+    transform: (g: Group) => Group,
+    failMessage: string,
+  ): Promise<void> {
+    if (groupSelection === null) return;
+    const gid = groupSelection.id;
+    // Optimistic update.
+    const cur = sessionStore.groups.get(gid);
+    if (cur === undefined) return;
+    const next = transform(cur);
+    sessionStore.groups.set(gid, next);
+    await sessionStore.applyMutation(
+      (layout) => ({
+        ...layout,
+        groups: layout.groups.map((g) => (g.id === gid ? transform(g) : g)),
+      }),
+      {
+        abortMessage: 'Group edit aborted — session reconnect failed.',
+        failMessage,
+      },
+    );
+  }
+
+  async function applyGroupLabel(next: string): Promise<void> {
+    const trimmed = next.trim();
+    await applyGroupMutation(
+      (g) => ({ ...g, label: trimmed.length === 0 ? null : trimmed }),
+      'Group label edit failed',
+    );
+  }
+
+  async function applyGroupColor(hex: string | null): Promise<void> {
+    await applyGroupMutation((g) => ({ ...g, color: hex }), 'Group color edit failed');
+  }
+
+  async function applyGroupVisibility(visible: boolean): Promise<void> {
+    await applyGroupMutation(
+      (g) => ({ ...g, visibility: visible ? 'visible' : 'hidden' }),
+      'Group visibility edit failed',
+    );
+  }
+
+  async function applyGroupLocked(locked: boolean): Promise<void> {
+    await applyGroupMutation((g) => ({ ...g, locked }), 'Group lock edit failed');
+  }
 
   /**
    * ADR-0027 D3 — Common numeric / string field 의 mixed-aware reader.
@@ -749,7 +910,163 @@
 
 <div class="item-info-view" aria-label="Item info">
   <div class="pane-info-body">
-    {#if selectedPanel === null}
+    {#if drillBreadcrumb.length > 0}
+      <!-- ADR-0010 D22.7 + design handover §8.2.2 — drill-state ancestor breadcrumb.
+           Each segment = drill-out button (setM([segment.id])).
+           Last segment = current selection label (display only, not a button). -->
+      <nav class="drill-breadcrumb" aria-label="Drill hierarchy">
+        {#each drillBreadcrumb as seg, i (seg.id)}
+          <button
+            type="button"
+            class="breadcrumb-seg"
+            title={`Drill out to ${seg.label ?? seg.id.slice(0, 8)}`}
+            onclick={(e: MouseEvent) => onBreadcrumbSegmentClick(seg.id, e)}
+          >
+            {seg.label ?? seg.id.slice(0, 8)}
+          </button>
+          <span class="breadcrumb-sep" aria-hidden="true">›</span>
+        {/each}
+        <span class="breadcrumb-current">{selectedDisplayLabel()}</span>
+      </nav>
+    {/if}
+
+    {#if groupSelection !== null}
+      <!-- ADR-0010 D19 + plan-0012 §3.6 F.2 — Group-specific Inspector view.
+           Common section (geometry / z) 숨김 — group 은 frame 없음 (G-hybrid). -->
+      <div class="multi-header">
+        <span class="multi-label">Group · <span class="muted">{groupDescendantStats.total} items</span></span>
+      </div>
+
+      <section class="prop-section">
+        <div class="prop-head"><h4>Identity</h4></div>
+        <div class="prop-row full">
+          <InspectorField
+            k="label"
+            value={groupSelection.label ?? ''}
+            mixed={false}
+            placeholder={groupInheritedLabel ?? 'Untitled group'}
+            ariaLabel="Group label"
+            oncommit={(next) => void applyGroupLabel(next)}
+          />
+        </div>
+        <div class="prop-row full">
+          <div class="display-row">
+            <span class="k">id</span>
+            <span class="display-val mono" title={groupSelection.id}>{groupSelection.id}</span>
+          </div>
+        </div>
+        <div class="prop-row full">
+          <div class="display-row">
+            <span class="k">Z-INDEX</span>
+            <span class="display-val mono">{groupZIndexDisplay}</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="prop-section">
+        <div class="prop-head"><h4>Color</h4></div>
+        <div class="prop-row full">
+          <ColorPicker
+            value={groupSelection.color ?? groupInheritedColor ?? null}
+            oncommit={(hex) => void applyGroupColor(hex)}
+          />
+        </div>
+        {#if groupSelection.color !== null}
+          <div class="prop-row full">
+            <button
+              type="button"
+              class="inline-action"
+              onclick={() => void applyGroupColor(null)}
+              title="Inherit color from parent"
+            >
+              Reset to inherit
+            </button>
+          </div>
+        {:else if groupInheritedColor !== null}
+          <div class="prop-row full">
+            <span class="hint mono">Inherited</span>
+          </div>
+        {/if}
+      </section>
+
+      <section class="prop-section">
+        <div class="prop-head"><h4>State</h4></div>
+        <div class="state-row" role="group" aria-label="Group state">
+          <button
+            type="button"
+            class="state-btn"
+            class:active={groupSelection.visibility === 'visible'}
+            disabled={groupEffective.inheritedHidden}
+            aria-pressed={groupSelection.visibility === 'visible'}
+            aria-label={groupSelection.visibility === 'visible' ? 'Hide group' : 'Show group'}
+            title={groupEffective.inheritedHidden
+              ? 'Hidden by ancestor — cannot show until ancestor visible'
+              : groupSelection.visibility === 'visible'
+                ? 'Visible (click to hide)'
+                : 'Hidden (click to show)'}
+            onclick={() => void applyGroupVisibility(groupSelection.visibility !== 'visible')}
+          >
+            {#if groupSelection.visibility === 'visible'}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+                <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
+                <line x1="1" y1="1" x2="23" y2="23"/>
+              </svg>
+            {/if}
+          </button>
+
+          <button
+            type="button"
+            class="state-btn"
+            class:active={groupSelection.locked}
+            disabled={groupEffective.inheritedLocked}
+            aria-pressed={groupSelection.locked}
+            aria-label={groupSelection.locked ? 'Unlock group' : 'Lock group'}
+            title={groupEffective.inheritedLocked
+              ? 'Locked by ancestor — cannot unlock until ancestor unlocked'
+              : groupSelection.locked
+                ? 'Locked (click to unlock)'
+                : 'Unlocked (click to lock)'}
+            onclick={() => void applyGroupLocked(!groupSelection.locked)}
+          >
+            {#if groupSelection.locked}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="11" width="16" height="10" rx="2"/>
+                <path d="M8 11V8a4 4 0 1 1 8 0v3"/>
+              </svg>
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="11" width="16" height="10" rx="2"/>
+                <path d="M8 11V8a4 4 0 0 1 7.5-2"/>
+              </svg>
+            {/if}
+          </button>
+        </div>
+      </section>
+
+      <section class="prop-section">
+        <div class="prop-head"><h4>Contents</h4></div>
+        <div class="prop-row full">
+          <div class="display-row">
+            <span class="k">direct</span>
+            <span class="display-val mono">{groupDescendantStats.direct}</span>
+          </div>
+        </div>
+        <div class="prop-row full">
+          <div class="display-row">
+            <span class="k">total</span>
+            <span class="display-val mono">{groupDescendantStats.total}</span>
+          </div>
+        </div>
+      </section>
+
+    {:else if selectedPanel === null}
       <div class="empty">
         <p>No selection</p>
         <p class="hint">Click a panel on the canvas to inspect.</p>
@@ -831,6 +1148,12 @@
               {/if}
             </div>
           </div>
+          <div class="prop-row full">
+            <div class="display-row">
+              <span class="k">Z-INDEX</span>
+              <span class="display-val mono">{numOr(selectedPanel['z'], '—')}</span>
+            </div>
+          </div>
         {/if}
       </section>
 
@@ -870,16 +1193,6 @@
             mixed={commonField('h') === 'Mixed'}
             ariaLabel="h"
             oncommit={(s) => void applyCommonNum('h', Number(s))}
-          />
-        </div>
-        <div class="prop-row full">
-          <InspectorField
-            type="number"
-            k="Z"
-            value={(() => { const v = commonField('z'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
-            mixed={commonField('z') === 'Mixed'}
-            ariaLabel="z-index"
-            oncommit={(s) => void applyCommonNum('z', Number(s))}
           />
         </div>
         {#if selectionCount >= 2}
@@ -1873,6 +2186,65 @@
   .inline-action:disabled {
     opacity: 0.45;
     cursor: not-allowed;
+  }
+
+  /* "Inherited" hint chip — group color self.null 상태 표시. */
+  .hint.mono {
+    font-size: var(--text-xs);
+    color: var(--color-fg-muted);
+    font-style: italic;
+  }
+
+  /* ADR-0010 D22.7 + design handover §8.2.2 — drill-state ancestor breadcrumb.
+     Inspector 상단 row, deep nest 시 truncation 자연 발생 (text-overflow ellipsis). */
+  .drill-breadcrumb {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 2px;
+    padding: var(--space-4) var(--space-8);
+    border-bottom: 1px solid var(--color-border);
+    overflow: hidden;
+    font-size: var(--text-xs);
+    line-height: 1.3;
+    background: var(--color-glass-1);
+    flex: 0 0 auto;
+  }
+
+  .breadcrumb-seg {
+    border: 0;
+    background: transparent;
+    color: var(--color-fg-muted);
+    cursor: pointer;
+    padding: 1px 4px;
+    border-radius: 2px;
+    font: inherit;
+    max-width: 80px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transition: color var(--motion-fast) var(--motion-easing);
+  }
+
+  .breadcrumb-seg:hover {
+    color: var(--color-fg);
+    background: var(--color-glass-2);
+  }
+
+  .breadcrumb-sep {
+    color: var(--color-fg-subtle);
+    font-size: var(--text-xs);
+    flex: 0 0 auto;
+  }
+
+  .breadcrumb-current {
+    color: var(--color-fg);
+    font-weight: 500;
+    padding: 1px 4px;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .session-chip {

@@ -32,6 +32,7 @@
   import { killTerminal } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem } from '$lib/types/canvas';
+  import { pruneEmptyGroups } from '$lib/types/group';
 
   let committing = $state(false);
 
@@ -108,15 +109,20 @@
     const gAll = new Set<string>([groupId, ...descendants.groupIds]);
     const itemIds = new Set<string>(descendants.items.map((it) => it.id));
     const result = await sessionStore.applyMutation(
-      (cur) => ({
-        ...cur,
-        groups: cur.groups.filter((g) => !gAll.has(g.id)),
-        items: cur.items.filter((it) => !itemIds.has(it.id)),
-      }),
+      (cur) =>
+        pruneEmptyGroups({
+          ...cur,
+          groups: cur.groups.filter((g) => !gAll.has(g.id)),
+          items: cur.items.filter((it) => !itemIds.has(it.id)),
+        }),
       { failMessage: 'Group prune failed' },
     );
     if (!result.ok) return false;
     for (const id of itemIds) sessionStore.M.delete(id);
+    for (const id of gAll) sessionStore.M.delete(id);
+    if (sessionStore.drillRootId !== null && gAll.has(sessionStore.drillRootId)) {
+      sessionStore.clearDrill();
+    }
     return true;
   }
 

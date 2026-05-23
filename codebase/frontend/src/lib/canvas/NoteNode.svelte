@@ -23,14 +23,14 @@
     title: string;
     body: string;
     color: string;
+    /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
+    group_selected?: boolean;
   }
 
   let {
     data,
-    selected = false,
   }: {
     data: NoteNodeData;
-    selected?: boolean;
     id?: string;
     type?: string;
     width?: number;
@@ -48,7 +48,7 @@
 
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
-  const isInM = $derived(selected || sessionStore.M.has(data.id));
+  const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const isMinimized = $derived(data.minimized === true);
 
   let titleEditing = $state(false);
@@ -456,7 +456,7 @@
      도 자연 통합. */
   .note-node.is-min.m-single {
     border-color: var(--color-accent);
-    border-width: 1.5px;
+    border-width: calc(1.5px / var(--canvas-zoom, 1));
   }
   .note-node.is-min .note-head,
   .note-node.is-min .note-body-wrap { display: none; }

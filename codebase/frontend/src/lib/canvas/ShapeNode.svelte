@@ -45,14 +45,14 @@
     stroke_enabled?: boolean;
     corner_rounded?: boolean;
     stroke_dash?: FigureStrokeDash;
+    /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
+    group_selected?: boolean;
   }
 
   let {
     data,
-    selected = false,
   }: {
     data: ShapeNodeData;
-    selected?: boolean;
     id?: string;
     type?: string;
     width?: number;
@@ -70,7 +70,7 @@
 
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
-  const isInM = $derived(selected || sessionStore.M.has(data.id));
+  const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const isEllipse = $derived(data.type === 'ellipse');
 
   // ADR-0018 D4 amend ① — fill/stroke on-off + dash.

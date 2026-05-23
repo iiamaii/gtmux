@@ -28,14 +28,14 @@
     label?: string;
     asset_id?: string;
     mime?: string;
+    /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
+    group_selected?: boolean;
   }
 
   let {
     data,
-    selected = false,
   }: {
     data: ImageNodeData;
-    selected?: boolean;
     id?: string;
     type?: string;
     width?: number;
@@ -53,7 +53,7 @@
 
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
-  const isInM = $derived(selected || sessionStore.M.has(data.id));
+  const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const hasAsset = $derived((data.asset_id ?? '').length > 0);
   const imageLabel = $derived(data.label ?? 'image');
 

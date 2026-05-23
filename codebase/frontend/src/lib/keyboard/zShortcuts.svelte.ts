@@ -7,8 +7,9 @@
 //   Shift + ]  → sendToBack       (z = min - 1)
 //
 // 동작 조건:
-//   - sessionStore.M.size === 1 (single selection 만)
-//   - 입력 중 (input/textarea/contentEditable) 이면 skip (registry default)
+//   - sessionStore.M.size >= 1 (single + multi 모두 — ADR-0024 D9 atomic block batch).
+//   - 입력 중 (input/textarea/contentEditable) 이면 skip (registry default).
+//   - Boundary (ADR-0024 D11) 도달 시 silent noop — keyboard path tooltip 없음.
 //
 // 본 모듈은 `shortcutRegistry` 의 consumer — 직접 keydown listener 등록 X.
 
@@ -16,16 +17,14 @@ import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { zStore } from '$lib/stores/zStore.svelte';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
-function selectedSingleId(): string | null {
-  if (sessionStore.M.size !== 1) return null;
-  const it = sessionStore.M.values().next();
-  return it.done ? null : it.value;
+function selectedIds(): string[] {
+  return [...sessionStore.M];
 }
 
-function withSelected(fn: (id: string) => void): boolean {
-  const id = selectedSingleId();
-  if (id === null) return false;
-  fn(id);
+function withSelected(fn: (ids: string[]) => void): boolean {
+  const ids = selectedIds();
+  if (ids.length === 0) return false;
+  fn(ids);
   return true;
 }
 
@@ -41,12 +40,18 @@ function withSelected(fn: (id: string) => void): boolean {
 export function bindZShortcuts(): () => void {
   const unsubs: Array<() => void> = [];
 
+  // ADR-0024 D11 (boundary): noop 시 silent (keyboard path 은 tooltip 없음).
+  // canXxx 가 false 면 fire-and-forget 처리하지 않음 — 호출 path 안 zStore 가
+  // 내부적으로도 noop 보장.
   unsubs.push(
     shortcutRegistry.register({
       key: '[',
       description: 'Bring forward (z +1)',
       category: 'Z',
-      handler: () => withSelected((id) => zStore.bringForward(id)),
+      handler: () =>
+        withSelected((ids) => {
+          if (zStore.canBringForward(ids)) zStore.bringForward(ids);
+        }),
     }),
   );
   unsubs.push(
@@ -54,25 +59,34 @@ export function bindZShortcuts(): () => void {
       key: ']',
       description: 'Send backward (z −1)',
       category: 'Z',
-      handler: () => withSelected((id) => zStore.sendBackward(id)),
+      handler: () =>
+        withSelected((ids) => {
+          if (zStore.canSendBackward(ids)) zStore.sendBackward(ids);
+        }),
     }),
   );
   unsubs.push(
     shortcutRegistry.register({
       key: '{',
       shift: true,
-      description: 'Bring to front (z = max + 1)',
+      description: 'Bring to front',
       category: 'Z',
-      handler: () => withSelected((id) => zStore.bringToFront(id)),
+      handler: () =>
+        withSelected((ids) => {
+          if (zStore.canBringToFront(ids)) zStore.bringToFront(ids);
+        }),
     }),
   );
   unsubs.push(
     shortcutRegistry.register({
       key: '}',
       shift: true,
-      description: 'Send to back (z = min − 1)',
+      description: 'Send to back',
       category: 'Z',
-      handler: () => withSelected((id) => zStore.sendToBack(id)),
+      handler: () =>
+        withSelected((ids) => {
+          if (zStore.canSendToBack(ids)) zStore.sendToBack(ids);
+        }),
     }),
   );
 
