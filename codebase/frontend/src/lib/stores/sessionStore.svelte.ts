@@ -1236,6 +1236,57 @@ class SessionStore {
     if (ids.length === 0) return { ok: 0, fail: 0 };
     const before = this.layoutSnapshot();
     const kill = options.killTerminal === true;
+    if (kill) {
+      const beforeItems = new Map(before.items.map((it) => [it.id, it] as const));
+      for (const id of ids) {
+        this.items.delete(id);
+        this.M.delete(id);
+      }
+      const results = await Promise.allSettled(ids.map((id) => deleteItem(active.name, id, true)));
+      let unauthorized = false;
+      let ok = 0;
+      let fail = 0;
+      for (let i = 0; i < results.length; i += 1) {
+        const result = results[i]!;
+        const id = ids[i]!;
+        if (result.status === 'fulfilled') {
+          ok += 1;
+          continue;
+        }
+        if (result.reason instanceof UnauthorizedError) {
+          unauthorized = true;
+          continue;
+        }
+        const original = beforeItems.get(id);
+        if (original !== undefined) this.items.set(id, original);
+        console.warn('[gtmux] deleteItem failed', id, result.reason);
+        fail += 1;
+      }
+      if (unauthorized) {
+        window.location.href = '/auth';
+        return { ok, fail };
+      }
+      if (ok > 0) {
+        const beforePrune = this.layoutSnapshot();
+        const afterPrune = pruneEmptyGroups(beforePrune);
+        if (afterPrune.groups.length !== this.groups.size) {
+          this.#applyLayoutSurgically(afterPrune);
+          await this.applyMutation(() => afterPrune, {
+            captureHistory: false,
+            failMessage: 'Empty group cleanup failed',
+            priorSnapshot: beforePrune,
+          });
+        }
+        for (const id of [...this.M]) {
+          if (!this.items.has(id) && !this.groups.has(id)) this.M.delete(id);
+        }
+        if (this.drillRootId !== null && !this.groups.has(this.drillRootId)) {
+          this.clearDrill();
+        }
+        historyStore.capture(active.name, before);
+      }
+      return { ok, fail };
+    }
     let ok = 0;
     let fail = 0;
     let unauthorized = false;

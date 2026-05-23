@@ -21,6 +21,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toolStore } from '$lib/stores/toolStore.svelte';
   import { attachConfirm, UnauthorizedError } from '$lib/http/sessions';
+  import { killTerminal } from '$lib/http/terminals';
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
   import type { CanvasItem, CanvasLayout } from '$lib/types/canvas';
   import {
@@ -33,7 +34,6 @@
   } from '$lib/types/group';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
-  import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
   import FilePickerModal from '$lib/chrome/FilePickerModal.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import { pickLocalFile } from '$lib/files/localFilePicker';
@@ -284,49 +284,63 @@
     if (ids.length === 0) return;
     const groupIds = ids.filter((id) => sessionStore.groups.has(id));
     if (groupIds.length > 0) {
-      if (ids.length === 1) {
-        const groupId = groupIds[0]!;
-        const groupsArr = [...sessionStore.groups.values()];
-        const itemsArr = [...sessionStore.items.values()];
-        const descendants = descendantItems(groupId, groupsArr, itemsArr);
-        const hasTerminal = descendants.some((it) => it.type === 'terminal');
-        if (hasTerminal) {
-          groupCloseDialog.show(groupId);
-          return;
-        }
-        const deletedGroupIds = new Set([
-          groupId,
-          ...descendantGroups(groupId, groupsArr).map((g) => g.id),
-        ]);
-        const deletedItemIds = new Set(descendants.map((it) => it.id));
-        const result = await sessionStore.applyMutation(
-          (cur) =>
-            pruneEmptyGroups({
-              ...cur,
-              groups: cur.groups.filter((g) => !deletedGroupIds.has(g.id)),
-              items: cur.items.filter((it) => !deletedItemIds.has(it.id)),
-            }),
-          { failMessage: 'Delete group items failed' },
-        );
-        if (result.ok) {
-          if (
-            sessionStore.drillRootId !== null &&
-            deletedGroupIds.has(sessionStore.drillRootId)
-          ) {
-            sessionStore.clearDrill();
-          }
-          sessionStore.clearM();
-          toastStore.show({
-            message: `Removed group + ${deletedItemIds.size} item${deletedItemIds.size === 1 ? '' : 's'}.`,
-            tone: 'success',
-          });
-        }
-      } else {
-        toastStore.show({
-          message: 'Delete one selected group at a time, or use the context menu.',
-          tone: 'error',
-        });
+      const groupsArr = [...sessionStore.groups.values()];
+      const itemsArr = [...sessionStore.items.values()];
+      const deletedGroupIds = new Set<string>();
+      const deletedItemIds = new Set<string>();
+      for (const groupId of groupIds) {
+        deletedGroupIds.add(groupId);
+        for (const g of descendantGroups(groupId, groupsArr)) deletedGroupIds.add(g.id);
+        for (const it of descendantItems(groupId, groupsArr, itemsArr)) deletedItemIds.add(it.id);
       }
+      for (const id of ids) {
+        if (sessionStore.items.has(id)) deletedItemIds.add(id);
+      }
+      const items = [...deletedItemIds]
+        .map((id) => sessionStore.items.get(id))
+        .filter((it): it is NonNullable<typeof it> => it !== undefined);
+      panelCloseDialog.show({
+        items,
+        onConfirm: async (killSelectedTerminals) => {
+          const itemCount = deletedItemIds.size;
+          const result = await sessionStore.applyMutation(
+            (cur) =>
+              pruneEmptyGroups({
+                ...cur,
+                groups: cur.groups.filter((g) => !deletedGroupIds.has(g.id)),
+                items: cur.items.filter((it) => !deletedItemIds.has(it.id)),
+              }),
+            { failMessage: 'Delete selected groups failed' },
+          );
+          if (result.ok) {
+            if (
+              sessionStore.drillRootId !== null &&
+              deletedGroupIds.has(sessionStore.drillRootId)
+            ) {
+              sessionStore.clearDrill();
+            }
+            sessionStore.clearM();
+            toastStore.show({
+              message: `Removed ${deletedGroupIds.size} group${deletedGroupIds.size === 1 ? '' : 's'} + ${itemCount} item${itemCount === 1 ? '' : 's'}${
+                killSelectedTerminals ? ' (terminals killed)' : ''
+              }.`,
+              tone: 'success',
+            });
+          }
+          if (result.ok && killSelectedTerminals) {
+            const terminals = items.filter((it) => it.type === 'terminal');
+            const results = await Promise.allSettled(terminals.map((it) => killTerminal(it.id)));
+            const unauthorized = results.some(
+              (r) => r.status === 'rejected' && r.reason instanceof UnauthorizedError,
+            );
+            if (unauthorized) {
+              window.location.href = '/auth';
+              return;
+            }
+            void terminalPool.refresh();
+          }
+        },
+      });
       return;
     }
     const items = ids
@@ -565,6 +579,16 @@
               e.stopPropagation();
               return;
             }
+          }
+          if (
+            !(e.metaKey || e.ctrlKey || e.shiftKey) &&
+            sessionStore.M.size > 1 &&
+            sessionStore.M.has(hitTarget)
+          ) {
+            beginSelectionDrag([...sessionStore.M], e);
+            e.preventDefault();
+            e.stopPropagation();
+            return;
           }
           // Capture-phase preselection runs before SvelteFlow starts native drag.
           // Without this, dragging a nested descendant inside a drill scope can
@@ -1550,6 +1574,7 @@
   }
 
   function clearCanvasDrillAndSelection(): void {
+    blurActiveCanvasElement();
     sessionStore.clearDrill();
     sessionStore.clearM();
   }

@@ -205,6 +205,15 @@
     }
   });
 
+  $effect(() => {
+    if (editingGroupId !== null && !sessionStore.M.has(editingGroupId)) {
+      editingGroupId = null;
+    }
+    if (editingItemId !== null && !sessionStore.M.has(editingItemId)) {
+      editingItemId = null;
+    }
+  });
+
   // ADR-0024 의 2026-05-22 ② amend (Tree=Z): Sidebar 는 *단일 view* (Tree).
   // 옛 Z tab 의 group atomic row + fold/unfold 는 Tree 가 이미 동일 affordance 제공
   // → Z tab UI 폐기. z-index 값 표시는 Inspector 로 단일화.

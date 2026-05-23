@@ -323,15 +323,22 @@
 
   .endpoint {
     position: absolute;
-    width: 10px;
-    height: 10px;
+    width: calc(10px / var(--canvas-zoom, 1));
+    height: calc(10px / var(--canvas-zoom, 1));
     padding: 0;
-    border: 1.5px solid var(--color-accent);
+    border: calc(1.5px / var(--canvas-zoom, 1)) solid var(--color-accent);
     border-radius: 999px;
     background: var(--color-surface);
     transform: translate(-50%, -50%);
     cursor: crosshair;
     pointer-events: auto;
+  }
+
+  .endpoint::before {
+    content: '';
+    position: absolute;
+    inset: calc(-6px / var(--canvas-zoom, 1));
+    border-radius: 999px;
   }
 
   .endpoint:hover {

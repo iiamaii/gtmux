@@ -7,7 +7,7 @@
    *
    * 키 처리:
    *   - Cmd/Ctrl + Enter → commit
-   *   - Enter (plain)    → newline (default)
+   *   - Enter (plain)    → newline (default) or commit when commitOnEnter=true
    *   - Esc              → cancel (escRouter priority 1)
    *   - blur             → commit
    *   - Empty commit     → allowEmpty 정책에 따름 (default true — note body 등)
@@ -31,6 +31,8 @@
     /** focus 시 전체 선택 여부. Canvas text 는 기존 위치 편집감을 위해 false 사용. */
     selectOnFocus?: boolean;
     textAlign?: 'left' | 'center' | 'right';
+    /** Plain Enter commits instead of inserting a newline. default false. */
+    commitOnEnter?: boolean;
   }
 
   const {
@@ -45,6 +47,7 @@
     plain = false,
     selectOnFocus = true,
     textAlign = 'left',
+    commitOnEnter = false,
   }: Props = $props();
 
   // $state init 시 prop 의 *최초 값* 만 capture — 실 동기화는 $effect 가 담당.
@@ -113,11 +116,16 @@
   }
 
   function onkeydown(e: KeyboardEvent): void {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !e.isComposing) {
+    if (
+      e.key === 'Enter' &&
+      !e.shiftKey &&
+      !e.isComposing &&
+      (commitOnEnter || e.metaKey || e.ctrlKey)
+    ) {
       e.preventDefault();
       commit();
     }
-    // Enter plain → newline (textarea default). Esc → escRouter.
+    // Enter plain → newline unless commitOnEnter=true. Esc → escRouter.
   }
 
   function onblur(): void {
