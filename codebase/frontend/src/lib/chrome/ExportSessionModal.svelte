@@ -44,9 +44,11 @@
 
   async function onDownload(): Promise<void> {
     if (activeName === null || downloading) return;
+    const sessionName = activeName;
     downloading = true;
     try {
-      const { blob, filename } = await exportSession(activeName);
+      await sessionStore.flushPendingViewport(sessionName);
+      const { blob, filename } = await exportSession(sessionName);
       // Trigger browser download via temp <a download>.
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -58,7 +60,7 @@
       // Revoke after a tick — Safari/Firefox 안전.
       setTimeout(() => URL.revokeObjectURL(url), 1_000);
       toastStore.show({
-        message: `Exported "${activeName}" to ${filename}`,
+        message: `Exported "${sessionName}" to ${filename}`,
         tone: 'success',
       });
       sessionIODialog.close();
@@ -99,18 +101,19 @@
         <ul>
           <li>Notes, text, document inline content</li>
           <li>File path references (path strings only — no file contents)</li>
+          <li>Image/document asset references (IDs only — no binary assets)</li>
           <li>Item geometry, colors, layout structure</li>
         </ul>
         <h4>What's excluded</h4>
         <ul>
           <li>Terminal output and process state</li>
+          <li>Image/document binary asset data</li>
           <li>Local OS files referenced by file_path items</li>
           <li>Auth credentials, settings, allowlists</li>
         </ul>
         <p class="caveat">
           Imported terminal panels will spawn fresh shells when first attached.
-          The latest saved layout state is exported — pending viewport changes
-          may take up to 500ms to flush.
+          Pending viewport changes are flushed before export starts.
         </p>
       </div>
     {/if}

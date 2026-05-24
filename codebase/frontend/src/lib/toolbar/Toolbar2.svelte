@@ -11,8 +11,9 @@
    * Layout (centre 정렬 + left/right absolute):
    *   ├─ left absolute: "Page 1 ▾" (page selector placeholder)
    *   ├─ centre groups:
-   *   │   [Select | Hand] | [Terminal] | [Rect | Ellipse | Line | FreeDraw]
-   *   │   | [Text | Note] | [Image | Document | FilePath]
+   *   │   [Select | Hand] | [Terminal] |
+   *   │   [Rect | Ellipse | Line | FreeDraw | Text] |
+   *   │   [Note | Snippets | Document | Image | FilePath]
    *   └─ right absolute: Comment | More (low-priority)
    *
    * Behaviour:
@@ -70,7 +71,8 @@
         path: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/>',
       },
     ],
-    // 3) Shapes (vector primitives)
+    // 3) Figures (vector primitives + text). Text shares this band because
+    //    it composes structurally like a primitive (axis-aligned, drag-spawn).
     [
       {
         id: 'rect',
@@ -96,35 +98,41 @@
         hint: 'P',
         path: '<path d="M4 17c2-4 4-2 6-5s2-7 5-7 5 4 5 6"/>',
       },
-    ],
-    // 4) Text
-    [
       {
         id: 'text',
         name: 'Text',
         hint: 'T',
         path: '<path d="M5 5h14M12 5v14M9 19h6" stroke-width="2"/>',
       },
+    ],
+    // 4) Content (annotations + assets + references). Notes/snippets share
+    //    this band with the asset items because they are all content-bearing
+    //    canvas items — distinct from the figure primitives above.
+    //    Snippets icon: scaled 12→24-unit viewBox (×2) so the path renders at
+    //    toolbar size; layer-tree row uses the same shape at native 12-unit.
+    [
       {
         id: 'note',
         name: 'Note',
         hint: 'N',
         path: '<path d="M5 4h10l4 4v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><path d="M15 4v4h4"/><path d="M7 13h8M7 17h5"/>',
       },
-    ],
-    // 5) Assets / refs
-    [
       {
-        id: 'image',
-        name: 'Image',
-        hint: 'I',
-        path: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="M3 17l5-4 4 3 5-5 4 4"/>',
+        id: 'snippets',
+        name: 'Snippets',
+        path: '<path d="M8 3h8l1 2H7z"/><rect x="5" y="5" width="14" height="16" rx="2"/><path d="M8 10h8M8 14h8M8 18h5"/>',
       },
       {
         id: 'document',
         name: 'Document',
         hint: 'D',
         path: '<path d="M6 3h8l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v4h4"/><path d="M8 13h8M8 17h5"/>',
+      },
+      {
+        id: 'image',
+        name: 'Image',
+        hint: 'I',
+        path: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="M3 17l5-4 4 3 5-5 4 4"/>',
       },
       {
         id: 'file_path',

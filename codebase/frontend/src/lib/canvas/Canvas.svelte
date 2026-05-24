@@ -46,6 +46,7 @@
   import ImageNode from './ImageNode.svelte';
   import DocumentNode from './DocumentNode.svelte';
   import FreeDrawNode from './FreeDrawNode.svelte';
+  import SnippetsNode from './SnippetsNode.svelte';
   import GroupOverlay from './GroupOverlay.svelte';
   import { groupHover } from '$lib/stores/groupHover.svelte';
   import {
@@ -57,6 +58,7 @@
     createImageItem,
     createDocumentItem,
     createFreeDrawItem,
+    createSnippetsItem,
     lineBoxFromEndpoints,
     DEFAULT_TERMINAL_SIZE,
     DEFAULT_NOTE_SIZE,
@@ -1027,6 +1029,8 @@
     image: ImageNode,
     document: DocumentNode,
     free_draw: FreeDrawNode,
+    // ADR-0038 — snippet collection (badges + inline edit form).
+    snippets: SnippetsNode,
     // ADR-0010 D15 — group entity overlay (dotted BBox outline).
     'gtmux-group': GroupOverlay,
   };
@@ -1077,6 +1081,26 @@
    * 명시 field 만 read = subscription 면적 제한 + 의도 명확.
    * 신규 field 추가 시 본 함수도 명시 update 필요 (누락 = stale render bug).
    */
+  /**
+   * djb2 string hash — collision 가능성은 사실상 의미 없음 (서로 다른 두 32-bit
+   * hash 가 우연히 일치할 확률 ~1/4e9). signature 의 *지문* 만 만들면 충분.
+   *
+   * 용도: ADR-0038 snippets entry 의 key/body content fingerprint. 같은 length
+   * 인데 내용만 바뀐 edit ('ab'→'cd', 'foo'→'bar' 등) 도 cache 가 invalidate
+   * 되도록 signature 에 hash 를 포함. 옛 length-only signature 는 same-length
+   * edit 에서 cache hit → stale render 회귀.
+   *
+   * 성능: 일반 사용 (< 50 entries × < 200 byte) 에서 < 50μs. SNIPPETS_ENTRIES_CAP
+   * (1000) × SNIPPET_BODY_MAX_BYTES (64 KB) 의 worst case 만 부담 — 그 영역은
+   * snippets node 의 사용 패턴 자체가 비전형이라 별 batch 의 entry-level WeakMap
+   * cache 도입 후보 (Open).
+   */
+  function djb2(s: string): number {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return h;
+  }
+
   function makeSignature(
     item: CanvasItem,
     effVisible: boolean,
@@ -1127,6 +1151,18 @@
         break;
       case 'document':
         payload = `|${item.asset_id ?? ''}|${item.mime}|${item.file_name}|${item.size_bytes}|${item.content ?? ''}`;
+        break;
+      case 'snippets':
+        // ADR-0038 — id + content hash. 옛 length-only sig 는 same-length edit
+        // ('ab'→'cd' 등) 에서 cache hit → stale render 회귀 (handover §0.5 verify
+        // 후 발견 — 2026-05-24). data 는 itemToNode 가 만든 plain object 라
+        // reactive proxy 가 아님 → cache 가 hit 되면 OLD data.entries 그대로
+        // 반환됨. djb2 32-bit hash 로 content fingerprint 포함 → 같은 length
+        // 의 다른 내용도 cache invalidate.
+        // 전체 body concat 회피 — entries 1000 × body 64KB 의 OOM 위험.
+        payload = `|${item.entries.length}|${item.entries
+          .map((e) => `${e.id}:${djb2(e.key)}:${djb2(e.body)}`)
+          .join(',')}`;
         break;
     }
     return `${effVisible ? 1 : 0}|${effLocked ? 1 : 0}|${selected ? 1 : 0}|${selectedByGroup ? 1 : 0}|${groupHitTarget ? 1 : 0}|${mMulti ? 1 : 0}|${common}${payload}`;
@@ -1775,6 +1811,15 @@
       }
       if (tool === 'note') {
         const item = createCanvasItem('note', centered('note'));
+        void commitNewItem(item)
+          .then(() => toolStore.consume())
+          .catch(onSpawnError);
+        return;
+      }
+      if (tool === 'snippets') {
+        // ADR-0038 D6 — point-spawn, empty entries. cursor=top-left (text 와
+        // 동일 — node 가 작아 centering 보다 click 위치가 더 직관).
+        const item = createSnippetsItem({ x: flow.x, y: flow.y });
         void commitNewItem(item)
           .then(() => toolStore.consume())
           .catch(onSpawnError);

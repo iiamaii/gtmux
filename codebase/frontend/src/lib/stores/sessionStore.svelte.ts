@@ -883,6 +883,21 @@ class SessionStore {
     }
   }
 
+  /**
+   * Export/download boundary helper — force the pending debounced viewport PUT
+   * to complete before code reads the persisted layout back from the server.
+   */
+  async flushPendingViewport(expectedSessionName?: string): Promise<void> {
+    if (this.#viewportTimer !== null) {
+      clearTimeout(this.#viewportTimer);
+      this.#viewportTimer = null;
+    }
+    const active = this.active;
+    if (active === null) return;
+    if (expectedSessionName !== undefined && active.name !== expectedSessionName) return;
+    await this.#flushViewport(active.name, { ...this.viewport });
+  }
+
   /* ────────────────────────────────────────────────────────────────────── */
   /* Reattach — ADR-0019 D5.1 / D5.4, plan-0008 §4.2                        */
   /* ────────────────────────────────────────────────────────────────────── */

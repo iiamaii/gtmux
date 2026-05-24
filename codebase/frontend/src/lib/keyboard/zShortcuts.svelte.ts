@@ -45,7 +45,9 @@ export function bindZShortcuts(): () => void {
   // 내부적으로도 noop 보장.
   unsubs.push(
     shortcutRegistry.register({
+      actionId: 'z.bring_forward',
       key: ']',
+      customizable: true,
       description: 'Bring forward (z +1)',
       category: 'Z',
       handler: () =>
@@ -56,7 +58,9 @@ export function bindZShortcuts(): () => void {
   );
   unsubs.push(
     shortcutRegistry.register({
+      actionId: 'z.send_backward',
       key: '[',
+      customizable: true,
       description: 'Send backward (z −1)',
       category: 'Z',
       handler: () =>
@@ -67,8 +71,10 @@ export function bindZShortcuts(): () => void {
   );
   unsubs.push(
     shortcutRegistry.register({
+      actionId: 'z.bring_to_front',
       key: '}',
       shift: true,
+      customizable: true,
       description: 'Bring to front',
       category: 'Z',
       handler: () =>
@@ -79,8 +85,10 @@ export function bindZShortcuts(): () => void {
   );
   unsubs.push(
     shortcutRegistry.register({
+      actionId: 'z.send_to_back',
       key: '{',
       shift: true,
+      customizable: true,
       description: 'Send to back',
       category: 'Z',
       handler: () =>

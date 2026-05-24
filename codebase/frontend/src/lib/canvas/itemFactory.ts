@@ -26,6 +26,7 @@ import type {
   DocumentItem,
   FreeDrawItem,
   Point,
+  SnippetsItem,
 } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { generateUuidV4 } from '$lib/uuid';
@@ -49,6 +50,11 @@ const DEFAULT_LINE_SIZE = { w: 240, h: 80 } as const;
 export const DEFAULT_IMAGE_SIZE = { w: 320, h: 240 } as const;
 /** DocumentNode — 시안 §02 inline-stored mode (ADR-0018 D4 amend ②). */
 export const DEFAULT_DOCUMENT_SIZE = { w: 360, h: 280 } as const;
+/** ADR-0038 D6 (v8 §12 chassis) — Snippets node default. 3-strip grid:
+ *  head 30 + body ~96 + foot 24 ≈ 150. width 320 fits 5~6 short pills per
+ *  row with wrap. NodeResizer minWidth/minHeight (220/100) keeps the head
+ *  + foot legible after shrink. */
+export const DEFAULT_SNIPPETS_SIZE = { w: 320, h: 150 } as const;
 export const LINE_MIN_LENGTH = 5;
 export const LINE_HIT_PADDING = 8;
 
@@ -211,6 +217,32 @@ export function createDocumentItem(pos: { x: number; y: number }): DocumentItem 
     file_name: 'document',
     size_bytes: new TextEncoder().encode(content).length,
     content,
+  };
+}
+
+/**
+ * ADR-0038 D6 — Snippets node spawn. point-click 으로 빈 entries 의 item 생성.
+ *
+ * z 는 commitNewItem 안에서 max(z)+1 로 재계산. 본 factory 는 0.
+ *
+ * 초기 상태: entries=[] (empty). node mount 후 사용자가 `[+]` 로 첫 entry
+ * 추가. spawn 직후 자동 edit 진입은 *안 함* — snippet 은 collection 이라
+ * 첫 entry 추가가 명시적인 게 자연스러움 (text 의 justSpawnedTextId 와 다름).
+ */
+export function createSnippetsItem(pos: { x: number; y: number }): SnippetsItem {
+  return {
+    id: freshId(),
+    parent_id: null,
+    x: pos.x,
+    y: pos.y,
+    z: 0,
+    visibility: 'visible',
+    locked: false,
+    minimized: false,
+    type: 'snippets',
+    w: DEFAULT_SNIPPETS_SIZE.w,
+    h: DEFAULT_SNIPPETS_SIZE.h,
+    entries: [],
   };
 }
 

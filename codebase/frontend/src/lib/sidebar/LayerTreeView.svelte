@@ -169,6 +169,8 @@
     label?: string | null;
     title?: string;
     file_name?: string;
+    /** ADR-0038 v8 §12.3 — snippets entries (key/body pairs). */
+    entries?: ReadonlyArray<{ id: string; key: string; body: string }>;
     visibility?: boolean;
     locked?: boolean;
     minimized?: boolean;
@@ -243,6 +245,7 @@
       label: it.label ?? null,
       title: it.type === 'note' ? it.title : undefined,
       file_name: it.type === 'document' ? it.file_name : undefined,
+      entries: it.type === 'snippets' ? it.entries : undefined,
       visibility: it.visibility === 'visible',
       locked: it.locked,
       minimized: it.minimized,
@@ -328,6 +331,11 @@
       if (poolLabel != null && poolLabel.length > 0) return poolLabel;
     }
     if (p.type === 'note' && p.title != null && p.title.length > 0) return p.title;
+    if (p.type === 'snippets') {
+      // ADR-0038 v8 §12.3 — "Snippets · {first_key}" peek; bare "Snippets" empty.
+      const firstKey = p.entries?.[0]?.key?.trim();
+      return firstKey != null && firstKey.length > 0 ? `Snippets · ${firstKey}` : 'Snippets';
+    }
     if (p.label != null && p.label.length > 0) return p.label;
     if (p.type === 'document' && p.file_name != null && p.file_name.length > 0) {
       const base = p.file_name.trim().split('/').pop() ?? p.file_name.trim();
@@ -338,6 +346,12 @@
     if (n !== null) return `%${n}`;
     const type = p.type === 'file_path' ? 'file' : (p.type ?? 'panel');
     return `${type}:${p.id.slice(0, 8)}`;
+  }
+
+  /** ADR-0038 v8 §12.3 — snippets row inline count badge (entries.length). */
+  function snippetsCount(p: PanelData): number | null {
+    if (p.type !== 'snippets') return null;
+    return p.entries?.length ?? 0;
   }
 
   function panelTypeIcon(p: PanelData): string {
@@ -1053,6 +1067,13 @@
                       <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
                       <path d="M3.6 5.2h4.8"/>
                     </svg>
+                  {:else if p.type === 'snippets'}
+                    <!-- ADR-0038 v8 §12.3 — clipboard-list icon. -->
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
+                      <path d="M4 1.5h4l0.5 1H3.5z"/>
+                      <rect x="2.5" y="2.5" width="7" height="8" rx="1"/>
+                      <path d="M4 5h4M4 7h4M4 9h2.5"/>
+                    </svg>
                   {:else}
                     {panelTypeIcon(p)}
                   {/if}
@@ -1081,11 +1102,24 @@
                       <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
                       <path d="M3.6 5.2h4.8"/>
                     </svg>
+                  {:else if p.type === 'snippets'}
+                    <!-- ADR-0038 v8 §12.3 — clipboard-list icon. -->
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
+                      <path d="M4 1.5h4l0.5 1H3.5z"/>
+                      <rect x="2.5" y="2.5" width="7" height="8" rx="1"/>
+                      <path d="M4 5h4M4 7h4M4 9h2.5"/>
+                    </svg>
                   {:else}
                     {panelTypeIcon(p)}
                   {/if}
                 </span>
                 <span class="label">{panelDisplayLabel(p)}{dead ? ' (Dead)' : ''}</span>
+                {#if p.type === 'snippets'}
+                  {@const sc = snippetsCount(p)}
+                  {#if sc !== null}
+                    <span class="snippets-count" aria-label={`${sc} entries`}>{sc}</span>
+                  {/if}
+                {/if}
               </button>
             {/if}
             {#snippet panelIcons()}
@@ -1340,6 +1374,24 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* ADR-0038 v8 §12.3 — snippets entry count badge.
+     Inline (not a new grid column) to avoid affecting other row types. */
+  .snippets-count {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 10%, transparent);
+    padding: 1px 6px;
+    border-radius: var(--radius-pill);
+    letter-spacing: 0.4px;
+    line-height: 1.4;
+    margin-left: 4px;
+  }
+  .row.selected .snippets-count {
+    background: color-mix(in srgb, var(--color-accent) 24%, transparent);
   }
 
   .type-icon {

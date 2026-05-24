@@ -27,6 +27,7 @@
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import { snippetEditPanel } from '$lib/stores/snippetEditPanel.svelte';
   import {
     ancestorChain,
     descendantGroups,
@@ -382,7 +383,12 @@
   type CommonBoolKey = 'visible' | 'locked' | 'minimized';
 
   function supportsMinimize(it: CanvasItem): boolean {
-    return it.type === 'terminal' || it.type === 'note' || it.type === 'document';
+    return (
+      it.type === 'terminal' ||
+      it.type === 'note' ||
+      it.type === 'document' ||
+      it.type === 'snippets'
+    );
   }
 
   function supportsMaximize(it: CanvasItem): boolean {
@@ -482,6 +488,13 @@
     const DOC_STRIP_H = 30;
     const DOC_RESTORE_W = 360;
     const DOC_RESTORE_H = 220;
+    // SnippetsNode.svelte 와 정합 (head-only mode 의 collapsed h + default
+    // restore geom). 두 entry point (canvas head min/restore + 본 inspector
+    // toggle) 가 같은 상수 + 같은 backupItemGeom store 를 공유하므로 어느
+    // 쪽에서 토글해도 일관 동작.
+    const SNIP_STRIP_H = 35;
+    const SNIP_RESTORE_W = 320;
+    const SNIP_RESTORE_H = 150;
     if (next === true) {
       sessionStore.backupItemGeom(it.id, { x: it.x, y: it.y, w: it.w, h: it.h });
       if (it.type === 'note') {
@@ -489,6 +502,9 @@
       }
       if (it.type === 'document') {
         return { ...it, minimized: true, h: DOC_STRIP_H } as CanvasItem;
+      }
+      if (it.type === 'snippets') {
+        return { ...it, minimized: true, h: SNIP_STRIP_H } as CanvasItem;
       }
       return { ...it, minimized: true, h: PANEL_STRIP_H } as CanvasItem;
     }
@@ -503,6 +519,11 @@
     if (it.type === 'document') {
       const w = backup?.w ?? DOC_RESTORE_W;
       const h = backup?.h ?? DOC_RESTORE_H;
+      return { ...it, minimized: false, w, h } as CanvasItem;
+    }
+    if (it.type === 'snippets') {
+      const w = backup?.w ?? SNIP_RESTORE_W;
+      const h = backup?.h ?? SNIP_RESTORE_H;
       return { ...it, minimized: false, w, h } as CanvasItem;
     }
     const h = backup?.h ?? PANEL_RESTORE_H;
@@ -1314,7 +1335,7 @@
         </section>
       {/if}
 
-      {#if selectionCount === 1 && sessionItem !== null && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document')}
+      {#if selectionCount === 1 && sessionItem !== null && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets')}
         <section class="prop-section">
           <div class="prop-head"><h4>Item Payload</h4></div>
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
@@ -1738,6 +1759,41 @@
                     <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
                     <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
                     <line x1="8" x2="16" y1="12" y2="12"/>
+                  </svg>
+                </button>
+              </div>
+            </div>
+          {:else if sessionItem.type === 'snippets'}
+            <!-- ADR-0038 — v8 design §12.2. Read-only display + add trigger.
+                 Editing lives in SnippetsNode inline form (Alt 5 rejected).
+                 locked toggle is owned by the standard State section below — no
+                 duplicate here. -->
+            {@const snipItem = sessionItem}
+            {@const snipEntries = snipItem.entries}
+            <div class="prop-row full">
+              <div class="display-row">
+                <span class="k">items</span>
+                <span class="display-val mono">{snipEntries.length}</span>
+                <span class="display-val mono muted" style="margin-left:4px;">/ 1000</span>
+                <button
+                  type="button"
+                  class="inline-action"
+                  title={snipItem.locked ? 'Locked — unlock to add' : 'Add a new snippet'}
+                  aria-label="Add a new snippet"
+                  disabled={snipItem.locked || snipEntries.length >= 1000}
+                  onclick={(e: MouseEvent) => {
+                    const target = e.currentTarget as HTMLButtonElement;
+                    const r = target.getBoundingClientRect();
+                    snippetEditPanel.openFor({
+                      nodeId: snipItem.id,
+                      entryId: null,
+                      anchor: { x: r.left, y: r.top, width: r.width, height: r.height },
+                      source: 'inspector',
+                    });
+                  }}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+                    <path d="M12 5v14M5 12h14"/>
                   </svg>
                 </button>
               </div>
@@ -2447,4 +2503,5 @@
   .style-btn.style-italic    { font-style: italic; }
   .style-btn.style-underline { text-decoration: underline; }
   .style-btn.style-strike    { text-decoration: line-through; }
+
 </style>

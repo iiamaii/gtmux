@@ -272,9 +272,10 @@
           {:else if section === 'storage'}
             <h3 class="section-head">Storage</h3>
             <p class="placeholder">
-              Workspace path · file_path allowlist editor · session export/import.
+              Workspace path · file_path allowlist editor.
               <br />
-              Waiting on BE: <code>/api/file-path/*</code>, <code>/api/sessions/import</code>.
+              Session import/export is available from the session menu.
+              Waiting on BE: <code>/api/file-path/*</code>.
             </p>
           {:else if section === 'auth'}
             <h3 class="section-head">Auth</h3>

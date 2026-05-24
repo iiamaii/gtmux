@@ -207,6 +207,24 @@ export interface FilePathItem extends ItemCommon {
   kind?: 'directory' | 'file';
 }
 
+/** ADR-0038 — 1 snippet = 1 (key, body) pair. */
+export interface SnippetEntry {
+  /** UUID v4 lowercase 36-char. List 안에서 unique — list reconciliation +
+   *  reorder + edit 의 stable id. BE schema 의 SnippetEntry::id 정합. */
+  id: string;
+  /** Badge display label. Save 시 trim 후 비어 있으면 reject (FE + BE 이중). */
+  key: string;
+  /** Clipboard 복사 대상. multiline 허용. 64 KB cap (`SNIPPET_BODY_MAX_BYTES`). */
+  body: string;
+}
+
+/** ADR-0038 — Snippet collection canvas item. */
+export interface SnippetsItem extends ItemCommon {
+  type: 'snippets';
+  /** 0..1000 entries. 순서 = 사용자가 본 badge 순서. drag-reorder 는 P1+. */
+  entries: SnippetEntry[];
+}
+
 /** Discriminated union — `type` field 로 narrow. */
 export type CanvasItem =
   | TerminalItem
@@ -218,7 +236,8 @@ export type CanvasItem =
   | FreeDrawItem
   | ImageItem
   | DocumentItem
-  | FilePathItem;
+  | FilePathItem
+  | SnippetsItem;
 
 /** `CanvasItem['type']` 의 모든 값 — UI registry / Toolbar 등록에 사용. */
 export type CanvasItemType = CanvasItem['type'];
@@ -261,3 +280,4 @@ export const isFreeDraw = (it: CanvasItem): it is FreeDrawItem => it.type === 'f
 export const isImage = (it: CanvasItem): it is ImageItem => it.type === 'image';
 export const isDocument = (it: CanvasItem): it is DocumentItem => it.type === 'document';
 export const isFilePath = (it: CanvasItem): it is FilePathItem => it.type === 'file_path';
+export const isSnippets = (it: CanvasItem): it is SnippetsItem => it.type === 'snippets';
