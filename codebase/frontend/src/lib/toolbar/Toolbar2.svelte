@@ -108,19 +108,21 @@
     // 4) Content (annotations + assets + references). Notes/snippets share
     //    this band with the asset items because they are all content-bearing
     //    canvas items — distinct from the figure primitives above.
-    //    Snippets icon: scaled 12→24-unit viewBox (×2) so the path renders at
-    //    toolbar size; layer-tree row uses the same shape at native 12-unit.
+    //    Note icon: lucide scroll-text. Snippets icon: lucide square-library.
+    //    24-unit viewBox; layer-tree rows use the same shapes scaled to 12-unit.
     [
+      // Note icon = lucide scroll-text (24-unit canonical). Layer-tree rows
+      // use a 12-unit simplified silhouette (3 text lines in a rounded rect).
       {
         id: 'note',
         name: 'Note',
         hint: 'N',
-        path: '<path d="M5 4h10l4 4v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><path d="M15 4v4h4"/><path d="M7 13h8M7 17h5"/>',
+        path: '<path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/>',
       },
       {
         id: 'snippets',
         name: 'Snippets',
-        path: '<path d="M8 3h8l1 2H7z"/><rect x="5" y="5" width="14" height="16" rx="2"/><path d="M8 10h8M8 14h8M8 18h5"/>',
+        path: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 7v10"/><path d="M11 7v10"/><path d="m15 7 2 10"/>',
       },
       {
         id: 'document',

@@ -109,6 +109,7 @@
   function onDblClick(e: MouseEvent): void {
     if (isLocked) return;
     e.stopPropagation();
+    if (sessionStore.consumeSuppressedTextEditDblClick(data.id)) return;
     editing = true;
   }
 
@@ -172,7 +173,7 @@
     class="text-node"
     class:m-single={isInM}
     class:locked={isLocked}
-    style="width: 100%; height: 100%; font-size: {data.font_size}px; color: {data.color}; text-align: {textAlign}; font-weight: {fontWeightCss}; font-style: {fontStyleCss}; text-decoration: {textDecorationCss};"
+    style="width: 100%; height: 100%; font-size: {data.font_size}px; color: {data.color}; text-align: {textAlign}; font-weight: {fontWeightCss}; font-style: {fontStyleCss}; --text-decoration: {textDecorationCss};"
     role="group"
     aria-label="Text item"
     ondblclick={onDblClick}
@@ -290,6 +291,8 @@
     display: block;
     width: 100%;
     line-height: 1;
+    text-decoration: var(--text-decoration);
+    text-decoration-skip-ink: auto;
   }
 
   :global(.text-content .text-edit) {
@@ -308,6 +311,8 @@
     resize: none;
     outline: none;
     line-height: 1;
+    text-decoration: var(--text-decoration);
+    text-decoration-skip-ink: auto;
     white-space: pre-wrap;
     word-break: break-word;
     overflow: hidden;

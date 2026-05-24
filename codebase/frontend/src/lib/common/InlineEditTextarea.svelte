@@ -13,7 +13,7 @@
    *   - Empty commit     → allowEmpty 정책에 따름 (default true — note body 등)
    */
 
-  import { tick } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import { escRouter } from './escRouter.svelte';
 
   interface Props {
@@ -54,6 +54,7 @@
   let draft = $state('');
   let textareaEl: HTMLTextAreaElement | undefined = $state();
   let escUnregister: (() => void) | null = null;
+  let wasEditing = false;
 
   /**
    * Auto-grow — plain 모드(.text-node 등 chrome-less inline edit)에서 textarea
@@ -68,11 +69,12 @@
   }
 
   $effect(() => {
-    if (editing) {
-      draft = value;
+    const isEditing = editing;
+    if (isEditing && !wasEditing) {
+      draft = untrack(() => value);
       void tick().then(() => {
         textareaEl?.focus();
-        if (selectOnFocus) textareaEl?.select();
+        if (untrack(() => selectOnFocus)) textareaEl?.select();
         syncAutoHeight();
       });
       escUnregister = escRouter.register({
@@ -82,17 +84,19 @@
           return true;
         },
       });
-    } else {
+    } else if (!isEditing && wasEditing) {
       if (escUnregister !== null) {
         escUnregister();
         escUnregister = null;
       }
     }
+    wasEditing = isEditing;
     return () => {
       if (escUnregister !== null) {
         escUnregister();
         escUnregister = null;
       }
+      wasEditing = false;
     };
   });
 
@@ -131,6 +135,10 @@
   function onblur(): void {
     if (editing) commit();
   }
+
+  function stopCanvasPropagation(e: Event): void {
+    e.stopPropagation();
+  }
 </script>
 
 {#if editing}
@@ -146,6 +154,10 @@
     class="inline-edit-textarea nodrag {extraClass}"
     class:plain
     style:text-align={textAlign}
+    onpointerdown={stopCanvasPropagation}
+    onmousedown={stopCanvasPropagation}
+    onclick={stopCanvasPropagation}
+    ondblclick={stopCanvasPropagation}
     {onkeydown}
     {onblur}
   ></textarea>

@@ -38,6 +38,9 @@
     locked: boolean;
     minimized?: boolean;
     entries: SnippetEntry[];
+    /** Optional user-editable display label (ItemCommon.label). Synced with
+     *  layer-tree row + inspector identity. Falls back to "Snippets" when null/empty. */
+    label?: string | null;
     /** Canvas.svelte group selection proxy. Descendants must not show own chrome. */
     group_selected?: boolean;
   }
@@ -76,17 +79,17 @@
   const SNIPPETS_RESTORE_W = 320;
   const SNIPPETS_RESTORE_H = 150;
   const entries = $derived(data.entries);
-  const isEmpty = $derived(entries.length === 0);
   const SNIPPETS_CAP = 1000;
+  // Sync source for head eyebrow + layer-tree row + inspector identity label.
+  // Falls back to 'Snippets' when the user has not set a custom label.
+  const displayLabel = $derived(
+    typeof data.label === 'string' && data.label.length > 0 ? data.label : 'Snippets',
+  );
   const canAdd = $derived(!isLocked && entries.length < SNIPPETS_CAP);
 
   // Transient copy feedback per entry — `is-copied` 200ms green flash (v8 §12).
   let copiedEntryId = $state<string | null>(null);
   let copiedTimer: ReturnType<typeof setTimeout> | null = null;
-
-  // First key for minimized head peek + Inspector cross-link. ADR-0005 D9 —
-  // derived value (stable string), not reactive proxy access in effects.
-  const firstKey = $derived(entries[0]?.key ?? null);
 
   // 2026-05-24 user spec — per-node interaction mode selected via head button
   // group (segmented control). Only one mode active at a time.
@@ -277,10 +280,18 @@
     );
   }
 
+  // Minimum size — body must fit at least one row of badges:
+  //   width  = body padding (12+12) + one short badge (~70) + gap (6) + [+] (28) ≈ 130
+  //   height = head (30) + body padding (10+10) + pill (22) ≈ 72 → 75 with breathing
+  // Below these the body wraps awkwardly or the head clips. NodeResizer prop +
+  // applyMutation clamp use the same constants so both code paths agree.
+  const SNIPPETS_RESIZE_MIN_W = 140;
+  const SNIPPETS_RESIZE_MIN_H = 75;
+
   type ResizeParams = { x: number; y: number; width: number; height: number };
   async function onResizeEnd(_e: unknown, params: ResizeParams): Promise<void> {
-    const nextW = Math.max(220, params.width);
-    const nextH = Math.max(100, params.height);
+    const nextW = Math.max(SNIPPETS_RESIZE_MIN_W, params.width);
+    const nextH = Math.max(SNIPPETS_RESIZE_MIN_H, params.height);
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -339,7 +350,6 @@
     class:m-single={isInM}
     class:is-locked={isLocked}
     class:is-min={isMinimized}
-    class:is-empty={isEmpty && !isMinimized}
     style="width: 100%; height: 100%;"
     role="group"
     aria-label="Snippets collection"
@@ -347,8 +357,8 @@
     <NodeResizer
       nodeId={data.id}
       isVisible={isInM && !isLocked && !isMinimized}
-      minWidth={220}
-      minHeight={100}
+      minWidth={SNIPPETS_RESIZE_MIN_W}
+      minHeight={SNIPPETS_RESIZE_MIN_H}
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
@@ -357,25 +367,16 @@
 
     <!-- Head strip — same vocabulary as Document's doc-head -->
     <div class="snip-head">
+      <!-- ADR-0038 — lucide square-library (scaled 24→12 ×0.5). -->
       <svg class="snip-glyph" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-        <path d="M4 1.5h4l0.5 1H3.5z"/>
-        <rect x="2.5" y="2.5" width="7" height="8" rx="1"/>
-        <path d="M4 5h4M4 7h4M4 9h2.5"/>
+        <rect x="1.5" y="1.5" width="9" height="9" rx="1"/>
+        <path d="M3.5 3.5v5"/>
+        <path d="M5.5 3.5v5"/>
+        <path d="m7.5 3.5 1 5"/>
       </svg>
-      {#if isMinimized}
-        <span class="eyebrow">Snippets</span>
-        {#if firstKey !== null}
-          <span class="sep">·</span>
-          <span class="count" title={firstKey}>{entries.length} · {firstKey}</span>
-        {:else}
-          <span class="sep">·</span>
-          <span class="count">empty</span>
-        {/if}
-      {:else}
-        <span class="eyebrow">Snippets</span>
-        <span class="sep">·</span>
-        <span class="count">{entries.length} / {SNIPPETS_CAP}</span>
-      {/if}
+      <span class="eyebrow" title={displayLabel}>{displayLabel}</span>
+      <span class="sep">·</span>
+      <span class="count">{entries.length} / {SNIPPETS_CAP}</span>
       {#if !isLocked}
         <div class="snip-actions">
           <!-- 2026-05-24 — mode segmented control. 3 buttons, only one active.
@@ -468,31 +469,11 @@
       {/if}
     </div>
 
-    <!-- Body strip — pills or empty hover state. Edit/add form lives in the
-         floating SnippetEditPanel, anchored to the trigger element. -->
-    {#if isEmpty}
-      <div
-        class="snip-body"
-        onclick={(e: MouseEvent) => openAddPanel(e.currentTarget as HTMLDivElement, 'canvas-empty')}
-        role="button"
-        tabindex={0}
-        onkeydown={(e: KeyboardEvent) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            openAddPanel(e.currentTarget as HTMLDivElement, 'canvas-empty');
-          }
-        }}
-        aria-label="Add first snippet"
-      >
-        <span class="empty-label">Empty</span>
-        <span class="empty-plus" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
-            <path d="M12 5v14M5 12h14"/>
-          </svg>
-        </span>
-      </div>
-    {:else}
-      <div class="snip-body" role="group">
+    <!-- Body strip — pill collection. When empty, only the `[+]` add badge
+         renders (same size/shape as the non-empty case) so the body chrome
+         stays consistent. Edit/add form lives in the floating
+         SnippetEditPanel, anchored to the trigger element. -->
+    <div class="snip-body" role="group">
         {#each entries as entry (entry.id)}
           <!-- Single pill atom. Click action depends on the node's viewMode
                (cycled via head mode button): idle=copy, edit=panel, delete=
@@ -560,12 +541,7 @@
           </svg>
         </button>
       </div>
-    {/if}
 
-    <!-- Foot strip — count summary -->
-    <div class="snip-foot">
-      <span>{entries.length} {entries.length === 1 ? 'item' : 'items'}</span>
-    </div>
   </div>
 {/if}
 
@@ -585,7 +561,7 @@
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06);
     color: var(--color-fg);
     display: grid;
-    grid-template-rows: 30px 1fr 24px;
+    grid-template-rows: 30px 1fr;
     overflow: visible;
     font-family: var(--font-sans);
   }
@@ -601,9 +577,10 @@
     cursor: default;
   }
 
-  /* Head + foot — surface-2 mono strip (borrowed from Document's chassis) */
-  .snip-head,
-  .snip-foot {
+  /* Head — surface-2 mono strip (borrowed from Document's chassis). Foot
+     dropped — count is already in the head eyebrow, separate foot was
+     redundant. */
+  .snip-head {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -612,17 +589,10 @@
     font-size: 10px;
     letter-spacing: 0.4px;
     color: var(--color-fg-muted);
-  }
-  .snip-head {
     padding: 0 4px 0 12px;
     border-bottom: 1px solid var(--color-border);
     /* Top corners match container — overflow:visible no longer clips for us. */
     border-radius: var(--radius-md) var(--radius-md) 0 0;
-  }
-  .snip-foot {
-    padding: 0 12px;
-    border-top: 1px solid var(--color-border);
-    border-radius: 0 0 var(--radius-md) var(--radius-md);
   }
   /* Minimized — head is the ONLY visible strip. Same pattern as DocumentNode
      /PanelNode: outer wrapper goes transparent, head takes all four corners
@@ -887,55 +857,9 @@
     height: 10px;
   }
 
-  /* Empty state — Document/Image empty pattern. Hover fades label, reveals
-     centered dashed-rounded-rectangle + plus glyph filling the body padding. */
-  .snippets-node.is-empty .snip-body {
-    display: grid;
-    grid-template-areas: 'stack';
-    place-items: center;
-    padding: 14px;
-    cursor: pointer;
-  }
-  .snippets-node.is-empty .snip-body > * {
-    grid-area: stack;
-  }
-  .snippets-node.is-empty .empty-label {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    letter-spacing: 0.7px;
-    text-transform: uppercase;
-    color: var(--color-fg-muted);
-    opacity: 0.7;
-    transition: opacity 0.12s;
-    pointer-events: none;
-  }
-  .snippets-node.is-empty .empty-plus {
-    width: 100%;
-    height: 100%;
-    border: 1px dashed var(--color-accent);
-    border-radius: var(--radius-md);
-    display: grid;
-    place-items: center;
-    color: var(--color-accent);
-    opacity: 0;
-    transform: scale(0.96);
-    transition: opacity 0.14s, transform 0.14s;
-    pointer-events: none;
-    background: transparent;
-  }
-  .snippets-node.is-empty:hover .empty-plus,
-  .snippets-node.is-empty .snip-body:focus-visible .empty-plus {
-    opacity: 1;
-    transform: scale(1);
-  }
-  .snippets-node.is-empty:hover .empty-label,
-  .snippets-node.is-empty .snip-body:focus-visible .empty-label {
-    opacity: 0;
-  }
-  .snippets-node.is-empty .empty-plus svg {
-    width: 18px;
-    height: 18px;
-  }
+  /* Empty state intentionally has no special chrome — the `[+]` add badge is
+     the only visible affordance and stays the same size/shape as in the
+     non-empty case, keeping body proportions stable across states. */
 
   /* Locked — body + add fade, head/foot stay legible */
   .snippets-node.is-locked .snip-body,
@@ -944,10 +868,9 @@
     pointer-events: none;
   }
 
-  /* Minimized — body + foot hidden. (.is-min outer + head visual is defined
-     near the container section above.) */
-  .snippets-node.is-min .snip-body,
-  .snippets-node.is-min .snip-foot {
+  /* Minimized — body hidden. (.is-min outer + head visual is defined near
+     the container section above.) */
+  .snippets-node.is-min .snip-body {
     display: none;
   }
 

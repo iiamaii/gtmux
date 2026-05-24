@@ -19,7 +19,7 @@
 
 import type { CanvasItem } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
-import { pasteItems } from '$lib/canvas/clipboardOps.svelte';
+import { pasteItems, materializeSelection } from '$lib/canvas/clipboardOps.svelte';
 import { nudgeBuffer } from './nudgeBuffer.svelte';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
@@ -41,11 +41,22 @@ function selectionMutableIds(): string[] {
 }
 
 function doDuplicate(): boolean {
-  // ADR-0030 D11 — clipboard state 변경 0, paste 와 동일 (24, 24) offset.
-  const sources = selectionMutableItems();
-  if (sources.length === 0) return false;
+  // ADR-0030 D11 + D12.6 — clipboard state 변경 0, paste 와 동일 (24, 24) offset.
+  // Group entity 가 M 에 있으면 자손 sub-tree 까지 materializeSelection 으로
+  // 확장 (D12.1). locked item 은 source 에서 제외 (D11 + D12.6).
   if (sessionStore.active === null) return false;
-  void pasteItems(sources, { offset: { dx: 24, dy: 24 }, failMessage: 'Duplicate failed' });
+  const payload = materializeSelection(
+    sessionStore.M,
+    sessionStore.items,
+    sessionStore.groups,
+  );
+  const mutableItems = payload.items.filter((it) => !it.locked);
+  if (mutableItems.length === 0 && payload.groups.length === 0) return false;
+  void pasteItems(
+    mutableItems,
+    payload.groups,
+    { offset: { dx: 24, dy: 24 }, failMessage: 'Duplicate failed' },
+  );
   return true;
 }
 

@@ -232,9 +232,10 @@
       title={isMinimized ? `${data.title || 'Untitled'} — click to restore` : undefined}
     >
       <div class="note-head">
+      <!-- lucide scroll-text — simplified for 12-unit small chrome. -->
       <svg class="note-glyph" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-        <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
-        <path d="M3.6 5.2h4.8"/>
+        <rect x="1.5" y="2" width="9" height="8" rx="1.5"/>
+        <path d="M3.5 4.5h5M3.5 6.5h5M3.5 8.5h3"/>
       </svg>
       <span class="note-label" ondblclick={onTitleDblClick} role="presentation">
         {#if titleEditing}
@@ -325,10 +326,12 @@
       {/if}
       </div>
 
-      <!-- 32×32 chip 모드 시 표시되는 speech-bubble glyph (note-head/body 는 hide). -->
+      <!-- 32×32 chip 모드 시 표시되는 type glyph (note-head/body 는 hide).
+           lucide scroll-text — head .note-glyph 와 동일 silhouette,
+           14-unit viewBox 에 맞춰 약간 확대. -->
       <svg class="note-chip" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-        <path d="M2 3h10v6.4H7L4.5 12V9.4H2z"/>
-        <path d="M4.4 6h5.2"/>
+        <rect x="2" y="2.5" width="10" height="9" rx="1.5"/>
+        <path d="M4 5h6M4 7h6M4 9h3.5"/>
       </svg>
     </div>
   </div>

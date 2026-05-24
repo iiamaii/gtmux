@@ -95,6 +95,19 @@ class HistoryStore {
   }
 
   /**
+   * PRE-state 만 보고 stack 은 변경하지 않음. caller 가 *비동기 확인 dialog*
+   * 등으로 user input 대기 후 popUndo 를 결정해야 할 때 사용 (ADR-0030 D12.8
+   * amend ④ — paste 의 undo 시 terminal kill confirm).
+   *
+   * 반환 null 이면 stack 비어 있음.
+   */
+  peekUndo(sessionName: string): CanvasLayout | null {
+    const h = this.#histories.get(sessionName);
+    if (h === undefined || h.undoStack.length === 0) return null;
+    return h.undoStack[h.undoStack.length - 1] ?? null;
+  }
+
+  /**
    * Redo 1 step — caller 가 보낸 current snapshot 을 undo 에 push (redo drop X).
    *
    * 반환 null 이면 redo stack 비어 있음.

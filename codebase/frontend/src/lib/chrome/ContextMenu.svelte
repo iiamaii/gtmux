@@ -23,8 +23,8 @@
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { zStore } from '$lib/stores/zStore.svelte';
-  import { clipboardStore } from '$lib/stores/clipboardStore.svelte';
-  import { pasteItems } from '$lib/canvas/clipboardOps.svelte';
+  import { clipboardStore, type ClipboardPayload } from '$lib/stores/clipboardStore.svelte';
+  import { pasteItems, materializeSelection } from '$lib/canvas/clipboardOps.svelte';
   import { doToggleLock, doToggleVisibility } from '$lib/keyboard/editingShortcuts.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
@@ -243,48 +243,56 @@
   /* ── EDIT — Copy / Cut / Paste (ADR-0030 D10). ──────────────────── */
 
   /**
-   * Effective copy/cut targets. ADR-0030 의 batch 동작 정합:
-   * - 클릭된 panel 이 M ∈ 이면 M 전체 (batch)
-   * - 클릭된 panel 이 M ∉ 이면 그 single item (M 은 변경 안 함 — ADR-0032 D1 의
-   *   click-to-replace 는 별 batch 에서 적용)
+   * Effective copy/cut targets. ADR-0030 D12 amend ③ + ADR-0032 D1:
+   * - 클릭된 panel/group 이 M ∈ 이면 M 전체 (batch). group 포함 시 자손까지
+   *   materializeSelection 가 sub-tree 로 확장 (D12.1).
+   * - 클릭된 panel 이 M ∉ 이면 그 single item (M 은 변경 안 함).
    */
-  function effectiveCopyTargets(): CanvasItem[] {
-    if (panelIdStr === null) return [];
+  function effectiveCopyTargets(): ClipboardPayload {
+    // ADR-0030 D12 amend ③ — groupEntity mode 면 그 group + 자손 sub-tree.
+    if (ctxMode === 'groupEntity' && groupIdStr !== null) {
+      return materializeSelection([groupIdStr], sessionStore.items, sessionStore.groups);
+    }
+    if (panelIdStr === null) return { items: [], groups: [] };
     const inM = sessionStore.M.has(panelIdStr);
     if (inM && sessionStore.M.size > 0) {
-      const out: CanvasItem[] = [];
-      for (const id of sessionStore.M) {
-        const it = sessionStore.items.get(id);
-        if (it !== undefined) out.push(it);
-      }
-      return out;
+      return materializeSelection(
+        sessionStore.M,
+        sessionStore.items,
+        sessionStore.groups,
+      );
     }
-    const it = sessionStore.items.get(panelIdStr);
-    return it ? [it] : [];
+    return materializeSelection([panelIdStr], sessionStore.items, sessionStore.groups);
   }
 
   function onCopy(): void {
-    const targets = effectiveCopyTargets();
-    if (targets.length > 0) clipboardStore.copy(targets);
+    const payload = effectiveCopyTargets();
+    if (payload.items.length > 0 || payload.groups.length > 0) {
+      clipboardStore.copy(payload);
+    }
     close();
   }
 
   async function onCut(): Promise<void> {
-    // ADR-0030 D5 — locked 제외.
-    const targets = effectiveCopyTargets().filter((it) => !it.locked);
-    if (targets.length === 0) {
+    // ADR-0030 D5 + D12.6 — locked item 제외.
+    const raw = effectiveCopyTargets();
+    const mutableItems = raw.items.filter((it) => !it.locked);
+    const payload: ClipboardPayload = { items: mutableItems, groups: raw.groups };
+    if (payload.items.length === 0 && payload.groups.length === 0) {
       close();
       return;
     }
-    clipboardStore.cut(targets);
+    clipboardStore.cut(payload);
     close();
+    // ADR-0030 D12.7 — group cut destructive 는 자손 items 만 deleteItem,
+    // group entity 는 pruneEmptyGroups 가 자동 cleanup.
+    if (mutableItems.length === 0) return;
     // ADR-0032 Amend ④ — terminal 포함 batch 는 PanelCloseConfirmModal 경유.
-    // terminal 없으면 store 가 즉시 onConfirm(false) → 기존 동작과 동일.
     panelCloseDialog.show({
-      items: targets,
+      items: mutableItems,
       onConfirm: async (killTerminal) => {
         await sessionStore.applyDeletion(
-          targets.map((it) => it.id),
+          mutableItems.map((it) => it.id),
           { killTerminal },
         );
       },
@@ -301,6 +309,7 @@
     // offset 계산. clickPos = pre-clamp 원본 viewport 좌표.
     const flow = screenToFlowPosition({ x: clickPos.x, y: clickPos.y });
     const sources = clipboardStore.entries;
+    const groups = clipboardStore.groups;
     const bboxX = sources.reduce(
       (m, it) => Math.min(m, it.x),
       Number.POSITIVE_INFINITY,
@@ -309,9 +318,11 @@
       (m, it) => Math.min(m, it.y),
       Number.POSITIVE_INFINITY,
     );
-    const offset = { dx: flow.x - bboxX, dy: flow.y - bboxY };
+    const offset = sources.length > 0
+      ? { dx: flow.x - bboxX, dy: flow.y - bboxY }
+      : { dx: 0, dy: 0 };
     close();
-    await pasteItems(sources, { offset, failMessage: 'Paste failed' });
+    await pasteItems(sources, groups, { offset, failMessage: 'Paste failed' });
   }
 
   /* ── ARRANGE 4 z actions (ADR-0024 D2 / ADR-0032 D11) — multi 시 batch. ── */
@@ -672,20 +683,21 @@
       </button>
     {/if}
 
-    {#if canCopyPaneId}
-      <div class="ctx-section">Panel</div>
-      <button
-        type="button"
-        class="ctx-item"
-        onclick={onCopyPaneId}
-      >
-        <span class="label">Copy panel id</span>
-      </button>
-      <div class="ctx-sep"></div>
-    {/if}
-
     {#if ctxMode === 'groupEntity'}
       <!-- ADR-0032 D25~D28 + plan-0012 §3.4 D — Group entity mode. -->
+      <!-- ADR-0030 D12 amend ③ — Group entity 도 Copy/Cut 의 1차 시민. Edit
+           section 을 가장 상단으로 두어 panel 분기와 일관성 유지. -->
+      <div class="ctx-section">Edit</div>
+      <button type="button" class="ctx-item" onclick={onCopy}>
+        <span class="label">Copy</span>
+        <span class="kbd mono">⌘C</span>
+      </button>
+      <button type="button" class="ctx-item" onclick={() => void onCut()}>
+        <span class="label">Cut</span>
+        <span class="kbd mono">⌘X</span>
+      </button>
+      <div class="ctx-sep"></div>
+
       <div class="ctx-section">Arrange</div>
       <button
         type="button"
@@ -768,6 +780,11 @@
         >
           <span class="label">Paste</span>
           <span class="kbd mono">⌘V</span>
+        </button>
+      {/if}
+      {#if canCopyPaneId}
+        <button type="button" class="ctx-item" onclick={onCopyPaneId}>
+          <span class="label">Copy panel id</span>
         </button>
       {/if}
       <div class="ctx-sep"></div>
