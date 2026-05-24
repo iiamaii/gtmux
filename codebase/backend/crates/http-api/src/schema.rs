@@ -45,6 +45,20 @@ pub const FREE_DRAW_POINT_CAP: usize = 5000;
 /// "UTF-8 markdown, cap 64 KB" wording in the ADR.
 pub const DOCUMENT_INLINE_MAX_BYTES: usize = 64 * 1024;
 
+/// Maximum bytes for a `SnippetEntry::key` (ADR-0038 D2 / O3).
+/// Badge display 길이 한도. truncate 는 FE 책임 — BE 는 hard cap 만 enforce.
+pub const SNIPPET_KEY_MAX_BYTES: usize = 256;
+
+/// Maximum bytes for a `SnippetEntry::body` (ADR-0038 D2 / O2).
+/// 64 KB — `DOCUMENT_INLINE_MAX_BYTES` 와 동일. 단일 snippet 의 body 가
+/// 64 KB 를 넘으면 그건 더 이상 snippet 이 아니라 document.
+pub const SNIPPET_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// Maximum number of entries per `Snippets` item (ADR-0038 D2).
+/// 한 node 의 badge 가 1000 개 이상이면 wrap 자체가 UX 파괴. wire / storage
+/// 의 hard cap 으로 1000 enforce — FE 의 [+ add] 는 999 entry 이후 disabled.
+pub const SNIPPETS_ENTRIES_CAP: usize = 1000;
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Top-level Layout
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,6 +209,23 @@ pub struct ItemCommon {
 pub struct Point {
     pub x: f64,
     pub y: f64,
+}
+
+/// ADR-0038 D2 — 1 snippet = 1 (key, body) pair. Multiple entries live in
+/// a `Snippets` item's `entries` Vec.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SnippetEntry {
+    /// UUID v4 lowercase 36-char. Stable across edits — FE uses this for
+    /// list reconciliation and reorder.
+    pub id: String,
+    /// Badge display label. Must be non-empty after `trim`. Length cap:
+    /// [`SNIPPET_KEY_MAX_BYTES`]. Duplicate keys within the same item are
+    /// allowed (FE shows a soft hint — ADR-0038 D7 / O9).
+    pub key: String,
+    /// Body payload — copied to clipboard verbatim on badge click. Allowed
+    /// to be empty. Length cap: [`SNIPPET_BODY_MAX_BYTES`].
+    pub body: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -479,6 +510,19 @@ pub enum Item {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label_offset: Option<Point>,
     },
+    /// ADR-0038 — Snippet collection. A canvas-local registry of (key, body)
+    /// pairs. Click a badge ⇒ copy `body` to clipboard (FE-side action,
+    /// no BE involvement). All edits round-trip through the standard
+    /// `PUT /layout` endpoint.
+    Snippets {
+        #[serde(flatten)]
+        common: ItemCommon,
+        /// 0..[`SNIPPETS_ENTRIES_CAP`] entries. Order is preserved verbatim;
+        /// FE renders badges in this order. Empty `Vec` is the *empty
+        /// state* (FE shows just the "+ add" affordance).
+        #[serde(default)]
+        entries: Vec<SnippetEntry>,
+    },
 }
 
 impl Item {
@@ -495,7 +539,8 @@ impl Item {
             | Item::Image { common, .. }
             | Item::Document { common, .. }
             | Item::FilePath { common, .. }
-            | Item::Connector { common, .. } => common,
+            | Item::Connector { common, .. }
+            | Item::Snippets { common, .. } => common,
         }
     }
 
@@ -514,7 +559,8 @@ impl Item {
             | Item::Image { common, .. }
             | Item::Document { common, .. }
             | Item::FilePath { common, .. }
-            | Item::Connector { common, .. } => common,
+            | Item::Connector { common, .. }
+            | Item::Snippets { common, .. } => common,
         }
     }
 }
@@ -579,6 +625,24 @@ pub enum ValidationError {
     /// the 8..=96 range.
     #[error("text font_size {font_size} must be in 8..=96")]
     TextFontSizeOutOfRange { font_size: u32 },
+    /// ADR-0038 — `SnippetEntry::id` is not a UUID v4-shape lowercase string.
+    #[error("snippet entry id is not a UUID v4-shape lowercase string: {0:?}")]
+    BadSnippetEntryId(String),
+    /// ADR-0038 — `SnippetEntry::key` is empty after `trim()`.
+    #[error("snippet entry key must be non-empty (after trim)")]
+    SnippetKeyEmpty,
+    /// ADR-0038 — `SnippetEntry::key` exceeds [`SNIPPET_KEY_MAX_BYTES`].
+    #[error("snippet entry key exceeds {} bytes", SNIPPET_KEY_MAX_BYTES)]
+    SnippetKeyTooLong,
+    /// ADR-0038 — `SnippetEntry::body` exceeds [`SNIPPET_BODY_MAX_BYTES`].
+    #[error("snippet entry body exceeds {} bytes", SNIPPET_BODY_MAX_BYTES)]
+    SnippetBodyTooLong,
+    /// ADR-0038 — `Snippets::entries` length exceeds [`SNIPPETS_ENTRIES_CAP`].
+    #[error("snippets entries length exceeds {}", SNIPPETS_ENTRIES_CAP)]
+    SnippetsEntriesTooMany,
+    /// ADR-0038 — duplicate `SnippetEntry::id` within a single `Snippets` item.
+    #[error("duplicate snippet entry id within a single item: {0:?}")]
+    DuplicateSnippetEntryId(String),
 }
 
 impl ValidationError {
@@ -604,6 +668,12 @@ impl ValidationError {
             Self::ConnectorSelfLoop => "connector_self_loop",
             Self::StrokeWidthOutOfRange { .. } => "stroke_width_out_of_range",
             Self::TextFontSizeOutOfRange { .. } => "text_font_size_out_of_range",
+            Self::BadSnippetEntryId(_) => "bad_snippet_entry_id",
+            Self::SnippetKeyEmpty => "snippet_key_empty",
+            Self::SnippetKeyTooLong => "snippet_key_too_long",
+            Self::SnippetBodyTooLong => "snippet_body_too_long",
+            Self::SnippetsEntriesTooMany => "snippets_entries_too_many",
+            Self::DuplicateSnippetEntryId(_) => "duplicate_snippet_entry_id",
         }
     }
 }
@@ -753,6 +823,33 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                     .ok_or(ValidationError::ConnectorEndpointMissing)?;
                 if matches!(from, Item::Connector { .. }) || matches!(to, Item::Connector { .. }) {
                     return Err(ValidationError::ConnectorInvalidEndpoint);
+                }
+            }
+            Item::Snippets { entries, .. } => {
+                // ADR-0038 — entries cap first (early exit for oversized
+                // payloads), then per-entry: UUID → unique id (intra-item)
+                // → key trim → key len → body len. fail-fast.
+                if entries.len() > SNIPPETS_ENTRIES_CAP {
+                    return Err(ValidationError::SnippetsEntriesTooMany);
+                }
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
+                for e in entries {
+                    if !is_uuid_shape(&e.id) {
+                        return Err(ValidationError::BadSnippetEntryId(e.id.clone()));
+                    }
+                    if !seen.insert(&e.id) {
+                        return Err(ValidationError::DuplicateSnippetEntryId(e.id.clone()));
+                    }
+                    if e.key.trim().is_empty() {
+                        return Err(ValidationError::SnippetKeyEmpty);
+                    }
+                    if e.key.len() > SNIPPET_KEY_MAX_BYTES {
+                        return Err(ValidationError::SnippetKeyTooLong);
+                    }
+                    if e.body.len() > SNIPPET_BODY_MAX_BYTES {
+                        return Err(ValidationError::SnippetBodyTooLong);
+                    }
                 }
             }
             _ => {}
@@ -1829,5 +1926,137 @@ mod tests {
         });
         let err = validate(&l).unwrap_err();
         assert_eq!(err.code(), "text_font_size_out_of_range");
+    }
+
+    // ── ADR-0038 — Snippets variant ────────────────────────────────────────
+
+    const SNIPPET_ID_1: &str = "00000000-0000-4000-8000-000000000001";
+    const SNIPPET_ID_2: &str = "00000000-0000-4000-8000-000000000002";
+
+    #[test]
+    fn snippets_round_trips_via_json() {
+        let body = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "id": UUID_A,
+                "type": "snippets",
+                "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 320.0, "h": 140.0, "z": 0,
+                "visibility": "visible", "locked": false,
+                "entries": [
+                    { "id": SNIPPET_ID_1, "key": "gs", "body": "git status" },
+                    { "id": SNIPPET_ID_2, "key": "deploy", "body": "pnpm build && rsync" }
+                ]
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        let parsed: Layout = serde_json::from_value(body).unwrap();
+        assert_eq!(parsed.items.len(), 1);
+        match &parsed.items[0] {
+            Item::Snippets { entries, .. } => assert_eq!(entries.len(), 2),
+            _ => panic!("expected Snippets"),
+        }
+        let re = serde_json::to_value(&parsed).unwrap();
+        let re_parsed: Layout = serde_json::from_value(re).unwrap();
+        assert_eq!(parsed, re_parsed);
+    }
+
+    #[test]
+    fn snippets_empty_entries_validates() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Snippets {
+            common: item_common(UUID_A),
+            entries: vec![],
+        });
+        assert!(validate(&l).is_ok());
+    }
+
+    #[test]
+    fn snippets_rejects_empty_key() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Snippets {
+            common: item_common(UUID_A),
+            entries: vec![SnippetEntry {
+                id: SNIPPET_ID_1.to_string(),
+                key: "   ".to_string(),
+                body: String::new(),
+            }],
+        });
+        assert_eq!(validate(&l), Err(ValidationError::SnippetKeyEmpty));
+    }
+
+    #[test]
+    fn snippets_rejects_too_many_entries() {
+        let mut l = Layout::empty();
+        let entries: Vec<SnippetEntry> = (0..(SNIPPETS_ENTRIES_CAP + 1))
+            .map(|i| SnippetEntry {
+                id: format!("00000000-0000-4000-8000-{:012x}", i + 1),
+                key: format!("k{i}"),
+                body: String::new(),
+            })
+            .collect();
+        l.items.push(Item::Snippets {
+            common: item_common(UUID_A),
+            entries,
+        });
+        assert_eq!(
+            validate(&l),
+            Err(ValidationError::SnippetsEntriesTooMany)
+        );
+    }
+
+    #[test]
+    fn snippets_rejects_duplicate_entry_id() {
+        let dup = SNIPPET_ID_1;
+        let mut l = Layout::empty();
+        l.items.push(Item::Snippets {
+            common: item_common(UUID_A),
+            entries: vec![
+                SnippetEntry {
+                    id: dup.to_string(),
+                    key: "a".to_string(),
+                    body: String::new(),
+                },
+                SnippetEntry {
+                    id: dup.to_string(),
+                    key: "b".to_string(),
+                    body: String::new(),
+                },
+            ],
+        });
+        assert_eq!(
+            validate(&l),
+            Err(ValidationError::DuplicateSnippetEntryId(dup.to_string()))
+        );
+    }
+
+    #[test]
+    fn snippets_rejects_oversized_body() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Snippets {
+            common: item_common(UUID_A),
+            entries: vec![SnippetEntry {
+                id: SNIPPET_ID_1.to_string(),
+                key: "big".to_string(),
+                body: "x".repeat(SNIPPET_BODY_MAX_BYTES + 1),
+            }],
+        });
+        assert_eq!(validate(&l), Err(ValidationError::SnippetBodyTooLong));
+    }
+
+    #[test]
+    fn snippets_rejects_bad_entry_id() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Snippets {
+            common: item_common(UUID_A),
+            entries: vec![SnippetEntry {
+                id: "not-a-uuid".to_string(),
+                key: "ok".to_string(),
+                body: String::new(),
+            }],
+        });
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "bad_snippet_entry_id");
     }
 }

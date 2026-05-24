@@ -72,23 +72,33 @@
   // Preview metrics — schema v2 layout 안의 type 별 count.
   const preview = $derived.by(() => {
     if (envelope === null) return null;
-    const items = envelope.layout.items;
+    const items = envelope.layout.items as CanvasItem[];
     const counts = {
       total: items.length,
+      groups: envelope.layout.groups.length,
       terminal: 0,
       text: 0,
       note: 0,
+      inlineDocument: 0,
+      assetReference: 0,
       file_path: 0,
       shape: 0,
       line: 0,
       other: 0,
     };
-    for (const it of items as CanvasItem[]) {
+    for (const it of items) {
       switch (it.type) {
         case 'terminal': counts.terminal += 1; break;
         case 'text': counts.text += 1; break;
         case 'note': counts.note += 1; break;
         case 'file_path': counts.file_path += 1; break;
+        case 'image':
+          if ((it.asset_id ?? '').length > 0) counts.assetReference += 1;
+          break;
+        case 'document':
+          if ((it.asset_id ?? '').length === 0 && it.content !== undefined) counts.inlineDocument += 1;
+          if ((it.asset_id ?? '').length > 0) counts.assetReference += 1;
+          break;
         case 'rect':
         case 'ellipse': counts.shape += 1; break;
         case 'line': counts.line += 1; break;
@@ -301,9 +311,12 @@
 
         <div class="counts">
           <div class="count-row"><span class="ct">total items</span><span class="cn">{preview.total}</span></div>
+          {#if preview.groups > 0}<div class="count-row"><span class="ct">groups</span><span class="cn">{preview.groups}</span></div>{/if}
           {#if preview.terminal > 0}<div class="count-row"><span class="ct">terminal panels</span><span class="cn">{preview.terminal}</span></div>{/if}
           {#if preview.text > 0}<div class="count-row"><span class="ct">text</span><span class="cn">{preview.text}</span></div>{/if}
           {#if preview.note > 0}<div class="count-row"><span class="ct">notes</span><span class="cn">{preview.note}</span></div>{/if}
+          {#if preview.inlineDocument > 0}<div class="count-row"><span class="ct">inline documents</span><span class="cn">{preview.inlineDocument}</span></div>{/if}
+          {#if preview.assetReference > 0}<div class="count-row"><span class="ct">asset references</span><span class="cn">{preview.assetReference}</span></div>{/if}
           {#if preview.file_path > 0}<div class="count-row"><span class="ct">file paths</span><span class="cn">{preview.file_path}</span></div>{/if}
           {#if preview.shape > 0}<div class="count-row"><span class="ct">shapes</span><span class="cn">{preview.shape}</span></div>{/if}
           {#if preview.line > 0}<div class="count-row"><span class="ct">lines</span><span class="cn">{preview.line}</span></div>{/if}
@@ -333,6 +346,13 @@
           <div class="caveat">
             Terminal panels will be re-spawned (fresh shell) when the imported
             session is first attached.
+          </div>
+        {/if}
+        {#if preview.assetReference > 0}
+          <div class="caveat">
+            Binary assets are not bundled in session export files. Asset-backed
+            images/documents may appear dangling unless this workspace already
+            has the referenced assets.
           </div>
         {/if}
       {/if}

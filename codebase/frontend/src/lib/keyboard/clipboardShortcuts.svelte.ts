@@ -65,6 +65,7 @@ export function bindClipboardShortcuts(): () => void {
   const unsubs: Array<() => void> = [];
 
   const register = (
+    actionId: string,
     key: string,
     modifier: 'meta' | 'ctrl',
     description: string,
@@ -72,11 +73,13 @@ export function bindClipboardShortcuts(): () => void {
   ): void => {
     unsubs.push(
       shortcutRegistry.register({
+        actionId,
         key,
         meta: modifier === 'meta',
         ctrl: modifier === 'ctrl',
         description,
         category: 'Edit',
+        customizable: true,
         // ADR-0030 D7 — editable / xterm focus 시 OS default 우선 (registry skip).
         allowInEditable: false,
         allowInXterm: false,
@@ -85,12 +88,12 @@ export function bindClipboardShortcuts(): () => void {
     );
   };
 
-  register('c', 'meta', 'Copy', doCopy);
-  register('c', 'ctrl', 'Copy (Win/Linux)', doCopy);
-  register('x', 'meta', 'Cut', doCut);
-  register('x', 'ctrl', 'Cut (Win/Linux)', doCut);
-  register('v', 'meta', 'Paste', doPaste);
-  register('v', 'ctrl', 'Paste (Win/Linux)', doPaste);
+  register('selection.copy', 'c', 'meta', 'Copy', doCopy);
+  register('selection.copy', 'c', 'ctrl', 'Copy (Win/Linux)', doCopy);
+  register('selection.cut', 'x', 'meta', 'Cut', doCut);
+  register('selection.cut', 'x', 'ctrl', 'Cut (Win/Linux)', doCut);
+  register('selection.paste', 'v', 'meta', 'Paste', doPaste);
+  register('selection.paste', 'v', 'ctrl', 'Paste (Win/Linux)', doPaste);
 
   return () => {
     for (const fn of unsubs) fn();

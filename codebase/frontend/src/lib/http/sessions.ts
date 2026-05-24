@@ -477,7 +477,13 @@ export async function exportSession(name: string): Promise<ExportSessionResult> 
   if (!res.ok) throw new Error(`GET export returned ${res.status}`);
   const text = await res.text();
   const blob = new Blob([text], { type: 'application/json' });
-  const envelope = parseEnvelope(JSON.parse(text));
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new EnvelopeParseError('export response is not valid JSON');
+  }
+  const envelope = parseEnvelope(parsed);
   // Content-Disposition 의 filename — fallback 은 session_name.
   const disposition = res.headers.get('content-disposition') ?? '';
   const match = disposition.match(/filename="?([^";]+)"?/i);

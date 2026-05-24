@@ -38,10 +38,10 @@ export function bindGroupShortcuts(): () => void {
   const unsubs: Array<() => void> = [];
   const reg = (d: ShortcutDescriptor) => unsubs.push(shortcutRegistry.register(d));
 
-  reg({ key: 'g', meta: true, category: 'Canvas', description: 'Group selection', handler: onGroup });
-  reg({ key: 'g', ctrl: true, category: 'Canvas', description: 'Group selection (Win/Linux)', handler: onGroup });
-  reg({ key: 'G', meta: true, shift: true, category: 'Canvas', description: 'Ungroup selection', handler: onUngroup });
-  reg({ key: 'G', ctrl: true, shift: true, category: 'Canvas', description: 'Ungroup selection (Win/Linux)', handler: onUngroup });
+  reg({ actionId: 'group.group', key: 'g', meta: true, customizable: true, category: 'Canvas', description: 'Group selection', handler: onGroup });
+  reg({ actionId: 'group.group', key: 'g', ctrl: true, customizable: true, category: 'Canvas', description: 'Group selection (Win/Linux)', handler: onGroup });
+  reg({ actionId: 'group.ungroup', key: 'G', meta: true, shift: true, customizable: true, category: 'Canvas', description: 'Ungroup selection', handler: onUngroup });
+  reg({ actionId: 'group.ungroup', key: 'G', ctrl: true, shift: true, customizable: true, category: 'Canvas', description: 'Ungroup selection (Win/Linux)', handler: onUngroup });
 
   return () => {
     for (const fn of unsubs) fn();

@@ -2,10 +2,11 @@
   /**
    * Session shutdown confirm modal (plan 0005 Stage C, ADR-0017 §D3).
    *
-   * Triggered from SessionMenu. On confirm, sends CTRL `kill-session`
-   * (ADR-0013 D10 amend) — backend acks + raises SIGTERM on itself →
-   * graceful_shutdown → WS close 1000. ReconnectBanner then surfaces
-   * "Session ended" (Stage C banner amend, separate file).
+   * Triggered from SessionMenu. On confirm, calls `POST /api/shutdown`
+   * with cookie auth and the stored bootstrap token as a Bearer fallback.
+   * The backend schedules graceful shutdown, emits SERVER_SHUTDOWN over WS,
+   * then exits with code 6. ReconnectBanner surfaces the intentional
+   * shutdown branch.
    *
    * Information density (ref §10 Figma style + sketch §13 destructive
    * action prevention):
@@ -14,13 +15,12 @@
    *   - Actions: [Cancel] ghost + [Shutdown] danger
    */
 
-  import { getContext } from 'svelte';
   import Modal from '$lib/ui/Modal.svelte';
   import Button from '$lib/ui/Button.svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
-  import { sendCtrl } from '$lib/ws/ctrl-registry';
   import { toastStore } from '$lib/ui/toast-store.svelte';
-  import type { WsClient } from '$lib/ws/client';
+  import { shutdownServer } from '$lib/http/shutdown';
+  import { UnauthorizedError } from '$lib/http/sessions';
 
   interface Props {
     open: boolean;
@@ -30,9 +30,6 @@
 
   const { open, sessionName, onclose }: Props = $props();
 
-  interface WsClientHolder { current: WsClient | null }
-  const wsClientHolder = getContext<WsClientHolder>('wsClient');
-
   const liveCount = $derived(
     [...muxStore.panes.values()].filter((p) => !p.dead).length
   );
@@ -40,26 +37,17 @@
   let inFlight = $state(false);
 
   async function onShutdown(): Promise<void> {
-    const client = wsClientHolder?.current;
-    if (!client) {
-      toastStore.show({ message: 'WebSocket not ready', tone: 'error' });
-      return;
-    }
     inFlight = true;
     try {
-      const { response } = sendCtrl(client, 'kill-session', [], { timeoutMs: 5_000 });
-      const result = await response;
-      if (!result.ok) {
-        toastStore.show({
-          message: `Shutdown failed: ${result.code ?? 'unknown'} ${result.error ?? ''}`,
-          tone: 'error',
-        });
-        return;
-      }
-      // Backend acked. The SIGTERM-self fires next and the WS will close
-      // 1000. ReconnectBanner takes over with the "Session ended" flow.
+      await shutdownServer();
+      // Backend accepted the request. The SERVER_SHUTDOWN WS frame and
+      // normal close follow; ReconnectBanner owns the visible end state.
       onclose();
     } catch (e) {
+      if (e instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
       toastStore.show({
         message: `Shutdown request failed: ${(e as Error).message ?? e}`,
         tone: 'error',

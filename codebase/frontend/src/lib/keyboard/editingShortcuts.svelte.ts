@@ -50,6 +50,7 @@ function doDuplicate(): boolean {
 }
 
 type ArrowKey = 'ArrowUp' | 'ArrowDown' | 'ArrowLeft' | 'ArrowRight';
+type ArrowDirection = 'up' | 'down' | 'left' | 'right';
 
 function dirDelta(key: ArrowKey, step: number): { dx: number; dy: number } {
   switch (key) {
@@ -70,6 +71,15 @@ function doNudge(key: ArrowKey, step: number): boolean {
   const { dx, dy } = dirDelta(key, step);
   nudgeBuffer.tick(ids, dx, dy);
   return true;
+}
+
+function arrowDirection(key: ArrowKey): ArrowDirection {
+  switch (key) {
+    case 'ArrowUp': return 'up';
+    case 'ArrowDown': return 'down';
+    case 'ArrowLeft': return 'left';
+    case 'ArrowRight': return 'right';
+  }
 }
 
 /** Selected items + groups 의 batch toggle 동작 (ADR-0017 D6 amend ⑨ + plan-0013).
@@ -176,29 +186,30 @@ export function bindEditingShortcuts(): () => void {
   };
 
   // Cmd/Ctrl+A — Select visible elements at the current canvas drill level.
-  reg({ key: 'a', meta: true, description: 'Select all visible elements at current level', handler: () => selectAllVisible() });
-  reg({ key: 'a', ctrl: true, description: 'Select all visible elements at current level (Win/Linux)', handler: () => selectAllVisible() });
+  reg({ actionId: 'selection.select_all', key: 'a', meta: true, customizable: true, description: 'Select all visible elements at current level', handler: () => selectAllVisible() });
+  reg({ actionId: 'selection.select_all', key: 'a', ctrl: true, customizable: true, description: 'Select all visible elements at current level (Win/Linux)', handler: () => selectAllVisible() });
 
   // Cmd/Ctrl+D — Duplicate (ADR-0030 D11).
-  reg({ key: 'd', meta: true, description: 'Duplicate', handler: () => doDuplicate() });
-  reg({ key: 'd', ctrl: true, description: 'Duplicate (Win/Linux)', handler: () => doDuplicate() });
+  reg({ actionId: 'selection.duplicate', key: 'd', meta: true, customizable: true, description: 'Duplicate', handler: () => doDuplicate() });
+  reg({ actionId: 'selection.duplicate', key: 'd', ctrl: true, customizable: true, description: 'Duplicate (Win/Linux)', handler: () => doDuplicate() });
 
   // Cmd/Ctrl+L — Lock toggle (D6 amend ⑦).
-  reg({ key: 'l', meta: true, description: 'Lock toggle (selection)', handler: () => doToggleLock() });
-  reg({ key: 'l', ctrl: true, description: 'Lock toggle (Win/Linux)', handler: () => doToggleLock() });
+  reg({ actionId: 'selection.toggle_lock', key: 'l', meta: true, customizable: true, description: 'Lock toggle (selection)', handler: () => doToggleLock() });
+  reg({ actionId: 'selection.toggle_lock', key: 'l', ctrl: true, customizable: true, description: 'Lock toggle (Win/Linux)', handler: () => doToggleLock() });
 
   // Cmd/Ctrl+Shift+H — Hide toggle (D6 amend ⑦).
-  reg({ key: 'h', meta: true, shift: true, description: 'Hide toggle (selection)', handler: () => doToggleVisibility() });
-  reg({ key: 'h', ctrl: true, shift: true, description: 'Hide toggle (Win/Linux)', handler: () => doToggleVisibility() });
+  reg({ actionId: 'selection.toggle_visibility', key: 'h', meta: true, shift: true, customizable: true, description: 'Hide toggle (selection)', handler: () => doToggleVisibility() });
+  reg({ actionId: 'selection.toggle_visibility', key: 'h', ctrl: true, shift: true, customizable: true, description: 'Hide toggle (Win/Linux)', handler: () => doToggleVisibility() });
 
   // Arrow nudge — 4 direction × 3 modifier (D6 amend ⑥).
   const dirs: ArrowKey[] = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
   for (const key of dirs) {
-    const label = key.slice(5).toLowerCase();
-    reg({ key, description: `Nudge ${label} 1px`, handler: () => doNudge(key, NUDGE_PX) });
-    reg({ key, shift: true, description: `Nudge ${label} 8px`, handler: () => doNudge(key, NUDGE_SHIFT_PX) });
-    reg({ key, meta: true, description: `Nudge ${label} 64px`, handler: () => doNudge(key, NUDGE_LARGE_PX) });
-    reg({ key, ctrl: true, description: `Nudge ${label} 64px (Win/Linux)`, handler: () => doNudge(key, NUDGE_LARGE_PX) });
+    const label = arrowDirection(key);
+    const protectedReason = 'Directional nudge has a dense repeated binding matrix; custom support is deferred.';
+    reg({ actionId: `selection.nudge.${label}.small`, key, customizable: false, protectedReason, description: `Nudge ${label} 1px`, handler: () => doNudge(key, NUDGE_PX) });
+    reg({ actionId: `selection.nudge.${label}.medium`, key, shift: true, customizable: false, protectedReason, description: `Nudge ${label} 8px`, handler: () => doNudge(key, NUDGE_SHIFT_PX) });
+    reg({ actionId: `selection.nudge.${label}.large`, key, meta: true, customizable: false, protectedReason, description: `Nudge ${label} 64px`, handler: () => doNudge(key, NUDGE_LARGE_PX) });
+    reg({ actionId: `selection.nudge.${label}.large`, key, ctrl: true, customizable: false, protectedReason, description: `Nudge ${label} 64px (Win/Linux)`, handler: () => doNudge(key, NUDGE_LARGE_PX) });
   }
 
   return () => {

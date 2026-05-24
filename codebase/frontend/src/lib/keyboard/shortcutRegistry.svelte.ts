@@ -19,6 +19,7 @@
 //
 // Usage:
 //   onMount(() => shortcutRegistry.register({
+//     actionId: 'canvas.new_terminal',
 //     key: 'n',
 //     meta: true,
 //     handler: () => { spawnTerminal(); return true; },
@@ -27,6 +28,11 @@
 const LETTER_KEYS = /^[a-z]$/;
 
 export interface ShortcutDescriptor {
+  /**
+   * Stable command identity for future Settings shortcut overrides.
+   * Multiple platform variants (Cmd vs Ctrl) share the same actionId.
+   */
+  actionId: string;
   /** event.key value to match. Letters are case-insensitive (compare
    *  via .toLowerCase()). Symbols are matched literally — e.g. `[`,
    *  `{`, `,`. */
@@ -53,6 +59,10 @@ export interface ShortcutDescriptor {
   description?: string;
   /** Optional category — `Canvas`, `Selection`, `Z`, `Chrome`, … */
   category?: string;
+  /** Whether the first custom-shortcut pass may expose this action. */
+  customizable?: boolean;
+  /** Human-readable reason when customizable is false. */
+  protectedReason?: string;
 }
 
 function isEditableFocused(): boolean {

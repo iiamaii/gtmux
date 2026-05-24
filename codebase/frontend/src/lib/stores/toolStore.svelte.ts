@@ -29,7 +29,8 @@ export type ToolId =
   | 'free_draw'
   | 'image'
   | 'document'
-  | 'file_path';
+  | 'file_path'
+  | 'snippets';
 
 /** Select / Hand 는 *mode* — one-shot 적용 X. */
 const STICKY_MODES: ReadonlySet<ToolId> = new Set(['select', 'hand']);
