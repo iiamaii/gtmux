@@ -11,7 +11,6 @@
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { CanvasItem, FontWeight, TextAlign, TextItem, TextVerticalAlign } from '$lib/types/canvas';
-  import CanvasCloseButton from './CanvasCloseButton.svelte';
   // 텍스트 정렬 UI 는 ToolbarSubbar (lib/toolbar/ToolbarSubbar.svelte) 로 이전.
   // 본 컴포넌트는 더 이상 alignment toolbar 를 그리지 않는다.
 
@@ -188,7 +187,6 @@
       lineClass="panel-resize-line"
       {onResizeEnd}
     />
-    <CanvasCloseButton id={data.id} disabled={isLocked} />
     <div
       class="text-content"
       class:editing
