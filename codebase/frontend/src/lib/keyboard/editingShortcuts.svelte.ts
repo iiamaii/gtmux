@@ -2,8 +2,9 @@
 //
 // 정본:
 // - ADR-0017 D6 amend ⑦ (a) — Cmd/Ctrl+A: canvas + LayerTreeView focus 모두
-//   sessionStore.M 에 active session 의 visible items 전체 set. xterm/editable
-//   focus 는 OS default 로 routing (registry skip).
+//   sessionStore.M 에 현재 drill scope 의 visible direct elements 전체 set.
+//   Root scope 는 top-level item/group 만, drill-in scope 는 해당 group 의 direct
+//   child item/group 만 선택. xterm/editable focus 는 OS default 로 routing.
 // - ADR-0010 D14 / D21 / D22.5 + plan-0013 — sessionStore.M 은 **group id 도
 //   포함 가능** (Cmd+G 직후 / drill-in plain click / sidebar grouped item click).
 //   본 wire 의 batch handler 는 item + group 모두 분기 — Lock / Hide toggle 은
@@ -23,14 +24,7 @@ import { nudgeBuffer } from './nudgeBuffer.svelte';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
 function selectAllVisible(): boolean {
-  if (sessionStore.active === null) return false;
-  const ids: string[] = [];
-  for (const [id, it] of sessionStore.items) {
-    if (it.visibility === 'visible') ids.push(id);
-  }
-  if (ids.length === 0) return false;
-  sessionStore.setM(ids);
-  return true;
+  return sessionStore.selectAllVisibleAtDrillScope();
 }
 
 function selectionMutableItems(): CanvasItem[] {
@@ -181,9 +175,9 @@ export function bindEditingShortcuts(): () => void {
     );
   };
 
-  // Cmd/Ctrl+A — Select all visible items (D6 amend ⑤ (a)).
-  reg({ key: 'a', meta: true, description: 'Select all visible items', handler: () => selectAllVisible() });
-  reg({ key: 'a', ctrl: true, description: 'Select all visible items (Win/Linux)', handler: () => selectAllVisible() });
+  // Cmd/Ctrl+A — Select visible elements at the current canvas drill level.
+  reg({ key: 'a', meta: true, description: 'Select all visible elements at current level', handler: () => selectAllVisible() });
+  reg({ key: 'a', ctrl: true, description: 'Select all visible elements at current level (Win/Linux)', handler: () => selectAllVisible() });
 
   // Cmd/Ctrl+D — Duplicate (ADR-0030 D11).
   reg({ key: 'd', meta: true, description: 'Duplicate', handler: () => doDuplicate() });

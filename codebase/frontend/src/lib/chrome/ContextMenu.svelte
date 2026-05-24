@@ -501,21 +501,9 @@
 
   /* ── EMPTY-AREA only — Select all / Clear all / Switch session ──────── */
 
-  /** Select all visible items (matches editingShortcuts 의 ⌘A 동작). */
+  /** Select visible elements at the current drill level (matches ⌘A). */
   function onSelectAll(): void {
-    if (sessionStore.active === null) {
-      close();
-      return;
-    }
-    const ids: string[] = [];
-    for (const [id, it] of sessionStore.items) {
-      if (it.visibility === 'visible') ids.push(id);
-    }
-    if (ids.length === 0) {
-      close();
-      return;
-    }
-    sessionStore.setM(ids);
+    sessionStore.selectAllVisibleAtDrillScope();
     close();
   }
 

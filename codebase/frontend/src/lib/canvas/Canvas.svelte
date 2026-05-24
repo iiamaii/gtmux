@@ -533,7 +533,7 @@
   }
 
   function isCanvasControlSurface(target: EventTarget | null): boolean {
-    if (!(target instanceof HTMLElement)) return false;
+    if (!(target instanceof Element)) return false;
     return (
       target.closest('.svelte-flow__resize-control') !== null ||
       target.closest('.nodrag') !== null ||
@@ -2323,7 +2323,7 @@
     panOnScroll={!isMaximizedActive}
     zoomOnScroll={!isMaximizedActive}
     zoomOnPinch={!isMaximizedActive}
-    zoomOnDoubleClick={!isMaximizedActive}
+    zoomOnDoubleClick={false}
     selectionOnDrag={false}
     nodesDraggable={isSelectMode && !isMaximizedActive}
     elementsSelectable={false}

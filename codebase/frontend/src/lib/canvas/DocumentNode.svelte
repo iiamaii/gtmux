@@ -642,7 +642,7 @@
                  icon = next mode 의 힌트 (사용자 click 시 가는 곳). -->
             <button
               type="button"
-              class="doc-btn"
+              class="doc-btn nodrag"
               class:is-active={viewMode !== 'rendered'}
               title={nextViewModeLabel}
               aria-label={nextViewModeLabel}
@@ -674,7 +674,7 @@
           {/if}
           <button
             type="button"
-            class="doc-btn"
+            class="doc-btn nodrag"
             title="Change document"
             aria-label="Change document"
             onclick={(e) => void onLoadFileClick(e)}
@@ -688,7 +688,7 @@
           </button>
           <button
             type="button"
-            class="doc-btn"
+            class="doc-btn nodrag"
             class:is-active={data.minimized === true}
             title={data.minimized === true ? 'Restore' : 'Minimize'}
             aria-label={data.minimized === true ? 'Restore' : 'Minimize'}
@@ -707,7 +707,7 @@
           </button>
           <button
             type="button"
-            class="doc-btn"
+            class="doc-btn nodrag"
             class:is-active={isMaximized}
             title={isMaximized ? 'Restore' : 'Maximize'}
             aria-label={isMaximized ? 'Restore' : 'Maximize'}
@@ -720,7 +720,7 @@
           </button>
           <button
             type="button"
-            class="doc-btn close"
+            class="doc-btn close nodrag"
             title="Close"
             aria-label="Close"
             onclick={(e) => void onCloseClick(e)}

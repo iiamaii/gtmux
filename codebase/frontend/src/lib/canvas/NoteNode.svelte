@@ -255,7 +255,7 @@
       {#if !isLocked}
         <button
           type="button"
-          class="note-btn"
+          class="note-btn nodrag"
           title={isMinimized ? 'Restore' : 'Minimize'}
           aria-label={isMinimized ? 'Restore' : 'Minimize'}
           onclick={(e) => void onMinimizeClick(e)}
@@ -274,7 +274,7 @@
         </button>
         <button
           type="button"
-          class="note-btn"
+          class="note-btn nodrag"
           title={isMaximized ? 'Restore' : 'Maximize'}
           aria-label={isMaximized ? 'Restore' : 'Maximize'}
           onclick={onMaximizeClick}
@@ -294,7 +294,7 @@
         </button>
         <button
           type="button"
-          class="note-btn close"
+          class="note-btn close nodrag"
           title="Close"
           aria-label="Close"
           onclick={(e) => void onCloseClick(e)}

@@ -36,7 +36,13 @@ import {
   type CanvasLayout,
   type Viewport,
 } from '$lib/types/canvas';
-import { descendantGroups, descendantItems, pruneEmptyGroups, type Group } from '$lib/types/group';
+import {
+  descendantGroups,
+  descendantItems,
+  effectiveVisibility,
+  pruneEmptyGroups,
+  type Group,
+} from '$lib/types/group';
 import { generateUuidV4 } from '$lib/uuid';
 import { normalizeLayout } from '$lib/stores/zSpace';
 import type { AttachConfirmSummary } from '$lib/types/sessions';
@@ -364,6 +370,39 @@ class SessionStore {
 
   clearDrill(): void {
     this.drillRootId = null;
+  }
+
+  /**
+   * Canvas-level Select All target.
+   *
+   * Root scope selects only root-level visible elements: root items + root
+   * groups. Drill scope selects only direct visible children of the active
+   * drill root. Descendant items under a child group stay represented by that
+   * child group id, matching canvas hit-test priority.
+   */
+  visibleElementsAtDrillScope(): string[] {
+    const parentId = this.drillRootId;
+    const groupsById = new Map(this.groups);
+    const ids: string[] = [];
+    for (const [id, group] of this.groups) {
+      if (group.parent_id !== parentId) continue;
+      if (!effectiveVisibility(group.visibility, group.parent_id, groupsById)) continue;
+      ids.push(id);
+    }
+    for (const [id, item] of this.items) {
+      if (item.parent_id !== parentId) continue;
+      if (!effectiveVisibility(item.visibility, item.parent_id, groupsById)) continue;
+      ids.push(id);
+    }
+    return ids;
+  }
+
+  selectAllVisibleAtDrillScope(): boolean {
+    if (this.active === null) return false;
+    const ids = this.visibleElementsAtDrillScope();
+    if (ids.length === 0) return false;
+    this.setM(ids);
+    return true;
   }
 
   /**

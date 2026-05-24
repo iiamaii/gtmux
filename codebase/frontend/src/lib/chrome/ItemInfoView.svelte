@@ -385,6 +385,10 @@
     return it.type === 'terminal' || it.type === 'note' || it.type === 'document';
   }
 
+  function supportsMaximize(it: CanvasItem): boolean {
+    return it.type === 'terminal' || it.type === 'note' || it.type === 'document';
+  }
+
   async function broadcastMutation(
     abortMessage: string,
     transform: (it: CanvasItem) => CanvasItem,
@@ -509,6 +513,21 @@
   // figure 만 선택된 경우 inspector 의 minimize 버튼 숨김.
   const minimizableSelectedItems = $derived.by(() => selectedItems.filter(supportsMinimize));
   const selectionSupportsMinimize = $derived(minimizableSelectedItems.length > 0);
+  const singleMaximizableItem = $derived.by((): CanvasItem | null => {
+    if (selectionCount !== 1) return null;
+    const it = selectedItems[0];
+    return it !== undefined && supportsMaximize(it) ? it : null;
+  });
+  const selectionSupportsMaximize = $derived(singleMaximizableItem !== null);
+  const maximizedState = $derived.by((): boolean => {
+    if (singleMaximizableItem === null) return false;
+    return sessionStore.maximizedItemId === singleMaximizableItem.id;
+  });
+
+  function toggleSelectedMaximize(): void {
+    if (singleMaximizableItem === null) return;
+    sessionStore.toggleMaximize(singleMaximizableItem.id);
+  }
 
   async function applyLineEndpoint(field: 'x2' | 'y2', value: number): Promise<void> {
     await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
@@ -1824,10 +1843,33 @@
             </button>
           {/if}
 
+          {#if selectionSupportsMaximize}
+            <button
+              type="button"
+              class="state-btn"
+              class:active={maximizedState}
+              aria-pressed={maximizedState}
+              aria-label={maximizedState ? 'Restore' : 'Maximize'}
+              title={maximizedState ? 'Maximized (click to restore)' : 'Normal (click to maximize)'}
+              onclick={toggleSelectedMaximize}
+            >
+              {#if maximizedState}
+                <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="2" y="3.6" width="6.5" height="6.4" rx="0.5"/>
+                  <path d="M4 3.6V2.4h6.5v6.4H9"/>
+                </svg>
+              {:else}
+                <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
+                  <rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/>
+                </svg>
+              {/if}
+            </button>
+          {/if}
+
           <!-- Focus 는 ViewportCtrl 의 focus 버튼으로 이동. -->
         </div>
         <!-- alive row 폐기 (사용자 요구 2026-05-21) — Terminal·Pool section 의
-             alive row 와 중복. State section 은 visibility/lock/minimize 만. -->
+             alive row 와 중복. State section 은 visibility/lock/minimize/maximize 만. -->
       </section>
     {/if}
   </div>

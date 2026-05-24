@@ -427,7 +427,7 @@
              빈번한 액션이라 우선 노출. DocumentNode change document link icon. -->
         <button
           type="button"
-          class="panel-btn"
+          class="panel-btn nodrag"
           aria-label="Change terminal"
           title="Change terminal"
           onclick={onChangeTerminalClick}
@@ -441,7 +441,7 @@
         </button>
         <button
           type="button"
-          class="panel-btn"
+          class="panel-btn nodrag"
           class:is-active={data.minimized === true}
           aria-label={data.minimized === true ? 'Restore' : 'Minimize'}
           title={data.minimized === true ? 'Restore' : 'Minimize'}
@@ -460,7 +460,7 @@
         </button>
         <button
           type="button"
-          class="panel-btn"
+          class="panel-btn nodrag"
           class:is-active={isMaximized}
           aria-label={isMaximized ? 'Restore' : 'Maximize'}
           title={isMaximized ? 'Restore' : 'Maximize'}
@@ -480,7 +480,7 @@
         </button>
         <button
           type="button"
-          class="panel-btn close"
+          class="panel-btn close nodrag"
           aria-label={closeTooltip}
           title={closeTooltip}
           disabled={closing}
