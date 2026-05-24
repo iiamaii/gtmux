@@ -65,6 +65,7 @@
     DEFAULT_FILE_PATH_SIZE,
     DEFAULT_IMAGE_SIZE,
     DEFAULT_DOCUMENT_SIZE,
+    DEFAULT_SNIPPETS_SIZE,
   } from './itemFactory';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
 
@@ -166,6 +167,7 @@
     file_path: DEFAULT_FILE_PATH_SIZE,
     image: DEFAULT_IMAGE_SIZE,
     document: DEFAULT_DOCUMENT_SIZE,
+    snippets: DEFAULT_SNIPPETS_SIZE,
   } as const;
   type GhostTool = keyof typeof POINT_SPAWN_DEFAULTS;
   const isGhostTool = $derived.by((): GhostTool | null => {
@@ -588,6 +590,9 @@
               const nextSelected =
                 overlayGroupId ?? targetAtDrillLevel(nodeId, hitTarget, sessionStore.items, sessionStore.groups);
               sessionStore.setM([nextSelected]);
+              if (sessionStore.items.get(nodeId)?.type === 'text') {
+                sessionStore.suppressTextEditDblClick(nodeId);
+              }
               e.preventDefault();
               e.stopPropagation();
               return;
@@ -1720,6 +1725,9 @@
           const nextSelected =
             overlayGroupId ?? targetAtDrillLevel(id, target, sessionStore.items, sessionStore.groups);
           sessionStore.setM([nextSelected]);
+          if (sessionStore.items.get(id)?.type === 'text') {
+            sessionStore.suppressTextEditDblClick(id);
+          }
         } else {
           sessionStore.setM([target]);
         }
@@ -1817,9 +1825,10 @@
         return;
       }
       if (tool === 'snippets') {
-        // ADR-0038 D6 — point-spawn, empty entries. cursor=top-left (text 와
-        // 동일 — node 가 작아 centering 보다 click 위치가 더 직관).
-        const item = createSnippetsItem({ x: flow.x, y: flow.y });
+        // ADR-0038 D6 — point-spawn, empty entries. cursor=center to match
+        // the spawn ghost outline (POINT_SPAWN_DEFAULTS.snippets) so what
+        // user sees as preview = what gets created at same center point.
+        const item = createSnippetsItem(centered('snippets'));
         void commitNewItem(item)
           .then(() => toolStore.consume())
           .catch(onSpawnError);
@@ -2508,6 +2517,12 @@
 
   .canvas-root :global(.svelte-flow__node.m-selected) {
     box-shadow: 0 0 0 calc(1.5px / var(--canvas-zoom, 1)) var(--color-accent);
+    /* Elevate selected nodes (and their bbox ring + NodeResizer handles)
+       above all other canvas items so the selection chrome is never
+       occluded by items with higher data.z. Stays below group overlay
+       (OVERLAY_Z = 1_000_000) so group bboxes still render on top.
+       Deselecting restores the data.z stacking. */
+    z-index: 9999 !important;
   }
 
   .canvas-root :global(.panel-resize-handle) {

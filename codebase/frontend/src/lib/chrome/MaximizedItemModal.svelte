@@ -312,9 +312,10 @@
     >
       <header class="max-header">
         {#if isNote}
+          <!-- lucide scroll-text — simplified for 12-unit small chrome. -->
           <svg class="header-glyph note-glyph" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-            <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
-            <path d="M3.6 5.2h4.8"/>
+            <rect x="1.5" y="2" width="9" height="8" rx="1.5"/>
+            <path d="M3.5 4.5h5M3.5 6.5h5M3.5 8.5h3"/>
           </svg>
         {:else if isDocument}
           <svg class="header-glyph" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">

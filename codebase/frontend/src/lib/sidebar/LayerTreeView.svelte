@@ -332,9 +332,12 @@
     }
     if (p.type === 'note' && p.title != null && p.title.length > 0) return p.title;
     if (p.type === 'snippets') {
-      // ADR-0038 v8 §12.3 — "Snippets · {first_key}" peek; bare "Snippets" empty.
-      const firstKey = p.entries?.[0]?.key?.trim();
-      return firstKey != null && firstKey.length > 0 ? `Snippets · ${firstKey}` : 'Snippets';
+      // Sync with canvas head displayLabel + inspector identity. User-set
+      // label takes precedence; "Snippets" is the type fallback. Entry
+      // count is communicated via the inline `.snippets-count` badge — no
+      // need to duplicate firstKey in the label string.
+      if (p.label != null && p.label.length > 0) return p.label;
+      return 'Snippets';
     }
     if (p.label != null && p.label.length > 0) return p.label;
     if (p.type === 'document' && p.file_name != null && p.file_name.length > 0) {
@@ -355,6 +358,9 @@
   }
 
   function panelTypeIcon(p: PanelData): string {
+    // Character fallback — only used for unknown/legacy types. Known types
+    // render via the typeIconSvg snippet below (full inline SVG matching
+    // the toolbar icon for visual consistency).
     switch (p.type) {
       case 'terminal':
       case 'panel':
@@ -890,6 +896,72 @@
   }
 </script>
 
+<!-- Reusable per-type icon block. Single source of truth for layer row
+     icons across the editing + display branches. note/snippets use 12-unit
+     paths matching their canvas-head glyphs; the rest use the same 24-unit
+     paths as Toolbar2 for consistency between toolbar and layer tree. -->
+{#snippet typeIconSvg(p: PanelData)}
+  <span class="type-icon" aria-hidden="true">
+    {#if p.type === 'note'}
+      <svg width="13" height="13" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
+        <rect x="1.5" y="2" width="9" height="8" rx="1.5"/>
+        <path d="M3.5 4.5h5M3.5 6.5h5M3.5 8.5h3"/>
+      </svg>
+    {:else if p.type === 'snippets'}
+      <svg width="13" height="13" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
+        <rect x="1.5" y="1.5" width="9" height="9" rx="1"/>
+        <path d="M3.5 3.5v5"/>
+        <path d="M5.5 3.5v5"/>
+        <path d="m7.5 3.5 1 5"/>
+      </svg>
+    {:else if p.type === 'terminal' || p.type === 'panel' || p.type == null}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <rect x="3" y="4" width="18" height="16" rx="2"/>
+        <path d="M7 9l3 3-3 3"/>
+        <path d="M13 15h4"/>
+      </svg>
+    {:else if p.type === 'text'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M5 5h14M12 5v14M9 19h6"/>
+      </svg>
+    {:else if p.type === 'rect'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <rect x="4" y="5" width="16" height="14" rx="1.5"/>
+      </svg>
+    {:else if p.type === 'ellipse'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <ellipse cx="12" cy="12" rx="8.5" ry="7"/>
+      </svg>
+    {:else if p.type === 'line'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <line x1="4.5" y1="19" x2="19.5" y2="5"/>
+      </svg>
+    {:else if p.type === 'free_draw'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M4 17c2-4 4-2 6-5s2-7 5-7 5 4 5 6"/>
+      </svg>
+    {:else if p.type === 'image'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <rect x="3" y="4" width="18" height="16" rx="2"/>
+        <circle cx="9" cy="10" r="1.5"/>
+        <path d="M3 17l5-4 4 3 5-5 4 4"/>
+      </svg>
+    {:else if p.type === 'document'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M6 3h8l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/>
+        <path d="M14 3v4h4"/>
+        <path d="M8 13h8M8 17h5"/>
+      </svg>
+    {:else if p.type === 'file_path'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+      </svg>
+    {:else}
+      {panelTypeIcon(p)}
+    {/if}
+  </span>
+{/snippet}
+
 <div class="layer-tree-view" aria-label="Layer tree">
   <!-- ADR-0024 의 2026-05-22 ② amend (Tree=Z) — Z tab UI 제거. Tree 가 단일 view.
        z-index 값 표시는 Inspector 로 단일화. -->
@@ -1061,23 +1133,7 @@
           >
             {#if editingItemId === node.id}
               <span class="row-button row-button-edit">
-                <span class="type-icon" aria-hidden="true">
-                  {#if p.type === 'note'}
-                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
-                      <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
-                      <path d="M3.6 5.2h4.8"/>
-                    </svg>
-                  {:else if p.type === 'snippets'}
-                    <!-- ADR-0038 v8 §12.3 — clipboard-list icon. -->
-                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
-                      <path d="M4 1.5h4l0.5 1H3.5z"/>
-                      <rect x="2.5" y="2.5" width="7" height="8" rx="1"/>
-                      <path d="M4 5h4M4 7h4M4 9h2.5"/>
-                    </svg>
-                  {:else}
-                    {panelTypeIcon(p)}
-                  {/if}
-                </span>
+                {@render typeIconSvg(p)}
                 <InlineEditField
                   value={panelDisplayLabel(p)}
                   editing={true}
@@ -1096,23 +1152,7 @@
                 ondblclick={(e: MouseEvent) => onStartRenameItem(node.id, e)}
                 title={`${panelDisplayLabel(p)} (double-click to rename)`}
               >
-                <span class="type-icon" aria-hidden="true">
-                  {#if p.type === 'note'}
-                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
-                      <path d="M1.6 2.5h8.8v5.4H6L3.6 10v-2.1H1.6z"/>
-                      <path d="M3.6 5.2h4.8"/>
-                    </svg>
-                  {:else if p.type === 'snippets'}
-                    <!-- ADR-0038 v8 §12.3 — clipboard-list icon. -->
-                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
-                      <path d="M4 1.5h4l0.5 1H3.5z"/>
-                      <rect x="2.5" y="2.5" width="7" height="8" rx="1"/>
-                      <path d="M4 5h4M4 7h4M4 9h2.5"/>
-                    </svg>
-                  {:else}
-                    {panelTypeIcon(p)}
-                  {/if}
-                </span>
+                {@render typeIconSvg(p)}
                 <span class="label">{panelDisplayLabel(p)}{dead ? ' (Dead)' : ''}</span>
                 {#if p.type === 'snippets'}
                   {@const sc = snippetsCount(p)}

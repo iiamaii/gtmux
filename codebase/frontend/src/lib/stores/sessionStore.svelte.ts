@@ -24,6 +24,8 @@ import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 import { debugCount } from '$lib/common/debugCounts';
 import { attachConfirm, deleteItem, EtagMismatchError, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+import { killTerminal } from '$lib/http/terminals';
+import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
 import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
 import { historyStore } from '$lib/stores/historyStore.svelte';
 import { terminalPool } from '$lib/stores/terminalPool.svelte';
@@ -170,6 +172,29 @@ class SessionStore {
   justSpawnedTextId = $state<string | null>(null);
 
   /**
+   * FE-only one-shot guard for the text node dblclick editor.
+   *
+   * Canvas group drill-in is detected from two `onnodeclick` events because
+   * xyflow/svelte does not expose a node double-click callback. The browser
+   * still dispatches the descendant TextNode's DOM `dblclick` after that same
+   * second click, so the first "drill in and select child" gesture can also
+   * open text editing. Canvas marks the originating text id here; TextNode
+   * consumes it once and leaves the next double-click free to edit.
+   */
+  suppressedTextEditDblClick = $state<{ id: string; until: number } | null>(null);
+
+  suppressTextEditDblClick(id: string): void {
+    this.suppressedTextEditDblClick = { id, until: Date.now() + 250 };
+  }
+
+  consumeSuppressedTextEditDblClick(id: string): boolean {
+    const suppressed = this.suppressedTextEditDblClick;
+    if (suppressed === null) return false;
+    this.suppressedTextEditDblClick = null;
+    return suppressed.id === id && Date.now() <= suppressed.until;
+  }
+
+  /**
    * Minimize / maximize 직전 옛 geometry 의 *in-memory backup*. FE-only — page
    * reload 시 손실 (사용자가 restore 누르면 default size 로 복원). Schema 의
    * item.x/y/w/h 변경 패턴 (PanelNode onMinimize/onMaximize) 에서 옛 값 보존용.
@@ -291,6 +316,7 @@ class SessionStore {
     this.maximizedItemId = null;
     this.focusMode = { enabled: false, targetPanelId: null };
     this.justSpawnedTextId = null;
+    this.suppressedTextEditDblClick = null;
     // ADR-0028 D4 — per-session history. 이전 session 의 stack 은 drop.
     historyStore.setActive(session.name);
   }
@@ -318,6 +344,7 @@ class SessionStore {
     this.maximizedItemId = null;
     this.focusMode = { enabled: false, targetPanelId: null };
     this.justSpawnedTextId = null;
+    this.suppressedTextEditDblClick = null;
     sessionStorageHint.clear();
     historyStore.setActive(null);
   }
@@ -1390,10 +1417,14 @@ class SessionStore {
    *
    * 동작:
    *  1. mutation guard
-   *  2. historyStore.popUndo(currentSnapshot) → PRE-state
-   *  3. mutateLayout(() => pre) — full snapshot PUT
-   *  4. 성공 시 loadLayout, currentSnapshot 은 popUndo 가 redo 에 push
-   *  5. 실패 시 D9 — 양 stack reset + toast
+   *  2. historyStore.peekUndo → PRE-state 확인
+   *  3. ADR-0030 D12.8 amend ④ (2026-05-25) — PRE 에 없고 current 에만 있는
+   *     terminal items 있으면 panelCloseDialog 경유 (= group/panel close 와
+   *     동일한 flow). 사용자가 [Panels only] / [Panels + Terminals] 선택.
+   *  4. onConfirm 안에서 popUndo + mutateLayout PUT + (kill 선택 시) terminal
+   *     kill API 호출.
+   *  5. terminal 변화 없으면 기존 flow — popUndo + PUT + respawnUnmatched.
+   *  6. 실패 시 D9 — 양 stack reset + toast
    *
    * Undo 자체는 captureHistory:false — 그렇지 않으면 undo→stack push→…→cycle.
    */
@@ -1403,10 +1434,59 @@ class SessionStore {
     const guard = await this.guardOutgoingMutation();
     if (!guard.ok) return;
     const current = this.layoutSnapshot();
-    const pre = historyStore.popUndo(active.name, current);
+    const pre = historyStore.peekUndo(active.name);
     if (pre === null) return;
+
+    // ADR-0030 D12.8 amend ④ — PRE-state 에 없고 current 에만 있는 terminal
+    // items 추출. paste 가 spawn 한 terminal 의 inverse 처리에 사용.
+    const preIds = new Set(pre.items.map((it) => it.id));
+    const spawnedTerminals = current.items.filter(
+      (it) => it.type === 'terminal' && !preIds.has(it.id),
+    );
+
+    if (spawnedTerminals.length > 0) {
+      const sessionName = active.name;
+      panelCloseDialog.show({
+        items: spawnedTerminals,
+        onConfirm: async (kill) => {
+          // User 가 확인했으니 popUndo 수행 + PUT.
+          const popped = historyStore.popUndo(sessionName, current);
+          if (popped === null) return;
+          try {
+            const { layout } = await mutateLayout(sessionName, () => popped);
+            this.loadLayout(layout);
+            if (kill) {
+              await Promise.allSettled(
+                spawnedTerminals.map((it) => killTerminal(it.id)),
+              );
+              void terminalPool.refresh();
+            }
+          } catch (err) {
+            if (err instanceof UnauthorizedError) {
+              window.location.href = '/auth';
+              return;
+            }
+            historyStore.reset(sessionName);
+            const reason =
+              err instanceof EtagMismatchError
+                ? 'layout changed by another source'
+                : err instanceof Error
+                  ? err.message
+                  : String(err);
+            toastStore.show({
+              message: `Cannot undo — ${reason}. History cleared.`,
+              tone: 'warning',
+            });
+          }
+        },
+      });
+      return;
+    }
+
+    const popped = historyStore.popUndo(active.name, current);
+    if (popped === null) return;
     try {
-      const { layout } = await mutateLayout(active.name, () => pre);
+      const { layout } = await mutateLayout(active.name, () => popped);
       this.loadLayout(layout);
       // ADR-0028 D13 (2026-05-21) — restore 후 unmatched terminal 자동 spawn.
       // Panel+Terminal delete 후 undo 시 killed terminal UUID 가 layout 으로

@@ -70,10 +70,20 @@
     let y: number;
 
     if (source === 'inspector') {
-      // Inspector trigger sits in the right panel — placing below would land
-      // on top of the inspector. Anchor the panel to the LEFT of the trigger
-      // so it appears in the canvas area instead.
+      // Inspector trigger sits in the right panel — placing below or aligned
+      // to anchor would overlap the inspector chrome. Compute the actual
+      // inspector left edge at runtime so the panel never crosses into it
+      // (the anchor button's own coords aren't enough — anchor sits *inside*
+      // the inspector, so anchor.x - PANEL_WIDTH may still overlap).
+      const inspectorEl = document.querySelector('.right-panel');
+      const inspectorLeft =
+        inspectorEl !== null ? inspectorEl.getBoundingClientRect().left : vw;
       x = anchor.x - PANEL_WIDTH - PANEL_GAP;
+      // Ensure the panel's right edge clears the inspector left edge by GAP.
+      const maxRight = inspectorLeft - PANEL_GAP;
+      if (x + PANEL_WIDTH > maxRight) {
+        x = maxRight - PANEL_WIDTH;
+      }
       // Vertical: align panel top to trigger top, clamped.
       y = anchor.y;
       // Fallback when there is no room on the left (very narrow viewport):
