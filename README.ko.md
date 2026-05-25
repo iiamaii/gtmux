@@ -16,19 +16,6 @@ You → browser → gtmux server (Rust, axum + tokio) → PTY pool → your shel
 
 ---
 
-## 문서 지도
-
-| 하고 싶은 일 | 보러갈 곳 |
-|---|---|
-| gtmux 설치 후 처음으로 canvas 까지 도달 | **[QUICKSTART.ko.md](QUICKSTART.ko.md)** |
-| Workspace 의 각 부분이 무엇을 하는지 | **[USAGE.ko.md](USAGE.ko.md)** |
-| 프로덕션 배포 (reverse proxy / systemd / TLS) | [docs/deploy.md](docs/deploy.md) |
-| 설계 + trade-off 이해 | [docs/sketch.md](docs/sketch.md) (KO, source of truth) |
-| Accepted 아키텍처 결정 읽기 | [docs/adr/](docs/adr/) |
-| 현재 구현 진행 트래킹 | [docs/plans/](docs/plans/) (가장 높은 번호 = 활성) |
-
----
-
 ## 이게 뭔가
 
 한 개의 PTY 기반 shell session 을 Figma 스타일 무한 캔버스로 바꿔주는
@@ -117,14 +104,6 @@ codebase/
   shared/      기계 전용 handoff (openapi.yaml + 생성된 TS 타입).
   smoke/       통합 smoke 스크립트.
   Makefile     codegen / build / test / smoke / clean.
-
-docs/
-  sketch.md    설계 spec (KO, source of truth).
-  adr/         Accepted 아키텍처 결정.
-  plans/       구현 계획 (활성 = 가장 높은 번호).
-  reports/     조사 + session handover.
-  ssot/        Single-source-of-truth spec (layout schema, wire proto).
-  deploy.md    프로덕션 배포 가이드.
 ```
 
 ---
