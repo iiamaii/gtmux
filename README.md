@@ -16,19 +16,6 @@ You → browser → gtmux server (Rust, axum + tokio) → PTY pool → your shel
 
 ---
 
-## Documentation map
-
-| You want to … | Read |
-|---|---|
-| Install gtmux and reach the canvas for the first time | **[QUICKSTART.md](QUICKSTART.md)** |
-| Know what every part of the workspace does | **[USAGE.md](USAGE.md)** |
-| Production deployment (reverse proxy, systemd, TLS) | [docs/deploy.md](docs/deploy.md) |
-| Understand the design and trade-offs | [docs/sketch.md](docs/sketch.md) (KO, source of truth) |
-| Read accepted architectural decisions | [docs/adr/](docs/adr/) |
-| Track current implementation work | [docs/plans/](docs/plans/) (highest-numbered file = active) |
-
----
-
 ## What it is
 
 A web app that turns one PTY-backed shell session into a Figma-style
@@ -116,14 +103,6 @@ codebase/
   shared/      Machine-only handoff (openapi.yaml + generated TS types).
   smoke/       Integration smoke scripts.
   Makefile     codegen / build / test / smoke / clean.
-
-docs/
-  sketch.md    Design spec (KO, source of truth).
-  adr/         Accepted architectural decisions.
-  plans/       Implementation plans (active = highest-numbered).
-  reports/     Investigations + session handovers.
-  ssot/        Single-source-of-truth specs (layout schema, wire proto).
-  deploy.md    Production deployment guide.
 ```
 
 ---
