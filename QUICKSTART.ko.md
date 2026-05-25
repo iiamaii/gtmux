@@ -1,281 +1,334 @@
-# gtmux Quickstart — single-user · localhost + 외부 접속
+# gtmux Quickstart — 설치 · 설정 · 인증 · 첫 session
 
-> Repo 의 `codebase/` 만 clone 한 직후 본 문서 한 장만으로 localhost 또는
-> 신뢰된 네트워크에서 접속 가능한 gtmux server 를 띄우는 절차.
-> 상세 설명·reverse proxy·systemd 는 `../docs/deploy.md` 참조.
+> [English](QUICKSTART.md) · **한국어**
+>
+> Localhost (또는 개인 cloud host) 에서 gtmux server 를 띄우고 브라우저로
+> canvas 에 접속하기까지의 1회용 가이드. 설치, 두 가지 실행 모드
+> (Local / Cloud), config 작성, auth handshake, UI 안에서 첫 session
+> 만들기까지 한 번에 다룬다.
+>
+> Reverse proxy · systemd · TLS 등 운영 단계 가이드는
+> [`docs/deploy.md`](docs/deploy.md) 참조.
+
+---
 
 ## ⚠ 보안 전제
 
-- gtmux **본체는 TLS 종단 미지원** — `bind = 0.0.0.0` 으로 직접 외부에
-  열면 토큰·세션 쿠키가 **평문 HTTP** 로 전송됨. 신뢰된 네트워크 (사내
-  VPN, Tailscale 등) 안에서만 사용 권장.
-- 인터넷에 직접 노출할 거면 본 문서 대신 `../docs/deploy.md` §3 의
-  Caddy/nginx + ACME reverse proxy 경로를 따를 것.
-- 단일 사용자 전제 유지 — 본인 1명이 본인의 인스턴스에 접속하는 시나리오.
-- localhost 전용 실행은 기본값 그대로 `127.0.0.1` 에 bind 되므로 cloud
-  보안 설정이 필요 없다.
+- gtmux 본체는 **TLS 종단을 직접 처리하지 않는다**. `bind = 0.0.0.0` 으로
+  인터넷에 직접 노출하면 토큰·쿠키가 **평문 HTTP** 로 전송된다. 본 문서의
+  절차는 신뢰 네트워크 (LAN / VPN / Tailscale) 만 가정한다. 인터넷 직접
+  노출이 필요하면 `docs/deploy.md` §3 의 Caddy/nginx + ACME reverse proxy
+  경로를 따른다.
+- 단일 사용자 — 본인 1명이 본인 인스턴스에 접속.
+- Localhost 전용 (`bind = "127.0.0.1"`, 기본값) 은 cloud 설정도 TLS 도
+  필요 없다.
+
+---
 
 ## 0) 사전 요구사항
 
-| 항목 | 버전 | 설치 |
+| 항목 | 버전 | 비고 |
 |---|---|---|
-| Rust | 1.85 | `curl https://sh.rustup.rs -sSf \| sh` — 첫 `cargo` 호출 시 `rust-toolchain.toml` 의 1.85 자동 설치 |
-| Node.js | ≥ 20 (22 LTS 권장) | `brew install node` / `nvm install --lts` / 호스트 패키지 매니저 |
-| OS | macOS / Linux (x86_64·aarch64) | Windows 미검증 |
+| Rust | 1.85 | `backend/rust-toolchain.toml` 로 pin. `curl https://sh.rustup.rs -sSf \| sh` 한 번이면 첫 `cargo` 호출 시 자동 설치 |
+| Node.js | ≥ 20 (22 LTS 권장) | Vite 7 floor. `brew install node` / `nvm install --lts` |
+| OS | macOS / Linux (x86_64 · aarch64) | Windows 미검증 |
 
-## 1) 의존성 설치 + 빌드
+`cargo` 와 `npm` 만 `$PATH` 에 있으면 된다. Vite / Svelte / xterm.js
+같은 글로벌 패키지는 `npm install` 로만 받는다.
+
+---
+
+## 1) 설치
+
+### 1.1 Source build (local · cloud 동일)
 
 ```bash
-cd codebase
+git clone https://github.com/iiamaii/gtmux.git
+cd gtmux/codebase
 
-# OpenAPI → TypeScript 타입 (frontend 빌드 전제)
+# OpenAPI → TypeScript 타입 (frontend build 전제).
 make codegen
 
-# frontend 의존성
+# Frontend 의존성.
 ( cd frontend && npm install --no-audit --no-fund )
 
-# backend release binary + frontend dist
-( cd backend && cargo build --workspace --release )
+# Release build: Rust workspace + 프로덕션 frontend 번들.
+( cd backend  && cargo build --workspace --release )
 ( cd frontend && npm run build )
-# 산출물: backend/target/release/gtmux + frontend/dist/
+
+# 산출물:
+#   backend/target/release/gtmux   (binary)
+#   frontend/dist/                  (binary 가 서빙할 정적 번들)
 ```
 
-## 2) Localhost 실행 (config 없이)
+### 1.2 (선택) Binary 를 system-wide 설치
 
-개발 PC 한 대에서만 접속한다면 config 파일을 만들지 않는다. 기본값이
-`bind = "127.0.0.1"` 이고, 이 경우 local mode 로 동작한다.
+```bash
+sudo install -m 755 backend/target/release/gtmux /usr/local/bin/gtmux
+```
+
+생략 시 full path 로 호출 (`./backend/target/release/gtmux …`). 본
+문서 이후로는 짧은 형태 `gtmux` 만 사용한다.
+
+> `gtmux` 는 root (`EUID == 0`) 실행을 거부한다. 일반 유저로 실행할 것.
+
+---
+
+## 2) 실행 모드 A — Local (`bind = 127.0.0.1`, config 없음)
+
+이 머신에서만 접속한다면 config 파일을 만들 필요가 없다. 빌트인 디폴트
+(`bind = "127.0.0.1"`, `port = 9001`, `mode = token`) 가 이미 Local
+모드다.
 
 ```bash
 cd codebase
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-./backend/target/release/gtmux start --session local
+gtmux start --session local
 ```
 
-stdout 에 다음 형태의 bootstrap URL 이 1회 출력된다.
+기동 시 stdout 에 1회 banner 가 출력된다.
 
 ```text
-Open URL: http://127.0.0.1:9001/auth/bootstrap?token=...
+gtmux local ready
+  Mode:         Local
+  Bind:         127.0.0.1:9001
+  Open URL:     http://127.0.0.1:9001/auth/bootstrap?token=<hex>
+  Token path:   ~/.local/state/gtmux/local.token (0600)
+  Backend:      PtyBackend (ADR-0013, supervisor pid=<n>)
 ```
 
-브라우저에서 이 URL 을 한 번 열면 HttpOnly cookie 가 발급되고 canvas 로
-진입한다. 이후 같은 브라우저에서는 token 없이 다음 주소로 접속한다.
+Local 모드의 특징:
 
-```text
-http://127.0.0.1:9001/
-```
-
-localhost 경로의 특징:
-
-| 항목 | 값 |
+| | |
 |---|---|
-| bind | `127.0.0.1` |
-| mode | Local |
-| auth | token bootstrap |
+| `bind` | `127.0.0.1` |
+| Mode | Local |
+| Auth | token bootstrap |
 | TLS | 불필요 |
-| `[cloud]` config | 불필요 |
+| `[cloud]` 블록 | 불필요 |
 | 외부 기기 접속 | 불가 |
 
-종료:
+`Ctrl-C` 하나로 supervisor 가 graceful shutdown (모든 child shell reap).
+
+다른 터미널에서 종료:
 
 ```bash
-./backend/target/release/gtmux stop --session local
+gtmux stop --session local
 ```
 
-## 3) Localhost 개발 실행 (implementation / hot reload)
+---
 
-UI 또는 backend 구현을 진행할 때는 backend 와 frontend dev server 를 따로
-띄운다. backend 는 API/WS 를 담당하고, Vite 는 frontend hot reload 를
-담당한다.
+## 3) 실행 모드 B — Cloud (`bind = 0.0.0.0`, config 파일)
 
-```bash
-# Terminal 1 — backend
-cd codebase/backend
-cargo run -p gtmux-cli -- start --session dev
-```
+같은 신뢰 네트워크의 다른 기기 (노트북, 폰, 또 다른 서버) 에서 접속할
+때 쓴다.
 
-```bash
-# Terminal 2 — frontend
-cd codebase/frontend
-npm run dev
-```
+### 3.1 Config 파일 작성
 
-절차:
-
-1. backend stdout 의 bootstrap URL
-   `http://127.0.0.1:9001/auth/bootstrap?token=...` 을 한 번 연다.
-2. cookie 발급 후 `http://localhost:5173/` 로 이동한다.
-3. frontend 변경은 Vite 가 즉시 반영한다.
-4. backend 변경은 `cargo run ...` 프로세스를 재시작해서 반영한다.
-
-개발 중 자주 쓰는 검증:
-
-```bash
-# frontend 타입/Svelte 검증
-( cd codebase/frontend && npm run check )
-
-# frontend production build
-( cd codebase/frontend && npm run build )
-
-# backend tests
-( cd codebase/backend && cargo test --workspace )
-```
-
-## 4) 외부 접속용 Config 파일 작성
-
-저장소에 동봉된 [`config.sample.toml`](./config.sample.toml) 을 복사해서
-**`PUBLIC_IP` 자리만 본인 서버 IP/도메인으로 교체**한다 (port 를 9001
-이외로 바꾸면 그 값도 함께).
+`codebase/config.sample.toml` 을 그대로 복사한 뒤 두 군데의
+`PUBLIC_IP` 자리만 본인 서버 IP 또는 도메인으로 교체 (포트를
+9001 외로 바꾸면 그 값도 함께 갱신).
 
 ```bash
 mkdir -p ~/.config/gtmux
-mkdir -p ~/.local/state/gtmux
-chmod 700 ~/.local/state/gtmux
-cp config.sample.toml ~/.config/gtmux/prod.config.toml
+mkdir -p ~/.local/state/gtmux && chmod 700 ~/.local/state/gtmux
 
-# 1) PUBLIC_IP → 본인 서버의 외부 IP 또는 도메인 (예: 203.0.113.42
-#    또는 gtmux.example.com)
-# 2) 기본 port 9001 을 안 쓰려면 [server].port + cors_origins +
-#    host_allowlist 의 :9001 도 함께 교체
-$EDITOR ~/.config/gtmux/prod.config.toml
+cp codebase/config.sample.toml ~/.config/gtmux/prod.config.toml
+$EDITOR    ~/.config/gtmux/prod.config.toml
 ```
 
-sample 의 핵심 항목:
+핵심 키:
 
-| 키 | 값 | 비고 |
+| 키 | 값 | 의미 |
 |---|---|---|
-| `[server].bind` | `"0.0.0.0"` | 모든 인터페이스 listen → cloud mode 자동 |
+| `[server].session` | `"prod"` | `--session` 인자와 일치 |
+| `[server].port` | `9001` | listen port |
+| `[server].bind` | `"0.0.0.0"` | 모든 인터페이스 listen → cloud mode 자동 발동 |
 | `[security].cors_origins` | `["http://PUBLIC_IP:9001"]` | 정확 일치, wildcard 금지 |
 | `[security].host_allowlist` | `["PUBLIC_IP:9001"]` | DNS rebind 방어 |
-| `[auth].mode` | `"token"` | 현재 Quickstart 검증 경로. `gtmux start` 가 1회용 bootstrap URL 발행 |
-| `[cloud].tls_required` | `false` | Quickstart 의 평문 HTTP 검증 경로. 이 값이 `false` 여야 HTTP 에서 cookie 가 저장됨 |
+| `[auth].mode` | `"token"` | `gtmux start` 가 매번 새 bootstrap URL 발행 (기본 검증 경로) |
+| `[cloud].tls_required` | `false` | 신뢰 네트워크 평문 HTTP 검증 경로. HTTPS reverse proxy 운영 시 `true` |
+| `[assets].max_size_bytes` | `104857600` | 업로드 asset 1개당 최대 크기 (이 sample 은 100 MiB) |
 
-전체 옵션 + 주석은 sample 파일 자체에 인라인으로 있다.
+모든 키의 인라인 설명은 sample 파일에 그대로 들어있다.
 
-## 5) 외부 접속용 서버 실행
+### 3.2 서버 기동
 
 ```bash
+cd codebase
+
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-./backend/target/release/gtmux start \
+gtmux start \
   --session prod \
   --config ~/.config/gtmux/prod.config.toml
 ```
 
-stdout 에 `Open URL: http://127.0.0.1:9001/auth/bootstrap?token=...` 형태의
-bootstrap URL 이 1회 출력된다. cloud mode 에서 `127.0.0.1` 은 로컬 표시용이므로,
-외부 브라우저에서는 host 부분을 §4 에서 설정한 `PUBLIC_IP:9001` 로 바꿔 연다.
+방화벽이 있다면 `9001/tcp` 를 미리 연다 (`sudo ufw allow 9001/tcp`
+등). Banner 의 `Open URL` 은 여전히 `http://127.0.0.1:9001/...` 형식이라
+외부 브라우저에서는 host 부분을 `PUBLIC_IP` 로 교체해서 연다:
 
-방화벽이 있다면 `9001/tcp` 를 미리 열어둘 것 (`ufw allow 9001/tcp` 등).
-
-## 6) 외부에서 접속
-
-브라우저로 bootstrap URL 을 연다:
-
-```
-http://PUBLIC_IP:9001/auth/bootstrap?token=...
+```text
+http://PUBLIC_IP:9001/auth/bootstrap?token=<hex>
 ```
 
-cookie 발급 후 canvas 로 진입한다. 이후 같은 브라우저에서는 token 없이
-`http://PUBLIC_IP:9001/` 로 접속한다.
+---
 
-## 7) Background 실행
+## 4) Auth — 쿠키 발급
 
-`gtmux start` 는 기본적으로 foreground 프로세스다. 터미널을 닫아도 계속
-띄워두려면 아래 중 하나를 사용한다.
+두 모드 모두 흐름은 같다.
 
-### 7.1 `nohup` 으로 간단히 실행
+1. Banner 의 **bootstrap URL** 을 브라우저로 한 번 연다.
+2. 서버가 토큰을 검증하고 `HttpOnly` + `SameSite=Strict` session
+   쿠키 (7일 rolling renewal) 를 발급하면서 URL 에서 토큰을 지운다.
+3. 이후로는 path-only URL 을 북마크한다 — Local 은
+   `http://127.0.0.1:9001/`, Cloud 는 `http://PUBLIC_IP:9001/`. 쿠키가
+   만료되거나 logout 하기 전까지 그대로 로그인 상태.
 
-별도 process manager 없이 빠르게 background 로 띄우는 방법이다. 로컬과 외부
-접속 모두 같은 방식으로 실행할 수 있다.
+### Password 모드로 전환 (선택)
+
+기본값인 token 모드는 `gtmux start` 마다 새 bootstrap URL 을 발행한다.
+대신 안정적인 비밀번호 로그인을 쓰고 싶다면:
+
+```bash
+gtmux set-password           # 2회 입력. Argon2id hash 저장
+                              # → ~/.local/state/gtmux/password.argon2 (0600)
+```
+
+Config 의 `[auth].mode = "password"` 로 바꾼 뒤 재시작. 로그인 페이지가
+토큰 자동 소비 대신 비밀번호 입력 폼으로 바뀐다 (5회 / 5분 throttle).
+
+비밀번호 분실 시 회전:
+
+```bash
+gtmux reset-password
+```
+
+토큰 유출 시 회전 (cloud 모드 한정 — local 모드는 매 start 마다 자동
+재발급):
+
+```bash
+gtmux rotate-token --session prod
+```
+
+---
+
+## 5) UI 안에서 첫 session 만들기
+
+§4 의 cookie 발급이 끝나면 브라우저가 canvas 페이지에 도달하면서 **Auth
+dialog** 가 나타나 session 을 선택 또는 생성하라고 묻는다.
+
+1. **[New session]** 클릭.
+2. session 이름 입력 (영문·숫자·`-`·`_`).
+3. 서버가 `${XDG_STATE_HOME:-~/.local/state}/gtmux/<name>.json` 에
+   workspace 파일을 만들고, 빈 canvas 가 열린다.
+4. 이후 toolbar 좌측 상단의 **Active session dropdown** 으로 같은
+   서버 안의 session 들을 전환한다. Titlebar 의 kebab (`Session menu`)
+   안에는 [New session] / [Session list] / [Import session] / [Export
+   session] / [Rotate token] / [Settings] / [Shutdown] / [Logout] 가
+   있다.
+
+이제 canvas 에 Terminal panel 을 떨어뜨려 본다:
+
+- Toolbar 의 **Terminal** tool 클릭 (단축키 **T**).
+- Canvas 임의 위치를 클릭 — 새 PTY 가 spawn 되고 해당 위치에 Terminal
+  panel 이 mount 된다.
+- Shell 은 `$SHELL` 을 따른다 (macOS 기본 `/bin/zsh`, 대부분의 Linux
+  는 `/bin/bash`). WebSocket 끊김에도 살아남고, panel 의 **×** 로 닫을
+  때는 confirm modal 거쳐 shell 이 종료된다.
+
+전체 기능 (toolbar 모든 tool, Group, layer tree, clipboard, shortcut)
+설명은 [`USAGE.ko.md`](USAGE.ko.md) 에 있다.
+
+---
+
+## 6) Background / 장기 실행
+
+`gtmux start` 는 기본적으로 foreground 프로세스다. 터미널을 닫아도
+계속 띄워두는 방법 3가지.
+
+### 6.1 `nohup` (가장 간단)
 
 ```bash
 cd codebase
 mkdir -p ~/.local/state/gtmux
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-nohup ./backend/target/release/gtmux start --session local \
+nohup gtmux start --session local \
   > ~/.local/state/gtmux/local.log 2>&1 &
+
+tail -f ~/.local/state/gtmux/local.log   # bootstrap URL 확인
 ```
 
-외부 접속용 config 를 사용할 때:
+Cloud 도 동일 — `--config ~/.config/gtmux/prod.config.toml` 만 추가.
 
-```bash
-cd codebase
-mkdir -p ~/.local/state/gtmux
+### 6.2 `tmux` / `screen` 안에서 실행
 
-GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-nohup ./backend/target/release/gtmux start \
-  --session prod \
-  --config ~/.config/gtmux/prod.config.toml \
-  > ~/.local/state/gtmux/prod.log 2>&1 &
-```
-
-로그에서 bootstrap URL 을 확인한다.
-
-```bash
-tail -f ~/.local/state/gtmux/local.log
-tail -f ~/.local/state/gtmux/prod.log
-```
-
-### 7.2 `tmux` 또는 `screen` 안에서 실행
-
-서버 콘솔과 bootstrap URL 을 직접 보존하고 싶다면 terminal multiplexer 안에서
-foreground 로 실행한다.
+Banner 와 log 를 직접 보존하고 싶을 때:
 
 ```bash
 tmux new -s gtmux-local
 cd codebase
-GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-./backend/target/release/gtmux start --session local
-```
-
-분리: `Ctrl-b`, `d`
-
-재접속:
-
-```bash
+GTMUX_FRONTEND_DIST="$PWD/frontend/dist" gtmux start --session local
+# detach: Ctrl-b d
 tmux attach -t gtmux-local
 ```
 
-### 7.3 장기 운영은 systemd 권장
+### 6.3 systemd (장기 운영 권장)
 
-서버 재부팅 후 자동 시작, journal 로그, restart 정책이 필요하면 user-level
-systemd unit 으로 운영한다. 예시는 `../docs/deploy.md` §3.7 을 따른다.
+User-level unit + auto-restart + journal 로그. Template 은
+`docs/deploy.md` §3.7.
 
-## 8) 종료 / 운영
-
-```bash
-# 정상 종료
-./backend/target/release/gtmux stop --session prod
-# 강제 종료
-./backend/target/release/gtmux stop --session prod --force
-# 상태 확인
-./backend/target/release/gtmux status --session prod
-# 5-step 청소 (token/layout/pidfile/config)
-./backend/target/release/gtmux teardown --session prod --force
-```
-
-(Optional) PATH 에 설치:
+어떤 방식으로 띄웠든 종료는 항상 다음 명령을 쓴다:
 
 ```bash
-sudo install -m 755 backend/target/release/gtmux /usr/local/bin/gtmux
-# 이후엔 `gtmux start --session prod --config …` 으로 호출 가능
+gtmux stop --session <name>            # SIGTERM, 5초 대기
+gtmux stop --session <name> --force    # 이어서 SIGKILL
 ```
 
-Background 로 실행한 경우에도 종료는 동일하게 `gtmux stop --session <name>` 을
-사용한다. `nohup` 으로 띄운 shell job 을 직접 kill 하기보다 pidfile 기반
-`stop` 명령을 우선 사용한다.
+이게 pidfile 을 존중하면서 모든 child shell 까지 reap 한다. Shell job
+을 직접 kill 하면 orphan PTY 가 남는다.
 
-## Troubleshooting
+---
 
-| 증상 | 조치 |
-|---|---|
-| `bind=... is cloud-mode but [cloud] section is missing` | §4 의 `[cloud]` 블록 누락. 더미 path 라도 명시 |
-| `[cloud].tls_cert and tls_key must be set when cloud.tls_required=true` | HTTPS 운영 경로인데 cert/key marker 가 없음. Quickstart 처럼 평문 HTTP 로 검증하려면 `[cloud].tls_required = false` |
-| 브라우저에 `Forbidden` | `cors_origins` / `host_allowlist` 가 실제 접속 origin 과 정확히 일치하는지 확인. port 포함, scheme 포함 (`http://`) |
-| `/` 가 `{"error":"not_found"}` | `GTMUX_FRONTEND_DIST="$PWD/frontend/dist"` 없이 서버를 띄움. §2, §5, §7 의 start 명령처럼 dist 경로를 지정 |
-| `cannot find type Group / Panel in api.d.ts` | `make codegen` 빼먹음. 재실행 후 빌드 |
-| `Address already in use` | `gtmux status` → `gtmux stop --session prod` |
-| `EUID==0` 거부 | root 실행 차단됨. 일반 유저로 |
+## 7) Lifecycle 명령 reference
 
-상세 가이드: `../docs/deploy.md`.
+```bash
+gtmux status                            # 알려진 session + liveness
+gtmux status   --session prod           # 단일 session
+gtmux stop     --session prod [--force] # graceful / 강제
+gtmux teardown --session prod --force   # 5단계 청소
+                                        # (token / layout / pidfile / socket / config)
+                                        # 부분 보존: --keep-state / --keep-config
+gtmux set-password / reset-password     # password 모드 credential
+gtmux rotate-token --session prod       # cloud 모드 token 회전
+```
+
+전체 flag 는 `gtmux <subcommand> --help`.
+
+---
+
+## 8) Troubleshooting
+
+| 증상 | 원인 | 조치 |
+|---|---|---|
+| `bind=... is cloud-mode but [cloud] section is missing` | cloud 모드인데 `[cloud]` 블록 누락 | Config 에 `[cloud]` 추가 (Quickstart 경로는 `tls_required = false`) |
+| `[cloud].tls_cert and tls_key must be set when cloud.tls_required=true` | TLS 강제인데 cert marker 누락 | 평문 HTTP 검증이면 `tls_required = false`, 운영이면 cert/key 지정 |
+| 브라우저에 `Forbidden` | `cors_origins` / `host_allowlist` 불일치 | scheme + host + port 가 모두 정확 일치해야 한다 |
+| `/` 가 `{"error":"not_found"}` | `GTMUX_FRONTEND_DIST` 없이 기동 | env var 지정 또는 번들 설치 |
+| `cannot find type Group / Panel in api.d.ts` | `make codegen` 누락 | 재실행 후 rebuild |
+| `Address already in use (os error 48)` | port 충돌 | `gtmux status` → `gtmux stop --session <name>` |
+| `pidfile exists but process is gone` | 이전 실행 crash | `gtmux teardown --session <name> --force --keep-state` |
+| 재방문 시 `Forbidden` | 쿠키 만료 / 삭제 | 가장 최근 `gtmux start` 의 banner URL 다시 열기 |
+| `gtmux` 가 기동 거부 | root (`EUID == 0`) 실행 | 일반 유저로 |
+
+상세 운영 가이드: [`docs/deploy.md`](docs/deploy.md).
+
+---
+
+## 다음 단계
+
+- [`USAGE.ko.md`](USAGE.ko.md) — main canvas 사용 설명서 (session
+  관리, architecture, 모든 toolbar tool, Group 기능).
+- [`README.ko.md`](README.ko.md) — project 개요 + 설계 docs 링크
+  (`docs/sketch.md`, ADR, plan).
