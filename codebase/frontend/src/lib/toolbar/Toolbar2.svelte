@@ -33,6 +33,7 @@
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { historyStore } from '$lib/stores/historyStore.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { shortcutRegistry, type ShortcutBinding } from '$lib/keyboard/shortcutRegistry.svelte';
 
   interface ToolDef {
     id: ToolId;
@@ -67,7 +68,6 @@
       {
         id: 'terminal',
         name: 'Terminal',
-        hint: 'T',
         path: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/>',
       },
     ],
@@ -147,9 +147,43 @@
 
   const current = $derived(toolStore.current);
   const locked = $derived(toolStore.locked);
+  const shortcutActions = $derived.by(() => shortcutRegistry.listActions());
   // No active session 시 12 도구는 의미 없음 (canvas mutation 무효). 사용자
   // 가 ActiveSessionDropdown 으로 session 을 먼저 연결하도록 유도.
   const noActiveSession = $derived(sessionStore.active === null);
+
+  const isMac = (() => {
+    if (typeof navigator === 'undefined') return false;
+    return /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
+  })();
+
+  function formatBinding(binding: ShortcutBinding): string {
+    const parts: string[] = [];
+    if (isMac) {
+      if (binding.ctrl) parts.push('⌃');
+      if (binding.alt) parts.push('⌥');
+      if (binding.shift) parts.push('⇧');
+      if (binding.meta) parts.push('⌘');
+      parts.push(binding.key.length === 1 ? binding.key.toUpperCase() : binding.key);
+      return parts.join('');
+    }
+    if (binding.ctrl) parts.push('Ctrl');
+    if (binding.alt) parts.push('Alt');
+    if (binding.shift) parts.push('Shift');
+    if (binding.meta) parts.push('Win');
+    parts.push(binding.key.length === 1 ? binding.key.toUpperCase() : binding.key);
+    return parts.join('+');
+  }
+
+  function toolActionId(id: ToolId): string {
+    return id === 'terminal' ? 'canvas.new_terminal' : `tool.${id}`;
+  }
+
+  function activeHint(id: ToolId, fallback?: string): string {
+    const action = shortcutActions.find((a) => a.actionId === toolActionId(id));
+    const binding = action?.activeBindings[0];
+    return binding ? formatBinding(binding) : fallback ?? '';
+  }
 
   function onkeydown(e: KeyboardEvent): void {
     // Q toggles lock (only if a non-mode tool is active).
@@ -189,6 +223,7 @@
       {/if}
       <div class="group">
         {#each group as tool (tool.id)}
+          {@const hint = activeHint(tool.id, tool.hint)}
           <button
             type="button"
             class="tool"
@@ -196,7 +231,7 @@
             class:locked={current === tool.id && locked}
             title={noActiveSession
               ? 'Connect a session to use canvas tools'
-              : tool.name + (tool.hint ? ` — ${tool.hint}` : '')}
+              : tool.name + (hint ? ` — ${hint}` : '')}
             aria-label={tool.name}
             aria-pressed={current === tool.id}
             disabled={noActiveSession}
@@ -221,7 +256,7 @@
             >
               {@html tool.path}
             </svg>
-            <span class="tooltip">{tool.name}{tool.hint ? ` · ${tool.hint}` : ''}</span>
+            <span class="tooltip">{tool.name}{hint ? ` · ${hint}` : ''}</span>
           </button>
         {/each}
       </div>

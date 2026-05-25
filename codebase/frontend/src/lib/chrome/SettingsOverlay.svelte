@@ -19,7 +19,12 @@
   import { themeStore, type ThemeMode } from '$lib/stores/theme.svelte';
   import { settingsDialog, type SettingsSection } from '$lib/stores/settingsDialog.svelte';
   import { settingsStore } from '$lib/stores/settings.svelte';
-  import { shortcutRegistry, type ShortcutDescriptor } from '$lib/keyboard/shortcutRegistry.svelte';
+  import {
+    shortcutRegistry,
+    type ShortcutAction,
+    type ShortcutBinding,
+  } from '$lib/keyboard/shortcutRegistry.svelte';
+  import { shortcutOverrides, normalizeShortcutBinding } from '$lib/stores/shortcutOverrides.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
 
@@ -93,8 +98,12 @@
     return /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
   })();
 
+  let capturingActionId = $state<string | null>(null);
+  let captureError = $state<string | null>(null);
+
   /** Format a shortcut as a user-facing string like `⌘⇧L` or `Ctrl+Shift+L`. */
-  function formatShortcut(d: ShortcutDescriptor): string {
+  function formatShortcut(d: ShortcutBinding | undefined): string {
+    if (d === undefined) return 'Unassigned';
     const parts: string[] = [];
     if (isMac) {
       if (d.ctrl) parts.push('⌃');
@@ -111,40 +120,65 @@
     return isMac ? parts.join('') : parts.join('+');
   }
 
-  /** Group descriptors by category. Show ⌘+Ctrl-pair entries (e.g. our
-   *  mac/win duplicates for the same chrome action) only once per
-   *  description by collapsing on description. */
+  function bindingFromEvent(e: KeyboardEvent): ShortcutBinding | null {
+    if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) return null;
+    return normalizeShortcutBinding({
+      key: e.key,
+      meta: e.metaKey,
+      ctrl: e.ctrlKey,
+      alt: e.altKey,
+      shift: e.shiftKey,
+    });
+  }
+
+  function startCapture(actionId: string): void {
+    capturingActionId = actionId;
+    captureError = null;
+  }
+
+  function cancelCapture(): void {
+    capturingActionId = null;
+    captureError = null;
+  }
+
+  function resetShortcut(actionId: string): void {
+    shortcutOverrides.reset(actionId);
+    if (capturingActionId === actionId) cancelCapture();
+  }
+
+  function setSection(next: SettingsSection): void {
+    cancelCapture();
+    settingsDialog.setSection(next);
+  }
+
+  function commitShortcutCapture(action: ShortcutAction, e: KeyboardEvent): void {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    if (e.key === 'Escape') {
+      cancelCapture();
+      return;
+    }
+    const binding = bindingFromEvent(e);
+    if (binding === null) return;
+    const conflict = shortcutRegistry.conflictFor(action.actionId, binding);
+    if (conflict !== null) {
+      captureError =
+        conflict.kind === 'reserved'
+          ? conflict.description
+          : `Already used by ${conflict.description}.`;
+      return;
+    }
+    shortcutOverrides.set(action.actionId, binding);
+    cancelCapture();
+  }
+
+  /** Group action descriptors by category. */
   const grouped = $derived.by(() => {
-    const list = shortcutRegistry.list();
-    const map = new Map<string, ShortcutDescriptor[]>();
-    const seen = new Set<string>();
+    const list = shortcutRegistry.listActions();
+    const map = new Map<string, ShortcutAction[]>();
     for (const d of list) {
-      const desc = d.description ?? '';
-      // Mac/Win pair collapse: on macOS we keep the meta variant; on
-      // non-mac we keep the ctrl variant. Falls through if neither
-      // modifier matches (e.g. plain keys like `[`).
-      const isMeta = Boolean(d.meta);
-      const isCtrl = Boolean(d.ctrl);
-      if (desc && (isMeta || isCtrl)) {
-        const key = `${desc}@${d.shift ? 'S' : ''}${d.alt ? 'A' : ''}${d.key}`;
-        if (seen.has(key)) continue;
-        // For pair-collision, prefer the platform-native modifier.
-        const pair = list.find(
-          (other) =>
-            other !== d &&
-            (other.description ?? '') === desc &&
-            (other.key.toLowerCase() === d.key.toLowerCase()) &&
-            Boolean(other.shift) === Boolean(d.shift) &&
-            Boolean(other.alt) === Boolean(d.alt) &&
-            Boolean(other.meta) !== isMeta,
-        );
-        if (pair) {
-          const preferred = isMac ? (isMeta ? d : pair) : isMeta ? pair : d;
-          if (preferred !== d) continue;
-          seen.add(key);
-        }
-      }
-      const cat = d.category ?? 'Misc';
+      const cat = d.category;
       const bucket = map.get(cat);
       if (bucket) bucket.push(d);
       else map.set(cat, [d]);
@@ -155,11 +189,20 @@
   /* ── Close ───────────────────────────────────────────────────────── */
 
   function close(): void {
+    cancelCapture();
     settingsDialog.close();
   }
 
   function onWindowKey(e: KeyboardEvent): void {
     if (!open) return;
+    if (capturingActionId !== null) {
+      const action = shortcutRegistry
+        .listActions()
+        .find((candidate) => candidate.actionId === capturingActionId);
+      if (action !== undefined) commitShortcutCapture(action, e);
+      else cancelCapture();
+      return;
+    }
     if (e.key === 'Escape') {
       e.preventDefault();
       close();
@@ -169,8 +212,8 @@
   $effect(() => {
     if (typeof window === 'undefined') return;
     if (!open) return;
-    window.addEventListener('keydown', onWindowKey);
-    return () => window.removeEventListener('keydown', onWindowKey);
+    window.addEventListener('keydown', onWindowKey, { capture: true });
+    return () => window.removeEventListener('keydown', onWindowKey, { capture: true });
   });
 </script>
 
@@ -203,7 +246,7 @@
               class="nav-btn"
               class:active={section === s.id}
               class:disabled={!s.ready}
-              onclick={() => settingsDialog.setSection(s.id)}
+              onclick={() => setSection(s.id)}
             >
               <span class="nav-label">{s.label}</span>
               {#if !s.ready}
@@ -247,8 +290,7 @@
           {:else if section === 'shortcuts'}
             <h3 class="section-head">Shortcuts</h3>
             <p class="section-hint">
-              Read-only matrix from the registered handlers. Customization
-              lands in a future revision.
+              Click a shortcut to record a replacement. Esc cancels recording.
             </p>
             {#if grouped.length === 0}
               <p class="placeholder">No shortcuts registered yet.</p>
@@ -257,18 +299,61 @@
                 <div class="shortcut-group">
                   <h4 class="group-head">{category}</h4>
                   <table class="shortcut-table">
-                    <tbody>
-                      {#each items as d (d.description ?? d.key)}
-                        <tr>
-                          <td class="desc">{d.description ?? '(no description)'}</td>
-                          <td class="combo mono">{formatShortcut(d)}</td>
-                        </tr>
-                      {/each}
-                    </tbody>
-                  </table>
-                </div>
-              {/each}
-            {/if}
+	                    <tbody>
+	                      {#each items as d (d.actionId)}
+	                        <tr>
+	                          <td class="desc">
+	                            <span>{d.description}</span>
+	                            {#if d.overridden}
+	                              <span class="shortcut-state">custom</span>
+	                            {/if}
+	                            {#if d.customizable === false && d.protectedReason}
+	                              <span class="shortcut-sub">{d.protectedReason}</span>
+	                            {/if}
+	                          </td>
+	                          <td class="combo mono">
+	                            {#if capturingActionId === d.actionId}
+	                              <button
+	                                type="button"
+	                                class="shortcut-capture"
+	                                onkeydown={(e) => commitShortcutCapture(d, e)}
+	                              >
+	                                Press keys…
+	                              </button>
+	                            {:else}
+	                              <button
+	                                type="button"
+	                                class="shortcut-button mono"
+	                                disabled={!d.customizable}
+	                                title={d.defaultBindings[0]
+	                                  ? `Default: ${formatShortcut(d.defaultBindings[0])}`
+	                                  : undefined}
+	                                onclick={() => startCapture(d.actionId)}
+	                              >
+	                                {formatShortcut(d.activeBindings[0])}
+	                              </button>
+	                            {/if}
+	                          </td>
+	                          <td class="shortcut-actions">
+	                            <button
+	                              type="button"
+	                              class="reset-btn"
+	                              disabled={!d.overridden}
+	                              onclick={() => resetShortcut(d.actionId)}
+	                            >
+	                              Reset
+	                            </button>
+	                          </td>
+	                        </tr>
+	                      {/each}
+	                    </tbody>
+	                  </table>
+	                </div>
+	              {/each}
+	              {#if captureError !== null}
+	                <p class="shortcut-error" role="alert">{captureError}</p>
+	              {/if}
+	            {/if}
           {:else if section === 'storage'}
             <h3 class="section-head">Storage</h3>
             <p class="placeholder">
@@ -593,6 +678,7 @@
   .shortcut-table td {
     padding: var(--space-4) var(--space-8);
     border-bottom: 1px solid var(--color-border);
+    vertical-align: middle;
   }
 
   .shortcut-table tr:last-child td {
@@ -603,11 +689,68 @@
     color: var(--color-fg);
   }
 
+  .shortcut-table .desc > span {
+    display: block;
+  }
+
+  .shortcut-table .desc > span + span {
+    margin-top: 2px;
+  }
+
   .shortcut-table .combo {
     text-align: right;
     color: var(--color-fg-muted);
     font-family: var(--font-mono);
     white-space: nowrap;
+  }
+
+  .shortcut-sub,
+  .shortcut-state {
+    color: var(--color-fg-muted);
+    font-size: var(--text-sm);
+  }
+
+  .shortcut-state {
+    color: var(--color-accent);
+  }
+
+  .shortcut-button,
+  .shortcut-capture,
+  .reset-btn {
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface-2);
+    color: var(--color-fg);
+    font: inherit;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+
+  .shortcut-button:hover:not(:disabled),
+  .reset-btn:hover:not(:disabled) {
+    border-color: var(--color-accent);
+  }
+
+  .shortcut-button:disabled,
+  .reset-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .shortcut-capture {
+    border-color: var(--color-accent);
+    color: var(--color-accent);
+  }
+
+  .shortcut-actions {
+    width: 76px;
+    text-align: right;
+  }
+
+  .shortcut-error {
+    margin: var(--space-8) 0 0;
+    color: var(--color-danger, #d33);
+    font-size: var(--text-md);
   }
 
   .mono {
