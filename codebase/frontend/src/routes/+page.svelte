@@ -41,6 +41,7 @@
   import { bindGroupShortcuts } from '$lib/keyboard/groupShortcuts.svelte';
   import { bindClipboardShortcuts } from '$lib/keyboard/clipboardShortcuts.svelte';
   import { bindEditingShortcuts } from '$lib/keyboard/editingShortcuts.svelte';
+  import { bindToolShortcuts } from '$lib/keyboard/toolShortcuts.svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
@@ -143,6 +144,7 @@
   let unbindGroupShortcuts: (() => void) | null = null;
   let unbindClipboardShortcuts: (() => void) | null = null;
   let unbindEditingShortcuts: (() => void) | null = null;
+  let unbindToolShortcuts: (() => void) | null = null;
   let unbindSystemTheme: (() => void) | null = null;
   let unbindVisibility: (() => void) | null = null;
   let unbindNativeContextMenu: (() => void) | null = null;
@@ -268,6 +270,8 @@
     unbindClipboardShortcuts = bindClipboardShortcuts();
     // Editing shortcuts (Cmd+A select-all) — ADR-0017 D6 amend ⑤ (a) / amend ⑦.
     unbindEditingShortcuts = bindEditingShortcuts();
+    // Tool shortcuts (V/H/R/O/L/P/T/N/S/D/I/F) — ADR-0017 D6 amend ⑫.
+    unbindToolShortcuts = bindToolShortcuts();
 
     // Bootstrap pipeline — token cookie 교환 → auth gate → WS subscriptions.
     // 순차 실행이 중요: cookie 가 발급되기 전에 /api/sessions 를 부르면 401 이
@@ -421,6 +425,10 @@
     if (unbindEditingShortcuts !== null) {
       unbindEditingShortcuts();
       unbindEditingShortcuts = null;
+    }
+    if (unbindToolShortcuts !== null) {
+      unbindToolShortcuts();
+      unbindToolShortcuts = null;
     }
     if (unbindSystemTheme !== null) {
       unbindSystemTheme();

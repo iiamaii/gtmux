@@ -25,9 +25,18 @@
 //     handler: () => { spawnTerminal(); return true; },
 //   }));
 
+import {
+  bindingKey,
+  normalizeShortcutBinding,
+  shortcutOverrides,
+  type ShortcutBinding,
+} from '$lib/stores/shortcutOverrides.svelte';
+
 const LETTER_KEYS = /^[a-z]$/;
 
-export interface ShortcutDescriptor {
+export type { ShortcutBinding };
+
+export interface ShortcutDescriptor extends ShortcutBinding {
   /**
    * Stable command identity for future Settings shortcut overrides.
    * Multiple platform variants (Cmd vs Ctrl) share the same actionId.
@@ -65,6 +74,23 @@ export interface ShortcutDescriptor {
   protectedReason?: string;
 }
 
+export interface ShortcutAction {
+  actionId: string;
+  description: string;
+  category: string;
+  customizable: boolean;
+  protectedReason?: string;
+  defaultBindings: ShortcutBinding[];
+  activeBindings: ShortcutBinding[];
+  overridden: boolean;
+}
+
+export interface ShortcutConflict {
+  kind: 'reserved' | 'action';
+  actionId?: string;
+  description: string;
+}
+
 function isEditableFocused(): boolean {
   if (typeof document === 'undefined') return false;
   const el = document.activeElement as HTMLElement | null;
@@ -82,15 +108,33 @@ function isXtermFocused(): boolean {
   return el.classList.contains('xterm-helper-textarea');
 }
 
-function eventMatches(d: ShortcutDescriptor, e: KeyboardEvent): boolean {
-  if ((d.meta ?? false) !== e.metaKey) return false;
-  if ((d.ctrl ?? false) !== e.ctrlKey) return false;
-  if ((d.alt ?? false) !== e.altKey) return false;
-  if ((d.shift ?? false) !== e.shiftKey) return false;
+function isMacPlatform(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
+}
+
+function descriptorBinding(d: ShortcutDescriptor): ShortcutBinding {
+  return normalizeShortcutBinding({
+    key: d.key,
+    meta: d.meta,
+    ctrl: d.ctrl,
+    alt: d.alt,
+    shift: d.shift,
+  });
+}
+
+function eventMatchesBinding(binding: ShortcutBinding, e: KeyboardEvent): boolean {
+  const normalized = normalizeShortcutBinding(binding);
+  if (normalized.meta !== e.metaKey) return false;
+  if (normalized.ctrl !== e.ctrlKey) return false;
+  if (normalized.alt !== e.altKey) return false;
+  if (normalized.shift !== e.shiftKey) return false;
   // Letters: case-insensitive.
-  const a = LETTER_KEYS.test(d.key.toLowerCase()) ? d.key.toLowerCase() : d.key;
-  const b = LETTER_KEYS.test(e.key.toLowerCase()) ? e.key.toLowerCase() : e.key;
-  return a === b;
+  const expected = LETTER_KEYS.test(normalized.key.toLowerCase())
+    ? normalized.key.toLowerCase()
+    : normalized.key;
+  const actual = LETTER_KEYS.test(e.key.toLowerCase()) ? e.key.toLowerCase() : e.key;
+  return expected === actual;
 }
 
 function defaultAllowInEditable(d: ShortcutDescriptor): boolean {
@@ -106,20 +150,55 @@ function defaultAllowInXterm(d: ShortcutDescriptor): boolean {
 class ShortcutRegistry {
   #handlers = new Set<ShortcutDescriptor>();
   #attached = false;
+  revision = $state(0);
 
   /** Register a shortcut. Returns an unregister callback. */
   register(d: ShortcutDescriptor): () => void {
     this.#handlers.add(d);
+    this.revision += 1;
     this.#ensureAttached();
     return () => {
       this.#handlers.delete(d);
+      this.revision += 1;
     };
   }
 
   /** Snapshot of currently-registered descriptors — for the future
    *  Settings · Shortcuts read-only list. */
   list(): ShortcutDescriptor[] {
+    void this.revision;
     return Array.from(this.#handlers);
+  }
+
+  listActions(): ShortcutAction[] {
+    void this.revision;
+    void shortcutOverrides.revision;
+    return Array.from(this.#groupedActions().values())
+      .map((descriptors) => this.#toAction(descriptors))
+      .sort((a, b) => {
+        const cat = a.category.localeCompare(b.category);
+        return cat !== 0 ? cat : a.description.localeCompare(b.description);
+      });
+  }
+
+  conflictFor(actionId: string, binding: ShortcutBinding): ShortcutConflict | null {
+    const normalized = normalizeShortcutBinding(binding);
+    const reserved = reservedReason(normalized);
+    if (reserved !== null) return { kind: 'reserved', description: reserved };
+    const wanted = bindingKey(normalized);
+    for (const action of this.listActions()) {
+      if (action.actionId === actionId) continue;
+      for (const active of action.activeBindings) {
+        if (bindingKey(active) === wanted) {
+          return {
+            kind: 'action',
+            actionId: action.actionId,
+            description: action.description,
+          };
+        }
+      }
+    }
+    return null;
   }
 
   #ensureAttached(): void {
@@ -134,12 +213,16 @@ class ShortcutRegistry {
     if (event.isComposing) return;
 
     // Snapshot — handler may unregister itself during dispatch.
-    const handlers = Array.from(this.#handlers);
+    void shortcutOverrides.revision;
+    const actions = Array.from(this.#groupedActions().values());
     const editableActive = isEditableFocused();
     const xtermActive = isXtermFocused();
 
-    for (const d of handlers) {
-      if (!eventMatches(d, event)) continue;
+    for (const descriptors of actions) {
+      const d = descriptors[0];
+      if (d === undefined) continue;
+      const activeBindings = this.#activeBindings(descriptors);
+      if (!activeBindings.some((binding) => eventMatchesBinding(binding, event))) continue;
       if (editableActive && !defaultAllowInEditable(d)) continue;
       if (xtermActive && !defaultAllowInXterm(d)) continue;
       const consumed = d.handler(event);
@@ -154,7 +237,70 @@ class ShortcutRegistry {
   /** Test/dev only. */
   _reset(): void {
     this.#handlers.clear();
+    this.revision += 1;
+  }
+
+  #groupedActions(): Map<string, ShortcutDescriptor[]> {
+    const map = new Map<string, ShortcutDescriptor[]>();
+    for (const d of this.#handlers) {
+      const bucket = map.get(d.actionId);
+      if (bucket) bucket.push(d);
+      else map.set(d.actionId, [d]);
+    }
+    return map;
+  }
+
+  #toAction(descriptors: ShortcutDescriptor[]): ShortcutAction {
+    const first = descriptors[0]!;
+    const customizable = first.customizable !== false;
+    return {
+      actionId: first.actionId,
+      description: first.description ?? first.actionId,
+      category: first.category ?? 'Misc',
+      customizable,
+      protectedReason: first.protectedReason,
+      defaultBindings: this.#defaultBindings(descriptors),
+      activeBindings: this.#activeBindings(descriptors),
+      overridden: shortcutOverrides.isOverridden(first.actionId),
+    };
+  }
+
+  #activeBindings(descriptors: ShortcutDescriptor[]): ShortcutBinding[] {
+    const first = descriptors[0];
+    if (first !== undefined && first.customizable !== false) {
+      const override = shortcutOverrides.get(first.actionId);
+      if (override !== null) return override;
+    }
+    return this.#defaultBindings(descriptors);
+  }
+
+  #defaultBindings(descriptors: ShortcutDescriptor[]): ShortcutBinding[] {
+    const isMac = isMacPlatform();
+    const hasMetaCtrlPair = descriptors.some((d) => d.meta) && descriptors.some((d) => d.ctrl);
+    const filtered = hasMetaCtrlPair
+      ? descriptors.filter((d) => (isMac ? d.meta === true : d.ctrl === true))
+      : descriptors;
+    const unique = new Map<string, ShortcutBinding>();
+    for (const d of filtered) {
+      const binding = descriptorBinding(d);
+      unique.set(bindingKey(binding), binding);
+    }
+    return Array.from(unique.values());
   }
 }
 
 export const shortcutRegistry = new ShortcutRegistry();
+
+function reservedReason(binding: ShortcutBinding): string | null {
+  const b = normalizeShortcutBinding(binding);
+  if (b.key === 'Escape') return 'Esc is reserved for cancel and shell input routing.';
+  if (b.key === 'Enter') return 'Enter is reserved for inline edit commit.';
+  if (b.key === 'Backspace' || b.key === 'Delete') return 'Delete and Backspace are reserved destructive keys.';
+  if (b.key === 'Tab') return 'Tab is reserved for browser focus navigation.';
+  if (b.key === ' ') return 'Space is reserved for hold-to-pan.';
+  const mod = b.meta || b.ctrl;
+  if (mod && ['s', 'p', 'w', 'r', 'f'].includes(b.key.toLowerCase())) {
+    return 'This browser or OS standard shortcut is reserved.';
+  }
+  return null;
+}
