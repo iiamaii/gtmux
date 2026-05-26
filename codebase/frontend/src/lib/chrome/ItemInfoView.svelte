@@ -449,28 +449,66 @@
   }
 
   async function applyCommonBool(key: CommonBoolKey, next: boolean): Promise<void> {
+    if (key === 'minimized') {
+      await applyCommonMinimized(next);
+      return;
+    }
     await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
       if (key === 'visible') {
         const v: Visibility = next ? 'visible' : 'hidden';
         return { ...it, visibility: v } as CanvasItem;
       }
-      if (key === 'minimized') {
-        if (!supportsMinimize(it)) return it;
-        return applyMinimizeGeom(it, next);
-      }
       return { ...it, [key]: next } as CanvasItem;
     });
   }
 
-  // PanelNode / NoteNode 의 onMinimizeClick 와 동일 패턴 — schema geom 변경 +
-  // sessionStore.restoredItemGeoms 백업. 둘 다 같은 backup map 을 공유하므로
-  // node-side button 과 inspector button 어느 쪽에서 토글해도 일관.
+  async function applyCommonMinimized(next: boolean): Promise<void> {
+    if (selectedItems.length === 0) return;
+    const ids = new Set(selectedIds);
+    const restoreGeoms = new Map<string, { x: number; y: number; w: number; h: number } | null>();
+    const restoringIds: string[] = [];
+
+    for (const it of selectedItems) {
+      if (!supportsMinimize(it) || it.minimized === next) continue;
+      if (next) {
+        sessionStore.backupItemGeom(it.id, { x: it.x, y: it.y, w: it.w, h: it.h });
+      } else {
+        restoreGeoms.set(it.id, sessionStore.getRestoredGeom(it.id));
+        restoringIds.push(it.id);
+      }
+    }
+
+    const result = await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it) =>
+          ids.has(it.id) ? applyMinimizeGeom(it, next, restoreGeoms) : it,
+        ),
+      }),
+      {
+        abortMessage: 'Edit aborted — session reconnect failed.',
+        failMessage: 'Inspector edit failed',
+      },
+    );
+
+    if (result.ok && !next) {
+      for (const id of restoringIds) sessionStore.clearRestoredGeom(id);
+    }
+  }
+
+  // PanelNode / NoteNode 의 onMinimizeClick 와 동일 패턴 — schema geom 변경.
+  // backup/clear 는 applyCommonMinimized 에서 transform 밖에서 처리한다.
+  // optimisticMutation 이 transform 을 두 번 실행하므로 본 함수는 순수해야 한다.
   // - terminal (PanelNode): h = 32 (header-strip), w 유지
   // - note    (NoteNode):   w = h = 32 (chip), 사각형 — node-side 와 정합
   // 그 외 type (rect/ellipse/line/text/free_draw/file_path/image) 은
   // minimize 시각 정의 없음 — inspector 의 minimize 버튼이 selectedTypes 에
   // terminal/note 가 하나도 없으면 hide. (selectionSupportsMinimize)
-  function applyMinimizeGeom(it: CanvasItem, next: boolean): CanvasItem {
+  function applyMinimizeGeom(
+    it: CanvasItem,
+    next: boolean,
+    restoreGeoms: ReadonlyMap<string, { x: number; y: number; w: number; h: number } | null>,
+  ): CanvasItem {
     if (it.minimized === next) return it;
     if (!supportsMinimize(it)) return it;
     // node-side 상수 정합:
@@ -485,18 +523,15 @@
     const NOTE_RESTORE_H = 96;
     const PANEL_STRIP_H = MINIMIZED_TERMINAL_PANEL_HEIGHT;
     const PANEL_RESTORE_H = 220;
-    const DOC_STRIP_H = 30;
+    const DOC_STRIP_H = 35;
     const DOC_RESTORE_W = 360;
     const DOC_RESTORE_H = 220;
-    // SnippetsNode.svelte 와 정합 (head-only mode 의 collapsed h + default
-    // restore geom). 두 entry point (canvas head min/restore + 본 inspector
-    // toggle) 가 같은 상수 + 같은 backupItemGeom store 를 공유하므로 어느
-    // 쪽에서 토글해도 일관 동작.
+    // SnippetsNode.svelte 와 정합 (head-only mode 의 collapsed h + fallback
+    // restore geom). 정상 restore 는 restoreGeoms 의 기존 사용자 크기를 우선한다.
     const SNIP_STRIP_H = 35;
     const SNIP_RESTORE_W = 320;
     const SNIP_RESTORE_H = 150;
     if (next === true) {
-      sessionStore.backupItemGeom(it.id, { x: it.x, y: it.y, w: it.w, h: it.h });
       if (it.type === 'note') {
         return { ...it, minimized: true, w: NOTE_CHIP, h: NOTE_CHIP } as CanvasItem;
       }
@@ -508,8 +543,7 @@
       }
       return { ...it, minimized: true, h: PANEL_STRIP_H } as CanvasItem;
     }
-    const backup = sessionStore.getRestoredGeom(it.id);
-    sessionStore.clearRestoredGeom(it.id);
+    const backup = restoreGeoms.get(it.id) ?? null;
     if (it.type === 'note') {
       // Note chip 은 정사각형이라 w 도 함께 복원해야 한다.
       const w = backup?.w ?? NOTE_RESTORE_W;

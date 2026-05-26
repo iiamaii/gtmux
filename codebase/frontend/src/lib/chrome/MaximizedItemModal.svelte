@@ -23,9 +23,8 @@
     isToggleableFileType,
     getNextViewMode,
     getNextViewModeLabel,
-    INTERACTIVE_IFRAME_SANDBOX,
-    IFRAME_HEIGHT_MESSAGE_TAG,
-    buildInteractiveSrcdoc,
+    RENDERED_HTML_IFRAME_SANDBOX,
+    buildRenderedHtmlSrcdoc,
     type DocumentViewMode,
   } from '$lib/canvas/documentRender';
   import type { CanvasItem, NoteItem } from '$lib/types/canvas';
@@ -91,50 +90,12 @@
   const documentNextViewModeLabel = $derived(
     getNextViewModeLabel(documentViewMode, documentFileTypeLabel),
   );
-  /** ADR-0037 — fileType 가 html 이 아니면 interactive 의미 없음. reset. */
-  $effect(() => {
-    if (
-      documentViewMode === 'interactive'
-      && documentFileTypeLabel !== 'html'
-      && itemId !== null
-    ) {
-      documentViewModeStore.set(itemId, 'rendered');
-    }
-  });
   const documentHtml = $derived.by(() => {
     if (documentFileTypeLabel === 'html') return renderHtml(documentText);
     return renderMarkdown(documentText);
   });
 
-  /** ADR-0037 R4 (2단계) — iframe height auto-fit via postMessage.
-   *  정본 정합 = DocumentNode 와 동일 패턴. */
-  let documentIframeRef = $state<HTMLIFrameElement | null>(null);
-  let documentIframeHeight = $state<number | null>(null);
-  const documentInteractiveSrcdoc = $derived(buildInteractiveSrcdoc(documentText));
-
-  $effect(() => {
-    function onMessage(e: MessageEvent): void {
-      if (documentIframeRef === null || e.source !== documentIframeRef.contentWindow) return;
-      const data = e.data as Record<string, unknown> | null;
-      if (data === null || typeof data !== 'object') return;
-      const h = data[IFRAME_HEIGHT_MESSAGE_TAG];
-      if (typeof h === 'number' && h > 0 && h < 50000) {
-        documentIframeHeight = h;
-      }
-    }
-    window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
-  });
-
-  $effect(() => {
-    if (documentViewMode !== 'interactive') {
-      documentIframeHeight = null;
-    }
-  });
-
-  const documentIframeHeightStyle = $derived(
-    documentIframeHeight !== null ? `${documentIframeHeight}px` : '100%',
-  );
+  const documentRenderedHtmlSrcdoc = $derived(buildRenderedHtmlSrcdoc(documentText));
   const canPreviewDocumentAsset = $derived.by(() => {
     if (item?.type !== 'document' || !item.asset_id) return false;
     const mime = (item.mime ?? '').toLowerCase();
@@ -241,6 +202,22 @@
     e.stopPropagation();
     e.preventDefault();
     sessionStore.unmaximize();
+  }
+
+  function interceptRenderedLinks(node: HTMLElement): { destroy: () => void } {
+    function onClick(e: MouseEvent): void {
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+      const anchor = target.closest('a[href]') as HTMLAnchorElement | null;
+      if (anchor === null || !node.contains(anchor)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      window.open(anchor.href, '_blank', 'noopener,noreferrer');
+    }
+    node.addEventListener('click', onClick);
+    return {
+      destroy: () => node.removeEventListener('click', onClick),
+    };
   }
 
   function blockBackdropEvent(e: Event): void {
@@ -360,8 +337,7 @@
         {/if}
         <div class="max-actions">
           {#if isDocument && documentCanToggleView}
-            <!-- ADR-0037 D1/D4 — DocumentNode 와 동일한 3-mode toggle.
-                 markdown: rendered↔source, html: rendered→interactive→source. -->
+            <!-- ADR-0037 amend — DocumentNode 와 동일한 rendered↔source toggle. -->
             <button
               type="button"
               class="max-btn"
@@ -378,12 +354,7 @@
                 }
               }}
             >
-              {#if documentViewMode === 'rendered' && documentFileTypeLabel === 'html'}
-                <!-- play (run interactively) -->
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
-                  <polygon points="6 4 20 12 6 20"/>
-                </svg>
-              {:else if documentViewMode === 'source'}
+              {#if documentViewMode === 'source'}
                 <!-- book-open (show rendered) — visibility eye 와 겹침 회피. -->
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
                   <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
@@ -490,22 +461,21 @@
             {:else}
               <div class="document-eyebrow">{item.asset_id ? 'Document file' : 'Inline document'}</div>
               <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — DocumentNode 와 동일
-                   markdown/html/interactive/source rendering. -->
+                   markdown/html/source rendering. -->
               {#if documentViewMode === 'source'}
                 <pre class="document-source">{documentText}</pre>
-              {:else if documentViewMode === 'interactive' && documentFileTypeLabel === 'html'}
+              {:else if documentFileTypeLabel === 'html'}
                 <!-- svelte-ignore a11y_missing_attribute -->
                 <iframe
-                  bind:this={documentIframeRef}
-                  class="document-iframe"
-                  sandbox={INTERACTIVE_IFRAME_SANDBOX}
+                  class="document-html-frame"
+                  sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+                  title={item.file_name}
                   referrerpolicy="no-referrer"
                   loading="lazy"
-                  srcdoc={documentInteractiveSrcdoc}
-                  style:height={documentIframeHeightStyle}
+                  srcdoc={documentRenderedHtmlSrcdoc}
                 ></iframe>
               {:else}
-                <div class="document-md">{@html documentHtml}</div>
+                <div class="document-md" use:interceptRenderedLinks>{@html documentHtml}</div>
               {/if}
             {/if}
           </article>
@@ -808,29 +778,28 @@
     overflow-wrap: anywhere;
   }
 
-  /* ADR-0037 D3 + R4 (2단계) — interactive mode (sandboxed iframe). normal 의
-     DocumentNode 와 동일 정책: iframe 가 host 의 padding 영역 가득 + eyebrow
-     숨김. R4: style:height inline 으로 content height 받고 host 가 scroll. */
-  .document-iframe {
+  /* ADR-0037 amend — rendered HTML is isolated in a sandboxed iframe. */
+  .document-html-frame {
     display: block;
-    flex: 0 0 auto;
+    flex: 1 1 auto;
     width: 100%;
-    min-height: 300px;
+    height: 100%;
+    min-height: 100%;
     border: 0;
     background: #ffffff;
   }
-  .document-body-host:has(.document-iframe) {
+  .document-body-host:has(.document-html-frame) {
     padding: 0;
-    overflow: auto;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
   }
-  .document-body-host:has(.document-iframe) .document-eyebrow {
+  .document-body-host:has(.document-html-frame) .document-eyebrow {
     display: none;
   }
 
   /* ADR-0018 D10 amend ⑦ (2026-05-22) — PDF iframe (browser-native viewer).
-     interactive HTML iframe 과 달리 height auto-fit 안 함 — PDF plugin 의
+     rendered HTML iframe 과 달리 height auto-fit 안 함 — PDF plugin 의
      internal scroll + multi-page nav 사용. host 100% 채우고 padding 제거. */
   .document-pdf {
     display: block;

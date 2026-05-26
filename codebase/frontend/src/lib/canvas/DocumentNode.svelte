@@ -34,10 +34,8 @@
     isToggleableFileType,
     getNextViewMode,
     getNextViewModeLabel,
-    INTERACTIVE_IFRAME_SANDBOX,
-    IFRAME_HEIGHT_MESSAGE_TAG,
-    buildInteractiveSrcdoc,
-    type DocumentViewMode,
+    RENDERED_HTML_IFRAME_SANDBOX,
+    buildRenderedHtmlSrcdoc,
   } from './documentRender';
   import type { CanvasItem, DocumentItem } from '$lib/types/canvas';
 
@@ -74,7 +72,7 @@
     sourcePosition?: unknown;
     targetPosition?: unknown;
     /** Svelte Flow 가 drag 중에만 true 로 set. iframe pointer-events 차단의
-     *  reactive 신호 — drag 중 mouse 가 PDF / interactive iframe 위로 들어가
+     *  reactive 신호 — drag 중 mouse 가 PDF / HTML iframe 위로 들어가
      *  iframe 의 plugin / sandbox 가 event capture → 부모 drag mousemove/up
      *  미도달 회귀 회피 (2026-05-22 사용자 보고, PDF 주로). */
     dragging?: boolean;
@@ -142,7 +140,7 @@
     }
   });
 
-  /** ADR-0018 D10 amend ③/④/⑤/⑥ + ADR-0037 — markdown/html viewer + 3-mode
+  /** ADR-0018 D10 amend ③/④/⑤/⑥ + ADR-0037 — markdown/html viewer + 2-mode
    *  toggle. helper + viewMode store 가 외부화 — DocumentNode (normal) 와
    *  MaximizedItemModal (maximize) 가 *같은 store* 의 같은 itemId 를 구독해
    *  rendering + 전이 + persist 동기화. normal↔maximize 전환 + unmount/remount
@@ -150,49 +148,8 @@
   const viewMode = $derived(documentViewModeStore.get(data.id));
   const canToggleView = $derived(isToggleableFileType(fileTypeLabel));
   const nextViewModeLabel = $derived(getNextViewModeLabel(viewMode, fileTypeLabel));
-  /** 'interactive' 는 fileType=html 일 때만 의미. fileType 가 바뀌면 reset. */
-  $effect(() => {
-    if (viewMode === 'interactive' && fileTypeLabel !== 'html') {
-      documentViewModeStore.set(data.id, 'rendered');
-    }
-  });
-
-  /** ADR-0037 R4 (2단계) — iframe content height auto-fit via postMessage.
-   *  iframe 안 inline probe script 가 ResizeObserver + load 시점에 parent
-   *  로 height 보내고, parent (본 컴포넌트) 가 받아서 iframe style.height
-   *  에 반영. cap = panel 의 max-height (CSS 의 max-height:100%). */
-  let iframeRef = $state<HTMLIFrameElement | null>(null);
-  let iframeContentHeight = $state<number | null>(null);
-  const interactiveSrcdoc = $derived(buildInteractiveSrcdoc(data.content ?? ''));
-  const interactiveSrcdocAsset = $derived(buildInteractiveSrcdoc(assetPreviewText ?? ''));
-
-  $effect(() => {
-    function onMessage(e: MessageEvent): void {
-      // sandbox 의 unique opaque origin 이라 origin 검사 의미 X. source 검증
-      // 으로 *우리* iframe 의 postMessage 만 accept — 다른 page 의 message
-      // (예: 외부 widget) 차단.
-      if (iframeRef === null || e.source !== iframeRef.contentWindow) return;
-      const data = e.data as Record<string, unknown> | null;
-      if (data === null || typeof data !== 'object') return;
-      const h = data[IFRAME_HEIGHT_MESSAGE_TAG];
-      if (typeof h === 'number' && h > 0 && h < 50000) {
-        iframeContentHeight = h;
-      }
-    }
-    window.addEventListener('message', onMessage);
-    return () => window.removeEventListener('message', onMessage);
-  });
-
-  /** viewMode 가 interactive 가 아닐 때 height state reset. */
-  $effect(() => {
-    if (viewMode !== 'interactive') {
-      iframeContentHeight = null;
-    }
-  });
-
-  const iframeHeightStyle = $derived(
-    iframeContentHeight !== null ? `${iframeContentHeight}px` : '100%',
-  );
+  const renderedHtmlSrcdoc = $derived(buildRenderedHtmlSrcdoc(data.content ?? ''));
+  const renderedHtmlSrcdocAsset = $derived(buildRenderedHtmlSrcdoc(assetPreviewText ?? ''));
   // Inline content (data.content) 의 mime 추정은 markdown 으로 기본 — fileTypeLabel
   // 이 'markdown' 이면 marked parse, 'html' 이면 sanitize only.
   function renderContent(raw: string): string {
@@ -215,7 +172,7 @@
     return mime.startsWith('text/') || mime === 'application/json';
   });
   /** ADR-0018 D10 amend ⑦ — PDF asset 은 browser-native PDF viewer 로 iframe
-   *  렌더. ADR-0037 의 sandbox-격리 HTML interactive 와 다른 mental model:
+   *  렌더. ADR-0037 의 sandbox-격리 HTML rendered 와 다른 mental model:
    *  PDF plugin 은 same-origin context 가 필요 (sandbox=allow-scripts 만 주면
    *  browser internal PDF viewer 미작동). single-user trust + same-origin
    *  endpoint 라 안전. text fetch 안 함 (binary). */
@@ -519,6 +476,22 @@
     e.stopPropagation();
   }
 
+  function interceptRenderedLinks(node: HTMLElement): { destroy: () => void } {
+    function onClick(e: MouseEvent): void {
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+      const anchor = target.closest('a[href]') as HTMLAnchorElement | null;
+      if (anchor === null || !node.contains(anchor)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      window.open(anchor.href, '_blank', 'noopener,noreferrer');
+    }
+    node.addEventListener('click', onClick);
+    return {
+      destroy: () => node.removeEventListener('click', onClick),
+    };
+  }
+
   /**
    * ADR-0018 D10 amend ⑧ 보강 (2026-05-22) — drag 중 iframe pointer-events
    * 차단의 *reactive bypass*. 기존 `class:drag-isolated={dragging}` 는 Svelte
@@ -541,7 +514,7 @@
    */
   function isolateLocalIframes(root: HTMLElement): void {
     const iframes = root.querySelectorAll<HTMLIFrameElement>(
-      'iframe.doc-iframe, iframe.doc-pdf',
+      'iframe.doc-html-frame, iframe.doc-pdf',
     );
     if (iframes.length === 0) return;
     iframes.forEach((f) => {
@@ -637,9 +610,8 @@
       {#if !isLocked}
         <div class="doc-actions">
           {#if canToggleView}
-            <!-- ADR-0037 D1/D4 — markdown 은 2-mode (rendered↔source),
-                 html 은 3-mode cyclic (rendered→interactive→source→rendered).
-                 icon = next mode 의 힌트 (사용자 click 시 가는 곳). -->
+            <!-- ADR-0037 amend — markdown/html use one 2-mode rendered↔source
+                 transition. The icon hints the next mode. -->
             <button
               type="button"
               class="doc-btn nodrag"
@@ -652,12 +624,7 @@
               }}
               onmousedown={(e: MouseEvent) => e.stopPropagation()}
             >
-              {#if viewMode === 'rendered' && fileTypeLabel === 'html'}
-                <!-- play (run interactively) -->
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
-                  <polygon points="6 4 20 12 6 20"/>
-                </svg>
-              {:else if viewMode === 'source'}
+              {#if viewMode === 'source'}
                 <!-- book-open (show rendered) — visibility eye 와 겹침 회피. -->
                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
                   <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
@@ -764,24 +731,23 @@
         </div>
       {:else if isInline}
         <div class="eyebrow">Inline document</div>
-        <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — markdown/html rendered or
-             interactive (sandboxed iframe, html 만) or source. -->
+        <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — markdown/html rendered
+             or source. HTML rendered is sandboxed iframe. -->
         {#if viewMode === 'source'}
           <pre class="doc-source">{data.content ?? ''}</pre>
-        {:else if viewMode === 'interactive' && fileTypeLabel === 'html'}
+        {:else if fileTypeLabel === 'html'}
           <!-- svelte-ignore a11y_missing_attribute -->
           <iframe
-            bind:this={iframeRef}
-            class="doc-iframe"
+            class="doc-html-frame"
             class:drag-isolated={dragging}
-            sandbox={INTERACTIVE_IFRAME_SANDBOX}
+            sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+            title={data.file_name}
             referrerpolicy="no-referrer"
             loading="lazy"
-            srcdoc={interactiveSrcdoc}
-            style:height={iframeHeightStyle}
+            srcdoc={renderedHtmlSrcdoc}
           ></iframe>
         {:else}
-          <div class="doc-md">{@html inlineHtml}</div>
+          <div class="doc-md" use:interceptRenderedLinks>{@html inlineHtml}</div>
         {/if}
       {:else if isPdfAsset}
         <!-- ADR-0018 D10 amend ⑦ — PDF iframe via browser-native plugin.
@@ -805,20 +771,19 @@
         {:else if assetPreviewText !== null && (assetPreviewText.trim().length > 0)}
           {#if viewMode === 'source'}
             <pre class="doc-source">{assetPreviewText}</pre>
-          {:else if viewMode === 'interactive' && fileTypeLabel === 'html'}
+          {:else if fileTypeLabel === 'html'}
             <!-- svelte-ignore a11y_missing_attribute -->
             <iframe
-              bind:this={iframeRef}
-              class="doc-iframe"
+              class="doc-html-frame"
               class:drag-isolated={dragging}
-              sandbox={INTERACTIVE_IFRAME_SANDBOX}
+              sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+              title={data.file_name}
               referrerpolicy="no-referrer"
               loading="lazy"
-              srcdoc={interactiveSrcdocAsset}
-              style:height={iframeHeightStyle}
+              srcdoc={renderedHtmlSrcdocAsset}
             ></iframe>
           {:else}
-            <div class="doc-md">{@html assetHtml}</div>
+            <div class="doc-md" use:interceptRenderedLinks>{@html assetHtml}</div>
           {/if}
         {:else}
           <div class="asset-summary">
@@ -1068,31 +1033,30 @@
     overflow-wrap: anywhere;
   }
 
-  /* ADR-0037 D3 + R4 (2단계) — interactive mode (sandboxed iframe). iframe 가
-     doc-body 의 padding 영역 가득 채우고 eyebrow 는 숨김. :has() 로 dedicated
-     branch CSS — markup churn 없이 layout 분기. R4: content height 를
-     style:height inline 으로 받고 max-height 으로 panel 안에서 cap →
-     content 크면 panel 안 scroll, 작으면 content 만큼만 (위 빈 공간 X). */
-  .doc-iframe {
+  /* ADR-0037 amend — rendered HTML lives in a sandboxed iframe. The iframe
+     fills the document body and keeps standalone document styles away from
+     the app DOM. */
+  .doc-html-frame {
     display: block;
-    flex: 0 0 auto;
+    flex: 1 1 auto;
     width: 100%;
-    min-height: 200px;
+    height: 100%;
+    min-height: 100%;
     border: 0;
     background: #ffffff;
   }
-  .doc-body:has(.doc-iframe) {
+  .doc-body:has(.doc-html-frame) {
     padding: 0;
-    overflow: auto;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
   }
-  .doc-body:has(.doc-iframe) .eyebrow {
+  .doc-body:has(.doc-html-frame) .eyebrow {
     display: none;
   }
 
   /* ADR-0018 D10 amend ⑦ (2026-05-22) — PDF iframe (browser-native viewer).
-     interactive HTML iframe (ADR-0037) 와 달리 height auto-fit 안 함:
+     rendered HTML iframe (ADR-0037) 와 달리 height auto-fit 안 함:
      PDF plugin 이 자체 internal scroll + multi-page navigation 제공 →
      host 영역 100% 채우고 PDF viewer 가 scroll 책임. host overflow 는
      hidden (외부 scroll 미발생). */
@@ -1112,14 +1076,14 @@
 
   /* ADR-0018 D10 amend ⑧ (2026-05-22, 사용자 보고 #drag-iframe-capture) —
      drag 중 iframe pointer-events 차단. iframe (PDF plugin / sandbox 안의
-     interactive HTML) 은 자체 browsing context 라 부모의 mouse event 와
+     rendered HTML) 은 자체 browsing context 라 부모의 mouse event 와
      분리. drag 중 mouse 가 iframe 위로 들어가면 iframe 이 event capture →
      부모 (xyflow) 의 drag mousemove/mouseup 미도달 → drag 가 멈춰버림.
      `dragging` prop 이 true 인 동안 iframe 의 pointer-events 만 차단 →
      mouse event 가 iframe 통과해 부모 wrapper 가 catch. drag 종료 후 즉시
-     복원. PDF / interactive HTML 양쪽 동일 fix. */
+     복원. PDF / rendered HTML 양쪽 동일 fix. */
   .doc-pdf.drag-isolated,
-  .doc-iframe.drag-isolated {
+  .doc-html-frame.drag-isolated {
     pointer-events: none;
   }
 
