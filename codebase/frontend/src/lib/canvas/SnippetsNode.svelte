@@ -24,6 +24,7 @@
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { snippetEditPanel } from '$lib/stores/snippetEditPanel.svelte';
   import { snippetDeleteDialog } from '$lib/stores/snippetDeleteDialog.svelte';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import type { CanvasItem, SnippetEntry, SnippetsItem } from '$lib/types/canvas';
 
   interface SnippetsNodeData {
@@ -103,8 +104,8 @@
   }
 
   async function copyBody(entry: SnippetEntry): Promise<void> {
-    try {
-      await navigator.clipboard.writeText(entry.body);
+    const result = await copyTextToSystemClipboard(entry.body);
+    if (result.ok) {
       // Pill green flash — 200ms (v8 §12).
       if (copiedTimer !== null) clearTimeout(copiedTimer);
       copiedEntryId = entry.id;
@@ -121,9 +122,9 @@
         tone: 'success',
         durationMs: 2_000,
       });
-    } catch {
+    } else {
       toastStore.show({
-        message: 'Failed to copy — clipboard permission denied',
+        message: 'Clipboard blocked by browser security. Use HTTPS or select/copy manually.',
         tone: 'error',
       });
     }
