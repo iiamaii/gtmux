@@ -343,6 +343,10 @@
     await sessionStore.applyDeletion([data.id], { killTerminal: false });
   }
 
+  function onBodyWheel(e: WheelEvent): void {
+    e.stopPropagation();
+  }
+
 </script>
 
 {#if isVisible}
@@ -474,7 +478,7 @@
          renders (same size/shape as the non-empty case) so the body chrome
          stays consistent. Edit/add form lives in the floating
          SnippetEditPanel, anchored to the trigger element. -->
-    <div class="snip-body" role="group">
+    <div class="snip-body nowheel" role="group" onwheel={onBodyWheel}>
         {#each entries as entry (entry.id)}
           <!-- Single pill atom. Click action depends on the node's viewMode
                (cycled via head mode button): idle=copy, edit=panel, delete=
@@ -552,7 +556,7 @@
          with Canvas wrapper's `.svelte-flow__node.m-selected` ring.
        - `overflow: visible`: NodeResizer handles sit at element corners with
          half-inside/half-outside positioning; overflow:hidden would clip them.
-         Body strip handles its own overflow:hidden for pill wrap clipping. */
+         Body strip owns its own scroll overflow for dense badge collections. */
   .snippets-node {
     box-sizing: border-box;
     position: relative;
@@ -714,13 +718,15 @@
   /* Body — pill flow */
   .snip-body {
     padding: 10px 12px;
-    overflow: hidden;
+    overflow: auto;
+    overscroll-behavior: contain;
     position: relative;
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
     align-content: flex-start;
     min-height: 0;
+    scrollbar-width: thin;
   }
 
   /* Single integrated pill. Hover grows right padding to make room for the

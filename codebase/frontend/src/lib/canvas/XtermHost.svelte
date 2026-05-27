@@ -37,7 +37,7 @@
   import { encodePaneIn, encodePaneResize, FRAME_TYPE } from '$lib/ws/decode';
   import { debugCount } from '$lib/common/debugCounts';
   import { themeStore } from '$lib/stores/theme.svelte';
-  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
+  import { registerTerminalCopyProvider } from '$lib/keyboard/terminalCopyShortcut';
   import type { WsClient } from '$lib/ws/client';
 
   // paneId 는 항상 numeric (legacy `%N` 의 N 또는 0x88 binding 으로 얻은 PaneId).
@@ -64,16 +64,6 @@
    *  synthetic event redispatch. WeakSet 으로 synth 재진입 차단. */
   const synthSet = new WeakSet<Event>();
   const MOUSE_TYPES = ['mousedown', 'mousemove', 'mouseup', 'click', 'contextmenu', 'dblclick'] as const;
-
-  function isTerminalCopyShortcut(e: KeyboardEvent): boolean {
-    return (e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'c';
-  }
-
-  async function copyTextToClipboard(text: string): Promise<void> {
-    if (text.length === 0) return;
-    const result = await copyTextToSystemClipboard(text);
-    if (!result.ok) throw new Error(result.reason ?? 'Clipboard copy failed');
-  }
 
   function relayMouse(e: MouseEvent): void {
     if (synthSet.has(e)) return;
@@ -140,6 +130,7 @@
   $effect(() => {
     // containerEl 이 아직 bind 되지 않은 첫 tick 보호.
     if (!containerEl) return;
+    const hostEl = containerEl;
     // paneId 가 정수 파싱 실패 (NaN) 면 송신 채널을 disable — 입력은 무시.
     const paneIdNumLocal = paneIdNum;
     const paneIdValid = Number.isInteger(paneIdNumLocal) && paneIdNumLocal > 0;
@@ -172,22 +163,13 @@
       containerEl.addEventListener(type, relayMouse, { capture: true });
     }
 
-    function onTerminalKeyDown(e: KeyboardEvent): void {
-      if (!isTerminalCopyShortcut(e)) return;
-      e.preventDefault();
-      e.stopImmediatePropagation();
-      const selectedText = term.getSelection();
-      if (selectedText.length > 0) {
-        void copyTextToClipboard(selectedText).catch((err) => {
-          console.debug('[gtmux] terminal copy failed', err);
-        });
-      }
-    }
-
-    // Ctrl/Cmd+Shift+C conflicts with browser DevTools inspect shortcuts.
-    // Scope the interception to xterm only, then copy xterm's internal
-    // selection instead of letting the browser default action run.
-    containerEl.addEventListener('keydown', onTerminalKeyDown, { capture: true });
+    const unregisterTerminalCopyProvider = registerTerminalCopyProvider({
+      containsFocus: () => {
+        const active = document.activeElement;
+        return active instanceof Node && hostEl.contains(active);
+      },
+      getSelection: () => term.getSelection(),
+    });
 
     // PaneOut 등록 — WS dispatcher 가 이 paneId 로 도착한 PANE_OUT(0x02) 을 본
     // 핸들러로 라우팅. `cb` 는 R2 F4 백프레셔 watermark 갱신 콜백 (term.write 가
@@ -312,8 +294,8 @@
         for (const type of MOUSE_TYPES) {
           containerEl.removeEventListener(type, relayMouse, { capture: true });
         }
-        containerEl.removeEventListener('keydown', onTerminalKeyDown, { capture: true });
       }
+      unregisterTerminalCopyProvider();
       termRef = null;
       term.dispose();
     };
