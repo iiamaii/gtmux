@@ -717,6 +717,7 @@
 
   /* Body — pill flow */
   .snip-body {
+    box-sizing: border-box;
     padding: 10px 12px;
     overflow: auto;
     overscroll-behavior: contain;
@@ -734,6 +735,7 @@
      Click behavior is driven by parent viewMode — pill itself is the only
      click target (the indicator span is pointer-events:none). */
   .snip-pill {
+    box-sizing: border-box;
     position: relative;
     display: inline-flex;
     align-items: center;
@@ -748,7 +750,8 @@
     letter-spacing: 0;
     line-height: 1.4;
     cursor: pointer;
-    max-width: 200px;
+    max-width: min(200px, 100%);
+    min-width: 0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -790,6 +793,7 @@
     background: color-mix(in srgb, var(--color-danger) 28%, transparent);
   }
   .snip-pill-text {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
