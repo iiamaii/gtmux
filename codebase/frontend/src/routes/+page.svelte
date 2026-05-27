@@ -40,6 +40,7 @@
   import { bindChromeShortcuts } from '$lib/keyboard/chromeShortcuts.svelte';
   import { bindGroupShortcuts } from '$lib/keyboard/groupShortcuts.svelte';
   import { bindClipboardShortcuts } from '$lib/keyboard/clipboardShortcuts.svelte';
+  import { bindGlobalTerminalCopyShortcut } from '$lib/keyboard/terminalCopyShortcut';
   import { bindEditingShortcuts } from '$lib/keyboard/editingShortcuts.svelte';
   import { bindToolShortcuts } from '$lib/keyboard/toolShortcuts.svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
@@ -143,6 +144,7 @@
   let unbindChromeShortcuts: (() => void) | null = null;
   let unbindGroupShortcuts: (() => void) | null = null;
   let unbindClipboardShortcuts: (() => void) | null = null;
+  let unbindGlobalTerminalCopyShortcut: (() => void) | null = null;
   let unbindEditingShortcuts: (() => void) | null = null;
   let unbindToolShortcuts: (() => void) | null = null;
   let unbindSystemTheme: (() => void) | null = null;
@@ -268,6 +270,9 @@
     unbindGroupShortcuts = bindGroupShortcuts();
     // Clipboard shortcuts (Cmd+C / Cmd+X / Cmd+V) — ADR-0030 D5/D7 + ADR-0017 D6 amend ⑤ (b).
     unbindClipboardShortcuts = bindClipboardShortcuts();
+    // Terminal copy shortcut (Cmd/Ctrl+Shift+C) — capture-phase ownership to
+    // block browser DevTools inspect while preserving xterm selection copy.
+    unbindGlobalTerminalCopyShortcut = bindGlobalTerminalCopyShortcut();
     // Editing shortcuts (Cmd+A select-all) — ADR-0017 D6 amend ⑤ (a) / amend ⑦.
     unbindEditingShortcuts = bindEditingShortcuts();
     // Tool shortcuts (V/H/R/O/L/P/T/N/S/D/I/F) — ADR-0017 D6 amend ⑫.
@@ -421,6 +426,10 @@
     if (unbindClipboardShortcuts !== null) {
       unbindClipboardShortcuts();
       unbindClipboardShortcuts = null;
+    }
+    if (unbindGlobalTerminalCopyShortcut !== null) {
+      unbindGlobalTerminalCopyShortcut();
+      unbindGlobalTerminalCopyShortcut = null;
     }
     if (unbindEditingShortcuts !== null) {
       unbindEditingShortcuts();
