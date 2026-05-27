@@ -281,12 +281,12 @@
     );
   }
 
-  // Minimum size — body must fit at least one row of badges:
-  //   width  = body padding (12+12) + one short badge (~70) + gap (6) + [+] (28) ≈ 130
+  // Minimum size — body must fit at least one row of badges and the always-on
+  // header action cluster without fractional compacting artifacts.
+  //   width  = 200, above the 180px compact header threshold
   //   height = head (30) + body padding (10+10) + pill (22) ≈ 72 → 75 with breathing
-  // Below these the body wraps awkwardly or the head clips. NodeResizer prop +
-  // applyMutation clamp use the same constants so both code paths agree.
-  const SNIPPETS_RESIZE_MIN_W = 140;
+  // NodeResizer prop + applyMutation clamp use the same constants so both code paths agree.
+  const SNIPPETS_RESIZE_MIN_W = 200;
   const SNIPPETS_RESIZE_MIN_H = 75;
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
