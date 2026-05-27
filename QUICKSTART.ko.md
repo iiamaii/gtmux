@@ -6,9 +6,6 @@
 > canvas 에 접속하기까지의 1회용 가이드. 설치, 두 가지 실행 모드
 > (Local / Cloud), config 작성, auth handshake, UI 안에서 첫 session
 > 만들기까지 한 번에 다룬다.
->
-> Reverse proxy · systemd · TLS 등 운영 단계 가이드는
-> [`docs/deploy.md`](docs/deploy.md) 참조.
 
 ---
 
@@ -17,8 +14,7 @@
 - gtmux 본체는 **TLS 종단을 직접 처리하지 않는다**. `bind = 0.0.0.0` 으로
   인터넷에 직접 노출하면 토큰·쿠키가 **평문 HTTP** 로 전송된다. 본 문서의
   절차는 신뢰 네트워크 (LAN / VPN / Tailscale) 만 가정한다. 인터넷 직접
-  노출이 필요하면 `docs/deploy.md` §3 의 Caddy/nginx + ACME reverse proxy
-  경로를 따른다.
+  노출이 필요하면 HTTPS reverse proxy 뒤에 둔다.
 - 단일 사용자 — 본인 1명이 본인 인스턴스에 접속.
 - Localhost 전용 (`bind = "127.0.0.1"`, 기본값) 은 cloud 설정도 TLS 도
   필요 없다.
@@ -95,7 +91,7 @@ gtmux local ready
   Bind:         127.0.0.1:9001
   Open URL:     http://127.0.0.1:9001/auth/bootstrap?token=<hex>
   Token path:   ~/.local/state/gtmux/local.token (0600)
-  Backend:      PtyBackend (ADR-0013, supervisor pid=<n>)
+  Backend:      PtyBackend (supervisor pid=<n>)
 ```
 
 Local 모드의 특징:
@@ -245,7 +241,7 @@ dialog** 가 나타나 session 을 선택 또는 생성하라고 묻는다.
 ## 6) Background / 장기 실행
 
 `gtmux start` 는 기본적으로 foreground 프로세스다. 터미널을 닫아도
-계속 띄워두는 방법 3가지.
+계속 띄워두는 방법 2가지.
 
 ### 6.1 `nohup` (가장 간단)
 
@@ -262,22 +258,10 @@ tail -f ~/.local/state/gtmux/local.log   # bootstrap URL 확인
 
 Cloud 도 동일 — `--config ~/.config/gtmux/prod.config.toml` 만 추가.
 
-### 6.2 `tmux` / `screen` 안에서 실행
+### 6.2 systemd (장기 운영 권장)
 
-Banner 와 log 를 직접 보존하고 싶을 때:
-
-```bash
-tmux new -s gtmux-local
-cd codebase
-GTMUX_FRONTEND_DIST="$PWD/frontend/dist" gtmux start --session local
-# detach: Ctrl-b d
-tmux attach -t gtmux-local
-```
-
-### 6.3 systemd (장기 운영 권장)
-
-User-level unit + auto-restart + journal 로그. Template 은
-`docs/deploy.md` §3.7.
+장기 운영에는 auto-restart 와 journal 로그가 있는 user-level service 를
+사용한다.
 
 어떤 방식으로 띄웠든 종료는 항상 다음 명령을 쓴다:
 
@@ -322,13 +306,8 @@ gtmux rotate-token --session prod       # cloud 모드 token 회전
 | 재방문 시 `Forbidden` | 쿠키 만료 / 삭제 | 가장 최근 `gtmux start` 의 banner URL 다시 열기 |
 | `gtmux` 가 기동 거부 | root (`EUID == 0`) 실행 | 일반 유저로 |
 
-상세 운영 가이드: [`docs/deploy.md`](docs/deploy.md).
-
----
-
 ## 다음 단계
 
 - [`USAGE.ko.md`](USAGE.ko.md) — main canvas 사용 설명서 (session
   관리, architecture, 모든 toolbar tool, Group 기능).
-- [`README.ko.md`](README.ko.md) — project 개요 + 설계 docs 링크
-  (`docs/sketch.md`, ADR, plan).
+- [`README.ko.md`](README.ko.md) — project 개요와 문서 안내.

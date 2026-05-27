@@ -1,45 +1,132 @@
 # gtmux
 
 > **English** · [한국어](README.ko.md)
->
-> Single-user web-canvas workspace. A Rust supervisor spawns PTY-backed
-> shells and lays each one out as a draggable panel on an infinite
-> canvas served from one process behind a per-session cookie.
+
+**gtmux is a single-user web canvas for terminal-centered work.**
+It runs a local or private-cloud Rust server, spawns PTY-backed shells,
+and lets you arrange terminals, notes, snippets, documents, images,
+shapes, and file references on an infinite browser canvas.
+
+It is designed for people who live in terminals but need more spatial
+context than a tab list: operators, developers, SREs, researchers, and
+anyone who keeps several command lines, notes, runbooks, and references
+open while working through a task.
 
 ```
-You → browser → gtmux server (Rust, axum + tokio) → PTY pool → your shells
-                            ↓
-                  canvas with Terminal panels,
-                  shapes, notes, snippets,
-                  documents, images, file refs.
+Browser canvas
+  ├─ Terminal panels      live PTY shells rendered with xterm.js
+  ├─ Snippets             one-click reusable commands/text blocks
+  ├─ Notes & documents    markdown, PDFs, file references, images
+  ├─ Shapes & text        visual grouping and lightweight diagrams
+  └─ Groups & layers      structure, visibility, locking, z-order
+
+          HTTP + WebSocket
+                │
+                ▼
+gtmux server: Rust · axum · tokio · portable-pty
 ```
 
 ---
 
-## What it is
+## Why It Exists
 
-A web app that turns one PTY-backed shell session into a Figma-style
-infinite canvas. You drop Terminal panels, sticky notes, shapes,
-images, snippet collections, and documents anywhere on the canvas;
-groups behave like layer-tree containers; auth and persistence are
-scoped to a named *session* that lives at
-`${XDG_STATE_HOME}/gtmux/<session>.json`.
+Terminal work is rarely just one terminal. A real task often has:
 
-There is no tmux at runtime (despite the name). The PTY supervisor
-lives inside the gtmux binary itself — see [`docs/adr/0013-pty-direct-no-tmux.md`](docs/adr/0013-pty-direct-no-tmux.md).
+- a running server, a database shell, a log tail, and a deploy command;
+- notes about the current incident or experiment;
+- commands that should be copied accurately, not retyped;
+- files, screenshots, diagrams, and references that explain what is
+  happening;
+- multiple related work areas that should stay visually separate.
+
+gtmux turns that into a persistent workspace. Instead of remembering
+which terminal tab was which, you place panels where they make sense,
+group related work, attach notes and snippets near the relevant shell,
+and return later to the same layout.
 
 ---
 
-## Quick install
+## What You Can Do
 
-Detailed flow (Local + Cloud, auth, first session) is in
-[QUICKSTART.md](QUICKSTART.md). The 30-second version:
+- **Run real shells in the browser.** Terminal panels are backed by PTYs
+  managed by the gtmux server. They survive browser reloads and
+  WebSocket reconnects while the server process is alive.
+- **Work spatially.** Drag, resize, group, hide, lock, minimize,
+  maximize, and reorder items on an infinite canvas.
+- **Keep commands close.** Snippet collections store reusable command or
+  text blocks as badges. Click a badge to copy its body.
+- **Document as you go.** Add notes, markdown documents, PDFs, images,
+  file paths, shapes, free-draw marks, and text labels next to the
+  terminals they explain.
+- **Organize complex tasks.** Use groups and the layer tree to keep
+  workflows tidy without mixing visual layout with terminal process
+  lifecycle.
+- **Recover from normal interruptions.** Reconnect banners, attach
+  recovery, terminal ring buffers, and persistent layout files make
+  browser refreshes and short network drops less disruptive.
+- **Move layouts around.** Import/export session JSON for backups or
+  templates. Live terminal output and uploaded asset bytes are not
+  bundled in exports.
+
+---
+
+## Convenience And Expected Benefits
+
+gtmux is not trying to replace your shell. It gives your shell work a
+workspace.
+
+- **Less context switching:** terminal, notes, snippets, and references
+  stay in one visual surface.
+- **Fewer command mistakes:** frequently used snippets can be copied
+  from named badges instead of being retyped from memory.
+- **Better task recall:** spatial layout, labels, notes, and groups make
+  it easier to remember what each terminal was doing.
+- **Cleaner handoff to yourself:** export layouts, keep runbooks near
+  command panels, and return to long-running work without reconstructing
+  the screen from scratch.
+- **Lower local setup overhead:** one Rust process serves the frontend,
+  HTTP API, WebSocket stream, auth, layout persistence, and PTY
+  supervisor.
+
+---
+
+## Technology Stack
+
+### Backend
+
+- **Rust 1.85**
+- **axum 0.8** and **tower/tower-http** for HTTP, static serving,
+  middleware, CORS, Host validation, and API routing
+- **tokio 1.52** for async runtime, process handling, IO, signals, and
+  timers
+- **tokio-tungstenite** for WebSocket transport
+- **portable-pty** for cross-platform PTY-backed child shells
+- **serde / serde_json** for layout and API data
+- **figment + TOML** for configuration
+- **argon2** for password-mode credential storage
+- **utoipa + openapi-typescript** for OpenAPI-driven frontend types
+
+### Frontend
+
+- **Svelte 5**, **TypeScript 5.9**, **Vite 7**
+- **@xyflow/svelte** for the canvas/node interaction foundation
+- **xterm.js 6** with fit and Unicode 11 addons for terminal rendering
+- **marked + DOMPurify** for sanitized markdown document rendering
+- **lucide-svelte** for UI icons
+- OpenAPI-generated API types shared from the backend contract
+
+---
+
+## Quick Start
+
+Full setup instructions are in [QUICKSTART.md](QUICKSTART.md). The
+short version:
 
 ```bash
 git clone https://github.com/iiamaii/gtmux.git
 cd gtmux/codebase
 
-make codegen                      # OpenAPI → TS types
+make codegen
 ( cd frontend && npm install --no-audit --no-fund && npm run build )
 ( cd backend  && cargo build --workspace --release )
 
@@ -47,75 +134,61 @@ GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
 ./backend/target/release/gtmux start --session demo
 ```
 
-Open the `Open URL: …token=…` line printed on stdout once. After that,
-bookmark `http://127.0.0.1:9001/`.
+Open the `Open URL: .../auth/bootstrap?token=...` line printed by the
+server once. After the cookie is issued, use the normal root URL such as
+`http://127.0.0.1:9001/`.
 
 ---
 
-## What's on screen
+## Local And Cloud Modes
 
-[USAGE.md](USAGE.md) is the full walkthrough. The short version:
+gtmux is single-user software. It is intended for:
 
-- **Toolbar** — 12 tools in 4 semantic groups:
-  - Mode: **Select (V)**, **Hand (H)**.
-  - Terminal: **Terminal (T)** — spawn a PTY-backed panel.
-  - Figures: **Rectangle (R)**, **Ellipse (O)**, **Line (L)**,
-    **Free draw (P)**, **Text (T)**.
-  - Content: **Note (N)**, **Snippets**, **Document (D)**,
-    **Image (I)**, **File path (F)**.
-  - Plus **Undo (⌘Z)** / **Redo (⇧⌘Z)** and the **Q-lock** indicator.
-- **Session management** — active-session dropdown + titlebar Session
-  menu (New / List / Import / Export / Rotate token / Settings /
-  Shutdown / Logout).
-- **Group feature** — Figma-style layer tree, drag-reparent,
-  AND-visibility / OR-lock propagation, sub-tree clipboard, z-index
-  separated from tree order.
-- **Architecture** — single gtmux process hosting (a) HTTP/WS server,
-  (b) terminal-server PTY supervisor with one broadcast channel per
-  Terminal, (c) the Svelte 5 web app. Multiple Terminal *panels* can
-  mirror one *Terminal* (1 PTY ↔ N panels).
+- **Local mode:** bind to `127.0.0.1`, run on your own machine, no TLS
+  required.
+- **Private cloud mode:** bind to a trusted LAN/VPN/Tailscale interface
+  with explicit CORS and Host allowlists.
+- **Public internet exposure:** put gtmux behind a proper HTTPS reverse
+  proxy. Do not expose plaintext HTTP with tokens and cookies to the
+  public internet.
+
+See [QUICKSTART.md](QUICKSTART.md) for the local/cloud setup flow.
 
 ---
 
-## CLI reference
+## Documentation Map
 
-```
-gtmux start    --session <name> [--port N] [--workspace PATH] [--config PATH]
-gtmux stop     --session <name> [--force]
-gtmux teardown --session <name> [--force] [--keep-state] [--keep-config]
-gtmux status   [--session <name>]
-gtmux rotate-token --session <name>
-gtmux set-password / gtmux reset-password
-```
-
-Run `gtmux <subcommand> --help` for full flags.
+- [QUICKSTART.md](QUICKSTART.md) — install, config, auth, first session
+- [USAGE.md](USAGE.md) — full UI walkthrough after sign-in
 
 ---
 
-## Repository layout
+## Repository Layout
 
 ```
 codebase/
-  backend/     Rust workspace (axum 0.8 + tokio).
-               crates/{ws-server, http-api, config, auth, pty-backend}
+  backend/     Rust workspace
+               crates/{http-api, ws-server, auth, config, pty-backend}
                bin/{gtmux-cli, gen-openapi}
-  frontend/    Svelte 5 + Vite 7 + TypeScript app (ADR-0012).
-  shared/      Machine-only handoff (openapi.yaml + generated TS types).
-  smoke/       Integration smoke scripts.
-  Makefile     codegen / build / test / smoke / clean.
+  frontend/    Svelte 5 + Vite + TypeScript browser app
+  shared/      Generated OpenAPI handoff files
+  smoke/       Integration smoke scripts
+  Makefile     codegen / build / test / smoke / clean
 ```
 
 ---
 
-## Project status
+## Project Status
 
-Active development — multi-session pivot (plan-0007) on Stage 5+, with
-the Session attach-recovery + delete-UI layers landing under
-[ADR-0019](docs/adr/0019-session-and-workspace-model.md).
+gtmux is under active development. Core terminal panels, session
+management, canvas layout, groups, snippets, documents, assets,
+import/export, auth, reconnect handling, and local/cloud startup paths
+are implemented, but the project should still be treated as evolving
+software rather than a stable production platform.
 
 ---
 
 ## License
 
-Dual-licensed under **MIT OR Apache-2.0**, matching the Cargo workspace
-metadata. Pick whichever fits downstream use.
+Dual-licensed under **MIT OR Apache-2.0**, matching the Rust workspace
+metadata.

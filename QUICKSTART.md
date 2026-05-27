@@ -7,9 +7,6 @@
 > (Local / Cloud), config, the auth handshake, and creating your first
 > session inside the UI.
 >
-> For full operational guidance (reverse proxy, systemd, TLS) see
-> [`docs/deploy.md`](docs/deploy.md).
-
 ---
 
 ## ⚠ Security baseline
@@ -17,8 +14,8 @@
 - gtmux does **not** terminate TLS itself. Binding `0.0.0.0` and exposing
   port 9001 directly to the public internet sends tokens + cookies as
   plaintext HTTP. Use a trusted network (LAN / VPN / Tailscale) for the
-  flow in this document, or front gtmux with Caddy/nginx + ACME as
-  described in `docs/deploy.md` §3.
+  flow in this document, or front gtmux with a proper HTTPS reverse
+  proxy.
 - Single user only — one human → one gtmux instance.
 - Localhost-only execution (`bind = "127.0.0.1"`, the default) requires
   no cloud config and no TLS.
@@ -97,7 +94,7 @@ gtmux local ready
   Bind:         127.0.0.1:9001
   Open URL:     http://127.0.0.1:9001/auth/bootstrap?token=<hex>
   Token path:   ~/.local/state/gtmux/local.token (0600)
-  Backend:      PtyBackend (ADR-0013, supervisor pid=<n>)
+  Backend:      PtyBackend (supervisor pid=<n>)
 ```
 
 Local-mode characteristics:
@@ -251,7 +248,7 @@ shortcuts — lives in [`USAGE.md`](USAGE.md).
 
 ## 6) Background / long-running operation
 
-`gtmux start` is a foreground process by default. Three idiomatic ways
+`gtmux start` is a foreground process by default. Two idiomatic ways
 to keep it alive after closing the terminal.
 
 ### 6.1 `nohup` (simplest)
@@ -270,22 +267,10 @@ tail -f ~/.local/state/gtmux/local.log   # read the bootstrap URL
 Cloud variant — same `nohup …` invocation with
 `--config ~/.config/gtmux/prod.config.toml`.
 
-### 6.2 Inside a `tmux` / `screen` session
+### 6.2 systemd (recommended for long-lived deployments)
 
-Useful when you want to keep the banner + log visible:
-
-```bash
-tmux new -s gtmux-local
-cd codebase
-GTMUX_FRONTEND_DIST="$PWD/frontend/dist" gtmux start --session local
-# detach: Ctrl-b d
-tmux attach -t gtmux-local
-```
-
-### 6.3 systemd (recommended for long-lived deployments)
-
-User-level unit with auto-restart and journal logging. Full template:
-`docs/deploy.md` §3.7.
+Use a user-level service with auto-restart and journal logging for
+long-lived deployments.
 
 Regardless of how you launched it, always stop the server with:
 
@@ -330,13 +315,8 @@ gtmux rotate-token --session prod       # cloud-mode token rotation
 | Bootstrap URL says “Forbidden” on re-open | Cookie expired / cleared | Re-open the most recent banner URL |
 | `gtmux` refuses to start | Running as root (`EUID == 0`) | Switch to a regular user |
 
-Deeper reference: [`docs/deploy.md`](docs/deploy.md).
-
----
-
 ## Next
 
 - [`USAGE.md`](USAGE.md) — main canvas walkthrough (session management,
   architecture, every toolbar tool, Group feature).
-- [`README.md`](README.md) — project overview + links into the design
-  docs (`docs/sketch.md`, ADRs, plans).
+- [`README.md`](README.md) — project overview and document index.
