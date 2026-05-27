@@ -47,8 +47,7 @@ not persisted — only the panel positioning and metadata.
 
 Triggered when the server has no active session bound to your browser
 tab yet — typically the very first sign-in, after `Switch session`, or
-after the server was restarted with new identity (ADR-0026 server-id
-mismatch → forced re-attach).
+after the server was restarted with a new identity.
 
 Choices in the dialog:
 
@@ -85,7 +84,7 @@ group with children) always show a confirm modal.
 
 ### 1.5 Import / Export — what's in and what's out
 
-`Export` writes a single `.json` matching `docs/ssot/canvas-layout-schema.md`:
+`Export` writes a single session `.json`:
 
 - ✅ Groups (tree, label, color, visibility, lock).
 - ✅ Items (positions, sizes, z, visibility, lock, per-type payload —
@@ -102,7 +101,7 @@ group with children) always show a confirm modal.
 
 This is fine for layout backup, sharing a canvas template, or moving a
 session between machines that share an asset store. It is not a full
-workspace archive (out of scope, see ADR-0029).
+workspace archive.
 
 ### 1.6 Attach recovery & reconnect
 
@@ -137,7 +136,7 @@ the browser tab.
               │
  ┌────────────▼───────────┐
  │  gtmux server          │  Rust (axum 0.8 + tokio). One process per
- │  · http-api crate      │  --session/--port pair (1:1:1, ADR-0007).
+ │  · http-api crate      │  --session/--port pair.
  │  · ws-server crate     │  Origin / Host / CSRF middleware. Auth.
  │  · auth crate          │  Layout persistence (HTTP PUT, 300 ms debounce).
  │  · config crate        │
@@ -145,7 +144,7 @@ the browser tab.
               │ in-process channels
               │
  ┌────────────▼───────────┐
- │  Terminal server       │  pty-backend crate (ADR-0013, ADR-0014).
+ │  Terminal server       │  pty-backend crate.
  │  (PTY supervisor)      │  Per Terminal: 1 PTY pair + 1 child shell.
  │  · portable-pty        │  Output → tokio::broadcast → all subscribers.
  │  · ring buffer (128KB) │  Input → master fd writer. SIGWINCH on resize.
@@ -156,14 +155,13 @@ the browser tab.
 ### 2.1 gtmux server — what it owns
 
 - One **session binding**, set by `--session` and immutable for the
-  process lifetime (ADR-0007).
+  process lifetime.
 - HTTP API: `GET/PUT /api/layout`, `GET /api/sessions`, `POST
   /api/sessions/import`, asset upload (`POST /api/assets/upload`),
-  file picker stat endpoint (`GET /api/files/stat`, ADR-0034),
+  file picker stat endpoint (`GET /api/files/stat`),
   auth (`POST /auth/login`, `POST /auth/logout`).
-- WebSocket: bidirectional control + data frames (see
-  `docs/ssot/wire-protocol.md`). Multiplexes per-terminal output and
-  notification frames.
+- WebSocket: bidirectional control + data frames. Multiplexes
+  per-terminal output and notification frames.
 - Cookie auth gate on every HTTP and WS handshake.
 - Per-session canvas layout persistence to
   `${XDG_STATE_HOME}/gtmux/<session>.json`.
@@ -183,10 +181,8 @@ the browser tab.
 - Resize: WS `PANE_RESIZE` → `MasterPty::resize()` → TIOCSWINSZ →
   SIGWINCH to the child.
 
-The PTY supervisor lives **inside** the gtmux process — there is no
-separate daemon to bring up. tmux is not used at runtime (ADR-0013);
-the project name reflects the original tmux-control-mode design that
-was retired before MVP.
+The PTY supervisor lives **inside** the gtmux process, so there is no
+separate terminal daemon to bring up.
 
 ### 2.3 Web app — what it owns
 
@@ -203,7 +199,7 @@ Everything **visual** and **layout-related**:
 - Toolbar, viewport controls, command palette, context menu.
 - Local FE clipboard (page lifetime), undo/redo stack (50 entries,
   in-memory).
-- Custom keyboard shortcut overrides via `localStorage` (ADR-0017 D6).
+- Custom keyboard shortcut overrides via `localStorage`.
 
 ### 2.4 Terminal vs Terminal panel — the most important distinction
 
@@ -243,7 +239,7 @@ multi-input panels.
   server's pool even though no panel currently references it. Switch
   back → panel re-attaches.
 - **Server restart (`gtmux stop` + `start`)**: terminals do **not**
-  survive (ADR-0014 D5). Layout JSON is replayed on next attach but
+  survive. Layout JSON is replayed on next attach but
   every panel becomes *dangling*; double-click to spawn a fresh shell
   into the same panel slot.
 - **`gtmux teardown --session X`**: layout file + token + state all
@@ -296,8 +292,8 @@ the icons are disabled.
 - Frontend: a panel mounts at the click position with default size
   (~640 × 360), attaches to the broadcast channel, and grabs the input
   target.
-- Auto-mount cascade (ADR-0015): if you spawn several terminals in
-  quick succession the FE offsets each by ~40 px so they don't stack
+- Auto-mount cascade: if you spawn several terminals in quick
+  succession the FE offsets each by ~40 px so they don't stack
   perfectly.
 - Output is rendered with **xterm.js** (256-colour, true-colour, full
   scrollback up to ring buffer size). Input goes straight to the
@@ -362,12 +358,12 @@ file paths). All drag-spawn.
   - Inline: paste / type Markdown directly (≤ 64 KB, stored in the
     layout JSON).
   - Asset-backed: upload a file → server stores it under
-    `<workspace>/.assets/<sha256>` (ADR-0033) and the item carries the
+    `<workspace>/.assets/<sha256>` and the item carries the
     `asset_id`.
 - Three render modes cycle through a button on the node:
   - **Rendered**: Markdown → HTML, sanitised through DOMPurify.
-  - **Interactive**: sandboxed iframe (ADR-0037) — full HTML/JS but
-    isolated origin.
+  - **Interactive**: sandboxed iframe — full HTML/JS but isolated
+    origin.
   - **Source**: raw text.
 
 #### Image (I)
@@ -380,9 +376,9 @@ file paths). All drag-spawn.
 
 #### File path (F)
 - Drag-spawn the node; the **File picker modal** auto-opens.
-- The picker traverses allowed roots only (ADR-0035 — defaults to your
-  home directory; configurable).
-- Server-side `GET /api/files/stat` returns file metadata (ADR-0034).
+- The picker traverses allowed roots only. Defaults to your home
+  directory and is configurable.
+- Server-side `GET /api/files/stat` returns file metadata.
   No file contents are uploaded — the node is a *reference* to a path.
 - Double-click the node to reopen the picker.
 
@@ -408,9 +404,9 @@ release.
 
 ### 3.7 Customising shortcuts
 
-`SettingsOverlay → Shortcuts` lets you reassign single-key bindings per
-ADR-0017 D6. Overrides are saved to `localStorage`, scoped to your
-browser. Default bindings:
+`SettingsOverlay → Shortcuts` lets you reassign single-key bindings.
+Overrides are saved to `localStorage`, scoped to your browser. Default
+bindings:
 
 | Group | Default keys |
 |---|---|
@@ -429,11 +425,11 @@ matrix.
 
 ## 4) Group feature
 
-A **Group** is a web-only hierarchical container — gtmux's equivalent
-of Figma's frame, used in place of tmux Windows. Groups have label,
-colour, visibility, lock, and an ordered list of children. Groups do
-**not** carry geometry of their own (G-hybrid model, ADR-0010): the
-group's visual bounds are derived from its children every render.
+A **Group** is a web-only hierarchical container for organizing related
+canvas items. Groups have label, colour, visibility, lock, and an
+ordered list of children. Groups do
+**not** carry geometry of their own: the group's visual bounds are
+derived from its children every render.
 
 ### 4.1 Data model (in `<session>.json`)
 
@@ -485,7 +481,7 @@ terminal* flow (`ChangeTerminalModal`).
 
 ### 4.5 Z-index and Groups
 
-z-index and the tree are **independent** (ADR-0024). Reordering rows in
+z-index and the tree are **independent**. Reordering rows in
 the layer tree changes only `order` (organisational); z stays put.
 Conversely, z-order changes (Bring to front, Send backward, …) do not
 touch the tree.
@@ -529,8 +525,7 @@ shares the *same* `terminal_id` as the original.
 When M ≥ 2:
 
 - Alignment: left / centre / right / top / middle / bottom + Distribute
-  H / Distribute V — buttons in the Inspector (`ItemInfoView`, ADR-0027)
-  and in the context menu.
+  H / Distribute V — buttons in the Inspector and in the context menu.
 - Bulk visibility / lock toggle from the layer tree (toggle group
   ancestor → AND/OR propagation handles the rest).
 - Bulk z-order: applies to the M set, preserving relative z order
@@ -680,12 +675,4 @@ shortcuts, group ops. Useful when you've forgotten a shortcut.
 
 - [`QUICKSTART.md`](QUICKSTART.md) — install, config, auth, session
   creation.
-- [`README.md`](README.md) — project overview + design doc links.
-- [`docs/sketch.md`](docs/sketch.md) — full design spec (Korean), the
-  source of truth for scope.
-- [`docs/adr/`](docs/adr/) — accepted architectural decisions
-  (especially 0007 server binding, 0008 single-pane convention, 0010
-  Group model, 0013/0014 PTY backend, 0017 layout, 0018 canvas item
-  data model, 0019 session model, 0020 auth lifecycle, 0021 terminal
-  pool/mirror, 0024 z-index, 0027 inspector, 0028 undo/redo, 0029
-  import/export, 0030 clipboard).
+- [`README.md`](README.md) — project overview.
