@@ -13,7 +13,7 @@
   // - 캔버스 dot grid 는 token-driven (--canvas-bg, --canvas-grid).
   // - panOnDrag = [1, 2] — middle/right 마우스 버튼만 pan (left는 selection/drag용).
 
-  import { onMount, untrack } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { SvelteFlow, Background, BackgroundVariant, useSvelteFlow } from '@xyflow/svelte';
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
@@ -102,20 +102,30 @@
   }
   let dragState = $state<DragState | null>(null);
   interface GroupDragState {
+    pointerId: number;
     startFlow: { x: number; y: number };
     currentFlow: { x: number; y: number };
+    startClient: { x: number; y: number };
+    currentClient: { x: number; y: number };
     originals: Map<string, CanvasItem>;
     priorSnapshot: CanvasLayout;
     moved: boolean;
   }
   let groupDragState = $state<GroupDragState | null>(null);
   interface LassoState {
+    pointerId: number;
     startFlow: { x: number; y: number };
     currentFlow: { x: number; y: number };
+    startClient: { x: number; y: number };
+    currentClient: { x: number; y: number };
     startLocal: { x: number; y: number };
     currentLocal: { x: number; y: number };
   }
   let lassoState = $state<LassoState | null>(null);
+  let canvasRootEl: HTMLElement | null = null;
+  let windowGesturePointerId: number | null = null;
+  let suppressNextPaneClickAfterLasso = false;
+  let suppressPaneClickTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** ADR-0018 D4 — free_draw point cap (저장 상한). */
   const FREE_DRAW_MAX_POINTS = 5000;
@@ -494,8 +504,111 @@
     };
   });
 
-  /** Drag 가 click 으로 취급되는 임계 — flow 좌표 기준 8px. */
+  /** Drag 가 click 으로 취급되는 임계. Lasso/group-drag 판정은 screen px 기준. */
   const DRAG_CLICK_THRESHOLD = 8;
+
+  function canvasLocalFromClient(clientX: number, clientY: number): { x: number; y: number } {
+    const rect = canvasRootEl?.getBoundingClientRect();
+    if (rect === undefined) return { x: clientX, y: clientY };
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }
+
+  function screenDistance(
+    a: { x: number; y: number },
+    b: { x: number; y: number },
+  ): number {
+    return Math.hypot(b.x - a.x, b.y - a.y);
+  }
+
+  function releaseCanvasPointer(pointerId: number): void {
+    if (canvasRootEl === null) return;
+    try {
+      if (canvasRootEl.hasPointerCapture(pointerId)) {
+        canvasRootEl.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // Pointer capture may already be released by the browser.
+    }
+  }
+
+  function removeWindowGestureFallback(): void {
+    if (typeof window === 'undefined') return;
+    if (windowGesturePointerId === null) return;
+    window.removeEventListener('pointermove', onWindowGesturePointerMove, { capture: true });
+    window.removeEventListener('pointerup', onWindowGesturePointerUp, { capture: true });
+    window.removeEventListener('pointercancel', onWindowGesturePointerCancel, { capture: true });
+    windowGesturePointerId = null;
+  }
+
+  function installWindowGestureFallback(pointerId: number): void {
+    if (typeof window === 'undefined') return;
+    if (windowGesturePointerId === pointerId) return;
+    removeWindowGestureFallback();
+    windowGesturePointerId = pointerId;
+    window.addEventListener('pointermove', onWindowGesturePointerMove, { capture: true });
+    window.addEventListener('pointerup', onWindowGesturePointerUp, { capture: true });
+    window.addEventListener('pointercancel', onWindowGesturePointerCancel, { capture: true });
+  }
+
+  function isActiveGesturePointer(e: PointerEvent): boolean {
+    return (
+      (lassoState !== null && lassoState.pointerId === e.pointerId) ||
+      (groupDragState !== null && groupDragState.pointerId === e.pointerId)
+    );
+  }
+
+  function onWindowGesturePointerMove(e: PointerEvent): void {
+    if (!isActiveGesturePointer(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (lassoState !== null) {
+      updateLasso(e);
+      return;
+    }
+    if (groupDragState !== null) updateGroupDrag(e);
+  }
+
+  function onWindowGesturePointerUp(e: PointerEvent): void {
+    if (!isActiveGesturePointer(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (lassoState !== null) {
+      finishLasso(e);
+      return;
+    }
+    if (groupDragState !== null) finishGroupDrag(e);
+  }
+
+  function onWindowGesturePointerCancel(e: PointerEvent): void {
+    if (!isActiveGesturePointer(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    cancelLassoAndGroupDrag(e.pointerId);
+  }
+
+  function cancelLassoAndGroupDrag(pointerId?: number): void {
+    groupDragState = null;
+    lassoState = null;
+    if (pointerId !== undefined) releaseCanvasPointer(pointerId);
+    removeWindowGestureFallback();
+  }
+
+  function clearSuppressedPaneClick(): void {
+    suppressNextPaneClickAfterLasso = false;
+    if (suppressPaneClickTimer !== null) {
+      clearTimeout(suppressPaneClickTimer);
+      suppressPaneClickTimer = null;
+    }
+  }
+
+  function suppressNextPaneClick(): void {
+    clearSuppressedPaneClick();
+    suppressNextPaneClickAfterLasso = true;
+    suppressPaneClickTimer = setTimeout(() => {
+      suppressNextPaneClickAfterLasso = false;
+      suppressPaneClickTimer = null;
+    }, 0);
+  }
 
   // ADR-0032 D9 — Right-click on selected node 의 M 보존 snapshot.
   // SvelteFlow 의 click-to-select internal logic 이 mousedown(button=2) 시점에
@@ -740,39 +853,47 @@
     if (originals.size === 0) return;
     const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     groupDragState = {
+      pointerId: e.pointerId,
       startFlow: flow,
       currentFlow: flow,
+      startClient: { x: e.clientX, y: e.clientY },
+      currentClient: { x: e.clientX, y: e.clientY },
       originals,
       priorSnapshot: sessionStore.layoutSnapshot(),
       moved: false,
     };
     const root = e.currentTarget as HTMLElement;
+    canvasRootEl = root;
     root.setPointerCapture(e.pointerId);
+    installWindowGestureFallback(e.pointerId);
   }
 
   function beginLasso(e: PointerEvent): void {
     const root = e.currentTarget as HTMLElement;
-    const rect = root.getBoundingClientRect();
-    const local = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    canvasRootEl = root;
+    const local = canvasLocalFromClient(e.clientX, e.clientY);
     const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     lassoState = {
+      pointerId: e.pointerId,
       startFlow: flow,
       currentFlow: flow,
+      startClient: { x: e.clientX, y: e.clientY },
+      currentClient: { x: e.clientX, y: e.clientY },
       startLocal: local,
       currentLocal: local,
     };
     root.setPointerCapture(e.pointerId);
+    installWindowGestureFallback(e.pointerId);
   }
 
   function updateLasso(e: PointerEvent): void {
     const state = lassoState;
     if (state === null) return;
-    const root = e.currentTarget as HTMLElement;
-    const rect = root.getBoundingClientRect();
     lassoState = {
       ...state,
       currentFlow: screenToFlowPosition({ x: e.clientX, y: e.clientY }),
-      currentLocal: { x: e.clientX - rect.left, y: e.clientY - rect.top },
+      currentClient: { x: e.clientX, y: e.clientY },
+      currentLocal: canvasLocalFromClient(e.clientX, e.clientY),
     };
   }
 
@@ -814,7 +935,10 @@
     const endFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     const dx = endFlow.x - state.startFlow.x;
     const dy = endFlow.y - state.startFlow.y;
-    if (Math.hypot(dx, dy) < DRAG_CLICK_THRESHOLD) {
+    releaseCanvasPointer(state.pointerId);
+    removeWindowGestureFallback();
+    const distance = screenDistance(state.startClient, { x: e.clientX, y: e.clientY });
+    if (distance < DRAG_CLICK_THRESHOLD) {
       clearCanvasDrillAndSelection();
       return;
     }
@@ -835,6 +959,7 @@
       return;
     }
     sessionStore.setM(ids);
+    suppressNextPaneClick();
   }
 
   function updateGroupDrag(e: PointerEvent): void {
@@ -843,8 +968,15 @@
     const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     const dx = flow.x - state.startFlow.x;
     const dy = flow.y - state.startFlow.y;
-    const moved = state.moved || Math.hypot(dx, dy) >= DRAG_CLICK_THRESHOLD;
-    groupDragState = { ...state, currentFlow: flow, moved };
+    const moved =
+      state.moved ||
+      screenDistance(state.startClient, { x: e.clientX, y: e.clientY }) >= DRAG_CLICK_THRESHOLD;
+    groupDragState = {
+      ...state,
+      currentFlow: flow,
+      currentClient: { x: e.clientX, y: e.clientY },
+      moved,
+    };
     if (!moved) return;
     for (const [id, original] of state.originals) {
       sessionStore.items.set(id, translateCanvasItem(original, dx, dy));
@@ -855,7 +987,12 @@
     const state = groupDragState;
     if (state === null) return;
     groupDragState = null;
-    if (!state.moved) return;
+    releaseCanvasPointer(state.pointerId);
+    removeWindowGestureFallback();
+    const moved =
+      state.moved ||
+      screenDistance(state.startClient, { x: e.clientX, y: e.clientY }) >= DRAG_CLICK_THRESHOLD;
+    if (!moved) return;
     const flow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     const dx = flow.x - state.startFlow.x;
     const dy = flow.y - state.startFlow.y;
@@ -889,12 +1026,14 @@
     };
     updateCanvasGroupHover(e);
     if (lassoState !== null) {
+      if (lassoState.pointerId !== e.pointerId) return;
       e.preventDefault();
       e.stopPropagation();
       updateLasso(e);
       return;
     }
     if (groupDragState !== null) {
+      if (groupDragState.pointerId !== e.pointerId) return;
       e.preventDefault();
       e.stopPropagation();
       updateGroupDrag(e);
@@ -933,12 +1072,14 @@
 
   function onCanvasPointerUp(e: PointerEvent) {
     if (lassoState !== null) {
+      if (lassoState.pointerId !== e.pointerId) return;
       e.preventDefault();
       e.stopPropagation();
       finishLasso(e);
       return;
     }
     if (groupDragState !== null) {
+      if (groupDragState.pointerId !== e.pointerId) return;
       e.preventDefault();
       e.stopPropagation();
       finishGroupDrag(e);
@@ -1000,8 +1141,12 @@
   }
 
   function onCanvasPointerCancel(_e: PointerEvent) {
-    groupDragState = null;
-    lassoState = null;
+    if (
+      (lassoState !== null && lassoState.pointerId === _e.pointerId) ||
+      (groupDragState !== null && groupDragState.pointerId === _e.pointerId)
+    ) {
+      cancelLassoAndGroupDrag(_e.pointerId);
+    }
     // OS 가 capture 를 빼앗는 경우 (다른 modal 등) drag state 청소.
     dragState = null;
     // 0065 FE-1 — pending rAF + buffer 정리 (다음 stroke 의 init 에서도
@@ -1585,6 +1730,11 @@
     return () => debugCount('canvas.unmount');
   });
 
+  onDestroy(() => {
+    cancelLassoAndGroupDrag();
+    clearSuppressedPaneClick();
+  });
+
 
   // 노드 클릭 → M 갱신. dual source.
   //   plain          : single (clear + add)
@@ -1783,6 +1933,10 @@
   function onpaneclick({ event }: { event: MouseEvent | TouchEvent }) {
     // Hand tool — exploration only, click no-op (Figma).
     if (isHandTool) return;
+    if (suppressNextPaneClickAfterLasso) {
+      clearSuppressedPaneClick();
+      return;
+    }
     if (
       event instanceof MouseEvent &&
       (event.metaKey || event.ctrlKey || event.shiftKey)
@@ -2339,6 +2493,7 @@
      를 cover. drag tool 비활성 시 down 핸들러가 즉시 early-return 하므로 일반
      이벤트는 SvelteFlow 가 정상 처리. -->
 <div
+  bind:this={canvasRootEl}
   class="canvas-root"
   role="presentation"
   class:drag-cursor={isDragTool && !isSpacePressed && !isHandTool}
