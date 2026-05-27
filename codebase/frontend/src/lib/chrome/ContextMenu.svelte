@@ -31,6 +31,7 @@
   import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
   import { groupCloseDialog } from '$lib/stores/groupCloseDialog.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import {
     commitNewItem,
     createCanvasItem,
@@ -147,11 +148,14 @@
 
   async function onCopyPaneId(): Promise<void> {
     if (!paneIdStr) return;
-    try {
-      await navigator.clipboard.writeText(paneIdStr);
+    const result = await copyTextToSystemClipboard(paneIdStr);
+    if (result.ok) {
       toastStore.show({ message: 'Copied panel id to clipboard', tone: 'success' });
-    } catch (e) {
-      toastStore.show({ message: `Clipboard failed: ${(e as Error).message ?? e}`, tone: 'error' });
+    } else {
+      toastStore.show({
+        message: `Clipboard failed: ${result.reason ?? 'browser security blocked copy'}`,
+        tone: 'error',
+      });
     }
     close();
   }

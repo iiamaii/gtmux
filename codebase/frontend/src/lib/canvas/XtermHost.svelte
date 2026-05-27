@@ -37,6 +37,7 @@
   import { encodePaneIn, encodePaneResize, FRAME_TYPE } from '$lib/ws/decode';
   import { debugCount } from '$lib/common/debugCounts';
   import { themeStore } from '$lib/stores/theme.svelte';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import type { WsClient } from '$lib/ws/client';
 
   // paneId 는 항상 numeric (legacy `%N` 의 N 또는 0x88 binding 으로 얻은 PaneId).
@@ -70,20 +71,8 @@
 
   async function copyTextToClipboard(text: string): Promise<void> {
     if (text.length === 0) return;
-    if (typeof navigator !== 'undefined' && typeof navigator.clipboard?.writeText === 'function') {
-      await navigator.clipboard.writeText(text);
-      return;
-    }
-    const textarea = document.createElement('textarea');
-    textarea.value = text;
-    textarea.setAttribute('readonly', 'true');
-    textarea.style.position = 'fixed';
-    textarea.style.left = '-9999px';
-    textarea.style.top = '0';
-    document.body.appendChild(textarea);
-    textarea.select();
-    document.execCommand('copy');
-    textarea.remove();
+    const result = await copyTextToSystemClipboard(text);
+    if (!result.ok) throw new Error(result.reason ?? 'Clipboard copy failed');
   }
 
   function relayMouse(e: MouseEvent): void {
