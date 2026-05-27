@@ -569,6 +569,7 @@
     grid-template-rows: 30px 1fr;
     overflow: visible;
     font-family: var(--font-sans);
+    container-type: inline-size;
   }
   /* Selection visual is owned by Canvas wrapper (.svelte-flow__node.m-selected
      in Canvas.svelte) — zoom-compensated 1.5px accent ring. Suppress default
@@ -586,6 +587,8 @@
      dropped — count is already in the head eyebrow, separate foot was
      redundant. */
   .snip-head {
+    min-width: 0;
+    overflow: hidden;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -626,6 +629,10 @@
     opacity: 0.75;
   }
   .snip-head .eyebrow {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     color: var(--color-fg);
     font-weight: 540;
     letter-spacing: 0.6px;
@@ -633,9 +640,11 @@
     font-size: 9.5px;
   }
   .snip-head .sep {
+    flex-shrink: 0;
     color: var(--color-border-strong);
   }
   .snip-head .count {
+    min-width: 0;
     color: var(--color-fg-muted);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -713,6 +722,28 @@
   .snip-mode-btn[data-mode='delete'].is-active:hover:not(:disabled) {
     background: var(--color-danger);
     color: #fff;
+  }
+
+  @container (max-width: 180px) {
+    .snip-head {
+      gap: 4px;
+      padding: 0 3px 0 6px;
+    }
+    .snip-head .eyebrow,
+    .snip-head .sep,
+    .snip-head .count {
+      display: none;
+    }
+    .snip-actions {
+      gap: 1px;
+      padding-left: 0;
+    }
+    .snip-mode-group {
+      gap: 0;
+    }
+    .snip-btn-icon {
+      width: 20px;
+    }
   }
 
   /* Body — pill flow */
