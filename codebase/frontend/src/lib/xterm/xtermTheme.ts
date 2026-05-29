@@ -68,6 +68,10 @@ const DARK: ITheme = {
   cursorAccent: '#1a1a1a',
   selectionBackground: 'rgba(235, 219, 178, 0.30)',
   selectionForeground: undefined,
+  scrollbarSliderBackground: 'rgba(235, 219, 178, 0.16)',
+  scrollbarSliderHoverBackground: 'rgba(235, 219, 178, 0.28)',
+  scrollbarSliderActiveBackground: 'rgba(235, 219, 178, 0.36)',
+  overviewRulerBorder: 'rgba(235, 219, 178, 0.10)',
   ...ANSI_DARK,
 };
 
@@ -78,6 +82,10 @@ const LIGHT: ITheme = {
   cursorAccent: '#fdf6e3',
   selectionBackground: 'rgba(7, 54, 66, 0.20)',
   selectionForeground: undefined,
+  scrollbarSliderBackground: 'rgba(7, 54, 66, 0.14)',
+  scrollbarSliderHoverBackground: 'rgba(7, 54, 66, 0.24)',
+  scrollbarSliderActiveBackground: 'rgba(7, 54, 66, 0.32)',
+  overviewRulerBorder: 'rgba(7, 54, 66, 0.10)',
   ...ANSI_LIGHT,
 };
 
