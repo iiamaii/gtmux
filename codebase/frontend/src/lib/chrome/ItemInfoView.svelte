@@ -47,14 +47,18 @@
   } from '$lib/canvas/alignment';
   import ColorPicker from '$lib/ui/ColorPicker.svelte';
   import Toggle from '$lib/ui/Toggle.svelte';
+  import Dropdown from '$lib/ui/Dropdown.svelte';
   import DashSegments from './DashSegments.svelte';
   import InspectorField from './InspectorField.svelte';
   import {
     MINIMIZED_TERMINAL_PANEL_HEIGHT,
     type CanvasItem,
     type FigureStrokeDash,
+    type FontFamily,
     type LineItem,
     type NoteItem,
+    type RectItem,
+    type EllipseItem,
     type TextAlign,
     type TextItem,
     type TextVerticalAlign,
@@ -271,6 +275,20 @@
     return fallback;
   }
 
+  type TextStylableItem = TextItem | RectItem | EllipseItem;
+
+  function isTextStylable(it: CanvasItem): it is TextStylableItem {
+    return it.type === 'text' || it.type === 'rect' || it.type === 'ellipse';
+  }
+
+  function fontLabel(family: FontFamily | undefined): string {
+    if (family === 'serif') return 'Serif';
+    if (family === 'mono') return 'Mono';
+    return 'Sans';
+  }
+  const FONT_FAMILIES: FontFamily[] = ['sans', 'serif', 'mono'];
+  let figureTextSettingsOpen = $state(false);
+
   function fileStem(fileName: string): string {
     const base = fileName.trim().split('/').pop() ?? fileName.trim();
     const dot = base.lastIndexOf('.');
@@ -429,6 +447,9 @@
     await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
       if (it.type === 'note') {
         return { ...it, title: next } as CanvasItem;
+      }
+      if (it.type === 'text' || it.type === 'rect' || it.type === 'ellipse') {
+        return { ...it, label: next, label_auto: false } as CanvasItem;
       }
       return { ...it, label: next } as CanvasItem;
     });
@@ -766,7 +787,7 @@
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line') return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text') return it;
           // line 에는 fill 이 없음 — 무시.
           if (field === 'fill' && it.type === 'line') return it;
           return { ...it, [field]: hex } as CanvasItem;
@@ -796,10 +817,10 @@
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
           if (field === 'corner_rounded') {
-            if (it.type !== 'rect') return it;
+            if (it.type !== 'rect' && it.type !== 'text') return it;
             return { ...it, corner_rounded: next } as CanvasItem;
           }
-          if (it.type !== 'rect' && it.type !== 'ellipse') return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'text') return it;
           return { ...it, [field]: next } as CanvasItem;
         }),
       }),
@@ -824,7 +845,7 @@
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line') return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text') return it;
           return { ...it, stroke_width: clamped } as CanvasItem;
         }),
       }),
@@ -844,7 +865,7 @@
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line') return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text') return it;
           // undefined = solid → field 제거 (옵셔널 의미 보존)
           const next = { ...it } as CanvasItem & { stroke_dash?: FigureStrokeDash };
           if (dash === undefined || dash === 'solid') {
@@ -866,39 +887,33 @@
    * Inspector 가 text item 의 alignment 를 직접 mutate. 옛
    * ToolbarSubbar/TextNode 에 분산되어 있던 로직을 본 곳으로 단일화. */
 
-  async function applyTextAlign(
-    target: TextItem,
-    next: TextAlign,
-  ): Promise<void> {
-    if (target.locked) return;
-    if (next === (target.text_align ?? 'center')) return;
+  async function applyTextAlign(next: TextAlign): Promise<void> {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
     await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
-        items: cur.items.map((it: CanvasItem) =>
-          it.id === target.id && it.type === 'text'
-            ? ({ ...it, text_align: next } as TextItem)
-            : it,
-        ),
+        items: cur.items.map((it: CanvasItem) => {
+          if (!ids.has(it.id) || !isTextStylable(it) || it.locked) return it;
+          if (next === (it.text_align ?? 'center')) return it;
+          return { ...it, text_align: next } as CanvasItem;
+        }),
       }),
       { failMessage: 'Text align failed' },
     );
   }
 
-  async function applyTextVerticalAlign(
-    target: TextItem,
-    next: TextVerticalAlign,
-  ): Promise<void> {
-    if (target.locked) return;
-    if (next === (target.text_vertical_align ?? 'middle')) return;
+  async function applyTextVerticalAlign(next: TextVerticalAlign): Promise<void> {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
     await sessionStore.optimisticMutation(
       (cur) => ({
         ...cur,
-        items: cur.items.map((it: CanvasItem) =>
-          it.id === target.id && it.type === 'text'
-            ? ({ ...it, text_vertical_align: next } as TextItem)
-            : it,
-        ),
+        items: cur.items.map((it: CanvasItem) => {
+          if (!ids.has(it.id) || !isTextStylable(it) || it.locked) return it;
+          if (next === (it.text_vertical_align ?? 'middle')) return it;
+          return { ...it, text_vertical_align: next } as CanvasItem;
+        }),
       }),
       { failMessage: 'Text vertical align failed' },
     );
@@ -915,9 +930,9 @@
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
-          ids.has(it.id) && it.type === 'text'
+          ids.has(it.id) && isTextStylable(it)
             && !it.locked
-            ? ({ ...it, font_weight: next } as TextItem)
+            ? ({ ...it, font_weight: next } as CanvasItem)
             : it,
         ),
       }),
@@ -935,9 +950,9 @@
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
-          ids.has(it.id) && it.type === 'text'
+          ids.has(it.id) && isTextStylable(it)
             && !it.locked
-            ? ({ ...it, [field]: next } as TextItem)
+            ? ({ ...it, [field]: next } as CanvasItem)
             : it,
         ),
       }),
@@ -954,9 +969,9 @@
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
-          ids.has(it.id) && it.type === 'text'
+          ids.has(it.id) && isTextStylable(it)
             && !it.locked
-            ? ({ ...it, font_size: clamped } as TextItem)
+            ? ({ ...it, font_size: clamped } as CanvasItem)
             : it,
         ),
       }),
@@ -971,13 +986,29 @@
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
-          ids.has(it.id) && it.type === 'text'
+          ids.has(it.id) && isTextStylable(it)
             && !it.locked
-            ? ({ ...it, color: hex } as TextItem)
+            ? ({ ...it, color: hex } as CanvasItem)
             : it,
         ),
       }),
       { failMessage: 'Text color failed' },
+    );
+  }
+
+  async function applyTextFontFamily(next: FontFamily): Promise<void> {
+    const ids = new Set(selectedIds);
+    if (ids.size === 0) return;
+    await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          ids.has(it.id) && isTextStylable(it) && !it.locked
+            ? ({ ...it, font_family: next } as CanvasItem)
+            : it,
+        ),
+      }),
+      { failMessage: 'Font family failed' },
     );
   }
 </script>
@@ -1020,6 +1051,7 @@
             mixed={false}
             placeholder={groupInheritedLabel ?? 'Untitled group'}
             ariaLabel="Group label"
+            live={true}
             oncommit={(next) => void applyGroupLabel(next)}
           />
         </div>
@@ -1042,6 +1074,7 @@
         <div class="prop-row full">
           <ColorPicker
             value={groupSelection.color ?? groupInheritedColor ?? null}
+            live={true}
             oncommit={(hex) => void applyGroupColor(hex)}
           />
         </div>
@@ -1193,6 +1226,7 @@
             mixed={commonDisplayLabel() === 'Mixed'}
             placeholder="—"
             ariaLabel="Label"
+            live={true}
             oncommit={(next) => void applyCommonLabel(next)}
           />
         </div>
@@ -1240,6 +1274,7 @@
             value={(() => { const v = commonField('x'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
             mixed={commonField('x') === 'Mixed'}
             ariaLabel="x"
+            live={true}
             oncommit={(s) => void applyCommonNum('x', Number(s))}
           />
           <InspectorField
@@ -1248,6 +1283,7 @@
             value={(() => { const v = commonField('y'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
             mixed={commonField('y') === 'Mixed'}
             ariaLabel="y"
+            live={true}
             oncommit={(s) => void applyCommonNum('y', Number(s))}
           />
         </div>
@@ -1258,6 +1294,7 @@
             value={(() => { const v = commonField('w'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
             mixed={commonField('w') === 'Mixed'}
             ariaLabel="w"
+            live={true}
             oncommit={(s) => void applyCommonNum('w', Number(s))}
           />
           <InspectorField
@@ -1266,6 +1303,7 @@
             value={(() => { const v = commonField('h'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
             mixed={commonField('h') === 'Mixed'}
             ariaLabel="h"
+            live={true}
             oncommit={(s) => void applyCommonNum('h', Number(s))}
           />
         </div>
@@ -1369,13 +1407,21 @@
         </section>
       {/if}
 
-      {#if selectionCount === 1 && sessionItem !== null && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets')}
+      {#if sessionItem !== null && ((selectionCount === 1 && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets')) || (isMultiHomogeneous && (commonType === 'rect' || commonType === 'ellipse' || commonType === 'text')))}
         <section class="prop-section">
           <div class="prop-head"><h4>Item Payload</h4></div>
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
             {@const shape = sessionItem}
             {@const fillOn = shape.fill_enabled !== false}
             {@const strokeOn = shape.stroke_enabled !== false}
+            {@const shapeText = shape.text ?? ''}
+            {@const shapeH = shape.text_align ?? 'center'}
+            {@const shapeV = shape.text_vertical_align ?? 'middle'}
+            {@const shapeFw = shape.font_weight ?? 'normal'}
+            {@const shapeFamily = shape.font_family ?? 'sans'}
+            {@const shapeItalic = shape.italic === true}
+            {@const shapeUnderline = shape.underline === true}
+            {@const shapeStrike = shape.strikethrough === true}
             <!-- Inspector design 규칙 (사용자 정의): fill/stroke/rounded 가
                  border-style group. header (label + toggle 우측) ↔ body 가
                  1px divider 로 분리. background/border 색은 state-row 와 통일
@@ -1398,6 +1444,7 @@
                 <div class="fig-group-body">
                   <ColorPicker
                     value={shape.fill}
+                    live={true}
                     allowAlpha={true}
                     allowTransparent={true}
                     disabled={shape.locked}
@@ -1423,6 +1470,7 @@
                 <div class="fig-group-body">
                   <ColorPicker
                     value={shape.stroke}
+                    live={true}
                     allowAlpha={true}
                     disabled={shape.locked}
                     oncommit={(hex) => void applyShapeColor('stroke', hex)}
@@ -1434,6 +1482,7 @@
                     mixed={false}
                     ariaLabel="Stroke width"
                     disabled={shape.locked}
+                    live={true}
                     oncommit={(s) => void applyShapeStrokeWidth(Number(s))}
                   />
                   <DashSegments
@@ -1461,6 +1510,105 @@
                 </div>
               </div>
             {/if}
+            <div class="fig-group" class:is-on={figureTextSettingsOpen}>
+              <button
+                type="button"
+                class="fig-group-head fig-toggle-head"
+                aria-expanded={figureTextSettingsOpen}
+                aria-label={figureTextSettingsOpen ? 'Collapse text settings' : 'Expand text settings'}
+                onclick={() => (figureTextSettingsOpen = !figureTextSettingsOpen)}
+              >
+                <span class="k">text</span>
+                <span class="fig-spacer"></span>
+                <span class="fig-caret" aria-hidden="true">{figureTextSettingsOpen ? '▾' : '◂'}</span>
+              </button>
+              {#if figureTextSettingsOpen}
+                <div class="fig-group-body">
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={shape.locked || shapeText.length === 0}
+                        aria-label="Font family"
+                        title="Font family"
+                        onclick={toggle}
+                      >
+                        <span class="font-label">font</span>
+                        <span class="font-value font-preview-{shapeFamily}">{fontLabel(shapeFamily)}</span>
+                        <span class="font-caret" aria-hidden="true">▾</span>
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each FONT_FAMILIES as f}
+                        <button
+                          type="button"
+                          class="font-option font-preview-{f}"
+                          disabled={shape.locked}
+                          onclick={() => {
+                            void applyTextFontFamily(f);
+                            close();
+                          }}
+                        >
+                          {fontLabel(f)}
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
+                <InspectorField
+                  type="number"
+                  k="size"
+                  value={String(shape.font_size ?? 14)}
+                  mixed={false}
+                  ariaLabel="Font size"
+                  disabled={shape.locked}
+                  live={true}
+                  oncommit={(s) => void applyTextFontSize(Number(s))}
+                />
+                <ColorPicker
+                  value={shape.color ?? 'var(--color-fg)'}
+                  live={true}
+                  allowAlpha={true}
+                  disabled={shape.locked}
+                  oncommit={(hex) => void applyTextColor(hex)}
+                />
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">weight</span>
+                  <div class="segmented-control" role="group" aria-label="Font weight">
+                    <button type="button" class="seg-btn weight-btn weight-light" class:active={shapeFw === 'light'} aria-pressed={shapeFw === 'light'} title="Light (300)" aria-label="Light weight" disabled={shape.locked} onclick={() => void applyTextFontWeight('light')}>L</button>
+                    <button type="button" class="seg-btn weight-btn weight-normal" class:active={shapeFw === 'normal'} aria-pressed={shapeFw === 'normal'} title="Normal (400)" aria-label="Normal weight" disabled={shape.locked} onclick={() => void applyTextFontWeight('normal')}>N</button>
+                    <button type="button" class="seg-btn weight-btn weight-bold" class:active={shapeFw === 'bold'} aria-pressed={shapeFw === 'bold'} title="Bold (700)" aria-label="Bold weight" disabled={shape.locked} onclick={() => void applyTextFontWeight('bold')}>B</button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">style</span>
+                  <div class="segmented-control multi" role="group" aria-label="Text style">
+                    <button type="button" class="seg-btn style-btn style-italic" class:active={shapeItalic} aria-pressed={shapeItalic} title="Italic" aria-label="Toggle italic" disabled={shape.locked} onclick={() => void applyTextBoolean('italic', !shapeItalic)}>I</button>
+                    <button type="button" class="seg-btn style-btn style-underline" class:active={shapeUnderline} aria-pressed={shapeUnderline} title="Underline" aria-label="Toggle underline" disabled={shape.locked} onclick={() => void applyTextBoolean('underline', !shapeUnderline)}>U</button>
+                    <button type="button" class="seg-btn style-btn style-strike" class:active={shapeStrike} aria-pressed={shapeStrike} title="Strikethrough" aria-label="Toggle strikethrough" disabled={shape.locked} onclick={() => void applyTextBoolean('strikethrough', !shapeStrike)}>S</button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">align</span>
+                  <div class="segmented-control" role="group" aria-label="Horizontal alignment">
+                    <button type="button" class="seg-btn" class:active={shapeH === 'left'} aria-pressed={shapeH === 'left'} title="Align left" aria-label="Align left" disabled={shape.locked} onclick={() => void applyTextAlign('left')}>L</button>
+                    <button type="button" class="seg-btn" class:active={shapeH === 'center'} aria-pressed={shapeH === 'center'} title="Align center" aria-label="Align center" disabled={shape.locked} onclick={() => void applyTextAlign('center')}>C</button>
+                    <button type="button" class="seg-btn" class:active={shapeH === 'right'} aria-pressed={shapeH === 'right'} title="Align right" aria-label="Align right" disabled={shape.locked} onclick={() => void applyTextAlign('right')}>R</button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">v-align</span>
+                  <div class="segmented-control" role="group" aria-label="Vertical alignment">
+                    <button type="button" class="seg-btn" class:active={shapeV === 'top'} aria-pressed={shapeV === 'top'} title="Align top" aria-label="Align top" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('top')}>T</button>
+                    <button type="button" class="seg-btn" class:active={shapeV === 'middle'} aria-pressed={shapeV === 'middle'} title="Align middle" aria-label="Align middle" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('middle')}>M</button>
+                    <button type="button" class="seg-btn" class:active={shapeV === 'bottom'} aria-pressed={shapeV === 'bottom'} title="Align bottom" aria-label="Align bottom" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('bottom')}>B</button>
+                  </div>
+                </div>
+                </div>
+              {/if}
+            </div>
           {:else if sessionItem.type === 'line'}
             {@const line = sessionItem}
             <div class="prop-row">
@@ -1471,6 +1619,7 @@
                 mixed={false}
                 ariaLabel="x2"
                 disabled={line.locked}
+                live={true}
                 oncommit={(s) => void applyLineEndpoint('x2', Number(s))}
               />
               <InspectorField
@@ -1480,6 +1629,7 @@
                 mixed={false}
                 ariaLabel="y2"
                 disabled={line.locked}
+                live={true}
                 oncommit={(s) => void applyLineEndpoint('y2', Number(s))}
               />
             </div>
@@ -1491,6 +1641,7 @@
               <div class="fig-group-body">
                 <ColorPicker
                   value={line.stroke}
+                  live={true}
                   allowAlpha={true}
                   disabled={line.locked}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
@@ -1502,6 +1653,7 @@
                   mixed={false}
                   ariaLabel="Stroke width"
                   disabled={line.locked}
+                  live={true}
                   oncommit={(s) => void applyShapeStrokeWidth(Number(s))}
                 />
                 <DashSegments
@@ -1516,9 +1668,12 @@
             {@const h = txt.text_align ?? 'center'}
             {@const v = txt.text_vertical_align ?? 'middle'}
             {@const fw = txt.font_weight ?? 'normal'}
+            {@const family = txt.font_family ?? 'sans'}
             {@const isItalic = txt.italic === true}
             {@const isUnderline = txt.underline === true}
             {@const isStrike = txt.strikethrough === true}
+            {@const textFillOn = txt.fill_enabled === true}
+            {@const textStrokeOn = txt.stroke_enabled === true}
             <!-- chars meta (read-only) — group 밖, info row -->
             <div class="prop-row full">
               <div class="display-row">
@@ -1533,6 +1688,39 @@
                 <span class="k">text</span>
               </div>
               <div class="fig-group-body">
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={txt.locked}
+                        aria-label="Font family"
+                        title="Font family"
+                        onclick={toggle}
+                      >
+                        <span class="font-label">font</span>
+                        <span class="font-value font-preview-{family}">{fontLabel(family)}</span>
+                        <span class="font-caret" aria-hidden="true">▾</span>
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each FONT_FAMILIES as f}
+                        <button
+                          type="button"
+                          class="font-option font-preview-{f}"
+                          disabled={txt.locked}
+                          onclick={() => {
+                            void applyTextFontFamily(f);
+                            close();
+                          }}
+                        >
+                          {fontLabel(f)}
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
                 <InspectorField
                   type="number"
                   k="size"
@@ -1540,10 +1728,12 @@
                   mixed={false}
                   ariaLabel="Font size"
                   disabled={txt.locked}
+                  live={true}
                   oncommit={(s) => void applyTextFontSize(Number(s))}
                 />
                 <ColorPicker
                   value={txt.color}
+                  live={true}
                   allowAlpha={true}
                   disabled={txt.locked}
                   oncommit={(hex) => void applyTextColor(hex)}
@@ -1629,7 +1819,7 @@
                       title="Align left"
                       aria-label="Align left"
                       disabled={txt.locked}
-                      onclick={() => void applyTextAlign(txt, 'left')}
+                      onclick={() => void applyTextAlign('left')}
                     >
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="4" y1="6" x2="20" y2="6"/>
@@ -1645,7 +1835,7 @@
                       title="Align center"
                       aria-label="Align center"
                       disabled={txt.locked}
-                      onclick={() => void applyTextAlign(txt, 'center')}
+                      onclick={() => void applyTextAlign('center')}
                     >
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="4" y1="6" x2="20" y2="6"/>
@@ -1661,7 +1851,7 @@
                       title="Align right"
                       aria-label="Align right"
                       disabled={txt.locked}
-                      onclick={() => void applyTextAlign(txt, 'right')}
+                      onclick={() => void applyTextAlign('right')}
                     >
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="4" y1="6" x2="20" y2="6"/>
@@ -1682,7 +1872,7 @@
                       title="Align top"
                       aria-label="Align top"
                       disabled={txt.locked}
-                      onclick={() => void applyTextVerticalAlign(txt, 'top')}
+                      onclick={() => void applyTextVerticalAlign('top')}
                     >
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="5" y1="5" x2="19" y2="5"/>
@@ -1698,7 +1888,7 @@
                       title="Align middle"
                       aria-label="Align middle"
                       disabled={txt.locked}
-                      onclick={() => void applyTextVerticalAlign(txt, 'middle')}
+                      onclick={() => void applyTextVerticalAlign('middle')}
                     >
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="6" y1="7" x2="18" y2="7"/>
@@ -1714,7 +1904,7 @@
                       title="Align bottom"
                       aria-label="Align bottom"
                       disabled={txt.locked}
-                      onclick={() => void applyTextVerticalAlign(txt, 'bottom')}
+                      onclick={() => void applyTextVerticalAlign('bottom')}
                     >
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="10" y1="9" x2="14" y2="9"/>
@@ -1726,11 +1916,86 @@
                 </div>
               </div>
             </div>
+            <div class="fig-group" class:is-on={textFillOn}>
+              <div class="fig-group-head">
+                <span class="k">fill</span>
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={textFillOn}
+                  disabled={txt.locked}
+                  ariaLabel="Toggle text box fill"
+                  onchange={(next) => void applyShapeBoolean('fill_enabled', next)}
+                />
+              </div>
+              {#if textFillOn}
+                <div class="fig-group-body">
+                  <ColorPicker
+                    value={txt.fill ?? 'var(--color-surface)'}
+                    live={true}
+                    allowAlpha={true}
+                    allowTransparent={true}
+                    disabled={txt.locked}
+                    oncommit={(hex) => void applyShapeColor('fill', hex)}
+                  />
+                </div>
+              {/if}
+            </div>
+            <div class="fig-group" class:is-on={textStrokeOn}>
+              <div class="fig-group-head">
+                <span class="k">stroke</span>
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={textStrokeOn}
+                  disabled={txt.locked}
+                  ariaLabel="Toggle text box stroke"
+                  onchange={(next) => void applyShapeBoolean('stroke_enabled', next)}
+                />
+              </div>
+              {#if textStrokeOn}
+                <div class="fig-group-body">
+                  <ColorPicker
+                    value={txt.stroke ?? 'var(--color-fg)'}
+                    live={true}
+                    allowAlpha={true}
+                    disabled={txt.locked}
+                    oncommit={(hex) => void applyShapeColor('stroke', hex)}
+                  />
+                  <InspectorField
+                    type="number"
+                    k="width"
+                    value={String(txt.stroke_width ?? 2)}
+                    mixed={false}
+                    ariaLabel="Text box stroke width"
+                    disabled={txt.locked}
+                    live={true}
+                    oncommit={(s) => void applyShapeStrokeWidth(Number(s))}
+                  />
+                  <DashSegments
+                    value={txt.stroke_dash ?? 'solid'}
+                    disabled={txt.locked}
+                    onpick={(next) => void applyShapeDash(next)}
+                  />
+                </div>
+              {/if}
+            </div>
+            <div class="fig-group" class:is-on={txt.corner_rounded === true}>
+              <div class="fig-group-head">
+                <span class="k">rounded</span>
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={txt.corner_rounded === true}
+                  disabled={txt.locked}
+                  ariaLabel="Toggle text box rounded corners"
+                  onchange={(next) => void applyShapeBoolean('corner_rounded', next)}
+                />
+              </div>
+            </div>
           {:else if sessionItem.type === 'note'}
             <!-- ColorPicker 자체 "C" 라벨 보유 → 외부 label 무. -->
             <div class="prop-row full">
               <ColorPicker
                 value={sessionItem.color}
+                live={true}
                 oncommit={(hex) => void applyNoteColor(hex)}
               />
             </div>
@@ -2141,6 +2406,19 @@
     font-size: 11px;
     color: var(--color-fg);
   }
+
+  .fig-toggle-head {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .fig-toggle-head:hover:not(:disabled) {
+    background: var(--color-glass-1);
+  }
+
   .fig-group-head > .k {
     flex: 0 0 56px;
     width: 56px;
@@ -2151,6 +2429,12 @@
   }
   .fig-group-head > .fig-spacer {
     flex: 1 1 auto;
+  }
+  .fig-caret {
+    flex: 0 0 14px;
+    width: 14px;
+    text-align: center;
+    color: var(--color-fg-muted);
   }
   /* on 시 head 와 body 사이 hairline divider — group 시각 결속. */
   .fig-group.is-on .fig-group-head {
@@ -2167,7 +2451,8 @@
   /* body 안의 InspectorField / DashSegments / ColorPicker 가 width full. */
   .fig-group-body > :global(.inspector-input),
   .fig-group-body > :global(.color-picker),
-  .fig-group-body > :global(.style-dropdown) {
+  .fig-group-body > :global(.style-dropdown),
+  .fig-group-body > .font-dropdown {
     width: 100%;
     min-width: 0;
   }
@@ -2255,6 +2540,105 @@
 
   .seg-btn:focus-visible {
     outline: none;
+  }
+
+  .font-dropdown {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .font-dropdown :global(.dropdown-host) {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .font-dropdown :global(.dropdown-menu) {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    margin-top: 4px;
+    padding: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  .font-dropdown :global(.dropdown-menu button) {
+    justify-content: center;
+    height: 24px;
+    padding: 0 6px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+
+  .font-trigger {
+    box-sizing: border-box;
+    flex: 1 1 auto;
+    min-width: 0;
+    width: 100%;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 6px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.2px;
+    cursor: pointer;
+    text-align: left;
+    transition: border-color var(--motion-fast) var(--motion-easing);
+  }
+
+  .font-trigger:hover:not(:disabled) {
+    border-color: var(--color-border-strong);
+  }
+
+  .font-trigger:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .font-label {
+    flex: 0 0 var(--inspector-k-w, 56px);
+    width: var(--inspector-k-w, 56px);
+    font-family: var(--font-mono);
+    color: var(--color-fg-muted);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.4px;
+    text-align: left;
+  }
+
+  .font-value {
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: center;
+  }
+
+  .font-caret {
+    flex: 0 0 14px;
+    width: 14px;
+    text-align: center;
+    color: var(--color-fg-muted);
+    font-family: var(--font-mono);
+  }
+
+  .font-option.font-preview-sans,
+  .font-preview-sans {
+    font-family: var(--font-sans);
+  }
+
+  .font-option.font-preview-serif,
+  .font-preview-serif {
+    font-family: var(--font-serif);
+  }
+
+  .font-option.font-preview-mono,
+  .font-preview-mono {
+    font-family: var(--font-mono);
   }
 
   .icon-segments .seg-btn {

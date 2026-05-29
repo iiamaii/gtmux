@@ -140,6 +140,12 @@ export function createCanvasItem(
         text_align: 'center',
         text_vertical_align: 'middle',
         color: 'var(--color-fg)',
+        font_family: 'sans',
+        fill_enabled: false,
+        stroke_enabled: false,
+        stroke: 'var(--color-fg)',
+        fill: 'var(--color-surface)',
+        stroke_width: 2,
       };
     case 'note':
       return {
@@ -287,6 +293,12 @@ export function createShapeItem(
       stroke_width: 2,
       fill_enabled: false,
       stroke_enabled: true,
+      text: '',
+      font_size: 14,
+      color: 'var(--color-fg)',
+      text_align: 'center',
+      text_vertical_align: 'middle',
+      font_family: 'sans',
     };
   }
   return {
@@ -297,6 +309,12 @@ export function createShapeItem(
     stroke_width: 2,
     fill_enabled: false,
     stroke_enabled: true,
+    text: '',
+    font_size: 14,
+    color: 'var(--color-fg)',
+    text_align: 'center',
+    text_vertical_align: 'middle',
+    font_family: 'sans',
   };
 }
 

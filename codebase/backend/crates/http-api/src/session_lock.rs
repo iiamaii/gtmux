@@ -28,7 +28,9 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};

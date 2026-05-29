@@ -29,6 +29,7 @@
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
+  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
   import {
     MINIMIZED_TERMINAL_PANEL_HEIGHT,
     type CanvasItem,
@@ -116,9 +117,18 @@
   // 라 본 handler 자체가 호출되지 않음 (resize handle 미노출). 즉 *minimized
   // + 큰 h 로 인한 빈 contents* 회귀가 source 차원에서 차단됨. 사용자가
   // resize 하려면 minimize 먼저 toggle 풀어야 함 (명료한 mental model).
-  function onResizeEnd(_event: unknown, params: ResizeParams) {
-    const nextW = Math.max(240, params.width);
-    const nextH = Math.max(140, params.height);
+  function onResizeEnd(event: unknown, params: ResizeParams) {
+    const current = {
+      x: data.x ?? params.x,
+      y: data.y ?? params.y,
+      w: data.w ?? params.width,
+      h: data.h ?? params.height,
+    };
+    const constrained = resizeEventShiftKey(event)
+      ? constrainResizeAspect(params, current, current.w / current.h, 240, 140)
+      : params;
+    const nextW = Math.max(240, constrained.width);
+    const nextH = Math.max(140, constrained.height);
     void sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -126,8 +136,8 @@
           it.id === data.id && it.type === 'terminal'
             ? ({
                 ...it,
-                x: params.x,
-                y: params.y,
+                x: constrained.x,
+                y: constrained.y,
                 w: nextW,
                 h: nextH,
               } as TerminalItem)

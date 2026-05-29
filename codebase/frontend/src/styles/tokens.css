@@ -58,6 +58,7 @@
   --font-sans: 'SF Pro Display', -apple-system, BlinkMacSystemFont,
                'Segoe UI', Roboto, system-ui, sans-serif;
   --font-mono: 'SF Mono', Menlo, 'JetBrains Mono', ui-monospace, monospace;
+  --font-serif: Georgia, Cambria, 'Times New Roman', 'Noto Serif', serif;
   --text-xs: 9px;
   --text-sm: 10px;
   --text-base: 11px;

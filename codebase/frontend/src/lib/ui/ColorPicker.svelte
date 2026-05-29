@@ -80,6 +80,8 @@
     mixed?: boolean;
     allowTransparent?: boolean;
     allowAlpha?: boolean;
+    /** Commit drag/input previews as they change instead of waiting for pointerup. */
+    live?: boolean;
   }
 
   const {
@@ -89,6 +91,7 @@
     mixed = false,
     allowTransparent = false,
     allowAlpha = false,
+    live = false,
   }: Props = $props();
 
   // ── Helpers (parse / normalize) ─────────────────────────────────
@@ -545,6 +548,11 @@
     if (norm !== null) pushRecentColor(norm);
   }
 
+  function previewColor(next: string): void {
+    if (!live || next === value) return;
+    oncommit(next);
+  }
+
   function onTextChange(): void {
     const trimmed = textInput.trim().toLowerCase();
     if (allowTransparent && !allowAlpha && isTransparentValue(trimmed)) {
@@ -649,6 +657,16 @@
     }
   }
 
+  function draftColor(): string {
+    const h = draftHsv;
+    const a = draftAlpha;
+    const baseRgb = h !== null
+      ? hsvToHex(h.h, h.s, h.v)
+      : (resolvedHex !== null ? hexRgb(resolvedHex) : '#000000');
+    const aPct = a !== null ? a : alphaPercent;
+    return allowAlpha ? combineHexAlpha(baseRgb, aPct) : baseRgb;
+  }
+
   function onSvDown(e: PointerEvent): void {
     if (disabled || svEl === undefined) return;
     e.preventDefault();
@@ -660,6 +678,7 @@
       const sy = clamp01((ev.clientY - r.top) / r.height);
       const h = (draftHsv ?? hsv).h;
       draftHsv = { h, s: sx * 100, v: (1 - sy) * 100 };
+      previewColor(draftColor());
     };
     update(e);
     const onMove = (ev: PointerEvent): void => update(ev);
@@ -687,6 +706,7 @@
       const t = clamp01((ev.clientX - r.left) / r.width);
       const cur = draftHsv ?? hsv;
       draftHsv = { h: t * 360, s: cur.s, v: cur.v };
+      previewColor(draftColor());
     };
     update(e);
     const onMove = (ev: PointerEvent): void => update(ev);
@@ -713,6 +733,7 @@
       const r = alphaEl.getBoundingClientRect();
       const t = clamp01((ev.clientX - r.left) / r.width);
       draftAlpha = Math.round(t * 100);
+      previewColor(draftColor());
     };
     update(e);
     const onMove = (ev: PointerEvent): void => update(ev);

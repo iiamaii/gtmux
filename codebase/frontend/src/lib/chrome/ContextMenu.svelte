@@ -212,6 +212,21 @@
     if (ctxMode === 'single') return panelIdStr !== null ? [panelIdStr] : [];
     return [];
   });
+  const selectedEntityIds = $derived.by((): string[] => {
+    const out: string[] = [];
+    for (const id of sessionStore.M) {
+      if (sessionStore.items.has(id) || sessionStore.groups.has(id)) out.push(id);
+    }
+    return out;
+  });
+  const selectedGroupIds = $derived.by((): string[] =>
+    selectedEntityIds.filter((id) => sessionStore.groups.has(id)),
+  );
+  const isGroupOnlyMultiMode = $derived(
+    ctxMode === 'multi' &&
+      selectedEntityIds.length >= 2 &&
+      selectedGroupIds.length === selectedEntityIds.length,
+  );
   /** Slice E 의 entry text prefix — groupEntity 에서만 "group " (ADR-0010 D16). */
   const zPrefix = $derived(ctxMode === 'groupEntity' ? 'group ' : '');
   const effectiveItems = $derived.by((): CanvasItem[] => {
@@ -375,12 +390,18 @@
     await sessionStore.createGroup(ids);
   }
 
-  /** ADR-0010 D12 + plan-0012 §3.4 D.5 — [Ungroup] entry handler (groupEntity). */
+  /** ADR-0010 D12 + plan-0012 §3.4 D.5 — [Ungroup] entry handler. */
   async function onUngroup(): Promise<void> {
-    if (sessionStore.active === null || groupIdStr === null) return;
-    const gid = groupIdStr;
+    if (sessionStore.active === null) return;
+    const groupIds =
+      ctxMode === 'groupEntity'
+        ? (groupIdStr !== null ? [groupIdStr] : [])
+        : [...selectedGroupIds];
+    if (groupIds.length === 0) return;
     close();
-    await sessionStore.ungroup(gid);
+    for (const gid of groupIds) {
+      await sessionStore.ungroup(gid);
+    }
   }
 
   /** ADR-0032 D29 — groupEntity [Delete all items]. */
@@ -844,6 +865,12 @@
         <span class="label">Group{isMultiMode ? ' (batch)' : ''}</span>
         <span class="kbd mono">⌘G</span>
       </button>
+      {#if isGroupOnlyMultiMode}
+        <button type="button" class="ctx-item" onclick={() => void onUngroup()}>
+          <span class="label">Ungroup (batch)</span>
+          <span class="kbd mono">⇧⌘G</span>
+        </button>
+      {/if}
       <div class="ctx-sep"></div>
 
       <div class="ctx-section">Visibility</div>

@@ -13,9 +13,12 @@
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import type { FilePathItem, CanvasItem } from '$lib/types/canvas';
   import CanvasCloseButton from './CanvasCloseButton.svelte';
+  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
 
   interface FilePathNodeData {
     id: string;
+    x: number;
+    y: number;
     w: number;
     h: number;
     visibility: boolean;
@@ -115,13 +118,22 @@
     );
   }
 
-  async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
+  async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
+    const constrained = resizeEventShiftKey(event)
+      ? constrainResizeAspect(params, data, data.w / data.h, 200, 80)
+      : params;
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'file_path'
-            ? ({ ...it, x: params.x, y: params.y, w: Math.max(200, params.width), h: Math.max(80, params.height) } as FilePathItem)
+            ? ({
+                ...it,
+                x: constrained.x,
+                y: constrained.y,
+                w: Math.max(200, constrained.width),
+                h: Math.max(80, constrained.height),
+              } as FilePathItem)
             : it,
         ),
       }),

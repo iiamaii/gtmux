@@ -18,9 +18,12 @@
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, ImageItem } from '$lib/types/canvas';
   import CanvasCloseButton from './CanvasCloseButton.svelte';
+  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
 
   interface ImageNodeData {
     id: string;
+    x: number;
+    y: number;
     w: number;
     h: number;
     visibility: boolean;
@@ -28,6 +31,8 @@
     label?: string;
     asset_id?: string;
     mime?: string;
+    original_w?: number;
+    original_h?: number;
     /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
     group_selected?: boolean;
   }
@@ -59,7 +64,14 @@
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
 
-  async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
+  async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
+    const sourceAspect =
+      data.original_w !== undefined && data.original_h !== undefined && data.original_h > 0
+        ? data.original_w / data.original_h
+        : data.w / data.h;
+    const constrained = resizeEventShiftKey(event)
+      ? constrainResizeAspect(params, data, sourceAspect, 120, 80)
+      : params;
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -67,10 +79,10 @@
           it.id === data.id && it.type === 'image'
             ? ({
                 ...it,
-                x: params.x,
-                y: params.y,
-                w: Math.max(120, params.width),
-                h: Math.max(80, params.height),
+                x: constrained.x,
+                y: constrained.y,
+                w: Math.max(120, constrained.width),
+                h: Math.max(80, constrained.height),
               } as ImageItem)
             : it,
         ),
