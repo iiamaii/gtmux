@@ -522,7 +522,7 @@
 
   .term-row {
     display: grid;
-    grid-template-columns: 8px 1fr auto auto auto;
+    grid-template-columns: 8px minmax(0, 1fr) auto auto auto;
     align-items: center;
     gap: var(--space-4);
     padding: var(--space-4) var(--space-8) var(--space-4) var(--space-12);
@@ -623,6 +623,7 @@
   }
 
   .name {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
