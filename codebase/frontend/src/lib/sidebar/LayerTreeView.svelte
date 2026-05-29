@@ -1307,6 +1307,7 @@
     align-items: center;
     gap: 0;
     width: 100%;
+    min-width: 0;
     transition:
       box-shadow var(--motion-fast) var(--motion-easing);
   }
@@ -1336,6 +1337,7 @@
     align-items: center;
     gap: var(--space-4);
     flex: 1 1 auto;
+    min-width: 0;
     padding: var(--space-4) var(--space-8) var(--space-4) 0;
     background: transparent;
     border: 0;
@@ -1411,6 +1413,7 @@
 
   .label {
     flex: 1 1 auto;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
