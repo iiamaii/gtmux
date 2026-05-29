@@ -42,7 +42,7 @@ pub fn spawn(path: &Path) -> Result<(), SpawnError> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     match command.spawn() {
-        Ok(mut child) => {
+        Ok(child) => {
             // Detach: we don't wait for the GUI handler. Drop the child
             // handle — on Unix the kernel reparents to PID 1 once the
             // server exits.

@@ -97,7 +97,9 @@ use axum::Router;
 use gtmux_auth::TokenString;
 use gtmux_config::{Config, Mode};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(test)]
+use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tower_http::services::{ServeDir, ServeFile};
@@ -969,30 +971,6 @@ pub(crate) fn apply_security_headers_for_config(headers: &mut HeaderMap, config:
     if config.tls_required() {
         headers.insert(header::STRICT_TRANSPORT_SECURITY, HSTS.clone());
     }
-}
-
-#[derive(Debug)]
-enum BodyReadError {
-    TooLarge,
-    Io(String),
-}
-
-/// Drain the request body, refusing payloads larger than `cap`. We do not
-/// trust `Content-Length` alone — a malicious client could lie — so the
-/// stream is read incrementally and short-circuited at the cap.
-async fn read_bounded_body(req: Request, cap: usize) -> Result<Vec<u8>, BodyReadError> {
-    use http_body_util::BodyExt;
-
-    let body = req.into_body();
-    let collected = body
-        .collect()
-        .await
-        .map_err(|e| BodyReadError::Io(format!("body read: {e}")))?;
-    let bytes = collected.to_bytes();
-    if bytes.len() > cap {
-        return Err(BodyReadError::TooLarge);
-    }
-    Ok(bytes.to_vec())
 }
 
 /// `MakeSpan` impl that records only the path — not the query string. This

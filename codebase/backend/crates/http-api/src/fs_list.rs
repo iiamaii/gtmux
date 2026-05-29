@@ -14,7 +14,9 @@
 //!   * Cap = [`MAX_ENTRIES`] (500). When exceeded the response reports
 //!     `truncated: true` and the slice of 500 — pagination is P3+ (D8).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(test)]
+use std::path::Path;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;

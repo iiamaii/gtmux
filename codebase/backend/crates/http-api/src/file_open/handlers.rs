@@ -318,7 +318,6 @@ fn validate_path(path: &str) -> Result<std::path::PathBuf, &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::file_open::FileOpenContext;
     use crate::settings::default_behavior_settings;
     use axum::body::Body;

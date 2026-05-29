@@ -66,7 +66,7 @@ mod audit;
 mod handlers;
 mod spawn;
 
-pub use allowlist::{Allowlist, AllowlistEntry, AllowlistError, AllowlistMatch};
+pub use allowlist::{Allowlist, AllowlistEntry, AllowlistMatch};
 pub use audit::AuditLog;
 pub use handlers::{
     allowlist_check_handler, allowlist_delete_handler, allowlist_get_handler,
