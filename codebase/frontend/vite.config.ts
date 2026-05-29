@@ -21,6 +21,7 @@ export default defineConfig({
         manualChunks: {
           xterm: ['@xterm/xterm', '@xterm/addon-fit', '@xterm/addon-unicode11'],
           svelteflow: ['@xyflow/svelte'],
+          markdown: ['marked', 'dompurify'],
         },
       },
     },

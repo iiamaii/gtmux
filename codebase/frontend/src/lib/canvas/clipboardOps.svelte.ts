@@ -223,7 +223,12 @@ function cloneSubtree(
     const parentInPool = src.parent_id !== null && sourceGroupIds.has(src.parent_id);
     const newParentId = parentInPool ? idMap.get(src.parent_id!)! : anchorParentId;
     if (!parentInPool) topLevelIds.push(newId);
-    return { ...cloned, id: newId, parent_id: newParentId } as CanvasItem;
+    const base = { ...cloned, id: newId, parent_id: newParentId };
+    // ADR-0040 D9: label_auto intentionally differs from the id-only clone rule
+    // so pasted text-capable items derive their label on the next text edit.
+    return src.type === 'text' || src.type === 'rect' || src.type === 'ellipse'
+      ? ({ ...base, label_auto: true } as CanvasItem)
+      : (base as CanvasItem);
   });
 
   return { items: newItems, groups: newGroups, topLevelIds };

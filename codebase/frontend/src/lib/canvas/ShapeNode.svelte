@@ -27,13 +27,20 @@
   // pattern 도 stretch 안 됨 (부수 개선).
 
   import { NodeResizer } from '@xyflow/svelte';
+  import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
-  import type { CanvasItem, EllipseItem, FigureStrokeDash, RectItem } from '$lib/types/canvas';
+  import type { CanvasItem, EllipseItem, FigureStrokeDash, FontFamily, FontWeight, RectItem, TextAlign, TextVerticalAlign } from '$lib/types/canvas';
+  import { deriveLabel, shouldDeriveLabel } from './labelDerive';
+  import { fontFamilyVar } from './fontFamily';
+  import { fontWeightCss, textDecorationCss } from './textStyle';
+  import { constrainResizeSquare, resizeEventShiftKey } from './resizeConstraint';
   import { strokeDashArray } from './strokeDash';
 
   interface ShapeNodeData {
     id: string;
     type: 'rect' | 'ellipse';
+    x: number;
+    y: number;
     w: number;
     h: number;
     visibility: boolean;
@@ -45,6 +52,18 @@
     stroke_enabled?: boolean;
     corner_rounded?: boolean;
     stroke_dash?: FigureStrokeDash;
+    text?: string;
+    font_size?: number;
+    color?: string;
+    text_align?: TextAlign;
+    text_vertical_align?: TextVerticalAlign;
+    font_weight?: FontWeight;
+    italic?: boolean;
+    underline?: boolean;
+    strikethrough?: boolean;
+    font_family?: FontFamily;
+    label?: string;
+    label_auto?: boolean;
     /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
     group_selected?: boolean;
   }
@@ -122,12 +141,25 @@
   const MIN_HIT_PX = 24;
   const needsBorderHitTarget = $derived(!fillEnabled && strokeEnabled);
   const hitStrokeWidth = $derived(Math.max(strokeWidth + HIT_TOLERANCE_PX, MIN_HIT_PX));
+  const shapeText = $derived(data.text ?? '');
+  const textAlign = $derived(data.text_align ?? 'center');
+  const textVerticalAlign = $derived(data.text_vertical_align ?? 'middle');
+  const textFontSize = $derived(data.font_size ?? 14);
+  const textColor = $derived(data.color ?? 'var(--color-fg)');
+  const textFontWeight = $derived(fontWeightCss(data.font_weight));
+  const textFontStyle = $derived(data.italic === true ? 'italic' : 'normal');
+  const textDecoration = $derived(textDecorationCss(data));
+  const textFontFamily = $derived(fontFamilyVar(data.font_family));
+  let editing = $state(false);
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
 
-  async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
-    const nextW = Math.max(20, params.width);
-    const nextH = Math.max(20, params.height);
+  async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
+    const constrained = resizeEventShiftKey(event)
+      ? constrainResizeSquare(params, data, 20)
+      : params;
+    const nextW = Math.max(20, constrained.width);
+    const nextH = Math.max(20, constrained.height);
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -135,8 +167,8 @@
           it.id === data.id && (it.type === 'rect' || it.type === 'ellipse')
             ? ({
                 ...it,
-                x: params.x,
-                y: params.y,
+                x: constrained.x,
+                y: constrained.y,
                 w: nextW,
                 h: nextH,
               } as RectItem | EllipseItem)
@@ -149,33 +181,62 @@
       },
     );
   }
+
+  function isControlSurface(e: MouseEvent): boolean {
+    const target = e.target;
+    return target instanceof Element && target.closest('.svelte-flow__resize-control') !== null;
+  }
+
+  function onDblClick(e: MouseEvent): void {
+    if (isLocked || isControlSurface(e)) return;
+    e.stopPropagation();
+    if (sessionStore.consumeSuppressedTextEditDblClick(data.id)) return;
+    editing = true;
+  }
+
+  async function onCommit(next: string): Promise<void> {
+    if (next === shapeText) {
+      editing = false;
+      return;
+    }
+    if (sessionStore.active === null) {
+      editing = false;
+      return;
+    }
+    const shouldDerive = shouldDeriveLabel(data.label_auto, data.label, next);
+    const result = await sessionStore.optimisticMutation(
+      (cur) => ({
+        ...cur,
+        items: cur.items.map((it: CanvasItem) =>
+          it.id === data.id && (it.type === 'rect' || it.type === 'ellipse')
+            ? (shouldDerive
+                ? ({
+                    ...it,
+                    text: next,
+                    label: deriveLabel(next),
+                    label_auto: false,
+                  } as RectItem | EllipseItem)
+                : ({ ...it, text: next } as RectItem | EllipseItem))
+            : it,
+        ),
+      }),
+      {
+        abortMessage: 'Text edit aborted — session reconnect failed.',
+        failMessage: 'Text commit failed',
+      },
+    );
+    if (result.ok) editing = false;
+  }
 </script>
 
 {#if isVisible}
-  <!--
-    Wrapper pointer-events 는 fillEnabled 분기:
-     - fillEnabled=true → 'auto' (div + SVG 둘 다 hit; interior 면 div 가 catch,
-       stroke ring 도 SVG 가 catch). 옛 동작과 정합 — 회귀 0.
-     - fillEnabled=false → 'none' (div 통과, SVG element 의 pointer-events 만
-       authoritative). interior 클릭은 뒤 panel/canvas 로 전달. SVG 의 ring 만
-       hit 가능 (stroke_enabled=true 면).
-
-    [정정 2026-05-21] 직전 버전 comment 의 "NodeResizer handle 은 자체
-    pointer-events:all 이라 wrapper none 와 무관" 가정은 *틀렸음*. xyflow 의
-    `.svelte-flow__resize-control` 의 CSS 는 `position: absolute` 만 명시 —
-    `pointer-events` 미지정이라 inheritable property 가 wrapper 로부터
-    `none` 상속 → fill-off shape 의 resize handle 이 클릭 불가가 되어
-    scale 변경 불가 회귀. `position: absolute` 는 시각 위치만 분리할 뿐 DOM
-    상속은 유지. 본 component 의 `:global(.svelte-flow__resize-control)`
-    rule 로 resize handle 에 한해 `pointer-events: all` 명시 override.
-  -->
   <div
     class="shape-node"
     class:m-single={isInM}
     class:locked={isLocked}
-    class:pass-through={!fillEnabled}
     role="group"
     aria-label={`${data.type} item`}
+    ondblclick={onDblClick}
   >
     <NodeResizer
       nodeId={data.id}
@@ -257,6 +318,35 @@
         {/if}
       {/if}
     </svg>
+    <div
+      class="shape-text"
+      class:editing
+      class:v-top={textVerticalAlign === 'top'}
+      class:v-middle={textVerticalAlign === 'middle'}
+      class:v-bottom={textVerticalAlign === 'bottom'}
+      style="font-size: {textFontSize}px; color: {textColor}; text-align: {textAlign}; font-family: {textFontFamily}; font-weight: {textFontWeight}; font-style: {textFontStyle}; --shape-text-decoration: {textDecoration};"
+    >
+      <div class="shape-text-cell">
+        {#if editing}
+          <InlineEditTextarea
+            value={shapeText}
+            editing={true}
+            allowEmpty={true}
+            placeholder=""
+            class="shape-text-edit"
+            plain={true}
+            rows={1}
+            selectOnFocus={shapeText.length === 0}
+            textAlign={textAlign}
+            commitOnEnter={true}
+            onCommit={(next: string) => void onCommit(next)}
+            onCancel={() => (editing = false)}
+          />
+        {:else if shapeText.length > 0}
+          <span class="shape-text-body">{shapeText}</span>
+        {/if}
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -269,19 +359,6 @@
     overflow: visible;
   }
 
-  /* Fill off — wrapper pass-through. SVG element 의 pointer-events attribute 가 authoritative hit-test. */
-  .shape-node.pass-through {
-    pointer-events: none;
-  }
-
-  /* xyflow NodeResizer handle 의 inherit 차단 — fill-off shape 도 resize 가능.
-     `.svelte-flow__resize-control` 는 xyflow internal class (style.css 기본은
-     position:absolute 만 명시, pointer-events 미지정). wrapper 의 `none` 이
-     inherit 되면 handle 클릭 불가 → scale 변경 불가 회귀 (2026-05-21 fix). */
-  .shape-node.pass-through :global(.svelte-flow__resize-control) {
-    pointer-events: all;
-  }
-
   .shape-node.m-single {
     outline: none;
   }
@@ -291,8 +368,11 @@
   }
 
   .shape-svg {
+    position: absolute;
+    inset: 0;
     display: block;
     overflow: visible;
+    z-index: 0;
   }
 
   /* Invisible thick hit-target — fill-off rect/ellipse 의 border 근처 cursor 시각 단서. */
@@ -301,5 +381,71 @@
   }
   .shape-node.locked .shape-hit {
     cursor: default;
+  }
+
+  .shape-text {
+    box-sizing: border-box;
+    position: absolute;
+    inset: 8px;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    pointer-events: none;
+    line-height: 1.2;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .shape-text.v-top {
+    justify-content: flex-start;
+  }
+
+  .shape-text.v-middle {
+    justify-content: center;
+  }
+
+  .shape-text.v-bottom {
+    justify-content: flex-end;
+  }
+
+  .shape-text.editing {
+    overflow: visible;
+    pointer-events: auto;
+  }
+
+  .shape-text-cell {
+    width: 100%;
+    line-height: 1.2;
+  }
+
+  .shape-text-body {
+    display: block;
+    width: 100%;
+    pointer-events: auto;
+    text-decoration: var(--shape-text-decoration);
+    text-decoration-skip-ink: auto;
+  }
+
+  :global(.shape-text .shape-text-edit) {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    min-height: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    font-family: inherit;
+    font-size: inherit;
+    color: inherit;
+    background: transparent;
+    resize: none;
+    outline: none;
+    line-height: 1.2;
+    text-decoration: var(--shape-text-decoration);
+    text-decoration-skip-ink: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow: hidden;
   }
 </style>

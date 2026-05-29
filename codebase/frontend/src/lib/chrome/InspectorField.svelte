@@ -23,6 +23,8 @@
     k?: string;
     ariaLabel?: string;
     disabled?: boolean;
+    /** Apply valid edits on every keystroke so canvas changes preview immediately. */
+    live?: boolean;
   }
 
   const {
@@ -35,6 +37,7 @@
     k,
     ariaLabel,
     disabled = false,
+    live = false,
   }: Props = $props();
 
   let draft = $state('');
@@ -84,6 +87,15 @@
       cancel(e.currentTarget as HTMLInputElement);
     }
   }
+
+  function oninput(e: Event): void {
+    draft = (e.currentTarget as HTMLInputElement).value;
+    if (!live || disabled) return;
+    const trimmed = draft.trim();
+    if (trimmed.length === 0) return;
+    if (type === 'number' && !Number.isFinite(Number(trimmed))) return;
+    oncommit(trimmed);
+  }
 </script>
 
 <label class="inspector-input" class:mixed class:editing>
@@ -99,7 +111,7 @@
     placeholder={mixed ? 'Mixed' : placeholder}
     aria-label={ariaLabel ?? k}
     {disabled}
-    oninput={(e) => (draft = (e.currentTarget as HTMLInputElement).value)}
+    {oninput}
     {onfocus}
     {onblur}
     {onkeydown}

@@ -68,6 +68,7 @@
     DEFAULT_SNIPPETS_SIZE,
   } from './itemFactory';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
+  import { projectPointToAngle, squarePointFromDrag } from './resizeConstraint';
 
   interface CanvasProps {
     /** ContextMenu trigger — `+page.svelte` 가 호스팅하는 ContextMenu
@@ -99,6 +100,8 @@
     /** Container-local screen coord — ghost overlay 의 left/top 계산용. */
     startLocal: { x: number; y: number };
     currentLocal: { x: number; y: number };
+    shiftKey: boolean;
+    lineShiftAngle: number | null;
   }
   let dragState = $state<DragState | null>(null);
   interface GroupDragState {
@@ -458,9 +461,18 @@
     }
     const sx = dragState.startLocal.x;
     const sy = dragState.startLocal.y;
-    const cx = dragState.currentLocal.x;
-    const cy = dragState.currentLocal.y;
+    let cx = dragState.currentLocal.x;
+    let cy = dragState.currentLocal.y;
     if (dragState.tool === 'line') {
+      if (dragState.shiftKey && dragState.lineShiftAngle !== null) {
+        const projected = projectPointToAngle(
+          dragState.startLocal,
+          dragState.currentLocal,
+          dragState.lineShiftAngle,
+        );
+        cx = projected.x;
+        cy = projected.y;
+      }
       const left = Math.min(sx, cx) - GHOST_LINE_PADDING;
       const top = Math.min(sy, cy) - GHOST_LINE_PADDING;
       return {
@@ -475,6 +487,14 @@
         y2: cy - top,
         path: '',
       };
+    }
+    if (
+      dragState.shiftKey &&
+      (dragState.tool === 'rect' || dragState.tool === 'ellipse')
+    ) {
+      const square = squarePointFromDrag(dragState.startLocal, dragState.currentLocal);
+      cx = square.x;
+      cy = square.y;
     }
     return {
       tool: dragState.tool,
@@ -793,6 +813,8 @@
       startFlow: flow,
       startLocal: { x: localX, y: localY },
       currentLocal: { x: localX, y: localY },
+      shiftKey: e.shiftKey,
+      lineShiftAngle: null,
     };
     if (tool === 'free_draw') {
       // 0065 FE-1 — 비반응 buffer init. 직전 stroke 잔여 정리 (cancel/abort
@@ -1064,9 +1086,23 @@
       // 만 trigger 로 사용. currentLocal stale 도 ghostPreview 가 안 읽음.
       return;
     }
+    let lineShiftAngle = dragState.lineShiftAngle;
+    if (dragState.tool === 'line') {
+      if (e.shiftKey) {
+        if (lineShiftAngle === null) {
+          const dx = nextLocal.x - dragState.startLocal.x;
+          const dy = nextLocal.y - dragState.startLocal.y;
+          if (Math.hypot(dx, dy) > 0.5) lineShiftAngle = Math.atan2(dy, dx);
+        }
+      } else {
+        lineShiftAngle = null;
+      }
+    }
     dragState = {
       ...dragState,
       currentLocal: nextLocal,
+      shiftKey: e.shiftKey,
+      lineShiftAngle,
     };
   }
 
@@ -1090,7 +1126,7 @@
     const state = dragState;
     dragState = null;
 
-    const endFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    let endFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     const dx = endFlow.x - state.startFlow.x;
     const dy = endFlow.y - state.startFlow.y;
     const distance = Math.hypot(dx, dy);
@@ -1108,18 +1144,26 @@
     } else if (state.tool === 'line') {
       // Line: endpoint pair 그대로 보존 → 4 방향 (TL→BR, BR→TL, TR→BL, BL→TR).
       // distance < threshold 면 default-size 의 down-right 방향 단일선.
+      if (e.shiftKey && state.lineShiftAngle !== null) {
+        endFlow = projectPointToAngle(state.startFlow, endFlow, state.lineShiftAngle);
+      }
       const p2 =
         distance < DRAG_CLICK_THRESHOLD
           ? { x: state.startFlow.x + 240, y: state.startFlow.y + 80 }
           : endFlow;
       item = createLineItem(state.startFlow, p2);
     } else {
+      if (e.shiftKey && (state.tool === 'rect' || state.tool === 'ellipse')) {
+        endFlow = squarePointFromDrag(state.startFlow, endFlow);
+      }
+      const constrainedDx = endFlow.x - state.startFlow.x;
+      const constrainedDy = endFlow.y - state.startFlow.y;
       // Rect/Ellipse: bounding box 정규화 (drag 방향 무관, w/h ≥ 0).
       const bounds = {
         x: Math.min(state.startFlow.x, endFlow.x),
         y: Math.min(state.startFlow.y, endFlow.y),
-        w: distance < DRAG_CLICK_THRESHOLD ? 0 : Math.abs(dx),
-        h: distance < DRAG_CLICK_THRESHOLD ? 0 : Math.abs(dy),
+        w: distance < DRAG_CLICK_THRESHOLD ? 0 : Math.abs(constrainedDx),
+        h: distance < DRAG_CLICK_THRESHOLD ? 0 : Math.abs(constrainedDy),
       };
       item = createShapeItem(state.tool, bounds);
     }
@@ -1270,9 +1314,10 @@
         break;
       case 'text':
         // batch-5 R3 신규: font_weight / italic / underline / strikethrough.
+        // ADR-0040/0041 신규: font_family + optional text box fill/stroke.
         // 누락 시 Inspector 변경이 cached Node 로 흡수되어 selection 해제 전엔
         // 반영 안 됨 — 회귀 가드.
-        payload = `|${item.text}|${item.font_size}|${item.color}|${item.text_align ?? ''}|${item.text_vertical_align ?? ''}|${item.font_weight ?? ''}|${item.italic ? 1 : 0}|${item.underline ? 1 : 0}|${item.strikethrough ? 1 : 0}`;
+        payload = `|${item.text}|${item.font_size}|${item.color}|${item.text_align ?? ''}|${item.text_vertical_align ?? ''}|${item.font_weight ?? ''}|${item.italic ? 1 : 0}|${item.underline ? 1 : 0}|${item.strikethrough ? 1 : 0}|${item.font_family ?? ''}|${item.fill ?? ''}|${item.stroke ?? ''}|${item.stroke_width ?? ''}|${item.fill_enabled === true ? 1 : 0}|${item.stroke_enabled === true ? 1 : 0}|${item.corner_rounded ? 1 : 0}|${item.stroke_dash ?? ''}`;
         break;
       case 'note':
         payload = `|${item.title ?? ''}|${item.body ?? ''}|${item.color ?? ''}`;
@@ -1282,11 +1327,13 @@
         break;
       case 'rect':
         // batch-5 R1+R2 신규: fill_enabled / stroke_enabled / corner_rounded / stroke_dash.
-        payload = `|${item.stroke}|${item.fill}|${item.stroke_width}|${item.fill_enabled === false ? 0 : 1}|${item.stroke_enabled === false ? 0 : 1}|${item.corner_rounded ? 1 : 0}|${item.stroke_dash ?? ''}`;
+        // ADR-0040/0041 신규: embedded figure text + text style fields.
+        payload = `|${item.stroke}|${item.fill}|${item.stroke_width}|${item.fill_enabled === false ? 0 : 1}|${item.stroke_enabled === false ? 0 : 1}|${item.corner_rounded ? 1 : 0}|${item.stroke_dash ?? ''}|${item.text ?? ''}|${item.font_size ?? ''}|${item.color ?? ''}|${item.text_align ?? ''}|${item.text_vertical_align ?? ''}|${item.font_weight ?? ''}|${item.italic ? 1 : 0}|${item.underline ? 1 : 0}|${item.strikethrough ? 1 : 0}|${item.font_family ?? ''}`;
         break;
       case 'ellipse':
         // batch-5 R1+R2 신규: fill_enabled / stroke_enabled / stroke_dash (corner_rounded 없음).
-        payload = `|${item.stroke}|${item.fill}|${item.stroke_width}|${item.fill_enabled === false ? 0 : 1}|${item.stroke_enabled === false ? 0 : 1}|${item.stroke_dash ?? ''}`;
+        // ADR-0040/0041 신규: embedded figure text + text style fields.
+        payload = `|${item.stroke}|${item.fill}|${item.stroke_width}|${item.fill_enabled === false ? 0 : 1}|${item.stroke_enabled === false ? 0 : 1}|${item.stroke_dash ?? ''}|${item.text ?? ''}|${item.font_size ?? ''}|${item.color ?? ''}|${item.text_align ?? ''}|${item.text_vertical_align ?? ''}|${item.font_weight ?? ''}|${item.italic ? 1 : 0}|${item.underline ? 1 : 0}|${item.strikethrough ? 1 : 0}|${item.font_family ?? ''}`;
         break;
       case 'line':
         // batch-5 R2 신규: stroke_dash.
@@ -1875,7 +1922,8 @@
           const nextSelected =
             overlayGroupId ?? targetAtDrillLevel(id, target, sessionStore.items, sessionStore.groups);
           sessionStore.setM([nextSelected]);
-          if (sessionStore.items.get(id)?.type === 'text') {
+          const itemType = sessionStore.items.get(id)?.type;
+          if (itemType === 'text' || itemType === 'rect' || itemType === 'ellipse') {
             sessionStore.suppressTextEditDblClick(id);
           }
         } else {

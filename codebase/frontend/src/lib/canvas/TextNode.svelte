@@ -10,7 +10,12 @@
   import { NodeResizer } from '@xyflow/svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
-  import type { CanvasItem, FontWeight, TextAlign, TextItem, TextVerticalAlign } from '$lib/types/canvas';
+  import type { CanvasItem, FigureStrokeDash, FontFamily, FontWeight, TextAlign, TextItem, TextVerticalAlign } from '$lib/types/canvas';
+  import { deriveLabel, shouldDeriveLabel } from './labelDerive';
+  import { fontFamilyVar } from './fontFamily';
+  import { fontWeightCss, textDecorationCss } from './textStyle';
+  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
+  import { strokeDashArray } from './strokeDash';
   // 텍스트 정렬 UI 는 ToolbarSubbar (lib/toolbar/ToolbarSubbar.svelte) 로 이전.
   // 본 컴포넌트는 더 이상 alignment toolbar 를 그리지 않는다.
 
@@ -37,21 +42,23 @@
     underline?: boolean;
     /** batch-5 R3 — strikethrough toggle. default false. */
     strikethrough?: boolean;
+    font_family?: FontFamily;
+    label_auto?: boolean;
+    stroke?: string;
+    fill?: string;
+    stroke_width?: number;
+    fill_enabled?: boolean;
+    stroke_enabled?: boolean;
+    corner_rounded?: boolean;
+    stroke_dash?: FigureStrokeDash;
     /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
     group_selected?: boolean;
   }
 
-  // R7 (batch-5 Grill #18) — label auto-derive 알고리즘. 첫 줄만 + trim +
-  // 기존 label cap (4096B, ADR-0018 D8) 자연 활용. 4 KB slice 는 byte 가 아닌
-  // char 기준 (byte-cap 은 BE validation 이 강제) — UI-friendly conservative.
-  const TEXT_LABEL_CHAR_CAP = 4000;
-  function deriveLabel(text: string): string {
-    const firstLine = text.split('\n', 1)[0] ?? '';
-    return firstLine.trim().slice(0, TEXT_LABEL_CHAR_CAP);
-  }
-
   let {
     data,
+    width,
+    height,
   }: {
     data: TextNodeData;
     id?: string;
@@ -74,20 +81,27 @@
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const textAlign = $derived(data.text_align ?? 'center');
   const textVerticalAlign = $derived(data.text_vertical_align ?? 'middle');
+  const liveW = $derived(width ?? data.w);
+  const liveH = $derived(height ?? data.h);
 
-  // batch-5 R3 — font weight / italic / underline / strikethrough.
-  // FontWeight: light=300 / normal=400 / bold=700 (Grill #6, 3-bucket).
   const fontWeight = $derived(data.font_weight ?? 'normal');
-  const fontWeightCss = $derived(
-    fontWeight === 'light' ? 300 : fontWeight === 'bold' ? 700 : 400,
-  );
+  const fontWeightValue = $derived(fontWeightCss(fontWeight));
   const fontStyleCss = $derived(data.italic === true ? 'italic' : 'normal');
-  const textDecorationCss = $derived.by(() => {
-    const parts: string[] = [];
-    if (data.underline === true) parts.push('underline');
-    if (data.strikethrough === true) parts.push('line-through');
-    return parts.length === 0 ? 'none' : parts.join(' ');
+  const textDecorationValue = $derived(textDecorationCss(data));
+  const fontFamilyCss = $derived(fontFamilyVar(data.font_family));
+
+  const fillEnabled = $derived(data.fill_enabled === true);
+  const strokeEnabled = $derived(data.stroke_enabled === true);
+  const strokeWidth = $derived(data.stroke_width ?? 2);
+  const boxFill = $derived(data.fill ?? 'var(--color-surface)');
+  const boxStroke = $derived(data.stroke ?? 'var(--color-fg)');
+  const boxDash = $derived(strokeEnabled ? strokeDashArray(data.stroke_dash, strokeWidth) : 'none');
+  const boxRadius = $derived.by(() => {
+    if (data.corner_rounded !== true) return 0;
+    const base = Math.min(liveW, liveH) * 0.15;
+    return Math.max(4, Math.min(16, base));
   });
+  const hasBox = $derived(fillEnabled || strokeEnabled);
 
   let editing = $state(false);
   const minTextHeight = $derived(Math.max(16, Math.ceil(data.font_size)));
@@ -125,8 +139,7 @@
     // R7 (batch-5 Grill #18) — label-empty trigger derive. label 이 비어있고
     // next 가 비지 않은 경우에만 deriveLabel(next) 로 갱신. 이후 사용자가
     // Inspector 에서 label 을 따로 입력하면 자동 derive 가 비활성 (자율성).
-    const curLabel = data.label ?? '';
-    const shouldDerive = curLabel === '' && next.length > 0;
+    const shouldDerive = shouldDeriveLabel(data.label_auto, data.label, next);
     // Inspector hot-path 와 같은 패턴: optimisticMutation 으로 commit 즉시
     // 반영 + PUT 실패 시 priorSnapshot 으로 자동 rollback. server 부하 변화
     // 0 — InlineEditTextarea 가 이미 commit-based (Enter/blur 1회).
@@ -136,7 +149,7 @@
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'text'
             ? (shouldDerive
-                ? ({ ...it, text: next, label: deriveLabel(next) } as TextItem)
+                ? ({ ...it, text: next, label: deriveLabel(next), label_auto: false } as TextItem)
                 : ({ ...it, text: next } as TextItem))
             : it,
         ),
@@ -149,13 +162,22 @@
     if (result.ok) editing = false;
   }
 
-  async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
+  async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
+    const constrained = resizeEventShiftKey(event)
+      ? constrainResizeAspect(params, data, data.w / data.h, 120, minTextHeight)
+      : params;
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'text'
-            ? ({ ...it, x: params.x, y: params.y, w: Math.max(120, params.width), h: Math.max(minTextHeight, params.height) } as TextItem)
+            ? ({
+                ...it,
+                x: constrained.x,
+                y: constrained.y,
+                w: Math.max(120, constrained.width),
+                h: Math.max(minTextHeight, constrained.height),
+              } as TextItem)
             : it,
         ),
       }),
@@ -173,7 +195,7 @@
     class="text-node"
     class:m-single={isInM}
     class:locked={isLocked}
-    style="width: 100%; height: 100%; font-size: {data.font_size}px; color: {data.color}; text-align: {textAlign}; font-weight: {fontWeightCss}; font-style: {fontStyleCss}; --text-decoration: {textDecorationCss};"
+    style="width: 100%; height: 100%; font-size: {data.font_size}px; color: {data.color}; text-align: {textAlign}; font-family: {fontFamilyCss}; font-weight: {fontWeightValue}; font-style: {fontStyleCss}; --text-decoration: {textDecorationValue};"
     role="group"
     aria-label="Text item"
     ondblclick={onDblClick}
@@ -188,6 +210,30 @@
       lineClass="panel-resize-line"
       {onResizeEnd}
     />
+    {#if hasBox}
+      <svg
+        class="text-box"
+        width="100%"
+        height="100%"
+        viewBox={`0 0 ${liveW} ${liveH}`}
+        preserveAspectRatio="none"
+        aria-hidden="true"
+      >
+        <rect
+          x={strokeEnabled ? strokeWidth / 2 : 0}
+          y={strokeEnabled ? strokeWidth / 2 : 0}
+          width={Math.max(0, liveW - (strokeEnabled ? strokeWidth : 0))}
+          height={Math.max(0, liveH - (strokeEnabled ? strokeWidth : 0))}
+          rx={boxRadius}
+          ry={boxRadius}
+          fill={fillEnabled ? boxFill : 'none'}
+          stroke={strokeEnabled ? boxStroke : 'none'}
+          stroke-width={strokeEnabled ? strokeWidth : 0}
+          stroke-dasharray={boxDash}
+          vector-effect="non-scaling-stroke"
+        />
+      </svg>
+    {/if}
     <div
       class="text-content"
       class:editing
@@ -250,6 +296,15 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    z-index: 0;
+  }
+
+  .text-box {
+    position: absolute;
+    inset: 0;
+    display: block;
+    overflow: visible;
+    pointer-events: none;
     z-index: 0;
   }
 

@@ -30,6 +30,7 @@ export const MINIMIZED_TERMINAL_PANEL_HEIGHT = 35;
 export type Visibility = 'visible' | 'hidden';
 export type TextAlign = 'left' | 'center' | 'right';
 export type TextVerticalAlign = 'top' | 'middle' | 'bottom';
+export type FontFamily = 'sans' | 'serif' | 'mono';
 
 /**
  * ADR-0018 D4 amend ① (batch-5, 2026-05-20) — rect/ellipse/line 의 stroke
@@ -99,6 +100,18 @@ export interface TextItem extends ItemCommon {
   underline?: boolean;
   /** ADR-0018 D4 amend ② (batch-5) — strikethrough toggle. composes with underline. */
   strikethrough?: boolean;
+  /** ADR-0041 — system-stack font family. default `"sans"`. */
+  font_family?: FontFamily;
+  /** ADR-0040 D9 — one-shot text→label derive flag. */
+  label_auto?: boolean;
+  /** ADR-0040 — optional box style for text items. defaults off. */
+  stroke?: string;
+  fill?: string;
+  stroke_width?: number;
+  fill_enabled?: boolean;
+  stroke_enabled?: boolean;
+  corner_rounded?: boolean;
+  stroke_dash?: FigureStrokeDash;
 }
 
 export interface NoteItem extends ItemCommon {
@@ -132,6 +145,19 @@ export interface RectItem extends ItemCommon {
   corner_rounded?: boolean;
   /** ADR-0018 D4 amend ① (batch-5) — stroke dash pattern. undefined=solid. */
   stroke_dash?: FigureStrokeDash;
+  /** ADR-0040 — embedded figure text. */
+  text?: string;
+  font_size?: number;
+  color?: string;
+  text_align?: TextAlign;
+  text_vertical_align?: TextVerticalAlign;
+  font_weight?: FontWeight;
+  italic?: boolean;
+  underline?: boolean;
+  strikethrough?: boolean;
+  font_family?: FontFamily;
+  /** ADR-0040 D9 — one-shot text→label derive flag. */
+  label_auto?: boolean;
 }
 
 export interface EllipseItem extends ItemCommon {
@@ -146,6 +172,19 @@ export interface EllipseItem extends ItemCommon {
   stroke_enabled?: boolean;
   /** ADR-0018 D4 amend ① (batch-5) — stroke dash pattern. undefined=solid. */
   stroke_dash?: FigureStrokeDash;
+  /** ADR-0040 — embedded figure text. */
+  text?: string;
+  font_size?: number;
+  color?: string;
+  text_align?: TextAlign;
+  text_vertical_align?: TextVerticalAlign;
+  font_weight?: FontWeight;
+  italic?: boolean;
+  underline?: boolean;
+  strikethrough?: boolean;
+  font_family?: FontFamily;
+  /** ADR-0040 D9 — one-shot text→label derive flag. */
+  label_auto?: boolean;
 }
 
 export interface LineItem extends ItemCommon {

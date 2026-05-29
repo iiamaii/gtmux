@@ -26,10 +26,13 @@
   import { snippetDeleteDialog } from '$lib/stores/snippetDeleteDialog.svelte';
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import type { CanvasItem, SnippetEntry, SnippetsItem } from '$lib/types/canvas';
+  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
 
   interface SnippetsNodeData {
     id: string;
     type: 'snippets';
+    x: number;
+    y: number;
     w: number;
     h: number;
     /** Canvas.svelte effectiveVisibility() output — boolean (true=show).
@@ -290,15 +293,30 @@
   const SNIPPETS_RESIZE_MIN_H = 75;
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
-  async function onResizeEnd(_e: unknown, params: ResizeParams): Promise<void> {
-    const nextW = Math.max(SNIPPETS_RESIZE_MIN_W, params.width);
-    const nextH = Math.max(SNIPPETS_RESIZE_MIN_H, params.height);
+  async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
+    const constrained = resizeEventShiftKey(event)
+      ? constrainResizeAspect(
+          params,
+          data,
+          data.w / data.h,
+          SNIPPETS_RESIZE_MIN_W,
+          SNIPPETS_RESIZE_MIN_H,
+        )
+      : params;
+    const nextW = Math.max(SNIPPETS_RESIZE_MIN_W, constrained.width);
+    const nextH = Math.max(SNIPPETS_RESIZE_MIN_H, constrained.height);
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'snippets'
-            ? ({ ...it, x: params.x, y: params.y, w: nextW, h: nextH } as SnippetsItem)
+            ? ({
+                ...it,
+                x: constrained.x,
+                y: constrained.y,
+                w: nextW,
+                h: nextH,
+              } as SnippetsItem)
             : it,
         ),
       }),

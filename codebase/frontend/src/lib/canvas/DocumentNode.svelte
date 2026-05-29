@@ -38,12 +38,15 @@
     buildRenderedHtmlSrcdoc,
   } from './documentRender';
   import type { CanvasItem, DocumentItem } from '$lib/types/canvas';
+  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
 
   /** Inline content cap = ADR-0018 D4 amend ② / BE DOCUMENT_INLINE_MAX_BYTES. */
   const DOCUMENT_INLINE_MAX_BYTES = 64 * 1024;
 
   interface DocumentNodeData {
     id: string;
+    x: number;
+    y: number;
     w: number;
     h: number;
     visibility: boolean;
@@ -355,7 +358,10 @@
   const DOC_RESTORE_W = 360;
   const DOC_RESTORE_H = 220;
 
-  async function onResizeEnd(_event: unknown, params: ResizeParams): Promise<void> {
+  async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
+    const constrained = resizeEventShiftKey(event)
+      ? constrainResizeAspect(params, data, data.w / data.h, 220, 160)
+      : params;
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -363,10 +369,10 @@
           it.id === data.id && it.type === 'document'
             ? ({
                 ...it,
-                x: params.x,
-                y: params.y,
-                w: Math.max(220, params.width),
-                h: Math.max(160, params.height),
+                x: constrained.x,
+                y: constrained.y,
+                w: Math.max(220, constrained.width),
+                h: Math.max(160, constrained.height),
               } as DocumentItem)
             : it,
         ),

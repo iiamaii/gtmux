@@ -20,6 +20,7 @@
   // 2026-05-20 figure UX 정리: rect/ellipse/line/free 는 canvas X 버튼 미제공
   // (Backspace / Cmd+Delete / ContextMenu Delete 로만 제거).
   import { strokeDashArray } from './strokeDash';
+  import { projectPointToAngle } from './resizeConstraint';
 
   interface LineNodeData {
     id: string;
@@ -72,6 +73,7 @@
   let draft = $state<DraftLine | null>(null);
   let pendingCommit = $state<DraftLine | null>(null);
   let activeEndpoint = $state<Endpoint | null>(null);
+  let endpointShiftAngle = $state<number | null>(null);
 
   // Render 기준점은 편집 중에도 기존 SvelteFlow node bbox 로 고정한다.
   // draft endpoint 는 이 기준점 밖의 음수/초과 좌표가 될 수 있으며, SVG/DOM
@@ -107,6 +109,7 @@
     e.preventDefault();
     e.stopPropagation();
     activeEndpoint = endpoint;
+    endpointShiftAngle = null;
     draft = { x: data.x, y: data.y, x2: data.x2, y2: data.y2 };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     window.addEventListener('pointermove', onWindowPointerMove, { capture: true });
@@ -114,9 +117,21 @@
     window.addEventListener('pointercancel', onWindowPointerCancel, { capture: true });
   }
 
-  function moveEndpointToClient(clientX: number, clientY: number): void {
+  function moveEndpointToClient(clientX: number, clientY: number, shiftKey: boolean): void {
     if (activeEndpoint === null || draft === null) return;
-    const flow = screenToFlowPosition({ x: clientX, y: clientY });
+    let flow = screenToFlowPosition({ x: clientX, y: clientY });
+    if (shiftKey) {
+      const fixed =
+        activeEndpoint === 'start'
+          ? { x: draft.x2, y: draft.y2 }
+          : { x: draft.x, y: draft.y };
+      if (endpointShiftAngle === null) {
+        endpointShiftAngle = Math.atan2(flow.y - fixed.y, flow.x - fixed.x);
+      }
+      flow = projectPointToAngle(fixed, flow, endpointShiftAngle);
+    } else {
+      endpointShiftAngle = null;
+    }
     draft =
       activeEndpoint === 'start'
         ? { ...draft, x: flow.x, y: flow.y }
@@ -133,16 +148,17 @@
     if (activeEndpoint === null) return;
     e.preventDefault();
     e.stopPropagation();
-    moveEndpointToClient(e.clientX, e.clientY);
+    moveEndpointToClient(e.clientX, e.clientY, e.shiftKey);
   }
 
   function onWindowPointerUp(e: PointerEvent): void {
     if (activeEndpoint === null || draft === null) return;
     e.preventDefault();
     e.stopPropagation();
-    moveEndpointToClient(e.clientX, e.clientY);
+    moveEndpointToClient(e.clientX, e.clientY, e.shiftKey);
     const next = draft;
     activeEndpoint = null;
+    endpointShiftAngle = null;
     draft = null;
     pendingCommit = next;
     removeWindowListeners();
@@ -153,6 +169,7 @@
     e?.preventDefault();
     e?.stopPropagation();
     activeEndpoint = null;
+    endpointShiftAngle = null;
     draft = null;
     removeWindowListeners();
   }
@@ -164,6 +181,7 @@
     if (activeEndpoint !== null) {
       removeWindowListeners();
       activeEndpoint = null;
+      endpointShiftAngle = null;
       draft = null;
       pendingCommit = null;
     }
