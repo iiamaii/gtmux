@@ -2650,4 +2650,31 @@ mod tests {
         let err = validate(&l).unwrap_err();
         assert_eq!(err.code(), "bad_snippet_entry_id");
     }
+
+    /// ADR-0042 interim cross-language drift guard. The OpenAPI codegen chain
+    /// does not carry the canvas `Item` schema (gen-openapi is a stub), so the
+    /// BE/FE contract is hand-mirrored. This test anchors the shared golden
+    /// fixture against the *live* `schema.rs` types: if a field is dropped or
+    /// renamed here while the fixture (the FE-facing contract) still carries
+    /// it, deserialize/validate/round-trip breaks loudly. See
+    /// `shared/contract/README.md` + `.scratch/openapi-schema-contract/`.
+    #[test]
+    fn contract_sample_layout_deserializes_validates_and_round_trips() {
+        const SAMPLE: &str =
+            include_str!("../../../../shared/contract/canvas-layout-contract.sample.json");
+        let layout: Layout = serde_json::from_str(SAMPLE)
+            .expect("contract sample must deserialize against current schema.rs Item types");
+        validate(&layout).expect("contract sample must pass validate()");
+        // Stable round-trip: serializing twice yields identical JSON (default
+        // fields are emitted consistently, so this is order-independent).
+        let once = serde_json::to_value(&layout).unwrap();
+        let twice: Layout = serde_json::from_value(once.clone()).unwrap();
+        let twice_val = serde_json::to_value(&twice).unwrap();
+        assert_eq!(once, twice_val, "contract sample must round-trip stably");
+        assert_eq!(
+            once["items"].as_array().map(|a| a.len()),
+            Some(4),
+            "contract sample item count drifted — update fixture + this guard together"
+        );
+    }
 }
