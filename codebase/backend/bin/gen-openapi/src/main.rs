@@ -8,9 +8,9 @@
 //! meaningful for canvas fields.
 
 use gtmux_http_api::schema::{
-    Anchor, Direction, FigureStrokeDash, FontFamily, FontWeight, Group, Head, Item, ItemCommon,
-    Layout, Point, Routing, SnippetEntry, StrokeDash, TextAlign, TextVerticalAlign, Viewport,
-    Visibility,
+    Anchor, FigureStrokeDash, FontFamily, FontWeight, Group, Head, Item, ItemCommon, Layout,
+    PathEndpoint, PathWaypoint, Point, Routing, SnippetEntry, TextAlign, TextVerticalAlign,
+    Viewport, Visibility,
 };
 use utoipa::OpenApi;
 
@@ -36,10 +36,10 @@ use utoipa::OpenApi;
         FontFamily,
         FigureStrokeDash,
         Anchor,
-        Direction,
         Head,
         Routing,
-        StrokeDash,
+        PathEndpoint,
+        PathWaypoint,
     ))
 )]
 struct ApiDoc;

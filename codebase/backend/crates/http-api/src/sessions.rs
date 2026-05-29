@@ -1567,17 +1567,18 @@ pub async fn layout_put_handler(
 
     // 3. Parse + recompute connector BBoxes + validate.
     //
-    // ADR-0036 Q4/Q5: connector `x/y/w/h` is a BBox cache derived from the
-    // two endpoint anchor points. Recompute it *before* validate() so the
-    // persisted layout is always self-consistent (FE-supplied values are
-    // ignored — server is canonical). Orphan connectors survive the
-    // recompute untouched (no endpoint to anchor against); the subsequent
-    // validate() arm rejects them with `connector_endpoint_missing`.
+    // ADR-0043 D6/D7: `path` `x/y/w/h` is a bbox cache derived from the
+    // endpoint + waypoint chain. The server is canonical (FE-supplied cache
+    // values are ignored), so before validate() we (1) degrade any path
+    // endpoint whose connected target was deleted to a free endpoint at its
+    // fallback_point — preserving the path (R4) instead of rejecting it —
+    // then (2) recompute every path's bbox cache + connected fallback points.
     let mut layout: Layout = match serde_json::from_slice::<Layout>(&body_bytes) {
         Ok(l) => l,
         Err(e) => return SessionError::BadJson(e.to_string()).into_response(),
     };
-    schema::recompute_connector_bboxes(&mut layout);
+    schema::degrade_dangling_path_endpoints(&mut layout);
+    schema::recompute_path_bboxes(&mut layout);
     if let Err(e) = schema::validate(&layout) {
         return SessionError::Validation(e).into_response();
     }

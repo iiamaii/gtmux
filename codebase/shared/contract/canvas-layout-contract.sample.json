@@ -76,7 +76,29 @@
       "visibility": "visible", "locked": false,
       "stroke": "#0d99ff", "stroke_width": 2,
       "x2": 300, "y2": 300,
-      "stroke_dash": "dot"
+      "stroke_dash": "dot",
+      "head_from": "none", "head_to": "arrow"
+    },
+    {
+      "id": "55555555-5555-4555-8555-555555555555",
+      "type": "path",
+      "parent_id": null,
+      "x": 0, "y": 0, "w": 0, "h": 0, "z": 5,
+      "visibility": "visible", "locked": false,
+      "from": {
+        "kind": "connected",
+        "item_id": "22222222-2222-4222-8222-222222222222",
+        "anchor": "E",
+        "fallback_point": { "x": 600, "y": 170 }
+      },
+      "to": { "kind": "free", "point": { "x": 900, "y": 400 } },
+      "routing": "orthogonal",
+      "waypoints": [
+        { "id": "66666666-6666-4666-8666-666666666666", "x": 750, "y": 170 }
+      ],
+      "head_from": "none", "head_to": "arrow",
+      "stroke": "#0d99ff", "stroke_width": 2,
+      "stroke_dash": "solid"
     }
   ],
   "viewport": { "x": 0, "y": 0, "zoom": 1.0 }
