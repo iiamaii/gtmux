@@ -334,11 +334,45 @@ impl Default for FontWeight {
     }
 }
 
+/// Font family bucket for text-bearing items (ADR-0041 D1). Three named
+/// stacks resolved to concrete `font-family` declarations FE-side; the BE
+/// only persists the keyword. Applies to `text` / `rect` / `ellipse`
+/// (ADR-0041 D3 — `note` / `document` keep their own typography).
+///
+/// Wire form is `lowercase`: `"sans" | "serif" | "mono"`. Default = `Sans`.
+/// An unknown variant is a serde deserialize error (strict) — the enum is
+/// FE-controlled so `#[serde(other)]` fallback is intentionally not added
+/// (an unrecognised value is safer rejected than silently coerced). The
+/// per-field `#[serde(default)]` keeps a *missing* field from rejecting the
+/// whole layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FontFamily {
+    #[default]
+    Sans,
+    Serif,
+    Mono,
+}
+
 /// `#[serde(default = "default_true")]` helper — used by Rect/Ellipse to
 /// keep `fill_enabled` / `stroke_enabled` defaulting to `true` for legacy
 /// records that pre-date the 2026-05-20 batch 5 schema amend.
 fn default_true() -> bool {
     true
+}
+
+/// `#[serde(default = "default_font_size")]` helper — embedded text on
+/// `rect` / `ellipse` (ADR-0040 D1) defaults to 14 px when absent. Distinct
+/// from `Item::Text`, where `font_size` stays a required field.
+fn default_font_size() -> u32 {
+    14
+}
+
+/// `#[serde(default = "default_stroke_width")]` helper — the box stroke on
+/// `Item::Text` (ADR-0040 D1) defaults to 2 px when absent, matching the
+/// figure stroke default. The legal range is the shared figure 1..=32.
+fn default_stroke_width() -> u32 {
+    2
 }
 
 /// Canvas Item discriminated union (ADR-0018 D1, D4).
@@ -376,6 +410,38 @@ pub enum Item {
         /// ADR-0018 D4 amend ② — strikethrough toggle.
         #[serde(default)]
         strikethrough: bool,
+        /// ADR-0041 D3 — font family bucket. Defaults to `Sans`.
+        #[serde(default)]
+        font_family: FontFamily,
+        // ── ADR-0040 D1/D2 BoxStyle — text box is default-OFF ──
+        /// Box stroke color. Empty string = FE token default.
+        #[serde(default)]
+        stroke: String,
+        /// Box fill color. Empty string = FE token default.
+        #[serde(default)]
+        fill: String,
+        /// Box stroke width. Shared figure range 1..=32; default 2.
+        #[serde(default = "default_stroke_width")]
+        stroke_width: u32,
+        /// Box fill on/off. ADR-0040 D2: **default `false`** (opposite of
+        /// Rect/Ellipse) so legacy text records render box-less.
+        #[serde(default)]
+        fill_enabled: bool,
+        /// Box stroke on/off. ADR-0040 D2: **default `false`** (opposite of
+        /// Rect/Ellipse).
+        #[serde(default)]
+        stroke_enabled: bool,
+        /// Rounded-corner toggle for the text box (radius computed FE-side).
+        #[serde(default)]
+        corner_rounded: bool,
+        /// Box stroke dash pattern. `None` = solid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke_dash: Option<FigureStrokeDash>,
+        /// ADR-0040 D9 — label auto-derive hint. `None` = unset (no strict
+        /// invariant); `Some(true)` = label tracks `text`, `Some(false)` =
+        /// user pinned a custom label.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label_auto: Option<bool>,
     },
     Note {
         #[serde(flatten)]
@@ -409,6 +475,34 @@ pub enum Item {
         /// `Some(Solid)` round-trips identically.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stroke_dash: Option<FigureStrokeDash>,
+        // ── ADR-0040 D1 embedded TextStyle — empty `text` = not rendered ──
+        /// Embedded text body. Default `""` (legacy rects render no text).
+        #[serde(default)]
+        text: String,
+        /// Embedded text size. 8..=96; default 14.
+        #[serde(default = "default_font_size")]
+        font_size: u32,
+        /// Embedded text color. Empty string = FE token foreground.
+        #[serde(default)]
+        color: String,
+        #[serde(default)]
+        text_align: TextAlign,
+        #[serde(default)]
+        text_vertical_align: TextVerticalAlign,
+        #[serde(default)]
+        font_weight: FontWeight,
+        #[serde(default)]
+        italic: bool,
+        #[serde(default)]
+        underline: bool,
+        #[serde(default)]
+        strikethrough: bool,
+        /// ADR-0041 D3 — font family bucket. Defaults to `Sans`.
+        #[serde(default)]
+        font_family: FontFamily,
+        /// ADR-0040 D9 — label auto-derive hint. See `Item::Text::label_auto`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label_auto: Option<bool>,
     },
     Ellipse {
         #[serde(flatten)]
@@ -425,6 +519,34 @@ pub enum Item {
         /// ADR-0018 D4 amend ① — stroke dash pattern. `None` = solid.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stroke_dash: Option<FigureStrokeDash>,
+        // ── ADR-0040 D1 embedded TextStyle — `corner_rounded` is rect-only ──
+        /// Embedded text body. Default `""`.
+        #[serde(default)]
+        text: String,
+        /// Embedded text size. 8..=96; default 14.
+        #[serde(default = "default_font_size")]
+        font_size: u32,
+        /// Embedded text color. Empty string = FE token foreground.
+        #[serde(default)]
+        color: String,
+        #[serde(default)]
+        text_align: TextAlign,
+        #[serde(default)]
+        text_vertical_align: TextVerticalAlign,
+        #[serde(default)]
+        font_weight: FontWeight,
+        #[serde(default)]
+        italic: bool,
+        #[serde(default)]
+        underline: bool,
+        #[serde(default)]
+        strikethrough: bool,
+        /// ADR-0041 D3 — font family bucket. Defaults to `Sans`.
+        #[serde(default)]
+        font_family: FontFamily,
+        /// ADR-0040 D9 — label auto-derive hint. See `Item::Text::label_auto`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label_auto: Option<bool>,
     },
     Line {
         #[serde(flatten)]
@@ -678,6 +800,34 @@ impl ValidationError {
     }
 }
 
+/// Shared text-payload byte cap check (ADR-0018 D8). Reused by `Item::Text`
+/// and the embedded text on `Item::Rect` / `Item::Ellipse` (ADR-0040 D1).
+fn check_text_cap(text: &str) -> Result<(), ValidationError> {
+    if text.len() > TEXT_PAYLOAD_MAX_BYTES {
+        return Err(ValidationError::TextTooLong);
+    }
+    Ok(())
+}
+
+/// Shared font-size range check (8..=96, ADR-0018 D4 amend ②). Reused by
+/// `Item::Text` and the embedded text on `Item::Rect` / `Item::Ellipse`.
+fn check_font_size(font_size: u32) -> Result<(), ValidationError> {
+    if !(8..=96).contains(&font_size) {
+        return Err(ValidationError::TextFontSizeOutOfRange { font_size });
+    }
+    Ok(())
+}
+
+/// Shared figure stroke-width range check (1..=32, ADR-0018 D4 amend ①).
+/// Reused by Rect / Ellipse / Line and the text box on `Item::Text`
+/// (ADR-0040 D1).
+fn check_stroke_width(width: u32) -> Result<(), ValidationError> {
+    if !(1..=32).contains(&width) {
+        return Err(ValidationError::StrokeWidthOutOfRange { width });
+    }
+    Ok(())
+}
+
 /// Validate a v2 [`Layout`] against ADR-0018 D8 rules. Returns the first
 /// failure encountered — callers that want the full set should fix one and
 /// re-call.
@@ -749,29 +899,39 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
         }
         match it {
             Item::Text {
-                text, font_size, ..
+                text,
+                font_size,
+                stroke_width,
+                ..
             } => {
-                if text.len() > TEXT_PAYLOAD_MAX_BYTES {
-                    return Err(ValidationError::TextTooLong);
-                }
+                check_text_cap(text)?;
                 // ADR-0018 D4 amend ② — Inspector slider caps at 8..=96.
-                if !(8..=96).contains(font_size) {
-                    return Err(ValidationError::TextFontSizeOutOfRange {
-                        font_size: *font_size,
-                    });
-                }
+                check_font_size(*font_size)?;
+                // ADR-0040 D1 — the text box stroke shares the figure band.
+                check_stroke_width(*stroke_width)?;
             }
             // ADR-0018 D4 amend ① — figure stroke_width is bounded to the
-            // inspector-enforced 1..=32 band. Rect / Ellipse / Line share
-            // the same bound; FreeDraw / Connector are scoped separately.
-            Item::Rect { stroke_width, .. }
-            | Item::Ellipse { stroke_width, .. }
-            | Item::Line { stroke_width, .. } => {
-                if !(1..=32).contains(stroke_width) {
-                    return Err(ValidationError::StrokeWidthOutOfRange {
-                        width: *stroke_width,
-                    });
-                }
+            // inspector-enforced 1..=32 band. ADR-0040 D1 — Rect / Ellipse
+            // now also carry embedded text, so they additionally reuse the
+            // text byte cap + font_size range. Line stays stroke-only.
+            Item::Rect {
+                stroke_width,
+                text,
+                font_size,
+                ..
+            }
+            | Item::Ellipse {
+                stroke_width,
+                text,
+                font_size,
+                ..
+            } => {
+                check_stroke_width(*stroke_width)?;
+                check_text_cap(text)?;
+                check_font_size(*font_size)?;
+            }
+            Item::Line { stroke_width, .. } => {
+                check_stroke_width(*stroke_width)?;
             }
             Item::FreeDraw { points, .. } => {
                 if points.len() > FREE_DRAW_POINT_CAP {
@@ -1083,6 +1243,15 @@ mod tests {
                     italic: false,
                     underline: false,
                     strikethrough: false,
+                    font_family: FontFamily::Sans,
+                    stroke: String::new(),
+                    fill: String::new(),
+                    stroke_width: 2,
+                    fill_enabled: false,
+                    stroke_enabled: false,
+                    corner_rounded: false,
+                    stroke_dash: None,
+                    label_auto: None,
                 },
                 Item::FreeDraw {
                     common: item_common(UUID_B),
@@ -1189,6 +1358,15 @@ mod tests {
             italic: false,
             underline: false,
             strikethrough: false,
+            font_family: FontFamily::Sans,
+            stroke: String::new(),
+            fill: String::new(),
+            stroke_width: 2,
+            fill_enabled: false,
+            stroke_enabled: false,
+            corner_rounded: false,
+            stroke_dash: None,
+            label_auto: None,
         });
         assert_eq!(validate(&l), Err(ValidationError::TextTooLong));
     }
@@ -1402,6 +1580,17 @@ mod tests {
             stroke_enabled: true,
             corner_rounded: false,
             stroke_dash: None,
+            text: String::new(),
+            font_size: 14,
+            color: String::new(),
+            text_align: TextAlign::Center,
+            text_vertical_align: TextVerticalAlign::Middle,
+            font_weight: FontWeight::Normal,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            font_family: FontFamily::Sans,
+            label_auto: None,
         }
     }
 
@@ -1770,6 +1959,17 @@ mod tests {
             stroke_enabled: true,
             corner_rounded: false,
             stroke_dash: None,
+            text: String::new(),
+            font_size: 14,
+            color: String::new(),
+            text_align: TextAlign::Center,
+            text_vertical_align: TextVerticalAlign::Middle,
+            font_weight: FontWeight::Normal,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            font_family: FontFamily::Sans,
+            label_auto: None,
         });
         let err = validate(&l).unwrap_err();
         assert_eq!(err.code(), "stroke_width_out_of_range");
@@ -1790,6 +1990,17 @@ mod tests {
             fill_enabled: true,
             stroke_enabled: true,
             stroke_dash: None,
+            text: String::new(),
+            font_size: 14,
+            color: String::new(),
+            text_align: TextAlign::Center,
+            text_vertical_align: TextVerticalAlign::Middle,
+            font_weight: FontWeight::Normal,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            font_family: FontFamily::Sans,
+            label_auto: None,
         });
         let err = validate(&l).unwrap_err();
         assert_eq!(err.code(), "stroke_width_out_of_range");
@@ -1808,6 +2019,17 @@ mod tests {
             stroke_enabled: true,
             corner_rounded: false,
             stroke_dash: None,
+            text: String::new(),
+            font_size: 14,
+            color: String::new(),
+            text_align: TextAlign::Center,
+            text_vertical_align: TextVerticalAlign::Middle,
+            font_weight: FontWeight::Normal,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+            font_family: FontFamily::Sans,
+            label_auto: None,
         });
         l.items.push(Item::Line {
             common: item_common(UUID_B),
@@ -1903,6 +2125,15 @@ mod tests {
             italic: false,
             underline: false,
             strikethrough: false,
+            font_family: FontFamily::Sans,
+            stroke: String::new(),
+            fill: String::new(),
+            stroke_width: 2,
+            fill_enabled: false,
+            stroke_enabled: false,
+            corner_rounded: false,
+            stroke_dash: None,
+            label_auto: None,
         });
         let err = validate(&l).unwrap_err();
         assert_eq!(err.code(), "text_font_size_out_of_range");
@@ -1923,9 +2154,369 @@ mod tests {
             italic: false,
             underline: false,
             strikethrough: false,
+            font_family: FontFamily::Sans,
+            stroke: String::new(),
+            fill: String::new(),
+            stroke_width: 2,
+            fill_enabled: false,
+            stroke_enabled: false,
+            corner_rounded: false,
+            stroke_dash: None,
+            label_auto: None,
         });
         let err = validate(&l).unwrap_err();
         assert_eq!(err.code(), "text_font_size_out_of_range");
+    }
+
+    // ── ADR-0040 / ADR-0041 — box-on-text · text-on-figure · font family ──
+
+    /// A1 — text + full BoxStyle round-trips losslessly, including the
+    /// `dash_dot` snake_case wire and the `mono` font family.
+    #[test]
+    fn text_with_box_round_trip() {
+        let raw = json!({
+            "type": "text",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "text": "boxed", "font_size": 16, "color": "#333",
+            "font_family": "mono",
+            "stroke": "#000", "fill": "#eee", "stroke_width": 3,
+            "fill_enabled": true, "stroke_enabled": true,
+            "corner_rounded": true, "stroke_dash": "dash_dot",
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Text {
+            font_family,
+            stroke,
+            fill,
+            stroke_width,
+            fill_enabled,
+            stroke_enabled,
+            corner_rounded,
+            stroke_dash,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Text");
+        };
+        assert_eq!(*font_family, FontFamily::Mono);
+        assert_eq!(stroke, "#000");
+        assert_eq!(fill, "#eee");
+        assert_eq!(*stroke_width, 3);
+        assert!(fill_enabled);
+        assert!(stroke_enabled);
+        assert!(corner_rounded);
+        assert_eq!(*stroke_dash, Some(FigureStrokeDash::DashDot));
+        let v = serde_json::to_value(&item).unwrap();
+        let item2: Item = serde_json::from_value(v).unwrap();
+        assert_eq!(item, item2);
+    }
+
+    /// A2 — a legacy text record (no box fields) defaults the box OFF.
+    /// ADR-0040 D2: text's `fill_enabled` / `stroke_enabled` default `false`
+    /// (the opposite of Rect/Ellipse) so old text renders box-less.
+    #[test]
+    fn text_old_layout_no_box() {
+        let raw = json!({
+            "type": "text",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "text": "Hello", "font_size": 16, "color": "#333",
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Text {
+            fill_enabled,
+            stroke_enabled,
+            corner_rounded,
+            stroke_width,
+            font_family,
+            stroke_dash,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Text");
+        };
+        assert!(!fill_enabled);
+        assert!(!stroke_enabled);
+        assert!(!corner_rounded);
+        assert_eq!(*stroke_width, 2);
+        assert_eq!(*font_family, FontFamily::Sans);
+        assert_eq!(*stroke_dash, None);
+    }
+
+    /// A3 — rect + embedded TextStyle round-trips, including align / weight /
+    /// font family.
+    #[test]
+    fn rect_with_embedded_text_round_trip() {
+        let raw = json!({
+            "type": "rect",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 120.0, "h": 80.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "fill": "#fff", "stroke_width": 2,
+            "text": "label", "font_size": 18, "color": "#111",
+            "text_align": "left", "text_vertical_align": "top",
+            "font_weight": "bold", "italic": true,
+            "font_family": "serif",
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Rect {
+            text,
+            font_size,
+            color,
+            text_align,
+            text_vertical_align,
+            font_weight,
+            italic,
+            font_family,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Rect");
+        };
+        assert_eq!(text, "label");
+        assert_eq!(*font_size, 18);
+        assert_eq!(color, "#111");
+        assert_eq!(*text_align, TextAlign::Left);
+        assert_eq!(*text_vertical_align, TextVerticalAlign::Top);
+        assert_eq!(*font_weight, FontWeight::Bold);
+        assert!(italic);
+        assert_eq!(*font_family, FontFamily::Serif);
+        let v = serde_json::to_value(&item).unwrap();
+        let item2: Item = serde_json::from_value(v).unwrap();
+        assert_eq!(item, item2);
+    }
+
+    /// A4 — a legacy rect (no embedded-text fields) defaults `text=""`,
+    /// `font_size=14`, `font_family=Sans`, `text_align=Center`.
+    #[test]
+    fn rect_old_layout_empty_text() {
+        let raw = json!({
+            "type": "rect",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 120.0, "h": 80.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "fill": "#fff", "stroke_width": 2,
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Rect {
+            text,
+            font_size,
+            font_family,
+            text_align,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Rect");
+        };
+        assert_eq!(text, "");
+        assert_eq!(*font_size, 14);
+        assert_eq!(*font_family, FontFamily::Sans);
+        assert_eq!(*text_align, TextAlign::Center);
+    }
+
+    /// A5 — ellipse + embedded TextStyle round-trips (mirrors rect; ellipse
+    /// has no `corner_rounded`).
+    #[test]
+    fn ellipse_with_embedded_text_round_trip() {
+        let raw = json!({
+            "type": "ellipse",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 120.0, "h": 80.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "fill": "#fff", "stroke_width": 2,
+            "text": "oval", "font_size": 20, "color": "#222",
+            "text_align": "right", "text_vertical_align": "bottom",
+            "font_weight": "light", "underline": true, "strikethrough": true,
+            "font_family": "mono",
+        });
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Ellipse {
+            text,
+            font_size,
+            text_vertical_align,
+            font_weight,
+            underline,
+            strikethrough,
+            font_family,
+            ..
+        } = &item
+        else {
+            panic!("expected Item::Ellipse");
+        };
+        assert_eq!(text, "oval");
+        assert_eq!(*font_size, 20);
+        assert_eq!(*text_vertical_align, TextVerticalAlign::Bottom);
+        assert_eq!(*font_weight, FontWeight::Light);
+        assert!(underline);
+        assert!(strikethrough);
+        assert_eq!(*font_family, FontFamily::Mono);
+        let v = serde_json::to_value(&item).unwrap();
+        let item2: Item = serde_json::from_value(v).unwrap();
+        assert_eq!(item, item2);
+    }
+
+    /// B1 — `FontFamily` wire form is the lowercase keyword (snake_case is
+    /// identical for these single-word variants).
+    #[test]
+    fn font_family_snake_case_wire() {
+        assert_eq!(serde_json::to_string(&FontFamily::Sans).unwrap(), "\"sans\"");
+        assert_eq!(
+            serde_json::to_string(&FontFamily::Serif).unwrap(),
+            "\"serif\""
+        );
+        assert_eq!(serde_json::to_string(&FontFamily::Mono).unwrap(), "\"mono\"");
+        let parsed: FontFamily = serde_json::from_str("\"serif\"").unwrap();
+        assert_eq!(parsed, FontFamily::Serif);
+    }
+
+    /// B2 — a missing `font_family` field defaults to `Sans`.
+    #[test]
+    fn font_family_default_sans() {
+        assert_eq!(FontFamily::default(), FontFamily::Sans);
+    }
+
+    /// B3 — an unknown `font_family` variant is a strict deserialize error
+    /// (no `#[serde(other)]` fallback).
+    #[test]
+    fn font_family_unknown_rejected() {
+        let raw = json!({
+            "type": "text",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "text": "Hi", "font_size": 16, "color": "#333",
+            "font_family": "comic",
+        });
+        let parsed: Result<Item, _> = serde_json::from_value(raw);
+        assert!(parsed.is_err(), "unknown font_family must reject");
+    }
+
+    /// C1 — embedded text on a rect reuses the 8..=96 font_size check.
+    #[test]
+    fn embedded_text_font_size_over_96_rejected() {
+        let l: Layout = serde_json::from_value(json!({
+            "schema_version": 2, "groups": [],
+            "items": [{
+                "type": "rect",
+                "id": UUID_A, "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 120.0, "h": 80.0, "z": 0,
+                "visibility": "visible", "locked": false,
+                "label": "", "description": "", "minimized": false,
+                "stroke": "#000", "fill": "#fff", "stroke_width": 2,
+                "text": "x", "font_size": 97,
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        }))
+        .unwrap();
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "text_font_size_out_of_range");
+    }
+
+    /// C2 — embedded text on a rect reuses the 64 KiB text byte cap.
+    #[test]
+    fn embedded_text_64kb_cap_enforced() {
+        let big = "x".repeat(TEXT_PAYLOAD_MAX_BYTES + 1);
+        let l: Layout = serde_json::from_value(json!({
+            "schema_version": 2, "groups": [],
+            "items": [{
+                "type": "rect",
+                "id": UUID_A, "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 120.0, "h": 80.0, "z": 0,
+                "visibility": "visible", "locked": false,
+                "label": "", "description": "", "minimized": false,
+                "stroke": "#000", "fill": "#fff", "stroke_width": 2,
+                "text": big, "font_size": 14,
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        }))
+        .unwrap();
+        assert_eq!(validate(&l), Err(ValidationError::TextTooLong));
+    }
+
+    /// C3 — the text box stroke reuses the figure 1..=32 stroke_width band.
+    #[test]
+    fn text_box_stroke_width_over_32_rejected() {
+        let l: Layout = serde_json::from_value(json!({
+            "schema_version": 2, "groups": [],
+            "items": [{
+                "type": "text",
+                "id": UUID_A, "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+                "visibility": "visible", "locked": false,
+                "label": "", "description": "", "minimized": false,
+                "text": "Hi", "font_size": 16, "color": "#333",
+                "stroke_width": 33,
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+        }))
+        .unwrap();
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "stroke_width_out_of_range");
+    }
+
+    /// D1 — `label_auto` round-trips for Some(true)/Some(false) and is
+    /// omitted from the wire form when `None`.
+    #[test]
+    fn label_auto_round_trip() {
+        let item_true: Item = serde_json::from_value(json!({
+            "type": "text",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "text": "Hi", "font_size": 16, "color": "#333",
+            "label_auto": true,
+        }))
+        .unwrap();
+        let Item::Text { label_auto, .. } = &item_true else {
+            panic!("expected Item::Text");
+        };
+        assert_eq!(*label_auto, Some(true));
+        let v = serde_json::to_value(&item_true).unwrap();
+        assert_eq!(v["label_auto"], true);
+
+        let item_false: Item = serde_json::from_value(json!({
+            "type": "text",
+            "id": UUID_B, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "text": "Hi", "font_size": 16, "color": "#333",
+            "label_auto": false,
+        }))
+        .unwrap();
+        let Item::Text { label_auto, .. } = &item_false else {
+            panic!("expected Item::Text");
+        };
+        assert_eq!(*label_auto, Some(false));
+
+        let item_none: Item = serde_json::from_value(json!({
+            "type": "text",
+            "id": UUID_B, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 160.0, "h": 56.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "text": "Hi", "font_size": 16, "color": "#333",
+        }))
+        .unwrap();
+        let Item::Text { label_auto, .. } = &item_none else {
+            panic!("expected Item::Text");
+        };
+        assert_eq!(*label_auto, None);
+        let v_none = serde_json::to_value(&item_none).unwrap();
+        assert!(
+            v_none.get("label_auto").is_none(),
+            "None must skip on serialise"
+        );
     }
 
     // ── ADR-0038 — Snippets variant ────────────────────────────────────────
