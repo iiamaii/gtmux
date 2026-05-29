@@ -18,6 +18,17 @@
 //    에는 포함하지 않는다.
 
 import type { Group } from './group';
+import type { components } from './api';
+
+/**
+ * BE `schema.rs` 에서 생성된 OpenAPI component 스키마 (ADR-0042 / plan-0017 Phase 3).
+ * leaf enum 류는 생성 타입을 단일 진실로 alias 해 BE↔FE enum drift 를 컴파일타임에
+ * 잡는다. 복합 variant interface 는 아직 수기 정의 — openapi-typescript 가 serde
+ * `skip_serializing_if` 의 `Option<T>` 를 (wire 상 *부재* 인데) `T | null` 로 렌더해
+ * 통째 alias 시 부정확한 `| null` 이 번지기 때문. 전체 마이그레이션은 plan-0017 의
+ * deferred 항목 (golden fixture 적합성 테스트로 구조 drift 는 가드).
+ */
+type Schemas = components['schemas'];
 
 /** Terminal panel 최소화 시 header 32px + selected border 1.5px × 2. */
 export const MINIMIZED_TERMINAL_PANEL_HEIGHT = 35;
@@ -26,24 +37,27 @@ export const MINIMIZED_TERMINAL_PANEL_HEIGHT = 35;
 /* Common field (ADR-0018 D3)                                                 */
 /* ────────────────────────────────────────────────────────────────────────── */
 
-/** schema v2 의 visibility — string enum. ADR-0018 D1 예시 JSON 정합. */
-export type Visibility = 'visible' | 'hidden';
-export type TextAlign = 'left' | 'center' | 'right';
-export type TextVerticalAlign = 'top' | 'middle' | 'bottom';
-export type FontFamily = 'sans' | 'serif' | 'mono';
+// ⬇ leaf enum 6종은 생성 스키마(Schemas)에서 alias — BE enum 변경이 즉시 FE 에
+//    반영되고, 빠진 case 는 switch 망라성 에러로 drift 포착 (ADR-0042 / Phase 3).
+
+/** schema v2 의 visibility — string enum. BE `schema.rs::Visibility` 정본. */
+export type Visibility = Schemas['Visibility'];
+export type TextAlign = Schemas['TextAlign'];
+export type TextVerticalAlign = Schemas['TextVerticalAlign'];
+/** ADR-0041 — system-stack font family. BE `schema.rs::FontFamily` 정본. */
+export type FontFamily = Schemas['FontFamily'];
 
 /**
- * ADR-0018 D4 amend ① (batch-5, 2026-05-20) — rect/ellipse/line 의 stroke
- * dash pattern. snake_case wire (BE schema.rs `FigureStrokeDash` 와 정합).
- * connector 의 `StrokeDash` 와는 의미·default 가 달라 별 enum.
+ * ADR-0018 D4 amend ① — rect/ellipse/line 의 stroke dash pattern (snake_case
+ * wire). connector 의 `StrokeDash` 와는 의미·default 가 달라 별 enum.
  */
-export type FigureStrokeDash = 'solid' | 'dash' | 'dot' | 'dash_dot';
+export type FigureStrokeDash = Schemas['FigureStrokeDash'];
 
 /**
- * ADR-0018 D4 amend ② (batch-5, 2026-05-20) — text 의 font weight 3-bucket.
- * Grill #6: register 의 100~900 numeric 은 P1 로 미루고 3 variant 채택.
+ * ADR-0018 D4 amend ② — text 의 font weight 3-bucket (Grill #6: 100~900
+ * numeric 은 P1, 3 variant 채택).
  */
-export type FontWeight = 'light' | 'normal' | 'bold';
+export type FontWeight = Schemas['FontWeight'];
 
 /** 모든 Canvas Item 공통 field. type-specific payload 는 각 variant 가 amend. */
 export interface ItemCommon {

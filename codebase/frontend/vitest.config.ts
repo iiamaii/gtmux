@@ -12,6 +12,11 @@ export default defineConfig({
       $lib: fileURLToPath(new URL('./src/lib', import.meta.url)),
     },
   },
+  // 공유 contract fixture(`../shared/contract/*.json`)를 import 하려면 frontend
+  // root 밖 파일 접근 허용 필요 (plan-0017 Phase 4 cross-language 앵커).
+  server: {
+    fs: { allow: ['..'] },
+  },
   test: {
     environment: 'node',
     include: ['src/**/*.{test,spec}.ts'],
