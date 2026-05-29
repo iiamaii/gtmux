@@ -1,12 +1,8 @@
-# gen-openapi: bootstrap codegen binary (Task C3).
+# gen-openapi: OpenAPI 3.1 generator for the gtmux API.
 #
-# Produces an OpenAPI 3.1 YAML document on stdout from utoipa-derived
-# stub structs (`Group`, `Panel`). The bodies are intentionally minimal --
-# the goal is to exercise the Rust -> OpenAPI -> TS pipeline, not to model
-# the real `canvas-layout-schema.md` yet.
-#
-# Real schema population happens once the http-api crate lands its
-# `GET/PUT /api/layout` handlers (ADR-0011 D3·D5, ADR-0012 D7).
+# Emits the Canvas Layout schema (ADR-0018) on stdout, sourced directly from
+# the `gtmux-http-api` crate's utoipa `ToSchema` derives (ADR-0042 /
+# plan-0017 Phase 1). Replaces the earlier Group/Panel id-only bootstrap stub.
 
 [package]
 name        = "gen-openapi"
@@ -21,7 +17,7 @@ name = "gen-openapi"
 path = "src/main.rs"
 
 [dependencies]
-serde   = { workspace = true }
+gtmux-http-api = { path = "../../crates/http-api" }
 utoipa  = { workspace = true }
 anyhow  = { workspace = true }
 serde_yaml = "0.9"

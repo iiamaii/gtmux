@@ -27,6 +27,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use utoipa::ToSchema;
 
 /// The schema version this module reads and writes.
 pub const SCHEMA_VERSION: u32 = 2;
@@ -65,7 +66,7 @@ pub const SNIPPETS_ENTRIES_CAP: usize = 1000;
 
 /// Body of a Session file record. Serde-derived: round-trips losslessly with
 /// the on-disk JSON shape defined in ADR-0018 D1.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Layout {
     /// Always `2` for v2 records. v1 → v2 hard cutover lives in `workspace.rs`.
@@ -97,7 +98,7 @@ impl Layout {
 
 /// Group node — shape locked by ADR-0010, kept identical across the v1→v2
 /// cutover so `boot_migration_v1_to_v2` can preserve `groups[]` verbatim.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     pub id: String,
@@ -114,7 +115,7 @@ pub struct Group {
 /// room for an `inherit` variant in the layer-tree work, and so that round-trip
 /// against legacy v1 payloads (which used `true`/`false`) is detected as an
 /// error rather than silently coerced.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
     Visible,
@@ -129,7 +130,7 @@ impl Default for Visibility {
 
 /// Horizontal alignment for text Canvas Items. Defaults to center so newly
 /// created empty text boxes edit from their visual center.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TextAlign {
     Left,
@@ -144,7 +145,7 @@ impl Default for TextAlign {
 }
 
 /// Vertical alignment for text Canvas Items.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TextVerticalAlign {
     Top,
@@ -159,7 +160,7 @@ impl Default for TextVerticalAlign {
 }
 
 /// Canvas viewport state.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Viewport {
     pub x: f64,
@@ -184,7 +185,7 @@ impl Default for Viewport {
 /// Fields common to every Canvas Item — flattened into each variant of [`Item`]
 /// via `#[serde(flatten)]` so the on-disk JSON keeps a single flat object per
 /// item (no nested `common: { ... }` envelope).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ItemCommon {
     pub id: String,
     pub parent_id: Option<String>,
@@ -204,7 +205,7 @@ pub struct ItemCommon {
 }
 
 /// 2D point — shared payload for `free_draw` and `connector` items.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Point {
     pub x: f64,
@@ -213,7 +214,7 @@ pub struct Point {
 
 /// ADR-0038 D2 — 1 snippet = 1 (key, body) pair. Multiple entries live in
 /// a `Snippets` item's `entries` Vec.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SnippetEntry {
     /// UUID v4 lowercase 36-char. Stable across edits — FE uses this for
@@ -235,7 +236,7 @@ pub struct SnippetEntry {
 /// 9-point connector anchor — 8 cardinal/diagonal edges + center (ADR-0036 D2).
 /// Wire form uses the uppercase keyword for the 8 edges and lowercase
 /// `"center"` for the middle. The `"auto"` mode is P1+.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub enum Anchor {
     #[serde(rename = "N")]
     N,
@@ -259,7 +260,7 @@ pub enum Anchor {
 
 /// Connector arrowhead direction mode (ADR-0036 D4). `head_from` / `head_to`
 /// may still override the default mapping per-end.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     Uni,
@@ -268,7 +269,7 @@ pub enum Direction {
 }
 
 /// Per-end connector head marker (ADR-0036 D4).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Head {
     Arrow,
@@ -280,7 +281,7 @@ pub enum Head {
 /// Connector routing style (ADR-0036 D3). MVP wires `Straight` only; the
 /// other two variants persist for round-trip but the FE renderer falls
 /// back to straight until P1.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Routing {
     Straight,
@@ -289,7 +290,7 @@ pub enum Routing {
 }
 
 /// Connector stroke dash pattern (ADR-0036 D1 — optional, `null` for solid).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StrokeDash {
     Dash,
@@ -303,7 +304,7 @@ pub enum StrokeDash {
 /// compatibility would break if the two were unified).
 ///
 /// Wire form is `snake_case`: `"solid" | "dash" | "dot" | "dash_dot"`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FigureStrokeDash {
     Solid,
@@ -320,7 +321,7 @@ impl Default for FigureStrokeDash {
 
 /// Text font weight (ADR-0018 D4 amend ② — 2026-05-20 batch 5). MVP carries
 /// three named buckets; numeric weights (100…900) are P1.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FontWeight {
     Light,
@@ -345,7 +346,7 @@ impl Default for FontWeight {
 /// (an unrecognised value is safer rejected than silently coerced). The
 /// per-field `#[serde(default)]` keeps a *missing* field from rejecting the
 /// whole layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FontFamily {
     #[default]
@@ -379,7 +380,7 @@ fn default_stroke_width() -> u32 {
 ///
 /// On the wire each variant becomes `{ "type": "<snake>", ...common, ...payload }`
 /// thanks to `#[serde(tag = "type")]` + `#[serde(flatten)]` on `common`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
     Terminal {

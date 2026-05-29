@@ -567,7 +567,7 @@ name = "gen-openapi"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "serde",
+ "gtmux-http-api",
  "serde_yaml",
  "utoipa",
 ]

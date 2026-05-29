@@ -49,7 +49,7 @@ mod auth;
 mod file_open;
 mod file_stat;
 mod fs_list;
-mod schema;
+pub mod schema;
 mod session_lock;
 mod session_pane_set;
 mod sessions;
