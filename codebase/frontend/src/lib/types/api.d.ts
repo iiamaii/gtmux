@@ -347,11 +347,12 @@ export interface components {
         /**
          * @description ADR-0043 D1 — one endpoint of a `path` item. A `free` endpoint pins to an
          *     absolute canvas point; a `connected` endpoint tracks another item's anchor
-         *     and keeps a `fallback_point` (the last resolved anchor coordinate) so the
-         *     endpoint can degrade to `free` when the target is deleted (ADR-0043 D7).
+         *     and keeps a `fallback_point` (the last resolved anchor coordinate plus
+         *     optional offset) so the endpoint can degrade to `free` when the target is
+         *     deleted (ADR-0043 D7).
          *
          *     Wire form is internally tagged on `kind`: `{"kind":"free","point":{..}}`
-         *     or `{"kind":"connected","item_id":..,"anchor":..,"fallback_point":{..}}`.
+         *     or `{"kind":"connected","item_id":..,"anchor":..,"offset"?:{..},"fallback_point":{..}}`.
          */
         PathEndpoint: {
             /** @enum {string} */
@@ -363,6 +364,7 @@ export interface components {
             item_id: string;
             /** @enum {string} */
             kind: "connected";
+            offset?: null | components["schemas"]["Point"];
         };
         /**
          * @description ADR-0043 D9 — a path waypoint (intermediate routing point). Carries a

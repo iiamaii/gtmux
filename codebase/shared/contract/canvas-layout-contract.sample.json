@@ -89,7 +89,8 @@
         "kind": "connected",
         "item_id": "22222222-2222-4222-8222-222222222222",
         "anchor": "E",
-        "fallback_point": { "x": 600, "y": 170 }
+        "offset": { "x": 16, "y": -8 },
+        "fallback_point": { "x": 616, "y": 162 }
       },
       "to": { "kind": "free", "point": { "x": 900, "y": 400 } },
       "routing": "orthogonal",

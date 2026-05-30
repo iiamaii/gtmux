@@ -231,11 +231,12 @@ pub struct SnippetEntry {
 
 /// ADR-0043 D1 — one endpoint of a `path` item. A `free` endpoint pins to an
 /// absolute canvas point; a `connected` endpoint tracks another item's anchor
-/// and keeps a `fallback_point` (the last resolved anchor coordinate) so the
-/// endpoint can degrade to `free` when the target is deleted (ADR-0043 D7).
+/// and keeps a `fallback_point` (the last resolved anchor coordinate plus
+/// optional offset) so the endpoint can degrade to `free` when the target is
+/// deleted (ADR-0043 D7).
 ///
 /// Wire form is internally tagged on `kind`: `{"kind":"free","point":{..}}`
-/// or `{"kind":"connected","item_id":..,"anchor":..,"fallback_point":{..}}`.
+/// or `{"kind":"connected","item_id":..,"anchor":..,"offset"?:{..},"fallback_point":{..}}`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PathEndpoint {
@@ -245,6 +246,9 @@ pub enum PathEndpoint {
     Connected {
         item_id: String,
         anchor: Anchor,
+        /// Optional delta from the resolved anchor point. Missing means `{0,0}`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<Point>,
         fallback_point: Point,
     },
 }
@@ -1009,8 +1013,7 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                 ..
             } => {
                 // ADR-0043 D9 — waypoint id shape + intra-path uniqueness.
-                let mut seen_wp: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
+                let mut seen_wp: std::collections::HashSet<&str> = std::collections::HashSet::new();
                 for wp in waypoints {
                     if !is_uuid_shape(&wp.id) {
                         return Err(ValidationError::PathWaypointBadId(wp.id.clone()));
@@ -1055,8 +1058,7 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                 if entries.len() > SNIPPETS_ENTRIES_CAP {
                     return Err(ValidationError::SnippetsEntriesTooMany);
                 }
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
                 for e in entries {
                     if !is_uuid_shape(&e.id) {
                         return Err(ValidationError::BadSnippetEntryId(e.id.clone()));
@@ -1096,8 +1098,11 @@ pub const PATH_HEAD_MARKER_PAD: f64 = 12.0;
 /// validation. The path itself is always kept — even when both endpoints
 /// degrade to free.
 pub fn degrade_dangling_path_endpoints(layout: &mut Layout) {
-    let live_ids: std::collections::HashSet<String> =
-        layout.items.iter().map(|it| it.common().id.clone()).collect();
+    let live_ids: std::collections::HashSet<String> = layout
+        .items
+        .iter()
+        .map(|it| it.common().id.clone())
+        .collect();
     for it in layout.items.iter_mut() {
         if let Item::Path { from, to, .. } = it {
             degrade_endpoint(from, &live_ids);
@@ -1204,10 +1209,15 @@ fn resolve_path_endpoint(
         PathEndpoint::Connected {
             item_id,
             anchor,
+            offset,
             fallback_point,
         } => {
             if let Some(&g) = geom.get(item_id) {
-                let (px, py) = anchor_point(g, *anchor);
+                let (ax, ay) = anchor_point(g, *anchor);
+                let dx = offset.as_ref().map_or(0.0, |point| point.x);
+                let dy = offset.as_ref().map_or(0.0, |point| point.y);
+                let px = ax + dx;
+                let py = ay + dy;
                 fallback_point.x = px;
                 fallback_point.y = py;
                 (px, py)
@@ -1744,6 +1754,7 @@ mod tests {
         PathEndpoint::Connected {
             item_id: item_id.into(),
             anchor,
+            offset: None,
             fallback_point: Point { x: 0.0, y: 0.0 },
         }
     }
@@ -1989,6 +2000,7 @@ mod tests {
             PathEndpoint::Connected {
                 item_id: UUID_A.into(),
                 anchor: Anchor::E,
+                offset: None,
                 fallback_point: Point { x: 100.0, y: 25.0 },
             }
         );
@@ -1997,10 +2009,49 @@ mod tests {
             PathEndpoint::Connected {
                 item_id: UUID_B.into(),
                 anchor: Anchor::W,
+                offset: None,
                 fallback_point: Point { x: 300.0, y: 220.0 },
             }
         );
         assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// Connected endpoint offset is resolved relative to the target anchor and
+    /// included in the refreshed fallback point.
+    #[test]
+    fn path_connected_endpoint_offset_updates_fallback() {
+        let mut p = path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W);
+        if let Item::Path { from, .. } = &mut p {
+            *from = PathEndpoint::Connected {
+                item_id: UUID_A.into(),
+                anchor: Anchor::E,
+                offset: Some(Point { x: 12.0, y: -6.0 }),
+                fallback_point: Point { x: 0.0, y: 0.0 },
+            };
+        }
+        let mut l = Layout {
+            schema_version: 2,
+            groups: vec![],
+            items: vec![
+                rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
+                rect_at(UUID_B, 300.0, 200.0, 80.0, 40.0),
+                p,
+            ],
+            viewport: Viewport::default(),
+        };
+        recompute_path_bboxes(&mut l);
+        let Item::Path { from, .. } = l.items.last().unwrap() else {
+            panic!("expected Item::Path");
+        };
+        assert_eq!(
+            *from,
+            PathEndpoint::Connected {
+                item_id: UUID_A.into(),
+                anchor: Anchor::E,
+                offset: Some(Point { x: 12.0, y: -6.0 }),
+                fallback_point: Point { x: 112.0, y: 19.0 },
+            }
+        );
     }
 
     /// ADR-0043 D7 / R4 — deleting a connected target degrades that endpoint
@@ -2014,6 +2065,7 @@ mod tests {
             *to = PathEndpoint::Connected {
                 item_id: UUID_B.into(),
                 anchor: Anchor::W,
+                offset: None,
                 fallback_point: Point { x: 300.0, y: 220.0 },
             };
         }
@@ -2694,12 +2746,18 @@ mod tests {
     /// identical for these single-word variants).
     #[test]
     fn font_family_snake_case_wire() {
-        assert_eq!(serde_json::to_string(&FontFamily::Sans).unwrap(), "\"sans\"");
+        assert_eq!(
+            serde_json::to_string(&FontFamily::Sans).unwrap(),
+            "\"sans\""
+        );
         assert_eq!(
             serde_json::to_string(&FontFamily::Serif).unwrap(),
             "\"serif\""
         );
-        assert_eq!(serde_json::to_string(&FontFamily::Mono).unwrap(), "\"mono\"");
+        assert_eq!(
+            serde_json::to_string(&FontFamily::Mono).unwrap(),
+            "\"mono\""
+        );
         let parsed: FontFamily = serde_json::from_str("\"serif\"").unwrap();
         assert_eq!(parsed, FontFamily::Serif);
     }
@@ -2918,10 +2976,7 @@ mod tests {
             common: item_common(UUID_A),
             entries,
         });
-        assert_eq!(
-            validate(&l),
-            Err(ValidationError::SnippetsEntriesTooMany)
-        );
+        assert_eq!(validate(&l), Err(ValidationError::SnippetsEntriesTooMany));
     }
 
     #[test]
