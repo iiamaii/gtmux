@@ -89,47 +89,6 @@ export function scheduleLiveAspectResize(
   queueMicrotask(() => apply(constrained));
 }
 
-export function scheduleLiveSquareResize(
-  event: unknown,
-  params: ResizeParams,
-  current: CurrentBounds,
-  minSize: number,
-  apply: (next: ResizeParams) => void,
-): void {
-  if (!resizeEventShiftKey(event)) return;
-  const constrained = constrainResizeSquare(params, current, minSize);
-  queueMicrotask(() => apply(constrained));
-}
-
-export function constrainResizeSquare(
-  params: ResizeParams,
-  current: CurrentBounds,
-  minSize: number,
-): ResizeParams {
-  const next = constrainResizeAspect(params, current, 1, minSize, minSize);
-  const size = Math.max(minSize, next.width, next.height);
-  return constrainResizeAspect(
-    { ...next, width: size, height: size },
-    current,
-    1,
-    minSize,
-    minSize,
-  );
-}
-
-export function squarePointFromDrag(
-  start: { x: number; y: number },
-  current: { x: number; y: number },
-): { x: number; y: number } {
-  const dx = current.x - start.x;
-  const dy = current.y - start.y;
-  const size = Math.max(Math.abs(dx), Math.abs(dy));
-  return {
-    x: start.x + Math.sign(dx || 1) * size,
-    y: start.y + Math.sign(dy || 1) * size,
-  };
-}
-
 export function projectPointToAngle(
   start: { x: number; y: number },
   current: { x: number; y: number },
