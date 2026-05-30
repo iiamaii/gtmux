@@ -20,7 +20,7 @@
    * h2 로, 나머지를 p 로 분할 렌더. 인라인 편집 진입 (더블 클릭) 은 후속.
    */
 
-  import { NodeResizer } from '@xyflow/svelte';
+  import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { documentViewModeStore } from '$lib/stores/documentViewMode.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
@@ -38,7 +38,10 @@
     buildRenderedHtmlSrcdoc,
   } from './documentRender';
   import type { CanvasItem, DocumentItem } from '$lib/types/canvas';
-  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
+  import {
+    constrainResizeAspectIfShift,
+    scheduleLiveAspectResize,
+  } from './resizeConstraint';
 
   /** Inline content cap = ADR-0018 D4 amend ② / BE DOCUMENT_INLINE_MAX_BYTES. */
   const DOCUMENT_INLINE_MAX_BYTES = 64 * 1024;
@@ -86,6 +89,7 @@
     parentId?: string;
   } = $props();
 
+  const { updateNode } = useSvelteFlow();
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
@@ -357,11 +361,38 @@
   const DOC_MIN_H = 35;
   const DOC_RESTORE_W = 360;
   const DOC_RESTORE_H = 220;
+  const DOC_RESIZE_MIN_W = 220;
+  const DOC_RESIZE_MIN_H = 160;
+
+  function applyLiveResize(next: ResizeParams): void {
+    updateNode(data.id, (node) => ({
+      position: { ...node.position, x: next.x, y: next.y },
+      width: Math.max(DOC_RESIZE_MIN_W, next.width),
+      height: Math.max(DOC_RESIZE_MIN_H, next.height),
+    }));
+  }
+
+  function onResize(event: unknown, params: ResizeParams): void {
+    scheduleLiveAspectResize(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      DOC_RESIZE_MIN_W,
+      DOC_RESIZE_MIN_H,
+      applyLiveResize,
+    );
+  }
 
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
-    const constrained = resizeEventShiftKey(event)
-      ? constrainResizeAspect(params, data, data.w / data.h, 220, 160)
-      : params;
+    const constrained = constrainResizeAspectIfShift(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      DOC_RESIZE_MIN_W,
+      DOC_RESIZE_MIN_H,
+    );
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -371,8 +402,8 @@
                 ...it,
                 x: constrained.x,
                 y: constrained.y,
-                w: Math.max(220, constrained.width),
-                h: Math.max(160, constrained.height),
+                w: Math.max(DOC_RESIZE_MIN_W, constrained.width),
+                h: Math.max(DOC_RESIZE_MIN_H, constrained.height),
               } as DocumentItem)
             : it,
         ),
@@ -587,6 +618,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResize}
       {onResizeEnd}
     />
     <!-- 1. Doc-head: file svg + title + actions. Filename lives in footer. -->

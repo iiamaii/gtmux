@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   resizeEventShiftKey,
   constrainResizeAspect,
+  constrainResizeAspectIfShift,
   constrainResizeSquare,
+  scheduleLiveAspectResize,
   squarePointFromDrag,
   projectPointToAngle,
 } from '$lib/canvas/resizeConstraint';
@@ -51,6 +53,34 @@ describe('constrainResizeAspect (image source-aspect / current-aspect lock)', ()
   it('passes through on non-finite/zero aspect', () => {
     const params = { x: 1, y: 2, width: 30, height: 40 };
     expect(constrainResizeAspect(params, { x: 0, y: 0, w: 10, h: 10 }, 0, 1, 1)).toEqual(params);
+  });
+});
+
+describe('constrainResizeAspectIfShift', () => {
+  it('only constrains when the resize event carries Shift', () => {
+    const params = { x: 0, y: 0, width: 300, height: 110 };
+    const current = { x: 0, y: 0, w: 200, h: 100 };
+    expect(constrainResizeAspectIfShift({ shiftKey: false }, params, current, 2, 20, 10)).toEqual(params);
+    const constrained = constrainResizeAspectIfShift({ shiftKey: true }, params, current, 2, 20, 10);
+    expect(constrained.width / constrained.height).toBeCloseTo(2, 5);
+  });
+});
+
+describe('scheduleLiveAspectResize', () => {
+  it('schedules live constrained geometry while Shift is held', async () => {
+    const calls: { x: number; y: number; width: number; height: number }[] = [];
+    scheduleLiveAspectResize(
+      { shiftKey: true },
+      { x: 0, y: 0, width: 300, height: 110 },
+      { x: 0, y: 0, w: 200, h: 100 },
+      2,
+      20,
+      10,
+      (next) => calls.push(next),
+    );
+    expect(calls).toEqual([]);
+    await Promise.resolve();
+    expect(calls[0]!.width / calls[0]!.height).toBeCloseTo(2, 5);
   });
 });
 

@@ -7,14 +7,17 @@
   // 현재 단계: 더블 클릭 → InlineEditTextarea (body) → commit 시 mutateLayout.
 
   import { untrack } from 'svelte';
-  import { NodeResizer } from '@xyflow/svelte';
+  import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { CanvasItem, FigureStrokeDash, FontFamily, FontWeight, TextAlign, TextItem, TextVerticalAlign } from '$lib/types/canvas';
   import { deriveLabel, shouldDeriveLabel } from './labelDerive';
   import { fontFamilyVar } from './fontFamily';
   import { fontWeightCss, textDecorationCss } from './textStyle';
-  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
+  import {
+    constrainResizeAspectIfShift,
+    scheduleLiveAspectResize,
+  } from './resizeConstraint';
   import { strokeDashArray } from './strokeDash';
   // 텍스트 정렬 UI 는 ToolbarSubbar (lib/toolbar/ToolbarSubbar.svelte) 로 이전.
   // 본 컴포넌트는 더 이상 alignment toolbar 를 그리지 않는다.
@@ -76,6 +79,7 @@
     parentId?: string;
   } = $props();
 
+  const { updateNode } = useSvelteFlow();
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
@@ -106,6 +110,26 @@
   let editing = $state(false);
   const minTextHeight = $derived(Math.max(16, Math.ceil(data.font_size)));
   type ResizeParams = { x: number; y: number; width: number; height: number };
+
+  function applyLiveResize(next: ResizeParams): void {
+    updateNode(data.id, (node) => ({
+      position: { ...node.position, x: next.x, y: next.y },
+      width: Math.max(120, next.width),
+      height: Math.max(minTextHeight, next.height),
+    }));
+  }
+
+  function onResize(event: unknown, params: ResizeParams): void {
+    scheduleLiveAspectResize(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      120,
+      minTextHeight,
+      applyLiveResize,
+    );
+  }
 
   // R7 (batch-5) — text item spawn 직후 auto-edit 진입. itemFactory 의 성공
   // path 가 sessionStore.justSpawnedTextId 를 set. mount 시 self id 와 일치
@@ -163,9 +187,14 @@
   }
 
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
-    const constrained = resizeEventShiftKey(event)
-      ? constrainResizeAspect(params, data, data.w / data.h, 120, minTextHeight)
-      : params;
+    const constrained = constrainResizeAspectIfShift(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      120,
+      minTextHeight,
+    );
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -208,6 +237,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResize}
       {onResizeEnd}
     />
     {#if hasBox}
