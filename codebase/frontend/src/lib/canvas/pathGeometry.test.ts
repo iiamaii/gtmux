@@ -139,6 +139,41 @@ describe('pathGeometry', () => {
     });
   });
 
+  it('updates offset fallback and bbox cache when a target moves or resizes', () => {
+    const a = rect('a', 20, 30, 100, 80);
+    const moved = rect('a', 50, 60, 140, 100);
+    const p = path({
+      from: {
+        kind: 'connected',
+        item_id: 'a',
+        anchor: 'SE',
+        offset: { x: 10, y: -12 },
+        fallback_point: { x: 0, y: 0 },
+      },
+      to: { kind: 'free', point: { x: 260, y: 200 } },
+    });
+
+    const initial = computePathBBox(
+      updateConnectedFallbacks(p, new Map([[a.id, a] as const])),
+      new Map([[a.id, a] as const]),
+    );
+    const next = updateConnectedFallbacks(p, new Map([[moved.id, moved] as const]));
+    const nextBox = computePathBBox(next, new Map([[moved.id, moved] as const]));
+
+    expect(next.from).toEqual({
+      kind: 'connected',
+      item_id: 'a',
+      anchor: 'SE',
+      offset: { x: 10, y: -12 },
+      fallback_point: { x: 200, y: 148 },
+    });
+    expect(nextBox.x).not.toBe(initial.x);
+    expect(pathPointChain(next, new Map([[moved.id, moved] as const]))[0]).toEqual({
+      x: 200,
+      y: 148,
+    });
+  });
+
   it('degrades deleted connected targets to free fallback endpoints', () => {
     const p = path({
       from: {
@@ -154,6 +189,34 @@ describe('pathGeometry', () => {
     });
   });
 
+  it('degrades only endpoints whose connected target was deleted', () => {
+    const p = path({
+      from: {
+        kind: 'connected',
+        item_id: 'gone',
+        anchor: 'E',
+        offset: { x: 4, y: 5 },
+        fallback_point: { x: 22, y: 33 },
+      },
+      to: {
+        kind: 'connected',
+        item_id: 'kept',
+        anchor: 'W',
+        offset: { x: -3, y: 2 },
+        fallback_point: { x: 80, y: 40 },
+      },
+    });
+    const next = degradeDeletedEndpoint(p, new Set(['gone']));
+    expect(next.from).toEqual({ kind: 'free', point: { x: 22, y: 33 } });
+    expect(next.to).toEqual({
+      kind: 'connected',
+      item_id: 'kept',
+      anchor: 'W',
+      offset: { x: -3, y: 2 },
+      fallback_point: { x: 80, y: 40 },
+    });
+  });
+
   it('detaches connected endpoints before geometry edits', () => {
     const a = rect('a', 0, 0);
     const p = path({
@@ -166,6 +229,28 @@ describe('pathGeometry', () => {
     });
     const next = detachConnectedEndpoints(p, new Map([[a.id, a]]));
     expect(next.from).toEqual({ kind: 'free', point: { x: 100, y: 40 } });
+  });
+
+  it('detaches offset endpoints to their resolved coordinates before width scaling', () => {
+    const a = rect('a', 0, 0, 100, 80);
+    const p = path({
+      from: {
+        kind: 'connected',
+        item_id: 'a',
+        anchor: 'E',
+        offset: { x: 12, y: -6 },
+        fallback_point: { x: 0, y: 0 },
+      },
+      to: { kind: 'free', point: { x: 212, y: 34 } },
+      waypoints: [{ id: 'mid', x: 162, y: 34 }],
+    });
+    const itemMap = new Map([[a.id, a] as const]);
+    const current = computePathBBox(detachConnectedEndpoints(p, itemMap), itemMap);
+    const next = editPathGeometry(p, 'w', current.w + 100, itemMap);
+
+    expect(next.from).toEqual({ kind: 'free', point: { x: 112, y: 34 } });
+    expect(next.to.kind === 'free' ? Math.round(next.to.point.x) : null).toBe(312);
+    expect(next.waypoints?.[0]).toEqual({ id: 'mid', x: 212, y: 34 });
   });
 
   it('connects a dragged endpoint to the nearest target anchor', () => {
