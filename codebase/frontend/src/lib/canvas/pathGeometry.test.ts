@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import type { CanvasItem, PathItem } from '$lib/types/canvas';
+import type { CanvasItem, PathItem, Point } from '$lib/types/canvas';
 import {
   anchorPoint,
   autoRoutePath,
+  buildPathD,
   bestAnchorPair,
   buildPathDFromPoints,
   connectPathEndpoint,
@@ -59,6 +60,21 @@ function path(overrides: Partial<PathItem> = {}): PathItem {
     stroke_width: 2,
     ...overrides,
   };
+}
+
+function pointsFromD(d: string): Point[] {
+  const nums = d.match(/-?\d+(?:\.\d+)?/g)?.map(Number) ?? [];
+  return Array.from({ length: nums.length / 2 }, (_, i) => ({
+    x: nums[i * 2]!,
+    y: nums[i * 2 + 1]!,
+  }));
+}
+
+function segmentDir(a: Point, b: Point): Point | null {
+  if (a.x === b.x && a.y === b.y) return null;
+  if (a.y === b.y) return { x: Math.sign(b.x - a.x), y: 0 };
+  if (a.x === b.x) return { x: 0, y: Math.sign(b.y - a.y) };
+  return null;
 }
 
 describe('pathGeometry', () => {
@@ -369,6 +385,81 @@ describe('pathGeometry', () => {
     expect(box.h).toBeGreaterThan(60);
   });
 
+  it('routes connected orthogonal endpoints along their anchor normals', () => {
+    const a = rect('a', 0, 0, 100, 80);
+    const b = rect('b', 240, 160, 100, 80);
+    const itemMap = new Map([a, b].map((it) => [it.id, it] as const));
+    const d = buildPathD(
+      path({
+        from: {
+          kind: 'connected',
+          item_id: 'a',
+          anchor: 'S',
+          fallback_point: { x: 50, y: 80 },
+        },
+        to: {
+          kind: 'connected',
+          item_id: 'b',
+          anchor: 'N',
+          fallback_point: { x: 290, y: 160 },
+        },
+      }),
+      itemMap,
+    );
+    const points = pointsFromD(d);
+    expect(points[0]).toEqual({ x: 50, y: 80 });
+    expect(points[1]?.x).toBe(points[0]?.x);
+    expect(points[1]!.y).toBeGreaterThan(points[0]!.y);
+    expect(points.at(-1)).toEqual({ x: 290, y: 160 });
+    expect(points.at(-2)?.x).toBe(points.at(-1)?.x);
+    expect(points.at(-2)!.y).toBeLessThan(points.at(-1)!.y);
+  });
+
+  it('infers free orthogonal endpoint direction from the dominant endpoint vector', () => {
+    const d = buildPathD(
+      path({
+        from: { kind: 'free', point: { x: 0, y: 0 } },
+        to: { kind: 'free', point: { x: 20, y: 120 } },
+      }),
+      new Map(),
+    );
+    const points = pointsFromD(d);
+    expect(points[1]?.x).toBe(points[0]?.x);
+    expect(points[1]!.y).toBeGreaterThan(points[0]!.y);
+    expect(points.at(-2)?.x).toBe(points.at(-1)?.x);
+    expect(points.at(-2)!.y).toBeLessThan(points.at(-1)!.y);
+  });
+
+  it('detours instead of immediately reversing from a constrained orthogonal endpoint', () => {
+    const a = rect('a', 0, 0, 100, 80);
+    const b = rect('b', 0, -220, 100, 80);
+    const itemMap = new Map([a, b].map((it) => [it.id, it] as const));
+    const points = pointsFromD(
+      buildPathD(
+        path({
+          from: {
+            kind: 'connected',
+            item_id: 'a',
+            anchor: 'S',
+            fallback_point: { x: 50, y: 80 },
+          },
+          to: {
+            kind: 'connected',
+            item_id: 'b',
+            anchor: 'N',
+            fallback_point: { x: 50, y: -220 },
+          },
+        }),
+        itemMap,
+      ),
+    );
+    for (let i = 1; i < points.length - 1; i += 1) {
+      const prev = segmentDir(points[i - 1]!, points[i]!);
+      const next = segmentDir(points[i]!, points[i + 1]!);
+      expect(next).not.toEqual(prev === null ? null : { x: -prev.x, y: -prev.y });
+    }
+  });
+
   it('builds smooth routing with continuous waypoint tangents', () => {
     const d = buildPathDFromPoints(
       [
@@ -391,6 +482,57 @@ describe('pathGeometry', () => {
     };
     expect(incoming.x).toBeCloseTo(outgoing.x);
     expect(incoming.y).toBeCloseTo(outgoing.y);
+  });
+
+  it('orients smooth connected endpoint handles from anchor normals', () => {
+    const a = rect('a', 0, 0, 100, 80);
+    const b = rect('b', 240, 160, 100, 80);
+    const itemMap = new Map([a, b].map((it) => [it.id, it] as const));
+    const points = pointsFromD(
+      buildPathD(
+        path({
+          routing: 'bezier',
+          from: {
+            kind: 'connected',
+            item_id: 'a',
+            anchor: 'S',
+            fallback_point: { x: 50, y: 80 },
+          },
+          to: {
+            kind: 'connected',
+            item_id: 'b',
+            anchor: 'N',
+            fallback_point: { x: 290, y: 160 },
+          },
+        }),
+        itemMap,
+      ),
+    );
+    const [start, c1, c2, end] = points;
+    expect(start).toEqual({ x: 50, y: 80 });
+    expect(c1?.x).toBe(start?.x);
+    expect(c1!.y).toBeGreaterThan(start!.y);
+    expect(end).toEqual({ x: 290, y: 160 });
+    expect(c2?.x).toBe(end?.x);
+    expect(c2!.y).toBeLessThan(end!.y);
+  });
+
+  it('infers smooth free endpoint handles from dominant endpoint vectors', () => {
+    const points = pointsFromD(
+      buildPathD(
+        path({
+          routing: 'bezier',
+          from: { kind: 'free', point: { x: 0, y: 0 } },
+          to: { kind: 'free', point: { x: 20, y: 120 } },
+        }),
+        new Map(),
+      ),
+    );
+    const [start, c1, c2, end] = points;
+    expect(c1?.x).toBe(start?.x);
+    expect(c1!.y).toBeGreaterThan(start!.y);
+    expect(c2?.x).toBe(end?.x);
+    expect(c2!.y).toBeLessThan(end!.y);
   });
 
   it('moves selected waypoints only', () => {
