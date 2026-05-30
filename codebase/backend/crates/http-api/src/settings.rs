@@ -438,11 +438,13 @@ pub(crate) async fn password_handler(
         }
     };
 
-    // 1. Verify current.
-    let current_ok = {
+    // 1. Verify current. Clone the stored hash out and drop the read lock
+    // *before* the Argon2 verify, which runs on the blocking pool (the KDF is
+    // memory-hard — never hold the lock across it nor stall a tokio worker).
+    let current_hash = {
         let guard = state.password_hash.read().await;
         match guard.as_deref() {
-            Some(h) => crate::auth::verify_password(&parsed.current_password, h),
+            Some(h) => h.to_string(),
             None => {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -456,6 +458,8 @@ pub(crate) async fn password_handler(
             }
         }
     };
+    let current_ok =
+        crate::auth::verify_password_async(parsed.current_password.clone(), current_hash).await;
     if !current_ok {
         return (
             StatusCode::UNAUTHORIZED,
@@ -470,7 +474,7 @@ pub(crate) async fn password_handler(
     }
 
     // 3. Hash new.
-    let new_hash = match crate::auth::hash_password(&parsed.new_password) {
+    let new_hash = match crate::auth::hash_password_async(parsed.new_password.clone()).await {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "password rotation: hash failed");

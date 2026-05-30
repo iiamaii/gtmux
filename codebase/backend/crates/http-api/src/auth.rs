@@ -322,6 +322,27 @@ pub fn verify_password(plaintext: &str, hash: &str) -> bool {
         .is_ok()
 }
 
+/// Async wrapper for [`verify_password`] — runs the memory-hard Argon2id
+/// verify (m=64 MiB, t=3, p=4) on the blocking thread pool so it never stalls
+/// a tokio worker (ADR-0020 perf). Returns `false` if the blocking task
+/// fails to join (treated as a non-match, fail-closed).
+pub async fn verify_password_async(plaintext: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || verify_password(&plaintext, &hash))
+        .await
+        .unwrap_or(false)
+}
+
+/// Async wrapper for [`hash_password`] — offloads the Argon2id KDF to the
+/// blocking pool (see [`verify_password_async`]).
+pub async fn hash_password_async(plaintext: String) -> Result<String, AuthError> {
+    match tokio::task::spawn_blocking(move || hash_password(&plaintext)).await {
+        Ok(result) => result,
+        Err(join_err) => Err(AuthError::Argon2(format!(
+            "hash task join error: {join_err}"
+        ))),
+    }
+}
+
 /// Persist `hash` to `path` with mode 0600 (ADR-0020 D5). The parent dir is
 /// created with mode 0700 if missing — mirrors the layout-store pattern.
 pub fn save_password_hash(path: &Path, hash: &str) -> Result<(), AuthError> {
@@ -495,7 +516,7 @@ pub async fn auth_login_handler(
                     }
                 }
             };
-            if !verify_password(password, &hash) {
+            if !verify_password_async(password.to_string(), hash).await {
                 state
                     .auth_failure_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

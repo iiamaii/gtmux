@@ -412,17 +412,30 @@ pub async fn serve_handler(
     }
 
     let path = wm.assets_dir().join(&asset_id);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+    // Read the (immutable, content-addressed) asset off the blocking pool so a
+    // large image read doesn't stall a tokio worker thread.
+    let read_path = path.clone();
+    let read_result =
+        tokio::task::spawn_blocking(move || std::fs::read(&read_path)).await;
+    let bytes = match read_result {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "error": "asset_not_found" })),
             )
                 .into_response();
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(error = %e, path = %path.display(), "assets: read failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "read_failed" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "assets: read task panicked");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "read_failed" })),
@@ -554,8 +567,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
     ctx.update(bytes);
     let d = ctx.finish();
     let mut hex = String::with_capacity(ASSET_ID_HEX_LEN);
-    for b in d.as_ref() {
-        hex.push_str(&format!("{b:02x}"));
+    {
+        use std::fmt::Write as _;
+        for b in d.as_ref() {
+            let _ = write!(hex, "{b:02x}");
+        }
     }
     hex
 }

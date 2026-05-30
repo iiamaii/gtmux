@@ -1098,6 +1098,13 @@ pub const PATH_HEAD_MARKER_PAD: f64 = 12.0;
 /// validation. The path itself is always kept — even when both endpoints
 /// degrade to free.
 pub fn degrade_dangling_path_endpoints(layout: &mut Layout) {
+    // Fast path: most layouts carry no `path` items (panel drag, figure edit,
+    // snippets, …), so skip the O(N) id-set build + clone entirely when there
+    // is nothing to degrade. Saves N String clones + a HashSet on every PUT
+    // for the common path-less case.
+    if !layout.items.iter().any(|it| matches!(it, Item::Path { .. })) {
+        return;
+    }
     let live_ids: std::collections::HashSet<String> = layout
         .items
         .iter()
@@ -1145,6 +1152,11 @@ fn degrade_endpoint(ep: &mut PathEndpoint, live_ids: &std::collections::HashSet<
 /// [`degrade_dangling_path_endpoints`]; standalone callers just reuse the
 /// cached point).
 pub fn recompute_path_bboxes(layout: &mut Layout) {
+    // Fast path: no `path` items → nothing to recompute. Skips the O(N)
+    // geometry-index build + id clones that Pass 2 would never consume.
+    if !layout.items.iter().any(|it| matches!(it, Item::Path { .. })) {
+        return;
+    }
     // Pass 1 — snapshot every non-path item's geometry by id.
     let endpoint_geom: std::collections::HashMap<String, (f64, f64, f64, f64)> = layout
         .items
