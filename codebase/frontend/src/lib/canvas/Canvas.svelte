@@ -74,9 +74,10 @@
   import {
     anchorPoint,
     autoRoutePath,
+    connectableTargetAtPoint,
     computePathBBox,
     hasConnectedEndpoint,
-    isConnectableItem,
+    isPathConnectedToAny,
     nearestAnchor,
     translatePath,
     updatePathBBoxCache,
@@ -624,18 +625,11 @@
     point: Point,
     blockedId: string | null = null,
   ): PathAnchorCandidate | null {
-    let topmost: CanvasItem | null = null;
-    for (const item of sessionStore.items.values()) {
-      if (blockedId !== null && item.id === blockedId) continue;
-      if (!isConnectableItem(item) || item.visibility !== 'visible') continue;
-      const inside =
-        point.x >= item.x - PATH_CONNECT_PREVIEW_MARGIN &&
-        point.x <= item.x + item.w + PATH_CONNECT_PREVIEW_MARGIN &&
-        point.y >= item.y - PATH_CONNECT_PREVIEW_MARGIN &&
-        point.y <= item.y + item.h + PATH_CONNECT_PREVIEW_MARGIN;
-      if (!inside) continue;
-      if (topmost === null || item.z >= topmost.z) topmost = item;
-    }
+    debugCount('path.anchorCandidate.scan');
+    const topmost = connectableTargetAtPoint(point, sessionStore.items, {
+      margin: PATH_CONNECT_PREVIEW_MARGIN,
+      excludeId: blockedId,
+    });
     if (topmost === null) return null;
     const target = topmost;
     const nearest = nearestAnchor(target, point);
@@ -811,6 +805,10 @@
   const GROUP_HITBOX_PREFIX = '__group-hitbox-';
 
   function updateCanvasGroupHover(e: PointerEvent): void {
+    if (!isSelectMode || lassoState !== null || dragState !== null) {
+      clearCanvasGroupHover();
+      return;
+    }
     const target = e.target as HTMLElement | null;
     const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
     const nodeId = nodeEl?.dataset.id ?? null;
@@ -1176,10 +1174,13 @@
       moved,
     };
     if (!moved) return;
+    const movedById = new Map<string, CanvasItem>();
     for (const [id, original] of state.originals) {
-      sessionStore.items.set(id, translateCanvasItem(original, dx, dy));
+      const next = translateCanvasItem(original, dx, dy);
+      movedById.set(id, next);
+      sessionStore.items.set(id, next);
     }
-    refreshLivePathCaches();
+    refreshLivePathCaches(movedById);
   }
 
   function finishGroupDrag(e: PointerEvent): void {
@@ -1202,7 +1203,7 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
-    refreshLivePathCaches();
+    refreshLivePathCaches(movedById);
     void sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -1217,14 +1218,19 @@
   }
 
   function onCanvasPointerMove(e: PointerEvent) {
-    // Always track hover screen position — terminal ghost preview 의 입력.
-    const rootEl = e.currentTarget as HTMLElement;
-    const rootRect = rootEl.getBoundingClientRect();
-    hoverScreen = {
-      x: e.clientX - rootRect.left,
-      y: e.clientY - rootRect.top,
-    };
-    hoverFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    const needsHoverTracking = isGhostTool !== null || isPathTool || pathCreateStart !== null;
+    if (needsHoverTracking) {
+      const rootEl = e.currentTarget as HTMLElement;
+      const rootRect = rootEl.getBoundingClientRect();
+      hoverScreen = {
+        x: e.clientX - rootRect.left,
+        y: e.clientY - rootRect.top,
+      };
+      hoverFlow = isPathTool ? screenToFlowPosition({ x: e.clientX, y: e.clientY }) : null;
+    } else if (hoverScreen !== null || hoverFlow !== null) {
+      hoverScreen = null;
+      hoverFlow = null;
+    }
     updateCanvasGroupHover(e);
     if (lassoState !== null) {
       if (lassoState.pointerId !== e.pointerId) return;
@@ -1475,6 +1481,21 @@
     return h;
   }
 
+  function pointSignature(point: Point | null | undefined): string {
+    return point == null ? '' : `${point.x},${point.y}`;
+  }
+
+  function pathEndpointSignature(endpoint: PathEndpoint): string {
+    if (endpoint.kind === 'free') return `free:${endpoint.point.x},${endpoint.point.y}`;
+    return [
+      'connected',
+      endpoint.item_id,
+      endpoint.anchor,
+      pointSignature(endpoint.offset),
+      pointSignature(endpoint.fallback_point),
+    ].join(':');
+  }
+
   function makeSignature(
     item: CanvasItem,
     effVisible: boolean,
@@ -1520,15 +1541,7 @@
         payload = `|${item.x2}|${item.y2}|${item.stroke}|${item.stroke_width}|${item.stroke_dash ?? ''}|${item.head_from ?? ''}|${item.head_to ?? ''}`;
         break;
       case 'path':
-        payload = `|${item.from.kind}|${
-          item.from.kind === 'free'
-            ? `${item.from.point.x},${item.from.point.y}`
-            : `${item.from.item_id},${item.from.anchor},${item.from.fallback_point.x},${item.from.fallback_point.y}`
-        }|${item.to.kind}|${
-          item.to.kind === 'free'
-            ? `${item.to.point.x},${item.to.point.y}`
-            : `${item.to.item_id},${item.to.anchor},${item.to.fallback_point.x},${item.to.fallback_point.y}`
-        }|${item.routing}|${item.head_from}|${item.head_to}|${item.stroke}|${item.stroke_width}|${item.stroke_dash ?? ''}|${(item.waypoints ?? [])
+        payload = `|${pathEndpointSignature(item.from)}|${pathEndpointSignature(item.to)}|${item.routing}|${item.head_from}|${item.head_to}|${item.stroke}|${item.stroke_width}|${item.stroke_dash ?? ''}|${(item.waypoints ?? [])
           .map((p) => `${p.id}:${p.x}:${p.y}`)
           .join(',')}`;
         break;
@@ -2441,16 +2454,21 @@
   ): CanvasItem[] {
     const merged = items.map((it) => movedById.get(it.id) ?? it);
     const itemMap = new Map(merged.map((it) => [it.id, it] as const));
+    const movedIds = new Set(movedById.keys());
     return merged.map((it) =>
-      it.type === 'path' ? updatePathBBoxCache(it, itemMap) : it,
+      it.type === 'path' && (movedById.has(it.id) || isPathConnectedToAny(it, movedIds))
+        ? updatePathBBoxCache(it, itemMap)
+        : it,
     );
   }
 
-  function refreshLivePathCaches(): void {
-    const itemMap = new Map(sessionStore.items);
+  function refreshLivePathCaches(movedById: ReadonlyMap<string, CanvasItem>): void {
+    const movedIds = new Set(movedById.keys());
     for (const item of sessionStore.items.values()) {
       if (item.type !== 'path') continue;
-      sessionStore.items.set(item.id, updatePathBBoxCache(item, itemMap));
+      if (!movedById.has(item.id) && !isPathConnectedToAny(item, movedIds)) continue;
+      debugCount('path.liveCache.refresh');
+      sessionStore.items.set(item.id, updatePathBBoxCache(item, sessionStore.items));
     }
   }
 
@@ -2520,7 +2538,7 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
-    refreshLivePathCaches();
+    refreshLivePathCaches(movedById);
   }
 
   function onnodedragstop({
@@ -2545,7 +2563,7 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
-    refreshLivePathCaches();
+    refreshLivePathCaches(movedById);
     // 0065 FE-2 — priorSnapshot 명시 → applyMutation 이 PUT 실패 시 store 를
     // 복원 (drag-stop 의 optimistic update 가 silent 로 회귀 안 되도록).
     void sessionStore.applyMutation(

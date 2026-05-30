@@ -6,11 +6,13 @@ import {
   bestAnchorPair,
   buildPathDFromPoints,
   connectPathEndpoint,
+  connectableTargetAtPoint,
   computePathBBox,
   degradeDeletedEndpoint,
   detachConnectedEndpoints,
   editPathGeometry,
   expandedPathPoints,
+  isPathConnectedToAny,
   moveWaypoints,
   pathPointChain,
   updateConnectedFallbacks,
@@ -267,6 +269,38 @@ describe('pathGeometry', () => {
       anchor: 'E',
       fallback_point: { x: 180, y: 130 },
     });
+  });
+
+  it('finds the topmost visible connectable target near a point', () => {
+    const back = { ...rect('back', 100, 100, 80, 60), z: 1 };
+    const front = { ...rect('front', 105, 105, 80, 60), z: 2 };
+    const hidden = { ...rect('hidden', 105, 105, 80, 60), z: 5, visibility: 'hidden' as const };
+    const itemMap = new Map([back, front, hidden].map((it) => [it.id, it] as const));
+
+    expect(connectableTargetAtPoint({ x: 110, y: 110 }, itemMap, { margin: 0 })?.id).toBe('front');
+    expect(
+      connectableTargetAtPoint(
+        { x: 110, y: 110 },
+        itemMap,
+        { margin: 0, excludeId: 'front' },
+      )?.id,
+    ).toBe('back');
+    expect(connectableTargetAtPoint({ x: 68, y: 110 }, itemMap, { margin: 36 })?.id).toBe('back');
+  });
+
+  it('detects whether a path depends on moved connected targets', () => {
+    const p = path({
+      from: {
+        kind: 'connected',
+        item_id: 'a',
+        anchor: 'E',
+        fallback_point: { x: 100, y: 40 },
+      },
+      to: { kind: 'free', point: { x: 200, y: 40 } },
+    });
+
+    expect(isPathConnectedToAny(p, new Set(['a']))).toBe(true);
+    expect(isPathConnectedToAny(p, new Set(['b']))).toBe(false);
   });
 
   it('rejects endpoint connection when it would self-loop to the same target', () => {

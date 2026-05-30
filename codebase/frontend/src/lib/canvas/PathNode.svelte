@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import { useSvelteFlow } from '@xyflow/svelte';
+  import { debugCount } from '$lib/common/debugCounts';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { pathEditStore } from '$lib/stores/pathEditStore.svelte';
   import type {
@@ -17,10 +18,10 @@
   import {
     anchorPoint,
     buildPathDFromPoints,
+    connectableTargetAtPoint,
     connectPathEndpoint,
     expandedPathPoints,
     insertWaypointNearPoint,
-    isConnectableItem,
     nearestAnchor,
     pathPointChain,
     removeWaypoints,
@@ -60,7 +61,7 @@
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
   const isEditing = $derived(pathEditStore.editingPathId === data.id);
-  const itemMap = $derived(new Map(sessionStore.items));
+  const itemMap = sessionStore.items;
   const svgDashArray = $derived(strokeDashArray(data.stroke_dash, data.stroke_width));
   const startHead = $derived(data.head_from ?? 'none');
   const endHead = $derived(data.head_to ?? 'none');
@@ -223,19 +224,12 @@
   function connectableDropTargetAt(point: Point, path: PathItem, endpoint: EndpointId): CanvasItem | null {
     const other = endpoint === 'from' ? path.to : path.from;
     const blockedId = other.kind === 'connected' ? other.item_id : null;
-    let topmost: CanvasItem | null = null;
-    for (const item of itemMap.values()) {
-      if (item.id === data.id || item.id === blockedId) continue;
-      if (!isConnectableItem(item) || item.visibility !== 'visible') continue;
-      const inside =
-        point.x >= item.x - CONNECT_PREVIEW_MARGIN &&
-        point.x <= item.x + item.w + CONNECT_PREVIEW_MARGIN &&
-        point.y >= item.y - CONNECT_PREVIEW_MARGIN &&
-        point.y <= item.y + item.h + CONNECT_PREVIEW_MARGIN;
-      if (!inside) continue;
-      if (topmost === null || item.z >= topmost.z) topmost = item;
-    }
-    return topmost;
+    debugCount('path.endpointCandidate.scan');
+    return connectableTargetAtPoint(point, itemMap, {
+      margin: CONNECT_PREVIEW_MARGIN,
+      excludeId: data.id,
+      excludeSecondId: blockedId,
+    });
   }
 
   function anchorPreviewAt(

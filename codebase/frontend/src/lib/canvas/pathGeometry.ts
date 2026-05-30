@@ -40,6 +40,31 @@ export function isConnectableItem(item: CanvasItem): item is ConnectableItem {
   );
 }
 
+export function connectableTargetAtPoint(
+  point: Point,
+  itemMap: ReadonlyMap<string, CanvasItem>,
+  options: {
+    margin: number;
+    excludeId?: string | null;
+    excludeSecondId?: string | null;
+  },
+): ConnectableItem | null {
+  let topmost: ConnectableItem | null = null;
+  for (const item of itemMap.values()) {
+    if (options.excludeId != null && item.id === options.excludeId) continue;
+    if (options.excludeSecondId != null && item.id === options.excludeSecondId) continue;
+    if (!isConnectableItem(item) || item.visibility !== 'visible') continue;
+    const inside =
+      point.x >= item.x - options.margin &&
+      point.x <= item.x + item.w + options.margin &&
+      point.y >= item.y - options.margin &&
+      point.y <= item.y + item.h + options.margin;
+    if (!inside) continue;
+    if (topmost === null || item.z >= topmost.z) topmost = item;
+  }
+  return topmost;
+}
+
 export function anchorPoint(item: CanvasItem, anchor: Anchor): Point {
   const x1 = item.x;
   const y1 = item.y;
@@ -270,6 +295,16 @@ function pathPointBounds(
 
 export function hasConnectedEndpoint(path: PathItem): boolean {
   return path.from.kind === 'connected' || path.to.kind === 'connected';
+}
+
+export function isPathConnectedToAny(
+  path: PathItem,
+  itemIds: ReadonlySet<string>,
+): boolean {
+  return (
+    (path.from.kind === 'connected' && itemIds.has(path.from.item_id)) ||
+    (path.to.kind === 'connected' && itemIds.has(path.to.item_id))
+  );
 }
 
 export function updateConnectedFallbacks(
