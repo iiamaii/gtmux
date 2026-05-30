@@ -2838,6 +2838,7 @@
   class="canvas-root"
   role="presentation"
   class:drag-cursor={isDragTool && !isSpacePressed && !isHandTool}
+  class:path-input-mode={isPathTool}
   class:path-cursor={isPathTool && !isSpacePressed && !isHandTool}
   class:path-create-pending={pathCreateStart !== null}
   class:text-cursor={isTextTool && !isSpacePressed && !isHandTool}
@@ -3191,6 +3192,17 @@
   .canvas-root.path-cursor,
   .canvas-root.path-cursor :global(.svelte-flow__pane) {
     cursor: crosshair;
+  }
+
+  /* Path tool is an input mode: canvas items are anchor candidates, not direct
+   * interaction targets. Keep hit-testing on the pane so clicks over components
+   * still create path endpoints; anchor previews remain geometry-driven through
+   * hoverFlow/connectableTargetAtPoint. */
+  .canvas-root.path-input-mode :global(.svelte-flow__node),
+  .canvas-root.path-input-mode :global(.svelte-flow__resize-control),
+  .canvas-root.path-input-mode :global(.svelte-flow__edge),
+  .canvas-root.path-input-mode :global(.svelte-flow__connection) {
+    pointer-events: none !important;
   }
 
   /* Text tool — I-beam cursor (입력 텍스트 위 cursor 정합). */
