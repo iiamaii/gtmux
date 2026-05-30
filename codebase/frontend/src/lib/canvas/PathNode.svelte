@@ -17,13 +17,11 @@
   } from '$lib/types/canvas';
   import {
     anchorPoint,
-    buildPathDFromPoints,
+    buildPathD,
     connectableTargetAtPoint,
     connectPathEndpoint,
-    expandedPathPoints,
     insertWaypointNearPoint,
     nearestAnchor,
-    pathPointChain,
     removeWaypoints,
     resolveEndpoint,
     updatePathBBoxCache,
@@ -105,13 +103,7 @@
 
   const renderPath = $derived(draft ?? pendingCommit ?? currentPath());
   const renderBox = $derived({ x: data.x, y: data.y, w: data.w, h: data.h });
-  const localPoints = $derived(
-    expandedPathPoints(pathPointChain(renderPath, itemMap), renderPath.routing).map((p) => ({
-      x: p.x - renderBox.x,
-      y: p.y - renderBox.y,
-    })),
-  );
-  const pathD = $derived(buildPathDFromPoints(localPoints, renderPath.routing));
+  const pathD = $derived(buildPathD(renderPath, itemMap, renderBox));
   const fromHandle = $derived(toLocal(resolveEndpoint(renderPath.from, itemMap)));
   const toHandle = $derived(toLocal(resolveEndpoint(renderPath.to, itemMap)));
   const waypointHandles = $derived(

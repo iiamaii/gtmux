@@ -11,6 +11,8 @@ import { generateUuidV4 } from '$lib/uuid';
 
 export const PATH_HIT_PADDING = 12;
 const ORTHOGONAL_DOMINANCE = 1.6;
+const ORTHOGONAL_ENDPOINT_STUB = 24;
+const BEZIER_ENDPOINT_HANDLE = 48;
 const ANCHORS: readonly Anchor[] = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'center'];
 
 export type ConnectableItem = Extract<
@@ -177,6 +179,216 @@ export function expandedPathPoints(points: readonly Point[], routing: PathRoutin
   return out;
 }
 
+function appendDistinctPoint(out: Point[], point: Point): void {
+  const prev = out[out.length - 1];
+  if (prev !== undefined && prev.x === point.x && prev.y === point.y) return;
+  out.push(point);
+}
+
+type AxisDir = { x: -1 | 0 | 1; y: -1 | 0 | 1 };
+
+function signDir(value: number): -1 | 0 | 1 {
+  if (value > 0) return 1;
+  if (value < 0) return -1;
+  return 0;
+}
+
+function isZeroDir(dir: AxisDir | null): boolean {
+  return dir === null || (dir.x === 0 && dir.y === 0);
+}
+
+function reverseDir(dir: AxisDir | null): AxisDir | null {
+  return dir === null ? null : { x: signDir(-dir.x), y: signDir(-dir.y) };
+}
+
+function isOppositeDir(a: AxisDir | null, b: AxisDir | null): boolean {
+  if (isZeroDir(a) || isZeroDir(b)) return false;
+  return a!.x === -b!.x && a!.y === -b!.y;
+}
+
+function directionBetween(a: Point, b: Point): AxisDir | null {
+  if (a.x === b.x && a.y === b.y) return null;
+  if (a.y === b.y) return { x: signDir(b.x - a.x), y: 0 };
+  if (a.x === b.x) return { x: 0, y: signDir(b.y - a.y) };
+  return null;
+}
+
+function dominantDirection(a: Point, b: Point): AxisDir | null {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  if (dx === 0 && dy === 0) return null;
+  return Math.abs(dx) >= Math.abs(dy)
+    ? { x: signDir(dx), y: 0 }
+    : { x: 0, y: signDir(dy) };
+}
+
+function addDir(point: Point, dir: AxisDir, distance: number): Point {
+  return {
+    x: point.x + dir.x * distance,
+    y: point.y + dir.y * distance,
+  };
+}
+
+function subtractOrigin(point: Point, origin?: Point): Point {
+  if (origin === undefined) return point;
+  return { x: point.x - origin.x, y: point.y - origin.y };
+}
+
+function anchorNormal(anchor: Anchor, point: Point, neighbor: Point): AxisDir | null {
+  const dx = neighbor.x - point.x;
+  const dy = neighbor.y - point.y;
+  const horizontal = Math.abs(dx) >= Math.abs(dy);
+  switch (anchor) {
+    case 'N':
+      return { x: 0, y: -1 };
+    case 'S':
+      return { x: 0, y: 1 };
+    case 'E':
+      return { x: 1, y: 0 };
+    case 'W':
+      return { x: -1, y: 0 };
+    case 'NE':
+      return horizontal ? { x: 1, y: 0 } : { x: 0, y: -1 };
+    case 'SE':
+      return horizontal ? { x: 1, y: 0 } : { x: 0, y: 1 };
+    case 'SW':
+      return horizontal ? { x: -1, y: 0 } : { x: 0, y: 1 };
+    case 'NW':
+      return horizontal ? { x: -1, y: 0 } : { x: 0, y: -1 };
+    case 'center':
+      return null;
+  }
+}
+
+function startTerminalDirection(
+  endpoint: PathEndpoint,
+  point: Point,
+  neighbor: Point,
+): AxisDir | null {
+  return endpoint.kind === 'connected'
+    ? anchorNormal(endpoint.anchor, point, neighbor)
+    : dominantDirection(point, neighbor);
+}
+
+function endTerminalDirection(
+  endpoint: PathEndpoint,
+  point: Point,
+  neighbor: Point,
+): AxisDir | null {
+  return endpoint.kind === 'connected'
+    ? reverseDir(anchorNormal(endpoint.anchor, point, neighbor))
+    : dominantDirection(neighbor, point);
+}
+
+function segmentLength(points: readonly Point[]): number {
+  let length = 0;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const a = points[i]!;
+    const b = points[i + 1]!;
+    length += Math.hypot(b.x - a.x, b.y - a.y);
+  }
+  return length;
+}
+
+function bendCount(points: readonly Point[]): number {
+  let bends = 0;
+  let previous: AxisDir | null = null;
+  for (let i = 0; i < points.length - 1; i += 1) {
+    const dir = directionBetween(points[i]!, points[i + 1]!);
+    if (dir === null) continue;
+    if (previous !== null && (previous.x !== dir.x || previous.y !== dir.y)) bends += 1;
+    previous = dir;
+  }
+  return bends;
+}
+
+function routeScore(points: readonly Point[], previousDir: AxisDir | null, nextDir: AxisDir | null): number {
+  if (points.length <= 1) return 0;
+  const first = directionBetween(points[0]!, points[1]!);
+  const last = directionBetween(points[points.length - 2]!, points[points.length - 1]!);
+  let score = segmentLength(points) + bendCount(points) * BEND_PENALTY;
+  if (isOppositeDir(first, previousDir)) score += 10_000;
+  if (previousDir !== null && first !== null && first.x === previousDir.x && first.y === previousDir.y) score -= 4;
+  if (isOppositeDir(last, nextDir)) score += 10_000;
+  if (nextDir !== null && last !== null && last.x === nextDir.x && last.y === nextDir.y) score -= 4;
+  return score;
+}
+
+function detourCandidates(a: Point, b: Point): Point[][] {
+  if (a.x === b.x) {
+    return [-1, 1].map((sign) => {
+      const x = a.x + sign * ORTHOGONAL_ENDPOINT_STUB;
+      return [a, { x, y: a.y }, { x, y: b.y }, b];
+    });
+  }
+  if (a.y === b.y) {
+    return [-1, 1].map((sign) => {
+      const y = a.y + sign * ORTHOGONAL_ENDPOINT_STUB;
+      return [a, { x: a.x, y }, { x: b.x, y }, b];
+    });
+  }
+  return [];
+}
+
+function orthogonalSegmentCandidates(a: Point, b: Point): Point[][] {
+  if (a.x === b.x && a.y === b.y) return [[a]];
+  if (a.x === b.x || a.y === b.y) return [[a, b], ...detourCandidates(a, b)];
+  return [
+    [a, { x: b.x, y: a.y }, b],
+    [a, { x: a.x, y: b.y }, b],
+  ];
+}
+
+function appendOrthogonalSegment(
+  out: Point[],
+  target: Point,
+  nextDir: AxisDir | null,
+): void {
+  const start = out[out.length - 1];
+  if (start === undefined) {
+    out.push(target);
+    return;
+  }
+  const previousDir = out.length >= 2 ? directionBetween(out[out.length - 2]!, start) : null;
+  const candidates = orthogonalSegmentCandidates(start, target);
+  let best = candidates[0]!;
+  let bestScore = routeScore(best, previousDir, nextDir);
+  for (const candidate of candidates.slice(1)) {
+    const score = routeScore(candidate, previousDir, nextDir);
+    if (score < bestScore) {
+      best = candidate;
+      bestScore = score;
+    }
+  }
+  for (const point of best.slice(1)) appendDistinctPoint(out, point);
+}
+
+export function pathRenderPoints(
+  path: PathItem,
+  itemMap: ReadonlyMap<string, CanvasItem>,
+): Point[] {
+  const chain = pathPointChain(path, itemMap);
+  if (path.routing !== 'orthogonal' || chain.length <= 1) return chain;
+
+  const first = chain[0]!;
+  const second = chain[1]!;
+  const last = chain[chain.length - 1]!;
+  const beforeLast = chain[chain.length - 2]!;
+  const startDir = startTerminalDirection(path.from, first, second);
+  const endDir = endTerminalDirection(path.to, last, beforeLast);
+  const out: Point[] = [first];
+
+  if (startDir !== null) appendDistinctPoint(out, addDir(first, startDir, ORTHOGONAL_ENDPOINT_STUB));
+  for (let i = 1; i < chain.length - 1; i += 1) {
+    appendOrthogonalSegment(out, chain[i]!, null);
+  }
+  if (endDir !== null) {
+    appendOrthogonalSegment(out, addDir(last, reverseDir(endDir)!, ORTHOGONAL_ENDPOINT_STUB), endDir);
+  }
+  appendOrthogonalSegment(out, last, null);
+  return compactRoute(out);
+}
+
 function bezierSegments(points: readonly Point[]): {
   c1: Point;
   c2: Point;
@@ -207,26 +419,61 @@ function bezierSegments(points: readonly Point[]): {
   return segments;
 }
 
-function bboxPoints(points: readonly Point[], routing: PathRouting): Point[] {
-  if (routing !== 'bezier') return expandedPathPoints(points, routing);
-  const first = points[0];
-  if (first === undefined) return [];
-  return [
-    first,
-    ...bezierSegments(points).flatMap((segment) => [
-      segment.c1,
-      segment.c2,
-      segment.to,
-    ]),
-  ];
+function bezierHandleLength(a: Point, b: Point): number {
+  const distance = Math.hypot(b.x - a.x, b.y - a.y);
+  if (distance === 0) return 0;
+  return Math.min(BEZIER_ENDPOINT_HANDLE, Math.max(1, distance / 3));
+}
+
+function pathBezierSegments(
+  path: PathItem,
+  itemMap: ReadonlyMap<string, CanvasItem>,
+): {
+  start: Point | null;
+  segments: { c1: Point; c2: Point; to: Point }[];
+} {
+  const points = pathPointChain(path, itemMap);
+  const start = points[0] ?? null;
+  if (points.length <= 1) return { start, segments: [] };
+  const first = points[0]!;
+  const second = points[1]!;
+  const last = points[points.length - 1]!;
+  const beforeLast = points[points.length - 2]!;
+  const startDir = startTerminalDirection(path.from, first, second);
+  const endDir = endTerminalDirection(path.to, last, beforeLast);
+  const segments = bezierSegments(points);
+  if (segments.length === 0) return { start, segments };
+
+  if (startDir !== null) {
+    const firstSegment = segments[0]!;
+    firstSegment.c1 = addDir(first, startDir, bezierHandleLength(first, second));
+  }
+  if (endDir !== null) {
+    const lastSegment = segments[segments.length - 1]!;
+    lastSegment.c2 = addDir(last, reverseDir(endDir)!, bezierHandleLength(beforeLast, last));
+  }
+  return { start, segments };
 }
 
 export function buildPathD(
   path: PathItem,
   itemMap: ReadonlyMap<string, CanvasItem>,
+  origin?: Point,
 ): string {
-  const points = pathPointChain(path, itemMap);
-  return buildPathDFromPoints(points, path.routing);
+  if (path.routing === 'bezier') {
+    const { start, segments } = pathBezierSegments(path, itemMap);
+    if (start === null) return '';
+    let d = `M ${subtractOrigin(start, origin).x} ${subtractOrigin(start, origin).y}`;
+    for (const segment of segments) {
+      const c1 = subtractOrigin(segment.c1, origin);
+      const c2 = subtractOrigin(segment.c2, origin);
+      const to = subtractOrigin(segment.to, origin);
+      d += ` C ${c1.x} ${c1.y} ${c2.x} ${c2.y} ${to.x} ${to.y}`;
+    }
+    return d;
+  }
+  const points = pathRenderPoints(path, itemMap);
+  return buildPathDFromPoints(points.map((point) => subtractOrigin(point, origin)), 'straight');
 }
 
 export function buildPathDFromPoints(
@@ -253,7 +500,15 @@ export function computePathBBox(
   path: PathItem,
   itemMap: ReadonlyMap<string, CanvasItem>,
 ): { x: number; y: number; w: number; h: number } {
-  const points = bboxPoints(pathPointChain(path, itemMap), path.routing);
+  const points = path.routing === 'bezier'
+    ? (() => {
+        const { start, segments } = pathBezierSegments(path, itemMap);
+        return [
+          ...(start === null ? [] : [start]),
+          ...segments.flatMap((segment) => [segment.c1, segment.c2, segment.to]),
+        ];
+      })()
+    : pathRenderPoints(path, itemMap);
   const first = points[0] ?? { x: path.x, y: path.y };
   let minX = first.x;
   let minY = first.y;
@@ -278,7 +533,7 @@ function pathPointBounds(
   path: PathItem,
   itemMap: ReadonlyMap<string, CanvasItem>,
 ): { minX: number; minY: number; maxX: number; maxY: number } {
-  const points = expandedPathPoints(pathPointChain(path, itemMap), path.routing);
+  const points = pathRenderPoints(path, itemMap);
   const first = points[0] ?? { x: path.x, y: path.y };
   let minX = first.x;
   let minY = first.y;
