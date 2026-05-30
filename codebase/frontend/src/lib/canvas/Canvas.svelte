@@ -23,7 +23,7 @@
   import { attachConfirm, UnauthorizedError } from '$lib/http/sessions';
   import { killTerminal } from '$lib/http/terminals';
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
-  import type { CanvasItem, CanvasLayout } from '$lib/types/canvas';
+  import type { Anchor, CanvasItem, CanvasLayout, PathEndpoint, Point } from '$lib/types/canvas';
   import {
     descendantGroups,
     descendantItems,
@@ -43,6 +43,7 @@
   import FilePathNode from './FilePathNode.svelte';
   import ShapeNode from './ShapeNode.svelte';
   import LineNode from './LineNode.svelte';
+  import PathNode from './PathNode.svelte';
   import ImageNode from './ImageNode.svelte';
   import DocumentNode from './DocumentNode.svelte';
   import FreeDrawNode from './FreeDrawNode.svelte';
@@ -54,6 +55,7 @@
     createCanvasItem,
     createShapeItem,
     createLineItem,
+    createPathItem,
     createTerminalItem,
     createImageItem,
     createDocumentItem,
@@ -69,6 +71,17 @@
   } from './itemFactory';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { projectPointToAngle, squarePointFromDrag } from './resizeConstraint';
+  import {
+    anchorPoint,
+    autoRoutePath,
+    computePathBBox,
+    hasConnectedEndpoint,
+    isConnectableItem,
+    nearestAnchor,
+    translatePath,
+    updatePathBBoxCache,
+  } from './pathGeometry';
+  import { pathEditStore } from '$lib/stores/pathEditStore.svelte';
 
   interface CanvasProps {
     /** ContextMenu trigger — `+page.svelte` 가 호스팅하는 ContextMenu
@@ -104,6 +117,25 @@
     lineShiftAngle: number | null;
   }
   let dragState = $state<DragState | null>(null);
+  interface PathCreateStart {
+    endpoint: PathEndpoint;
+    point: Point;
+    local: Point;
+  }
+  let pathCreateStart = $state<PathCreateStart | null>(null);
+  type PathAnchorCandidate = {
+    endpoint: PathEndpoint;
+    point: Point;
+    local: Point;
+    box: { x: number; y: number; w: number; h: number };
+    anchors: {
+      anchor: Anchor;
+      x: number;
+      y: number;
+      nearest: boolean;
+      hovered: boolean;
+    }[];
+  };
   interface GroupDragState {
     pointerId: number;
     startFlow: { x: number; y: number };
@@ -172,6 +204,10 @@
    * 노드 위면 null 로 hide. text 는 작아서 (160×56) ghost 의미 약함 — 제외.
    */
   let hoverScreen = $state<{ x: number; y: number } | null>(null);
+  let hoverFlow = $state<Point | null>(null);
+  const PATH_CONNECT_PREVIEW_MARGIN = 36;
+  const PATH_ANCHOR_HOVER_RADIUS = 18;
+  const PATH_PREVIEW_ANCHORS: readonly Anchor[] = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'center'];
 
   /** 점-spawn 도구 중 ghost 표시 + cursor=center spawn 적용 대상. */
   const POINT_SPAWN_DEFAULTS = {
@@ -210,9 +246,14 @@
       toolStore.current === 'line' ||
       toolStore.current === 'free_draw',
   );
+  const isPathTool = $derived(toolStore.current === 'path');
 
   // Text tool 은 drag-to-create 아닌 click-to-create — cursor 만 text I-beam.
   const isTextTool = $derived(toolStore.current === 'text');
+
+  $effect(() => {
+    if (!isPathTool) pathCreateStart = null;
+  });
 
   /* ── G29: Space-hold pan modifier ────────────────────────────────────
    * Figma convention — Space 를 누르면 cursor=grab, 그 상태에서 left-drag =
@@ -243,6 +284,13 @@
   }
 
   function onWindowKeyDown(e: KeyboardEvent): void {
+    if (e.key === 'Escape' && pathCreateStart !== null) {
+      if (isEditableFocused()) return;
+      e.preventDefault();
+      pathCreateStart = null;
+      return;
+    }
+
     // ── Undo / Redo (ADR-0028 D8) — Cmd+Z / Cmd+Shift+Z (mac) / Ctrl+Z /
     // Ctrl+Y (others). editable / xterm focus 시 무시 (native input undo
     // 우선). active session 없으면 sessionStore.undo/redo 가 자체 noop.
@@ -510,6 +558,32 @@
     };
   });
 
+  const pathCreateAnchorPreview = $derived.by(() => {
+    if (!isPathTool || hoverFlow === null) return null;
+    return pathAnchorCandidateAt(hoverFlow, pathCreateBlockedTargetId());
+  });
+
+  const pathCreatePreview = $derived.by(() => {
+    const endLocal = pathCreateAnchorPreview?.local ?? hoverScreen;
+    if (pathCreateStart === null || endLocal === null) return null;
+    const sx = pathCreateStart.local.x;
+    const sy = pathCreateStart.local.y;
+    const cx = endLocal.x;
+    const cy = endLocal.y;
+    const left = Math.min(sx, cx) - GHOST_LINE_PADDING;
+    const top = Math.min(sy, cy) - GHOST_LINE_PADDING;
+    return {
+      left,
+      top,
+      width: Math.max(Math.abs(cx - sx), 1) + GHOST_LINE_PADDING * 2,
+      height: Math.max(Math.abs(cy - sy), 1) + GHOST_LINE_PADDING * 2,
+      x1: sx - left,
+      y1: sy - top,
+      x2: cx - left,
+      y2: cy - top,
+    };
+  });
+
   const lassoPreview = $derived.by(() => {
     if (lassoState === null) return null;
     const sx = lassoState.startLocal.x;
@@ -531,6 +605,95 @@
     const rect = canvasRootEl?.getBoundingClientRect();
     if (rect === undefined) return { x: clientX, y: clientY };
     return { x: clientX - rect.left, y: clientY - rect.top };
+  }
+
+  function flowToLocal(point: Point): Point {
+    const viewport = sessionStore.viewport;
+    return {
+      x: point.x * viewport.zoom + viewport.x,
+      y: point.y * viewport.zoom + viewport.y,
+    };
+  }
+
+  function pathCreateBlockedTargetId(): string | null {
+    const endpoint = pathCreateStart?.endpoint;
+    return endpoint?.kind === 'connected' ? endpoint.item_id : null;
+  }
+
+  function pathAnchorCandidateAt(
+    point: Point,
+    blockedId: string | null = null,
+  ): PathAnchorCandidate | null {
+    let topmost: CanvasItem | null = null;
+    for (const item of sessionStore.items.values()) {
+      if (blockedId !== null && item.id === blockedId) continue;
+      if (!isConnectableItem(item) || item.visibility !== 'visible') continue;
+      const inside =
+        point.x >= item.x - PATH_CONNECT_PREVIEW_MARGIN &&
+        point.x <= item.x + item.w + PATH_CONNECT_PREVIEW_MARGIN &&
+        point.y >= item.y - PATH_CONNECT_PREVIEW_MARGIN &&
+        point.y <= item.y + item.h + PATH_CONNECT_PREVIEW_MARGIN;
+      if (!inside) continue;
+      if (topmost === null || item.z >= topmost.z) topmost = item;
+    }
+    if (topmost === null) return null;
+    const target = topmost;
+    const nearest = nearestAnchor(target, point);
+    const nearestPoint = anchorPoint(target, nearest);
+    const zoom = sessionStore.viewport.zoom;
+    const boxLocal = flowToLocal({ x: target.x, y: target.y });
+    return {
+      endpoint: {
+        kind: 'connected',
+        item_id: target.id,
+        anchor: nearest,
+        fallback_point: nearestPoint,
+      },
+      point: nearestPoint,
+      local: flowToLocal(nearestPoint),
+      box: {
+        x: boxLocal.x,
+        y: boxLocal.y,
+        w: target.w * zoom,
+        h: target.h * zoom,
+      },
+      anchors: PATH_PREVIEW_ANCHORS.map((anchor) => {
+        const pos = anchorPoint(target, anchor);
+        const local = flowToLocal(pos);
+        const distance = Math.hypot(pos.x - point.x, pos.y - point.y);
+        return {
+          anchor,
+          x: local.x,
+          y: local.y,
+          nearest: anchor === nearest,
+          hovered: anchor === nearest && distance <= PATH_ANCHOR_HOVER_RADIUS,
+        };
+      }),
+    };
+  }
+
+  function pathEndpointAt(point: Point, local: Point): PathCreateStart {
+    const candidate = pathAnchorCandidateAt(point, pathCreateBlockedTargetId());
+    if (candidate !== null) {
+      return {
+        endpoint: candidate.endpoint,
+        point: candidate.point,
+        local: candidate.local,
+      };
+    }
+    return {
+      endpoint: { kind: 'free', point },
+      point,
+      local,
+    };
+  }
+
+  function pathParentForEndpoints(from: PathEndpoint, to: PathEndpoint): string | null {
+    if (from.kind !== 'connected' || to.kind !== 'connected') return null;
+    const fromItem = sessionStore.items.get(from.item_id);
+    const toItem = sessionStore.items.get(to.item_id);
+    if (fromItem === undefined || toItem === undefined) return null;
+    return fromItem.parent_id === toItem.parent_id ? fromItem.parent_id : null;
   }
 
   function screenDistance(
@@ -674,7 +837,8 @@
     return (
       target.closest('.svelte-flow__resize-control') !== null ||
       target.closest('.nodrag') !== null ||
-      target.closest('.endpoint') !== null
+      target.closest('.endpoint') !== null ||
+      target.closest('.waypoint') !== null
     );
   }
 
@@ -691,6 +855,9 @@
           const hitTarget = groupIdFromOverlayNode(nodeId) ?? canvasTargetFor(nodeId);
           if (!targetIsInsideDrill(hitTarget)) sessionStore.clearDrill();
           sessionStore.toggleM(hitTarget);
+          if (pathEditStore.editingPathId !== null && !sessionStore.M.has(pathEditStore.editingPathId)) {
+            pathEditStore.end();
+          }
           resetDoubleClickTracker();
           // Keep xyflow from toggling the leaf node internally. In drill scope,
           // multi-select must operate on the current drill-level target, not the
@@ -723,6 +890,7 @@
               const nextSelected =
                 overlayGroupId ?? targetAtDrillLevel(nodeId, hitTarget, sessionStore.items, sessionStore.groups);
               sessionStore.setM([nextSelected]);
+              if (pathEditStore.editingPathId !== nextSelected) pathEditStore.end();
               if (sessionStore.items.get(nodeId)?.type === 'text') {
                 sessionStore.suppressTextEditDblClick(nodeId);
               }
@@ -747,6 +915,7 @@
           // the current drill-level group.
           if (!(e.metaKey || e.ctrlKey || e.shiftKey)) {
             sessionStore.setM([hitTarget]);
+            if (pathEditStore.editingPathId !== hitTarget) pathEditStore.end();
             beginSelectionDrag([hitTarget], e);
             e.preventDefault();
             e.stopPropagation();
@@ -766,6 +935,7 @@
           // SvelteFlow click/drag events may still follow, but selection UI no
           // longer waits for its internal selected state or mousemove effects.
           sessionStore.setM([hitTarget]);
+          if (pathEditStore.editingPathId !== hitTarget) pathEditStore.end();
         }
       }
       if (nodeId === null && !(e.metaKey || e.ctrlKey || e.shiftKey)) {
@@ -851,6 +1021,9 @@
         points: item.points.map((p) => ({ x: p.x + dx, y: p.y + dy })),
       };
     }
+    if (item.type === 'path') {
+      return translatePath(item, dx, dy);
+    }
     return { ...item, x: item.x + dx, y: item.y + dy };
   }
 
@@ -926,6 +1099,9 @@
         { x: item.x2, y: item.y2 },
       );
       return { x: box.x, y: box.y, w: box.w, h: box.h };
+    }
+    if (item.type === 'path') {
+      return computePathBBox(item, sessionStore.items);
     }
     return { x: item.x, y: item.y, w: item.w, h: item.h };
   }
@@ -1003,6 +1179,7 @@
     for (const [id, original] of state.originals) {
       sessionStore.items.set(id, translateCanvasItem(original, dx, dy));
     }
+    refreshLivePathCaches();
   }
 
   function finishGroupDrag(e: PointerEvent): void {
@@ -1025,10 +1202,11 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
+    refreshLivePathCaches();
     void sessionStore.applyMutation(
       (cur) => ({
         ...cur,
-        items: cur.items.map((it) => movedById.get(it.id) ?? it),
+        items: mergeMovedItemsWithPathCaches(cur.items, movedById),
       }),
       {
         abortMessage: 'Group drag aborted — session reconnect failed.',
@@ -1046,6 +1224,7 @@
       x: e.clientX - rootRect.left,
       y: e.clientY - rootRect.top,
     };
+    hoverFlow = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     updateCanvasGroupHover(e);
     if (lassoState !== null) {
       if (lassoState.pointerId !== e.pointerId) return;
@@ -1220,6 +1399,7 @@
     rect: ShapeNode,
     ellipse: ShapeNode,
     line: LineNode,
+    path: PathNode,
     image: ImageNode,
     document: DocumentNode,
     free_draw: FreeDrawNode,
@@ -1336,8 +1516,21 @@
         payload = `|${item.stroke}|${item.fill}|${item.stroke_width}|${item.fill_enabled === false ? 0 : 1}|${item.stroke_enabled === false ? 0 : 1}|${item.stroke_dash ?? ''}|${item.text ?? ''}|${item.font_size ?? ''}|${item.color ?? ''}|${item.text_align ?? ''}|${item.text_vertical_align ?? ''}|${item.font_weight ?? ''}|${item.italic ? 1 : 0}|${item.underline ? 1 : 0}|${item.strikethrough ? 1 : 0}|${item.font_family ?? ''}`;
         break;
       case 'line':
-        // batch-5 R2 신규: stroke_dash.
-        payload = `|${item.x2}|${item.y2}|${item.stroke}|${item.stroke_width}|${item.stroke_dash ?? ''}`;
+        // batch-5 R2 신규: stroke_dash. ADR-0043: head markers.
+        payload = `|${item.x2}|${item.y2}|${item.stroke}|${item.stroke_width}|${item.stroke_dash ?? ''}|${item.head_from ?? ''}|${item.head_to ?? ''}`;
+        break;
+      case 'path':
+        payload = `|${item.from.kind}|${
+          item.from.kind === 'free'
+            ? `${item.from.point.x},${item.from.point.y}`
+            : `${item.from.item_id},${item.from.anchor},${item.from.fallback_point.x},${item.from.fallback_point.y}`
+        }|${item.to.kind}|${
+          item.to.kind === 'free'
+            ? `${item.to.point.x},${item.to.point.y}`
+            : `${item.to.item_id},${item.to.anchor},${item.to.fallback_point.x},${item.to.fallback_point.y}`
+        }|${item.routing}|${item.head_from}|${item.head_to}|${item.stroke}|${item.stroke_width}|${item.stroke_dash ?? ''}|${(item.waypoints ?? [])
+          .map((p) => `${p.id}:${p.x}:${p.y}`)
+          .join(',')}`;
         break;
       case 'free_draw':
         // P2 — placeholder until ship
@@ -1394,10 +1587,16 @@
     ) {
       classes.push('fill-off');
     }
+    if (item.type === 'path') {
+      classes.push('path-node-wrapper');
+    }
     const common = {
       id: item.id,
       position: { x: item.x, y: item.y },
-      draggable: !locked && !groupHitTarget,
+      draggable:
+        !locked &&
+        !groupHitTarget &&
+        (item.type !== 'path' || !hasConnectedEndpoint(item)),
       selectable: true,
       selected: false,
       zIndex: item.z,
@@ -1454,6 +1653,26 @@
           _boxY1: item.y - box.y,
           _boxX2: item.x2 - box.x,
           _boxY2: item.y2 - box.y,
+        },
+      };
+    }
+    if (item.type === 'path') {
+      const box = computePathBBox(item, sessionStore.items);
+      return {
+        ...common,
+        type: 'path',
+        position: { x: box.x, y: box.y },
+        width: box.w,
+        height: box.h,
+        data: {
+          ...(item as unknown as Record<string, unknown>),
+          visibility: visible,
+          locked,
+          group_selected: selectedByGroup,
+          x: box.x,
+          y: box.y,
+          w: box.w,
+          h: box.h,
         },
       };
     }
@@ -1848,6 +2067,7 @@
 
   function clearCanvasDrillAndSelection(): void {
     blurActiveCanvasElement();
+    pathEditStore.end();
     sessionStore.clearDrill();
     sessionStore.clearM();
   }
@@ -1922,18 +2142,21 @@
           const nextSelected =
             overlayGroupId ?? targetAtDrillLevel(id, target, sessionStore.items, sessionStore.groups);
           sessionStore.setM([nextSelected]);
+          if (pathEditStore.editingPathId !== nextSelected) pathEditStore.end();
           const itemType = sessionStore.items.get(id)?.type;
           if (itemType === 'text' || itemType === 'rect' || itemType === 'ellipse') {
             sessionStore.suppressTextEditDblClick(id);
           }
         } else {
           sessionStore.setM([target]);
+          if (pathEditStore.editingPathId !== target) pathEditStore.end();
         }
         blurActiveCanvasElement();
         return;
       }
       if (!targetIsInsideDrill(target)) sessionStore.clearDrill();
       sessionStore.setM([target]);
+      if (pathEditStore.editingPathId !== target) pathEditStore.end();
       return;
     }
     if (event instanceof MouseEvent) {
@@ -2021,6 +2244,31 @@
       }
       if (tool === 'note') {
         const item = createCanvasItem('note', centered('note'));
+        void commitNewItem(item)
+          .then(() => toolStore.consume())
+          .catch(onSpawnError);
+        return;
+      }
+      if (tool === 'path') {
+        const local = canvasLocalFromClient(event.clientX, event.clientY);
+        hoverScreen = local;
+        hoverFlow = flow;
+        if (pathCreateStart === null) {
+          pathCreateStart = pathEndpointAt(flow, local);
+          return;
+        }
+        const end = pathEndpointAt(flow, local);
+        const parentId = pathParentForEndpoints(pathCreateStart.endpoint, end.endpoint);
+        const item = autoRoutePath(
+          {
+            ...createPathItem(pathCreateStart.point, end.point),
+            parent_id: parentId,
+            from: pathCreateStart.endpoint,
+            to: end.endpoint,
+          },
+          sessionStore.items,
+        );
+        pathCreateStart = null;
         void commitNewItem(item)
           .then(() => toolStore.consume())
           .catch(onSpawnError);
@@ -2187,6 +2435,25 @@
    */
   let nodeDragPriorSnapshot: CanvasLayout | null = null;
 
+  function mergeMovedItemsWithPathCaches(
+    items: readonly CanvasItem[],
+    movedById: ReadonlyMap<string, CanvasItem>,
+  ): CanvasItem[] {
+    const merged = items.map((it) => movedById.get(it.id) ?? it);
+    const itemMap = new Map(merged.map((it) => [it.id, it] as const));
+    return merged.map((it) =>
+      it.type === 'path' ? updatePathBBoxCache(it, itemMap) : it,
+    );
+  }
+
+  function refreshLivePathCaches(): void {
+    const itemMap = new Map(sessionStore.items);
+    for (const item of sessionStore.items.values()) {
+      if (item.type !== 'path') continue;
+      sessionStore.items.set(item.id, updatePathBBoxCache(item, itemMap));
+    }
+  }
+
   function movedItemsFromNodes(nodes: Node[]): Map<string, CanvasItem> {
     const movedById = new Map<string, CanvasItem>();
     for (const n of nodes) {
@@ -2227,6 +2494,12 @@
           y: pos.y,
           points: cur.points.map((p) => ({ x: p.x + dx, y: p.y + dy })),
         };
+      } else if (cur.type === 'path') {
+        if (hasConnectedEndpoint(cur)) continue;
+        const oldBox = computePathBBox(cur, sessionStore.items);
+        const dx = pos.x - oldBox.x;
+        const dy = pos.y - oldBox.y;
+        next = translatePath(cur, dx, dy);
       } else {
         next = { ...cur, x: pos.x, y: pos.y };
       }
@@ -2247,6 +2520,7 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
+    refreshLivePathCaches();
   }
 
   function onnodedragstop({
@@ -2271,12 +2545,13 @@
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);
     }
+    refreshLivePathCaches();
     // 0065 FE-2 — priorSnapshot 명시 → applyMutation 이 PUT 실패 시 store 를
     // 복원 (drag-stop 의 optimistic update 가 silent 로 회귀 안 되도록).
     void sessionStore.applyMutation(
       (cur) => ({
         ...cur,
-        items: cur.items.map((it) => movedById.get(it.id) ?? it),
+        items: mergeMovedItemsWithPathCaches(cur.items, movedById),
       }),
       {
         abortMessage: 'Drag commit aborted — session reconnect failed.',
@@ -2545,6 +2820,8 @@
   class="canvas-root"
   role="presentation"
   class:drag-cursor={isDragTool && !isSpacePressed && !isHandTool}
+  class:path-cursor={isPathTool && !isSpacePressed && !isHandTool}
+  class:path-create-pending={pathCreateStart !== null}
   class:text-cursor={isTextTool && !isSpacePressed && !isHandTool}
   class:pan-cursor={isSpacePressed || isHandTool}
   class:hand-mode={isHandTool}
@@ -2555,6 +2832,7 @@
   onpointercancelcapture={onCanvasPointerCancel}
   onpointerleave={() => {
     hoverScreen = null;
+    hoverFlow = null;
     clearCanvasGroupHover();
   }}
   oncontextmenucapture={onCanvasContextMenu}
@@ -2648,6 +2926,51 @@
     </div>
   {/if}
 
+  {#if pathCreatePreview !== null}
+    <div
+      class="path-create-preview"
+      style="left: {pathCreatePreview.left}px; top: {pathCreatePreview.top}px; width: {pathCreatePreview.width}px; height: {pathCreatePreview.height}px;"
+      aria-hidden="true"
+    >
+      <svg
+        width={pathCreatePreview.width}
+        height={pathCreatePreview.height}
+        viewBox={`0 0 ${pathCreatePreview.width} ${pathCreatePreview.height}`}
+        preserveAspectRatio="none"
+      >
+        <line
+          x1={pathCreatePreview.x1}
+          y1={pathCreatePreview.y1}
+          x2={pathCreatePreview.x2}
+          y2={pathCreatePreview.y2}
+          stroke="var(--color-accent)"
+          stroke-width={2}
+          stroke-linecap="round"
+          stroke-dasharray="6 4"
+        />
+        <circle cx={pathCreatePreview.x1} cy={pathCreatePreview.y1} r="3.5" />
+        <circle cx={pathCreatePreview.x2} cy={pathCreatePreview.y2} r="3.5" />
+      </svg>
+    </div>
+  {/if}
+
+  {#if pathCreateAnchorPreview !== null}
+    <div
+      class="path-anchor-preview-box"
+      style="left: {pathCreateAnchorPreview.box.x}px; top: {pathCreateAnchorPreview.box.y}px; width: {pathCreateAnchorPreview.box.w}px; height: {pathCreateAnchorPreview.box.h}px;"
+      aria-hidden="true"
+    ></div>
+    {#each pathCreateAnchorPreview.anchors as previewAnchor (previewAnchor.anchor)}
+      <div
+        class="path-anchor-preview"
+        class:nearest={previewAnchor.nearest}
+        class:hovered={previewAnchor.hovered}
+        style="left: {previewAnchor.x}px; top: {previewAnchor.y}px;"
+        aria-hidden="true"
+      ></div>
+    {/each}
+  {/if}
+
   {#if lassoPreview !== null}
     <div
       class="selection-marquee"
@@ -2736,6 +3059,7 @@
     border-width: 1.5px !important;
     border-style: solid !important;
     border-radius: 1px !important;
+    pointer-events: auto !important;
     z-index: 10 !important;
   }
 
@@ -2757,6 +3081,7 @@
 
   .canvas-root :global(.panel-resize-line) {
     border-color: transparent !important;
+    pointer-events: auto !important;
   }
 
   .canvas-root :global(.svelte-flow__node.is-minimized.m-selected) {
@@ -2788,7 +3113,10 @@
    * 시각은 LineNode 의 endpoint button 이 담당. */
   .canvas-root :global(.svelte-flow__node-line),
   .canvas-root :global(.svelte-flow__node-line:hover),
-  .canvas-root :global(.svelte-flow__node-line.m-selected) {
+  .canvas-root :global(.svelte-flow__node-line.m-selected),
+  .canvas-root :global(.svelte-flow__node-path),
+  .canvas-root :global(.svelte-flow__node-path:hover),
+  .canvas-root :global(.svelte-flow__node-path.m-selected) {
     box-shadow: none;
   }
 
@@ -2803,12 +3131,13 @@
    *    ShapeNode 의 SVG `<rect>` / `<ellipse>` 의 pointer-events="visibleStroke"
    *    가 stroke ring 만 catch — 내부 클릭은 뒤 layer (canvas / panel) 로 전달.
    *
-   * NodeResizer handle 은 SvelteFlow 의
-   *   .svelte-flow__resize-control { pointer-events: all }
-   * 로 그대로 hit (CSS pointer-events 비상속 — child 의 explicit value 가 자체
-   * 활성). resize / drag 기능 회귀 0.
+   * NodeResizer handle/line 은 위 `.panel-resize-*` rule 이 pointer-events 를
+   * 명시적으로 되살린다. SvelteFlow 의 기본 `.svelte-flow__resize-control`
+   * 에는 pointer-events override 가 없으므로 이 override 가 없으면
+   * fill-off wrapper 의 pass-through 와 함께 resize hit-test 도 죽는다.
    */
   .canvas-root :global(.svelte-flow__node-line),
+  .canvas-root :global(.svelte-flow__node-path),
   .canvas-root :global(.svelte-flow__node.fill-off),
   .canvas-root :global(.svelte-flow__node.gtmux-group) {
     pointer-events: none;
@@ -2838,6 +3167,11 @@
   /* Drag-to-create tool cursor — Batch 2 (rect/ellipse/line). */
   .canvas-root.drag-cursor,
   .canvas-root.drag-cursor :global(.svelte-flow__pane) {
+    cursor: crosshair;
+  }
+
+  .canvas-root.path-cursor,
+  .canvas-root.path-cursor :global(.svelte-flow__pane) {
     cursor: crosshair;
   }
 
@@ -2884,6 +3218,58 @@
     background: color-mix(in srgb, var(--color-accent) 10%, transparent);
     pointer-events: none;
     z-index: var(--z-canvas-overlay);
+  }
+
+  .path-create-preview {
+    position: absolute;
+    pointer-events: none;
+    z-index: var(--z-canvas-overlay);
+  }
+
+  .path-create-preview svg {
+    display: block;
+    overflow: visible;
+  }
+
+  .path-create-preview circle {
+    fill: var(--color-accent);
+  }
+
+  .path-anchor-preview-box,
+  .path-anchor-preview {
+    position: absolute;
+    pointer-events: none;
+    z-index: var(--z-canvas-overlay);
+  }
+
+  .path-anchor-preview-box {
+    box-sizing: border-box;
+    border: var(--canvas-scaler-border, 1.5px) dashed var(--color-accent);
+    border-radius: 4px;
+    opacity: 0.55;
+  }
+
+  .path-anchor-preview {
+    width: var(--canvas-scaler-size, 10px);
+    height: var(--canvas-scaler-size, 10px);
+    border: var(--canvas-scaler-border, 1.5px) solid var(--color-accent);
+    border-radius: 999px;
+    background: var(--color-surface);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-bg) 80%, transparent);
+    opacity: 0.85;
+    transform: translate(-50%, -50%);
+  }
+
+  .path-anchor-preview.nearest {
+    opacity: 1;
+    border-color: var(--color-accent);
+  }
+
+  .path-anchor-preview.hovered {
+    background: var(--color-accent);
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, var(--color-bg) 80%, transparent),
+      0 0 0 6px color-mix(in srgb, var(--color-accent) 22%, transparent);
   }
 
   /* Live preview during drag — container-local screen coords. */

@@ -1,9 +1,9 @@
 <script lang="ts">
   /**
-   * Toolbar2 — 56px Figma-style 12-tool toolbar (FE-2 / Stage 5).
+   * Toolbar2 — 56px Figma-style 13-tool toolbar (FE-2 / Stage 5).
    *
    * 정본:
-   * - plan-0007 §14.2 FE-2 (12 도구 + dividers)
+   * - plan-0007 §14.2 FE-2 (tool groups + dividers)
    * - plan-0007 §14.20.3 G22 (one-shot default + Q lock)
    * - ref/frontend-design/SPEC.md §4 (visual spec)
    * - ADR-0018 D4 (도구 ↔ ItemType 1:1 매핑)
@@ -45,7 +45,7 @@
     fill?: boolean;
   }
 
-  /** 12 tools grouped by semantic. Divider 는 그룹 사이. */
+  /** 13 tools grouped by semantic. Divider 는 그룹 사이. */
   const GROUPS: ToolDef[][] = [
     // 1) Mode (always sticky)
     [
@@ -91,6 +91,11 @@
         name: 'Line',
         hint: 'L',
         path: '<line x1="4.5" y1="19" x2="19.5" y2="5"/>',
+      },
+      {
+        id: 'path',
+        name: 'Path',
+        path: '<path d="M4 18h6V7h8"/><path d="m15 4 3 3-3 3"/>',
       },
       {
         id: 'free_draw',

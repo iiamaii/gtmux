@@ -9,8 +9,9 @@
 // 2. 250ms idle 시 flush — applyMutation PUT (history capture + priorSnapshot rollback 계약).
 // 3. 같은 session 안의 다음 tick 은 같은 batch 로 누적; session 전환 시 cancel.
 
-import type { CanvasLayout, CanvasItem, LineItem } from '$lib/types/canvas';
+import type { CanvasLayout, CanvasItem, LineItem, PathItem } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
+import { translatePath } from '$lib/canvas/pathGeometry';
 
 const NUDGE_FLUSH_MS = 250;
 
@@ -41,12 +42,14 @@ class NudgeBuffer {
       if (it === undefined) continue;
       if (it.locked) continue;
       this.#activeIds.add(id);
-      const next = { ...it, x: it.x + dx, y: it.y + dy } as CanvasItem;
+      let next = { ...it, x: it.x + dx, y: it.y + dy } as CanvasItem;
       if (next.type === 'line') {
         const lineSrc = it as LineItem;
         const lineOut = next as LineItem;
         lineOut.x2 = lineSrc.x2 + dx;
         lineOut.y2 = lineSrc.y2 + dy;
+      } else if (next.type === 'path') {
+        next = translatePath(it as PathItem, dx, dy);
       }
       sessionStore.items.set(id, next);
     }
@@ -89,6 +92,8 @@ class NudgeBuffer {
             const lineOut = next as LineItem;
             lineOut.x2 = (fresh as LineItem).x2;
             lineOut.y2 = (fresh as LineItem).y2;
+          } else if (next.type === 'path') {
+            return fresh;
           }
           return next;
         });

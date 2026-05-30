@@ -48,6 +48,7 @@ import {
 import { generateUuidV4 } from '$lib/uuid';
 import { normalizeLayout } from '$lib/stores/zSpace';
 import type { AttachConfirmSummary } from '$lib/types/sessions';
+import { degradeDeletedEndpoint, updatePathBBoxCache } from '$lib/canvas/pathGeometry';
 
 /** Active session 의 식별 정보. attach 성공 시 set, detach 시 null. */
 export interface ActiveSession {
@@ -107,6 +108,24 @@ function normalizeLoadedItem(item: CanvasItem): CanvasItem {
     return { ...item, h: MINIMIZED_TERMINAL_PANEL_HEIGHT };
   }
   return item;
+}
+
+function normalizePathItems(layout: CanvasLayout): CanvasLayout {
+  const itemIds = new Set(layout.items.map((it) => it.id));
+  let items = layout.items.map((it) => {
+    if (it.type !== 'path') return it;
+    const deletedIds = new Set<string>();
+    if (it.from.kind === 'connected' && !itemIds.has(it.from.item_id)) {
+      deletedIds.add(it.from.item_id);
+    }
+    if (it.to.kind === 'connected' && !itemIds.has(it.to.item_id)) {
+      deletedIds.add(it.to.item_id);
+    }
+    return deletedIds.size > 0 ? degradeDeletedEndpoint(it, deletedIds) : it;
+  });
+  const itemMap = new Map(items.map((it) => [it.id, it] as const));
+  items = items.map((it) => (it.type === 'path' ? updatePathBBoxCache(it, itemMap) : it));
+  return { ...layout, items };
 }
 
 class SessionStore {
@@ -249,7 +268,7 @@ class SessionStore {
     // 옛 layout (gap 있는 z) 가 fresh attach / LAYOUT_CHANGED 으로 들어와도 store
     // entry 시점에 *FE 측 invariant* 정합. Idempotent — 이미 정합인 layout 은
     // z 값 변경 0건. 다음 mutation PUT 시 normalized z 가 BE 로 자연 commit.
-    const normalized = normalizeLayout(layout);
+    const normalized = normalizePathItems(normalizeLayout(layout));
     this.items.clear();
     for (const it of normalized.items) {
       const item = normalizeLoadedItem(it);
@@ -569,7 +588,7 @@ class SessionStore {
     };
 
     // Optimistic update (items + groups 모두 surgical).
-    const optimistic = transform(priorSnapshot);
+    const optimistic = normalizePathItems(transform(priorSnapshot));
     this.#applyLayoutSurgically(optimistic);
     const priorM = [...this.M];
     this.setM([newGroupId]);
@@ -639,7 +658,7 @@ class SessionStore {
       return normalizeLayout(interim, overrides);
     };
 
-    const optimistic = transform(priorSnapshot);
+    const optimistic = normalizePathItems(transform(priorSnapshot));
     this.#applyLayoutSurgically(optimistic);
     const priorM = [...this.M];
     const priorDrillRootId = this.drillRootId;
@@ -1214,7 +1233,10 @@ class SessionStore {
     for (const id of [...this.items.keys()]) {
       if (!nextIds.has(id)) this.items.delete(id);
     }
-    return await this.applyMutation(transform, { ...options, priorSnapshot });
+    return await this.applyMutation(
+      (cur) => normalizePathItems(transform(cur)),
+      { ...options, priorSnapshot },
+    );
   }
 
   async applyMutation(
@@ -1252,7 +1274,9 @@ class SessionStore {
       ? (priorSnapshot ?? this.layoutSnapshot())
       : null;
     try {
-      const { layout } = await mutateLayout(active.name, transform);
+      const { layout } = await mutateLayout(active.name, (cur) =>
+        normalizePathItems(transform(cur)),
+      );
       this.loadLayout(layout);
       if (before !== null) historyStore.capture(active.name, before);
       return { ok: true, layout };

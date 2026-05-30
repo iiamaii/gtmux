@@ -375,6 +375,8 @@
         return '○';
       case 'line':
         return '╱';
+      case 'path':
+        return '↱';
       case 'free_draw':
         return '⌁';
       case 'image':
@@ -935,6 +937,11 @@
     {:else if p.type === 'line'}
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
         <line x1="4.5" y1="19" x2="19.5" y2="5"/>
+      </svg>
+    {:else if p.type === 'path'}
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M4 18h6V7h8"/>
+        <path d="m15 4 3 3-3 3"/>
       </svg>
     {:else if p.type === 'free_draw'}
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">

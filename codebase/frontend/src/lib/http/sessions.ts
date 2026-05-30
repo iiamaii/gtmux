@@ -57,6 +57,21 @@ async function json<T>(res: Response): Promise<T> {
   }
 }
 
+async function responseErrorMessage(res: Response, prefix: string): Promise<string> {
+  const text = await res.text().catch(() => '');
+  if (text.trim().length === 0) return `${prefix} ${res.status}`;
+  try {
+    const body = JSON.parse(text) as { error?: unknown; message?: unknown };
+    const code = typeof body.error === 'string' ? body.error : null;
+    const message = typeof body.message === 'string' ? body.message : null;
+    if (code !== null && message !== null) return `${prefix} ${res.status}: ${code}: ${message}`;
+    if (message !== null) return `${prefix} ${res.status}: ${message}`;
+  } catch {
+    // Fall through to the raw body snippet.
+  }
+  return `${prefix} ${res.status}: ${text.slice(0, 500)}`;
+}
+
 /* ────────────────────────────────────────────────────────────────────────── */
 /* GET /api/sessions                                                          */
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -314,7 +329,7 @@ export async function putLayout(
   if (res.status === 401) throw new UnauthorizedError();
   if (res.status === 412) throw new EtagMismatchError();
   if (res.status === 428) throw new Error('precondition required (If-Match missing)');
-  if (!res.ok) throw new Error(`PUT layout returned ${res.status}`);
+  if (!res.ok) throw new Error(await responseErrorMessage(res, 'PUT layout returned'));
   const newEtag = (res.headers.get('ETag') ?? '').replace(/^"|"$/g, '');
   return { etag: newEtag };
 }

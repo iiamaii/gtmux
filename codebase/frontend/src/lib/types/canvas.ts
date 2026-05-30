@@ -52,6 +52,8 @@ export type FontFamily = Schemas['FontFamily'];
  * wire). connector 의 `StrokeDash` 와는 의미·default 가 달라 별 enum.
  */
 export type FigureStrokeDash = Schemas['FigureStrokeDash'];
+export type Anchor = Schemas['Anchor'];
+export type Head = Schemas['Head'];
 
 /**
  * ADR-0018 D4 amend ② — text 의 font weight 3-bucket (Grill #6: 100~900
@@ -211,6 +213,10 @@ export interface LineItem extends ItemCommon {
   y2: number;
   /** ADR-0018 D4 amend ① (batch-5) — stroke dash pattern. undefined=solid. */
   stroke_dash?: FigureStrokeDash;
+  /** ADR-0043 D2 — optional marker at the start endpoint. */
+  head_from?: Head;
+  /** ADR-0043 D2 — optional marker at the end endpoint. */
+  head_to?: Head;
 }
 
 export interface Point {
@@ -278,6 +284,41 @@ export interface SnippetsItem extends ItemCommon {
   entries: SnippetEntry[];
 }
 
+export type PathRouting = Schemas['Routing'];
+
+export type PathEndpoint =
+  | {
+      kind: 'free';
+      point: Point;
+    }
+  | {
+      kind: 'connected';
+      item_id: string;
+      anchor: Anchor;
+      /** Optional delta from the resolved anchor point. Missing means {0,0}. */
+      offset?: Point | null;
+      fallback_point: Point;
+    };
+
+export interface PathWaypoint {
+  id: string;
+  x: number;
+  y: number;
+}
+
+export interface PathItem extends ItemCommon {
+  type: 'path';
+  from: PathEndpoint;
+  to: PathEndpoint;
+  routing: PathRouting;
+  waypoints?: PathWaypoint[];
+  head_from: Head;
+  head_to: Head;
+  stroke: string;
+  stroke_width: number;
+  stroke_dash?: FigureStrokeDash;
+}
+
 /** Discriminated union — `type` field 로 narrow. */
 export type CanvasItem =
   | TerminalItem
@@ -290,7 +331,8 @@ export type CanvasItem =
   | ImageItem
   | DocumentItem
   | FilePathItem
-  | SnippetsItem;
+  | SnippetsItem
+  | PathItem;
 
 /** `CanvasItem['type']` 의 모든 값 — UI registry / Toolbar 등록에 사용. */
 export type CanvasItemType = CanvasItem['type'];
@@ -334,3 +376,4 @@ export const isImage = (it: CanvasItem): it is ImageItem => it.type === 'image';
 export const isDocument = (it: CanvasItem): it is DocumentItem => it.type === 'document';
 export const isFilePath = (it: CanvasItem): it is FilePathItem => it.type === 'file_path';
 export const isSnippets = (it: CanvasItem): it is SnippetsItem => it.type === 'snippets';
+export const isPath = (it: CanvasItem): it is PathItem => it.type === 'path';
