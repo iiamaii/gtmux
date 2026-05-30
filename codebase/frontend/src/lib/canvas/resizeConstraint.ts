@@ -89,6 +89,18 @@ export function scheduleLiveAspectResize(
   queueMicrotask(() => apply(constrained));
 }
 
+export function scheduleLiveSquareResize(
+  event: unknown,
+  params: ResizeParams,
+  current: CurrentBounds,
+  minSize: number,
+  apply: (next: ResizeParams) => void,
+): void {
+  if (!resizeEventShiftKey(event)) return;
+  const constrained = constrainResizeSquare(params, current, minSize);
+  queueMicrotask(() => apply(constrained));
+}
+
 export function constrainResizeSquare(
   params: ResizeParams,
   current: CurrentBounds,

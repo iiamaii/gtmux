@@ -5,6 +5,7 @@ import {
   constrainResizeAspectIfShift,
   constrainResizeSquare,
   scheduleLiveAspectResize,
+  scheduleLiveSquareResize,
   squarePointFromDrag,
   projectPointToAngle,
 } from '$lib/canvas/resizeConstraint';
@@ -81,6 +82,23 @@ describe('scheduleLiveAspectResize', () => {
     expect(calls).toEqual([]);
     await Promise.resolve();
     expect(calls[0]!.width / calls[0]!.height).toBeCloseTo(2, 5);
+  });
+});
+
+describe('scheduleLiveSquareResize', () => {
+  it('schedules live square geometry while Shift is held', async () => {
+    const calls: { x: number; y: number; width: number; height: number }[] = [];
+    scheduleLiveSquareResize(
+      { shiftKey: true },
+      { x: 0, y: 0, width: 170, height: 120 },
+      { x: 0, y: 0, w: 100, h: 100 },
+      20,
+      (next) => calls.push(next),
+    );
+    expect(calls).toEqual([]);
+    await Promise.resolve();
+    expect(calls[0]!.width).toBe(calls[0]!.height);
+    expect(calls[0]!.width).toBe(170);
   });
 });
 
