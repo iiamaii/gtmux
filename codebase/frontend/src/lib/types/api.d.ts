@@ -8,21 +8,415 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
-         * @description Placeholder Group payload. ADR-0010 G-hybrid will extend this with
-         *     `parent_id`, `label`, `color`, `visibility`, `locked`, `order`.
+         * @description 9-point connector anchor — 8 cardinal/diagonal edges + center (ADR-0036 D2).
+         *     Wire form uses the uppercase keyword for the 8 edges and lowercase
+         *     `"center"` for the middle. The `"auto"` mode is P1+.
+         * @enum {string}
+         */
+        Anchor: "N" | "NE" | "E" | "SE" | "S" | "SW" | "W" | "NW" | "center";
+        /**
+         * @description Connector arrowhead direction mode (ADR-0036 D4). `head_from` / `head_to`
+         *     may still override the default mapping per-end.
+         * @enum {string}
+         */
+        Direction: "uni" | "bi" | "none";
+        /**
+         * @description Figure stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20 batch 5,
+         *     rect / ellipse / line). Kept distinct from connector's [`StrokeDash`]
+         *     because the figure form is a 4-variant enum with an explicit `Solid`
+         *     default, while connector's wire uses `null` for solid (round-trip
+         *     compatibility would break if the two were unified).
+         *
+         *     Wire form is `snake_case`: `"solid" | "dash" | "dot" | "dash_dot"`.
+         * @enum {string}
+         */
+        FigureStrokeDash: "solid" | "dash" | "dot" | "dash_dot";
+        /**
+         * @description Font family bucket for text-bearing items (ADR-0041 D1). Three named
+         *     stacks resolved to concrete `font-family` declarations FE-side; the BE
+         *     only persists the keyword. Applies to `text` / `rect` / `ellipse`
+         *     (ADR-0041 D3 — `note` / `document` keep their own typography).
+         *
+         *     Wire form is `lowercase`: `"sans" | "serif" | "mono"`. Default = `Sans`.
+         *     An unknown variant is a serde deserialize error (strict) — the enum is
+         *     FE-controlled so `#[serde(other)]` fallback is intentionally not added
+         *     (an unrecognised value is safer rejected than silently coerced). The
+         *     per-field `#[serde(default)]` keeps a *missing* field from rejecting the
+         *     whole layout.
+         * @enum {string}
+         */
+        FontFamily: "sans" | "serif" | "mono";
+        /**
+         * @description Text font weight (ADR-0018 D4 amend ② — 2026-05-20 batch 5). MVP carries
+         *     three named buckets; numeric weights (100…900) are P1.
+         * @enum {string}
+         */
+        FontWeight: "light" | "normal" | "bold";
+        /**
+         * @description Group node — shape locked by ADR-0010, kept identical across the v1→v2
+         *     cutover so `boot_migration_v1_to_v2` can preserve `groups[]` verbatim.
          */
         Group: {
-            /** @description Stable identifier for the group node within a Canvas Layout tree. */
+            color?: string | null;
             id: string;
+            label: string;
+            locked: boolean;
+            /** Format: int32 */
+            order: number;
+            parent_id?: string | null;
+            visibility: components["schemas"]["Visibility"];
         };
         /**
-         * @description Placeholder Panel payload. The real schema adds geometry, z-order,
-         *     visibility, lock, label, note, and parent linkage (ADR-0010).
+         * @description Per-end connector head marker (ADR-0036 D4).
+         * @enum {string}
          */
-        Panel: {
-            /** @description Stable identifier for the panel node within a Canvas Layout tree. */
+        Head: "arrow" | "circle" | "diamond" | "none";
+        /**
+         * @description Canvas Item discriminated union (ADR-0018 D1, D4).
+         *
+         *     On the wire each variant becomes `{ "type": "<snake>", ...common, ...payload }`
+         *     thanks to `#[serde(tag = "type")]` + `#[serde(flatten)]` on `common`.
+         */
+        Item: (components["schemas"]["ItemCommon"] & {
+            /** @enum {string} */
+            type: "terminal";
+        }) | (components["schemas"]["ItemCommon"] & {
+            color: string;
+            /** @description Rounded-corner toggle for the text box (radius computed FE-side). */
+            corner_rounded?: boolean;
+            /** @description Box fill color. Empty string = FE token default. */
+            fill?: string;
+            /**
+             * @description Box fill on/off. ADR-0040 D2: **default `false`** (opposite of
+             *     Rect/Ellipse) so legacy text records render box-less.
+             */
+            fill_enabled?: boolean;
+            /** @description ADR-0041 D3 — font family bucket. Defaults to `Sans`. */
+            font_family?: components["schemas"]["FontFamily"];
+            /** Format: int32 */
+            font_size: number;
+            /**
+             * @description ADR-0018 D4 amend ② (2026-05-20 batch 5) — text font weight.
+             *     Defaults to `Normal` when absent so legacy records round-trip.
+             */
+            font_weight?: components["schemas"]["FontWeight"];
+            /** @description ADR-0018 D4 amend ② — italic toggle. CSS `font-style: italic`. */
+            italic?: boolean;
+            /**
+             * @description ADR-0040 D9 — label auto-derive hint. `None` = unset (no strict
+             *     invariant); `Some(true)` = label tracks `text`, `Some(false)` =
+             *     user pinned a custom label.
+             */
+            label_auto?: boolean | null;
+            /** @description ADR-0018 D4 amend ② — strikethrough toggle. */
+            strikethrough?: boolean;
+            /** @description Box stroke color. Empty string = FE token default. */
+            stroke?: string;
+            stroke_dash?: null | components["schemas"]["FigureStrokeDash"];
+            /**
+             * @description Box stroke on/off. ADR-0040 D2: **default `false`** (opposite of
+             *     Rect/Ellipse).
+             */
+            stroke_enabled?: boolean;
+            /**
+             * Format: int32
+             * @description Box stroke width. Shared figure range 1..=32; default 2.
+             */
+            stroke_width?: number;
+            text: string;
+            text_align?: components["schemas"]["TextAlign"];
+            text_vertical_align?: components["schemas"]["TextVerticalAlign"];
+            /**
+             * @description ADR-0018 D4 amend ② — underline toggle. Composes with
+             *     `strikethrough` via CSS `text-decoration: underline line-through`.
+             */
+            underline?: boolean;
+        } & {
+            /** @enum {string} */
+            type: "text";
+        }) | (components["schemas"]["ItemCommon"] & {
+            body: string;
+            color: string;
+            title: string;
+        } & {
+            /** @enum {string} */
+            type: "note";
+        }) | (components["schemas"]["ItemCommon"] & {
+            /** @description Embedded text color. Empty string = FE token foreground. */
+            color?: string;
+            /**
+             * @description ADR-0018 D4 amend ① — rounded-corner toggle (rect only). The
+             *     actual radius is computed FE-side as `clamp(min(w,h)*0.15, 4, 16)`;
+             *     the BE only persists the boolean.
+             */
+            corner_rounded?: boolean;
+            fill: string;
+            /**
+             * @description ADR-0018 D4 amend ① (2026-05-20 batch 5) — fill on/off.
+             *     `false` is *not* alpha=0: hit-testing is also disabled by the FE
+             *     (the painted area no longer captures pointer events). Legacy
+             *     records default to `true`.
+             */
+            fill_enabled?: boolean;
+            /** @description ADR-0041 D3 — font family bucket. Defaults to `Sans`. */
+            font_family?: components["schemas"]["FontFamily"];
+            /**
+             * Format: int32
+             * @description Embedded text size. 8..=96; default 14.
+             */
+            font_size?: number;
+            font_weight?: components["schemas"]["FontWeight"];
+            italic?: boolean;
+            /** @description ADR-0040 D9 — label auto-derive hint. See `Item::Text::label_auto`. */
+            label_auto?: boolean | null;
+            strikethrough?: boolean;
+            stroke: string;
+            stroke_dash?: null | components["schemas"]["FigureStrokeDash"];
+            /**
+             * @description ADR-0018 D4 amend ① — stroke on/off. `false` removes both the
+             *     rendered border and its hit-target band.
+             */
+            stroke_enabled?: boolean;
+            /** Format: int32 */
+            stroke_width: number;
+            /** @description Embedded text body. Default `""` (legacy rects render no text). */
+            text?: string;
+            text_align?: components["schemas"]["TextAlign"];
+            text_vertical_align?: components["schemas"]["TextVerticalAlign"];
+            underline?: boolean;
+        } & {
+            /** @enum {string} */
+            type: "rect";
+        }) | (components["schemas"]["ItemCommon"] & {
+            /** @description Embedded text color. Empty string = FE token foreground. */
+            color?: string;
+            fill: string;
+            /** @description ADR-0018 D4 amend ① — see `Rect::fill_enabled`. */
+            fill_enabled?: boolean;
+            /** @description ADR-0041 D3 — font family bucket. Defaults to `Sans`. */
+            font_family?: components["schemas"]["FontFamily"];
+            /**
+             * Format: int32
+             * @description Embedded text size. 8..=96; default 14.
+             */
+            font_size?: number;
+            font_weight?: components["schemas"]["FontWeight"];
+            italic?: boolean;
+            /** @description ADR-0040 D9 — label auto-derive hint. See `Item::Text::label_auto`. */
+            label_auto?: boolean | null;
+            strikethrough?: boolean;
+            stroke: string;
+            stroke_dash?: null | components["schemas"]["FigureStrokeDash"];
+            /** @description ADR-0018 D4 amend ① — see `Rect::stroke_enabled`. */
+            stroke_enabled?: boolean;
+            /** Format: int32 */
+            stroke_width: number;
+            /** @description Embedded text body. Default `""`. */
+            text?: string;
+            text_align?: components["schemas"]["TextAlign"];
+            text_vertical_align?: components["schemas"]["TextVerticalAlign"];
+            underline?: boolean;
+        } & {
+            /** @enum {string} */
+            type: "ellipse";
+        }) | (components["schemas"]["ItemCommon"] & {
+            stroke: string;
+            stroke_dash?: null | components["schemas"]["FigureStrokeDash"];
+            /** Format: int32 */
+            stroke_width: number;
+            /** Format: double */
+            x2: number;
+            /** Format: double */
+            y2: number;
+        } & {
+            /** @enum {string} */
+            type: "line";
+        }) | (components["schemas"]["ItemCommon"] & {
+            points: components["schemas"]["Point"][];
+            stroke: string;
+            /** Format: int32 */
+            stroke_width: number;
+        } & {
+            /** @enum {string} */
+            type: "free_draw";
+        }) | (components["schemas"]["ItemCommon"] & {
+            asset_id: string;
+            mime: string;
+            /** Format: int32 */
+            original_h?: number | null;
+            /** Format: int32 */
+            original_w?: number | null;
+        } & {
+            /** @enum {string} */
+            type: "image";
+        }) | (components["schemas"]["ItemCommon"] & {
+            /**
+             * @description (a) asset-based mode: sha256 → `/api/assets/<asset_id>`.
+             *     (b) inline-stored mode: `None`.
+             */
+            asset_id?: string | null;
+            /**
+             * @description (b) inline-stored UTF-8 markdown, capped at
+             *     [`DOCUMENT_INLINE_MAX_BYTES`]. (a) is `None`.
+             */
+            content?: string | null;
+            file_name: string;
+            mime: string;
+            /**
+             * Format: int64
+             * @description (a) asset-based: real binary size.
+             *     (b) inline-stored: `content.len()` bytes.
+             */
+            size_bytes: number;
+        } & {
+            /** @enum {string} */
+            type: "document";
+        }) | (components["schemas"]["ItemCommon"] & {
+            kind?: string | null;
+            path: string;
+        } & {
+            /** @enum {string} */
+            type: "file_path";
+        }) | (components["schemas"]["ItemCommon"] & {
+            direction: components["schemas"]["Direction"];
+            from_anchor: components["schemas"]["Anchor"];
+            from_id: string;
+            head_from: components["schemas"]["Head"];
+            head_to: components["schemas"]["Head"];
+            label_offset?: null | components["schemas"]["Point"];
+            routing: components["schemas"]["Routing"];
+            stroke: string;
+            stroke_dash?: null | components["schemas"]["StrokeDash"];
+            /** Format: int32 */
+            stroke_width: number;
+            to_anchor: components["schemas"]["Anchor"];
+            to_id: string;
+            waypoints?: components["schemas"]["Point"][] | null;
+        } & {
+            /** @enum {string} */
+            type: "connector";
+        }) | (components["schemas"]["ItemCommon"] & {
+            /**
+             * @description 0..[`SNIPPETS_ENTRIES_CAP`] entries. Order is preserved verbatim;
+             *     FE renders badges in this order. Empty `Vec` is the *empty
+             *     state* (FE shows just the "+ add" affordance).
+             */
+            entries?: components["schemas"]["SnippetEntry"][];
+        } & {
+            /** @enum {string} */
+            type: "snippets";
+        });
+        /**
+         * @description Fields common to every Canvas Item — flattened into each variant of [`Item`]
+         *     via `#[serde(flatten)]` so the on-disk JSON keeps a single flat object per
+         *     item (no nested `common: { ... }` envelope).
+         */
+        ItemCommon: {
+            description?: string;
+            /** Format: double */
+            h: number;
             id: string;
+            label?: string;
+            locked: boolean;
+            minimized?: boolean;
+            parent_id?: string | null;
+            visibility: components["schemas"]["Visibility"];
+            /** Format: double */
+            w: number;
+            /** Format: double */
+            x: number;
+            /** Format: double */
+            y: number;
+            /** Format: int32 */
+            z: number;
         };
+        /**
+         * @description Body of a Session file record. Serde-derived: round-trips losslessly with
+         *     the on-disk JSON shape defined in ADR-0018 D1.
+         */
+        Layout: {
+            /** @description Group tree (unchanged across v1/v2 — ADR-0010). */
+            groups: components["schemas"]["Group"][];
+            /** @description Canvas Items (terminal Panel + non-terminal) — discriminated union by `type`. */
+            items: components["schemas"]["Item"][];
+            /**
+             * Format: int32
+             * @description Always `2` for v2 records. v1 → v2 hard cutover lives in `workspace.rs`.
+             */
+            schema_version: number;
+            /** @description Canvas viewport state (pan + zoom). */
+            viewport?: components["schemas"]["Viewport"];
+        };
+        /** @description 2D point — shared payload for `free_draw` and `connector` items. */
+        Point: {
+            /** Format: double */
+            x: number;
+            /** Format: double */
+            y: number;
+        };
+        /**
+         * @description Connector routing style (ADR-0036 D3). MVP wires `Straight` only; the
+         *     other two variants persist for round-trip but the FE renderer falls
+         *     back to straight until P1.
+         * @enum {string}
+         */
+        Routing: "straight" | "orthogonal" | "bezier";
+        /**
+         * @description ADR-0038 D2 — 1 snippet = 1 (key, body) pair. Multiple entries live in
+         *     a `Snippets` item's `entries` Vec.
+         */
+        SnippetEntry: {
+            /**
+             * @description Body payload — copied to clipboard verbatim on badge click. Allowed
+             *     to be empty. Length cap: [`SNIPPET_BODY_MAX_BYTES`].
+             */
+            body: string;
+            /**
+             * @description UUID v4 lowercase 36-char. Stable across edits — FE uses this for
+             *     list reconciliation and reorder.
+             */
+            id: string;
+            /**
+             * @description Badge display label. Must be non-empty after `trim`. Length cap:
+             *     [`SNIPPET_KEY_MAX_BYTES`]. Duplicate keys within the same item are
+             *     allowed (FE shows a soft hint — ADR-0038 D7 / O9).
+             */
+            key: string;
+        };
+        /**
+         * @description Connector stroke dash pattern (ADR-0036 D1 — optional, `null` for solid).
+         * @enum {string}
+         */
+        StrokeDash: "dash" | "dot";
+        /**
+         * @description Horizontal alignment for text Canvas Items. Defaults to center so newly
+         *     created empty text boxes edit from their visual center.
+         * @enum {string}
+         */
+        TextAlign: "left" | "center" | "right";
+        /**
+         * @description Vertical alignment for text Canvas Items.
+         * @enum {string}
+         */
+        TextVerticalAlign: "top" | "middle" | "bottom";
+        /** @description Canvas viewport state. */
+        Viewport: {
+            /** Format: double */
+            x: number;
+            /** Format: double */
+            y: number;
+            /** Format: double */
+            zoom: number;
+        };
+        /**
+         * @description Visibility tri-state. The JSON wire form is `"visible" | "hidden"`. We keep
+         *     it as a typed enum here instead of `bool` because ADR-0010 explicitly leaves
+         *     room for an `inherit` variant in the layer-tree work, and so that round-trip
+         *     against legacy v1 payloads (which used `true`/`false`) is detected as an
+         *     error rather than silently coerced.
+         * @enum {string}
+         */
+        Visibility: "visible" | "hidden";
     };
     responses: never;
     parameters: never;

@@ -1,46 +1,51 @@
-//! gen-openapi: emit an OpenAPI 3.1 YAML document built from utoipa-derived
-//! stub structs to stdout.
+//! gen-openapi: emit an OpenAPI 3.1 YAML document for the gtmux API.
 //!
-//! Bootstrap-grade. The `Group` and `Panel` schemas here are placeholders
-//! covering only an `id` field -- their job is to prove that the
-//! `utoipa` derive -> serde_yaml -> `openapi-typescript` chain works
-//! end to end. The real Canvas Layout schema (groups[] + panels[] tree,
-//! ADR-0010 G-hybrid, `docs/ssot/canvas-layout-schema.md`) is populated
-//! incrementally once the `http-api` crate lands.
+//! The Canvas Layout schema (ADR-0018) is sourced directly from the
+//! `gtmux-http-api` crate's `schema` module via utoipa `ToSchema` derives
+//! (ADR-0042 / plan-0017 Phase 1). This replaces the earlier Group/Panel
+//! id-only bootstrap stub so `openapi.yaml` → `api.d.ts` carries the real
+//! canvas `Item` discriminated union — making the codegen drift gate
+//! meaningful for canvas fields.
 
-use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
-
-/// Placeholder Group payload. ADR-0010 G-hybrid will extend this with
-/// `parent_id`, `label`, `color`, `visibility`, `locked`, `order`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct Group {
-    /// Stable identifier for the group node within a Canvas Layout tree.
-    pub id: String,
-}
-
-/// Placeholder Panel payload. The real schema adds geometry, z-order,
-/// visibility, lock, label, note, and parent linkage (ADR-0010).
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct Panel {
-    /// Stable identifier for the panel node within a Canvas Layout tree.
-    pub id: String,
-}
+use gtmux_http_api::schema::{
+    Anchor, Direction, FigureStrokeDash, FontFamily, FontWeight, Group, Head, Item, ItemCommon,
+    Layout, Point, Routing, SnippetEntry, StrokeDash, TextAlign, TextVerticalAlign, Viewport,
+    Visibility,
+};
+use utoipa::OpenApi;
 
 #[derive(OpenApi)]
 #[openapi(
     info(
         title = "gtmux API",
         version = "0.0.0",
-        description = "Bootstrap OpenAPI stub for Task C3 codegen pipeline. Real surface lands with http-api crate.",
+        description = "gtmux Canvas Layout schema (ADR-0018). Generated from gtmux-http-api schema.rs via utoipa (ADR-0042).",
     ),
-    components(schemas(Group, Panel))
+    components(schemas(
+        Layout,
+        Group,
+        Viewport,
+        ItemCommon,
+        Item,
+        Point,
+        SnippetEntry,
+        Visibility,
+        TextAlign,
+        TextVerticalAlign,
+        FontWeight,
+        FontFamily,
+        FigureStrokeDash,
+        Anchor,
+        Direction,
+        Head,
+        Routing,
+        StrokeDash,
+    ))
 )]
 struct ApiDoc;
 
 fn main() -> anyhow::Result<()> {
     let doc = ApiDoc::openapi();
-    let yaml = serde_yaml::to_string(&doc)?;
-    print!("{yaml}");
+    print!("{}", serde_yaml::to_string(&doc)?);
     Ok(())
 }
