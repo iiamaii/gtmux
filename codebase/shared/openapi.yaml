@@ -12,9 +12,9 @@ components:
     Anchor:
       type: string
       description: |-
-        9-point connector anchor — 8 cardinal/diagonal edges + center (ADR-0036 D2).
-        Wire form uses the uppercase keyword for the 8 edges and lowercase
-        `"center"` for the middle. The `"auto"` mode is P1+.
+        9-point anchor — 8 cardinal/diagonal edges + center (ADR-0043 D1, was
+        ADR-0036 D2). Used by `path` connected endpoints. Wire form uses the
+        uppercase keyword for the 8 edges and lowercase `"center"` for the middle.
       enum:
       - N
       - NE
@@ -25,23 +25,12 @@ components:
       - W
       - NW
       - center
-    Direction:
-      type: string
-      description: |-
-        Connector arrowhead direction mode (ADR-0036 D4). `head_from` / `head_to`
-        may still override the default mapping per-end.
-      enum:
-      - uni
-      - bi
-      - none
     FigureStrokeDash:
       type: string
       description: |-
-        Figure stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20 batch 5,
-        rect / ellipse / line). Kept distinct from connector's [`StrokeDash`]
-        because the figure form is a 4-variant enum with an explicit `Solid`
-        default, while connector's wire uses `null` for solid (round-trip
-        compatibility would break if the two were unified).
+        Figure / path stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20
+        batch 5; extended to `path` by ADR-0043). 4-variant enum with an explicit
+        `Solid` default.
 
         Wire form is `snake_case`: `"solid" | "dash" | "dot" | "dash_dot"`.
       enum:
@@ -110,12 +99,16 @@ components:
       additionalProperties: false
     Head:
       type: string
-      description: Per-end connector head marker (ADR-0036 D4).
+      description: |-
+        Per-end head marker for `path` / `line` (ADR-0043 D2/D3). `direction` was
+        removed (ADR-0043 D3) — directionality is derived from the head pair:
+        only `Arrow` carries direction meaning; `Circle` / `Diamond` are plain
+        endpoint markers. Defaults to `None`.
       enum:
+      - none
       - arrow
       - circle
       - diamond
-      - none
     Item:
       oneOf:
       - allOf:
@@ -389,6 +382,13 @@ components:
           - x2
           - y2
           properties:
+            head_from:
+              $ref: '#/components/schemas/Head'
+              description: |-
+                ADR-0043 D2 — per-end head markers. `#[serde(default)]` (→ `None`)
+                so legacy line records pre-dating ADR-0043 round-trip unchanged.
+            head_to:
+              $ref: '#/components/schemas/Head'
             stroke:
               type: string
             stroke_dash:
@@ -554,31 +554,20 @@ components:
         - $ref: '#/components/schemas/ItemCommon'
         - type: object
           required:
-          - from_id
-          - to_id
-          - from_anchor
-          - to_anchor
-          - direction
-          - stroke
-          - stroke_width
+          - from
+          - to
+          - routing
           - head_from
           - head_to
-          - routing
+          - stroke
+          - stroke_width
           properties:
-            direction:
-              $ref: '#/components/schemas/Direction'
-            from_anchor:
-              $ref: '#/components/schemas/Anchor'
-            from_id:
-              type: string
+            from:
+              $ref: '#/components/schemas/PathEndpoint'
             head_from:
               $ref: '#/components/schemas/Head'
             head_to:
               $ref: '#/components/schemas/Head'
-            label_offset:
-              oneOf:
-              - type: 'null'
-              - $ref: '#/components/schemas/Point'
             routing:
               $ref: '#/components/schemas/Routing'
             stroke:
@@ -586,45 +575,45 @@ components:
             stroke_dash:
               oneOf:
               - type: 'null'
-              - $ref: '#/components/schemas/StrokeDash'
+              - $ref: '#/components/schemas/FigureStrokeDash'
             stroke_width:
               type: integer
               format: int32
               minimum: 0
-            to_anchor:
-              $ref: '#/components/schemas/Anchor'
-            to_id:
-              type: string
+            to:
+              $ref: '#/components/schemas/PathEndpoint'
             waypoints:
-              type:
-              - array
-              - 'null'
+              type: array
               items:
-                $ref: '#/components/schemas/Point'
+                $ref: '#/components/schemas/PathWaypoint'
         - type: object
           description: |-
-            ADR-0018 D12 amend / ADR-0036 — Canvas component connector.
+            ADR-0043 — Canvas `path` component (supersedes ADR-0036 `connector`).
 
-            Endpoint-bound wire connecting two other items. `x/y/w/h` on `common`
-            is a *BBox cache* (not user input): `put_layout_handler` recomputes
-            it from the two anchor points before validation. `from_id` / `to_id`
-            must refer to non-connector items (refer-integrity + no chain), and
-            `from_id != to_id` (self-loop reject, MVP — ADR-0036 O2).
+            A free-or-connected poly-path. Each endpoint (`from` / `to`) is either
+            a `free` absolute point or `connected` to another item's anchor. `x/y/
+            w/h` on `common` is a *BBox cache* (not user input): the PUT handler
+            degrades dangling endpoints then recomputes the cache from the actual
+            endpoint + waypoint chain before validation. Connected endpoints must
+            refer to a connectable item (ADR-0043 D5); a path connected to the
+            same item on both ends is rejected (self-loop, MVP — D5).
           required:
           - type
           properties:
             type:
               type: string
               enum:
-              - connector
+              - path
         description: |-
-          ADR-0018 D12 amend / ADR-0036 — Canvas component connector.
+          ADR-0043 — Canvas `path` component (supersedes ADR-0036 `connector`).
 
-          Endpoint-bound wire connecting two other items. `x/y/w/h` on `common`
-          is a *BBox cache* (not user input): `put_layout_handler` recomputes
-          it from the two anchor points before validation. `from_id` / `to_id`
-          must refer to non-connector items (refer-integrity + no chain), and
-          `from_id != to_id` (self-loop reject, MVP — ADR-0036 O2).
+          A free-or-connected poly-path. Each endpoint (`from` / `to`) is either
+          a `free` absolute point or `connected` to another item's anchor. `x/y/
+          w/h` on `common` is a *BBox cache* (not user input): the PUT handler
+          degrades dangling endpoints then recomputes the cache from the actual
+          endpoint + waypoint chain before validation. Connected endpoints must
+          refer to a connectable item (ADR-0043 D5); a path connected to the
+          same item on both ends is rejected (self-loop, MVP — D5).
       - allOf:
         - $ref: '#/components/schemas/ItemCommon'
         - type: object
@@ -736,9 +725,73 @@ components:
           $ref: '#/components/schemas/Viewport'
           description: Canvas viewport state (pan + zoom).
       additionalProperties: false
+    PathEndpoint:
+      oneOf:
+      - type: object
+        required:
+        - point
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - free
+          point:
+            $ref: '#/components/schemas/Point'
+      - type: object
+        required:
+        - item_id
+        - anchor
+        - fallback_point
+        - kind
+        properties:
+          anchor:
+            $ref: '#/components/schemas/Anchor'
+          fallback_point:
+            $ref: '#/components/schemas/Point'
+          item_id:
+            type: string
+          kind:
+            type: string
+            enum:
+            - connected
+          offset:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Point'
+              description: Optional delta from the resolved anchor point. Missing means `{0,0}`.
+      description: |-
+        ADR-0043 D1 — one endpoint of a `path` item. A `free` endpoint pins to an
+        absolute canvas point; a `connected` endpoint tracks another item's anchor
+        and keeps a `fallback_point` (the last resolved anchor coordinate plus
+        optional offset) so the endpoint can degrade to `free` when the target is
+        deleted (ADR-0043 D7).
+
+        Wire form is internally tagged on `kind`: `{"kind":"free","point":{..}}`
+        or `{"kind":"connected","item_id":..,"anchor":..,"offset"?:{..},"fallback_point":{..}}`.
+    PathWaypoint:
+      type: object
+      description: |-
+        ADR-0043 D9 — a path waypoint (intermediate routing point). Carries a
+        stable UUID id (the endpoints use `from`/`to` themselves as identity, so
+        only waypoints need an explicit id).
+      required:
+      - id
+      - x
+      - y
+      properties:
+        id:
+          type: string
+        x:
+          type: number
+          format: double
+        y:
+          type: number
+          format: double
+      additionalProperties: false
     Point:
       type: object
-      description: 2D point — shared payload for `free_draw` and `connector` items.
+      description: 2D point — shared payload for `free_draw` points and `path` endpoints.
       required:
       - x
       - y
@@ -753,9 +806,10 @@ components:
     Routing:
       type: string
       description: |-
-        Connector routing style (ADR-0036 D3). MVP wires `Straight` only; the
-        other two variants persist for round-trip but the FE renderer falls
-        back to straight until P1.
+        Path routing style (ADR-0043 D9). The point chain
+        `[from, ...waypoints, to]` is connected as straight segments
+        (`Straight`), axis-aligned segments (`Orthogonal`), or a smooth spline
+        (`Bezier`). New-path default is `Orthogonal` (ADR-0043 D13, FE-side).
       enum:
       - straight
       - orthogonal
@@ -787,12 +841,6 @@ components:
             [`SNIPPET_KEY_MAX_BYTES`]. Duplicate keys within the same item are
             allowed (FE shows a soft hint — ADR-0038 D7 / O9).
       additionalProperties: false
-    StrokeDash:
-      type: string
-      description: Connector stroke dash pattern (ADR-0036 D1 — optional, `null` for solid).
-      enum:
-      - dash
-      - dot
     TextAlign:
       type: string
       description: |-

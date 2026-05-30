@@ -7,12 +7,15 @@
   // - Minimized state (`.is-min`): 32×32 chip — rounded square icon button (visible bg/hover),
   //   click anywhere to restore. Schema h = w = 32 + minimized=true. Backup geom in sessionStore.
 
-  import { NodeResizer } from '@xyflow/svelte';
+  import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { NoteItem, CanvasItem } from '$lib/types/canvas';
-  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
+  import {
+    constrainResizeAspectIfShift,
+    scheduleLiveAspectResize,
+  } from './resizeConstraint';
 
   interface NoteNodeData {
     id: string;
@@ -49,6 +52,7 @@
     parentId?: string;
   } = $props();
 
+  const { updateNode } = useSvelteFlow();
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
@@ -57,6 +61,8 @@
   let titleEditing = $state(false);
   let bodyEditing = $state(false);
   type ResizeParams = { x: number; y: number; width: number; height: number };
+  const RESIZE_MIN_W = 160;
+  const RESIZE_MIN_H = 60;
 
   // Minimize: schema-driven geom (w=h=32 chip, minimized=true) + in-memory backup.
   // PanelNode 와 동일 패턴 — `sessionStore.restoredItemGeoms` 사용.
@@ -127,10 +133,35 @@
     }
   }
 
+  function applyLiveResize(next: ResizeParams): void {
+    updateNode(data.id, (node) => ({
+      position: { ...node.position, x: next.x, y: next.y },
+      width: Math.max(RESIZE_MIN_W, next.width),
+      height: Math.max(RESIZE_MIN_H, next.height),
+    }));
+  }
+
+  function onResize(event: unknown, params: ResizeParams): void {
+    scheduleLiveAspectResize(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      RESIZE_MIN_W,
+      RESIZE_MIN_H,
+      applyLiveResize,
+    );
+  }
+
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
-    const constrained = resizeEventShiftKey(event)
-      ? constrainResizeAspect(params, data, data.w / data.h, 160, 60)
-      : params;
+    const constrained = constrainResizeAspectIfShift(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      RESIZE_MIN_W,
+      RESIZE_MIN_H,
+    );
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -140,8 +171,8 @@
                 ...it,
                 x: constrained.x,
                 y: constrained.y,
-                w: Math.max(160, constrained.width),
-                h: Math.max(60, constrained.height),
+                w: Math.max(RESIZE_MIN_W, constrained.width),
+                h: Math.max(RESIZE_MIN_H, constrained.height),
               } as NoteItem)
             : it,
         ),
@@ -226,6 +257,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResize}
       {onResizeEnd}
     />
 

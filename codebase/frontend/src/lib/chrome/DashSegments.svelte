@@ -15,6 +15,7 @@
 
   import { onDestroy } from 'svelte';
   import type { FigureStrokeDash } from '$lib/types/canvas';
+  import DropdownChevron from '$lib/ui/DropdownChevron.svelte';
 
   interface Props {
     value: FigureStrokeDash;
@@ -91,9 +92,7 @@
         stroke-linecap={current.linecap}
       />
     </svg>
-    <svg class="chevron" viewBox="0 0 10 6" aria-hidden="true">
-      <path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
+    <DropdownChevron />
   </button>
   {#if open}
     <div class="style-popover" role="listbox" aria-label="Stroke style options">
@@ -128,6 +127,8 @@
 <style>
   /* Inspector design 규칙 (2026-05-21): height 24px, label inside left, width full. */
   .inspector-input {
+    --inspector-k-w: 56px;
+    --inspector-dropdown-menu-left: calc(var(--inspector-k-w) + 10px);
     position: relative;
     display: flex;
     align-items: center;
@@ -148,8 +149,8 @@
   .inspector-input.disabled { opacity: 0.5; pointer-events: none; }
 
   .k {
-    flex: 0 0 56px;
-    width: 56px;
+    flex: 0 0 var(--inspector-k-w);
+    width: var(--inspector-k-w);
     color: var(--color-fg-muted);
     text-transform: uppercase;
     font-family: var(--font-mono);
@@ -166,7 +167,6 @@
     height: 100%;
     padding: 0 6px 0 6px;
     border: 0;
-    border-left: 1px solid var(--color-border);
     background: transparent;
     color: var(--color-fg);
     cursor: pointer;
@@ -179,17 +179,10 @@
     min-width: 0;
     color: var(--color-fg);
   }
-  .chevron {
-    flex: 0 0 10px;
-    width: 10px;
-    height: 6px;
-    color: var(--color-fg-muted);
-  }
-
   .style-popover {
     position: absolute;
     top: calc(100% + 2px);
-    left: 0;
+    left: var(--inspector-dropdown-menu-left);
     right: 0;
     z-index: 30;
     display: flex;

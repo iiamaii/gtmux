@@ -605,7 +605,7 @@ async fn handle_socket(
     );
     if let Ok(buf) = hello.encode() {
         if sink
-            .send(Message::Binary(buf.to_vec().into()))
+            .send(Message::Binary(buf))
             .await
             .is_err()
         {
@@ -633,7 +633,7 @@ async fn handle_socket(
             );
             if let Ok(buf) = env.encode() {
                 if sink
-                    .send(Message::Binary(buf.to_vec().into()))
+                    .send(Message::Binary(buf))
                     .await
                     .is_err()
                 {
@@ -668,7 +668,7 @@ async fn handle_socket(
         );
         if let Ok(buf) = spawned.encode() {
             if sink
-                .send(Message::Binary(buf.to_vec().into()))
+                .send(Message::Binary(buf))
                 .await
                 .is_err()
             {
@@ -687,7 +687,7 @@ async fn handle_socket(
                 );
                 if let Ok(buf) = env.encode() {
                     if sink
-                        .send(Message::Binary(buf.to_vec().into()))
+                        .send(Message::Binary(buf))
                         .await
                         .is_err()
                     {
@@ -776,7 +776,7 @@ async fn handle_socket(
                     Ok(notify) => {
                         if let Some(env) = notify_to_envelope(&notify) {
                             if let Ok(buf) = env.encode() {
-                                if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                                if sink.send(Message::Binary(buf)).await.is_err() {
                                     break;
                                 }
                             }
@@ -819,7 +819,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                            if sink.send(Message::Binary(buf)).await.is_err() {
                                 break;
                             }
                         }
@@ -859,7 +859,7 @@ async fn handle_socket(
                             Bytes::from(payload::encode_layout_changed(&etag)),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                            if sink.send(Message::Binary(buf)).await.is_err() {
                                 break;
                             }
                         }
@@ -896,7 +896,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                            if sink.send(Message::Binary(buf)).await.is_err() {
                                 debug!("ws attach-replay send failed; peer hung up");
                                 break;
                             }
@@ -926,7 +926,7 @@ async fn handle_socket(
                             Bytes::from(payload::encode_terminal_died(&event.uuid, event.reason)),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                            if sink.send(Message::Binary(buf)).await.is_err() {
                                 break;
                             }
                         }
@@ -974,7 +974,7 @@ async fn handle_socket(
                         };
                         let env = Envelope::new(kind, event.payload.clone());
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                            if sink.send(Message::Binary(buf)).await.is_err() {
                                 break;
                             }
                         }
@@ -1019,7 +1019,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                            if sink.send(Message::Binary(buf)).await.is_err() {
                                 break;
                             }
                         }
@@ -1071,7 +1071,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                            if sink.send(Message::Binary(buf)).await.is_err() {
                                 break;
                             }
                         }
@@ -1152,7 +1152,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                            let _ = sink.send(Message::Binary(buf)).await;
                         }
                         // Send the close frame ourselves so the FE sees
                         // a deterministic ordering: 0x89 envelope then
@@ -1218,7 +1218,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf.to_vec().into())).await.is_err() {
+                            if sink.send(Message::Binary(buf)).await.is_err() {
                                 break;
                             }
                         }
@@ -1400,7 +1400,7 @@ async fn handle_client_envelope(
                 let body = payload::encode_ctrl_error(None, "ERR_BAD_REQUEST", "invalid CTRL JSON");
                 let err = Envelope::new(FrameType::Ctrl, Bytes::from(body));
                 if let Ok(buf) = err.encode() {
-                    let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                    let _ = sink.send(Message::Binary(buf)).await;
                 }
                 return false;
             };
@@ -1419,7 +1419,7 @@ async fn handle_client_envelope(
                 );
                 let err = Envelope::new(FrameType::Ctrl, Bytes::from(body));
                 if let Ok(buf) = err.encode() {
-                    let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                    let _ = sink.send(Message::Binary(buf)).await;
                 }
                 return false;
             }
@@ -1437,7 +1437,7 @@ async fn handle_client_envelope(
                     let body = payload::encode_ctrl_success(ctrl.id.as_deref());
                     let ack = Envelope::new(FrameType::Ctrl, Bytes::from(body));
                     if let Ok(buf) = ack.encode() {
-                        let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                        let _ = sink.send(Message::Binary(buf)).await;
                     }
                 }
                 CtrlOutcome::OkAndExit => {
@@ -1447,7 +1447,7 @@ async fn handle_client_envelope(
                     let body = payload::encode_ctrl_success(ctrl.id.as_deref());
                     let ack = Envelope::new(FrameType::Ctrl, Bytes::from(body));
                     if let Ok(buf) = ack.encode() {
-                        let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                        let _ = sink.send(Message::Binary(buf)).await;
                     }
                     // SAFETY: libc::raise with a constant signal number is
                     // sound. Process self-signal is the canonical way to
@@ -1465,7 +1465,7 @@ async fn handle_client_envelope(
                     );
                     let err = Envelope::new(FrameType::Ctrl, Bytes::from(body));
                     if let Ok(buf) = err.encode() {
-                        let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                        let _ = sink.send(Message::Binary(buf)).await;
                     }
                 }
                 CtrlOutcome::BadRequest => {
@@ -1476,7 +1476,7 @@ async fn handle_client_envelope(
                     );
                     let err = Envelope::new(FrameType::Ctrl, Bytes::from(body));
                     if let Ok(buf) = err.encode() {
-                        let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                        let _ = sink.send(Message::Binary(buf)).await;
                     }
                 }
                 CtrlOutcome::BackendError(e) => {
@@ -1484,7 +1484,7 @@ async fn handle_client_envelope(
                     let body = payload::encode_ctrl_error(ctrl.id.as_deref(), "ERR_BACKEND", &msg);
                     let err = Envelope::new(FrameType::Ctrl, Bytes::from(body));
                     if let Ok(buf) = err.encode() {
-                        let _ = sink.send(Message::Binary(buf.to_vec().into())).await;
+                        let _ = sink.send(Message::Binary(buf)).await;
                     }
                 }
             }

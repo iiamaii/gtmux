@@ -15,12 +15,13 @@
   import { useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
-  import type { CanvasItem, FigureStrokeDash, LineItem } from '$lib/types/canvas';
+  import type { CanvasItem, FigureStrokeDash, Head, LineItem } from '$lib/types/canvas';
   import { LINE_HIT_PADDING, LINE_MIN_LENGTH, lineBoxFromEndpoints } from './itemFactory';
   // 2026-05-20 figure UX 정리: rect/ellipse/line/free 는 canvas X 버튼 미제공
   // (Backspace / Cmd+Delete / ContextMenu Delete 로만 제거).
   import { strokeDashArray } from './strokeDash';
   import { projectPointToAngle } from './resizeConstraint';
+  import PathHeadMarker from './PathHeadMarker.svelte';
 
   interface LineNodeData {
     id: string;
@@ -35,6 +36,8 @@
     x2: number;
     y2: number;
     stroke_dash?: FigureStrokeDash;
+    head_from?: Head;
+    head_to?: Head;
     /** Canvas itemToNode 가 주입 — box-local 시작점. 4 방향 모두 처리. */
     _boxX1: number;
     _boxY1: number;
@@ -88,6 +91,12 @@
 
   // ADR-0018 D4 amend ① (batch-5) — stroke dash pattern.
   const svgDashArray = $derived(strokeDashArray(data.stroke_dash, data.stroke_width));
+  const startHead = $derived(data.head_from ?? 'none');
+  const endHead = $derived(data.head_to ?? 'none');
+  const startMarkerId = $derived(`line-${data.id}-marker-start-${startHead}`);
+  const endMarkerId = $derived(`line-${data.id}-marker-end-${endHead}`);
+  const startMarkerRef = $derived(startHead === 'none' ? undefined : `url(#${startMarkerId})`);
+  const endMarkerRef = $derived(endHead === 'none' ? undefined : `url(#${endMarkerId})`);
 
   // 2026-05-20 figure UX 정리 — 본 wrapper bbox 가 클릭 영역으로 잡히는 옛
   // 동작 (line 을 포함한 큰 사각형이 hit-test 흡수) 을 폐기. 시각적 line 은
@@ -246,6 +255,15 @@
       preserveAspectRatio="none"
       aria-hidden="true"
     >
+      <defs>
+        <PathHeadMarker
+          id={startMarkerId}
+          head={startHead}
+          stroke={data.stroke}
+          orient="auto-start-reverse"
+        />
+        <PathHeadMarker id={endMarkerId} head={endHead} stroke={data.stroke} />
+      </defs>
       <!-- Visible stroke — pointer-events:none, hit-target line 이 catch.
            ADR-0005 D10 — vector-effect=non-scaling-stroke. drag-resize 중
            viewBox stale 의 stroke stretch 회피. -->
@@ -258,6 +276,8 @@
         stroke-width={data.stroke_width}
         stroke-dasharray={svgDashArray}
         stroke-linecap="round"
+        marker-start={startMarkerRef}
+        marker-end={endMarkerRef}
         vector-effect="non-scaling-stroke"
         pointer-events="none"
       />

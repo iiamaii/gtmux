@@ -48,15 +48,25 @@
   import ColorPicker from '$lib/ui/ColorPicker.svelte';
   import Toggle from '$lib/ui/Toggle.svelte';
   import Dropdown from '$lib/ui/Dropdown.svelte';
+  import DropdownChevron from '$lib/ui/DropdownChevron.svelte';
   import DashSegments from './DashSegments.svelte';
+  import HeadIcon from './HeadIcon.svelte';
   import InspectorField from './InspectorField.svelte';
+  import PathAnchorPicker from './PathAnchorPicker.svelte';
+  import RoutingIcon from './RoutingIcon.svelte';
   import {
     MINIMIZED_TERMINAL_PANEL_HEIGHT,
+    type Anchor,
     type CanvasItem,
     type FigureStrokeDash,
     type FontFamily,
+    type Head,
     type LineItem,
     type NoteItem,
+    type PathEndpoint,
+    type PathItem,
+    type PathRouting,
+    type Point,
     type RectItem,
     type EllipseItem,
     type TextAlign,
@@ -64,6 +74,17 @@
     type TextVerticalAlign,
     type Visibility,
   } from '$lib/types/canvas';
+  import {
+    anchorPoint,
+    connectedEndpointPoint,
+    editPathGeometry,
+    isConnectableItem,
+    resolveEndpoint,
+    updatePathBBoxCache,
+    type ConnectableItem,
+  } from '$lib/canvas/pathGeometry';
+  import { lineBoxFromEndpoints } from '$lib/canvas/itemFactory';
+  import { rememberPathStyle } from '$lib/canvas/pathStyleMemory';
 
   // ADR-0027 D2 — multi-select aware. selectedIds = M 의 array snapshot.
   // selectedPanelId = first id (display 의 single-item fallback path 용).
@@ -289,6 +310,35 @@
   const FONT_FAMILIES: FontFamily[] = ['sans', 'serif', 'mono'];
   let figureTextSettingsOpen = $state(false);
 
+  type PathEndpointId = 'from' | 'to';
+
+  const HEAD_OPTIONS: { value: Head; label: string }[] = [
+    { value: 'none', label: 'None' },
+    { value: 'arrow', label: 'Arrow' },
+    { value: 'circle', label: 'Circle' },
+    { value: 'diamond', label: 'Diamond' },
+  ];
+  const ROUTING_OPTIONS: { value: PathRouting; label: string }[] = [
+    { value: 'orthogonal', label: 'Orthogonal' },
+    { value: 'bezier', label: 'Smooth' },
+    { value: 'straight', label: 'Straight' },
+  ];
+  const ANCHOR_OPTIONS: { value: Anchor; label: string }[] = [
+    { value: 'N', label: 'N' },
+    { value: 'NE', label: 'NE' },
+    { value: 'E', label: 'E' },
+    { value: 'SE', label: 'SE' },
+    { value: 'S', label: 'S' },
+    { value: 'SW', label: 'SW' },
+    { value: 'W', label: 'W' },
+    { value: 'NW', label: 'NW' },
+    { value: 'center', label: 'Center' },
+  ];
+
+  function headLabel(head: Head | undefined): string {
+    return HEAD_OPTIONS.find((option) => option.value === (head ?? 'none'))?.label ?? 'None';
+  }
+
   function fileStem(fileName: string): string {
     const base = fileName.trim().split('/').pop() ?? fileName.trim();
     const dot = base.lastIndexOf('.');
@@ -319,6 +369,101 @@
       if (displayLabel(it) !== firstVal) return 'Mixed';
     }
     return firstVal;
+  }
+
+  const TARGET_LABEL_MAX = 30;
+
+  function truncateTargetLabel(value: string, max = TARGET_LABEL_MAX): string {
+    if (value.length <= max) return value;
+    if (max <= 3) return value.slice(0, max);
+    return `${value.slice(0, max - 3)}...`;
+  }
+
+  function itemOptionTitle(item: CanvasItem): string {
+    const label = displayLabel(item).trim();
+    return label.length > 0 ? `${label} · ${item.type}` : `${item.type} · ${item.id.slice(0, 8)}`;
+  }
+
+  function itemOptionLabel(item: CanvasItem): string {
+    return truncateTargetLabel(itemOptionTitle(item));
+  }
+
+  function endpointOf(path: PathItem, endpointId: PathEndpointId): PathEndpoint {
+    return endpointId === 'from' ? path.from : path.to;
+  }
+
+  function otherEndpointOf(path: PathItem, endpointId: PathEndpointId): PathEndpoint {
+    return endpointId === 'from' ? path.to : path.from;
+  }
+
+  function setPathEndpoint(
+    path: PathItem,
+    endpointId: PathEndpointId,
+    endpoint: PathEndpoint,
+  ): PathItem {
+    return endpointId === 'from'
+      ? { ...path, from: endpoint }
+      : { ...path, to: endpoint };
+  }
+
+  function endpointOffset(endpoint: PathEndpoint): Point {
+    if (endpoint.kind !== 'connected') return { x: 0, y: 0 };
+    return endpoint.offset ?? { x: 0, y: 0 };
+  }
+
+  function normalizeEndpointOffset(offset: Point): Point | undefined {
+    return offset.x === 0 && offset.y === 0 ? undefined : offset;
+  }
+
+  function nearestAnchor(item: CanvasItem, point: Point): Anchor {
+    let best = ANCHOR_OPTIONS[0]!.value;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const option of ANCHOR_OPTIONS) {
+      const anchor = anchorPoint(item, option.value);
+      const distance = Math.hypot(anchor.x - point.x, anchor.y - point.y);
+      if (distance < bestDistance) {
+        best = option.value;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+
+  function nearestConnectableTarget(
+    path: PathItem,
+    endpointId: PathEndpointId,
+    point: Point,
+    itemMap: ReadonlyMap<string, CanvasItem>,
+  ): ConnectableItem | null {
+    const other = otherEndpointOf(path, endpointId);
+    const blockedId = other.kind === 'connected' ? other.item_id : null;
+    let best: ConnectableItem | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const item of itemMap.values()) {
+      if (!isConnectableItem(item)) continue;
+      if (item.id === blockedId) continue;
+      const center = anchorPoint(item, 'center');
+      const distance = Math.hypot(center.x - point.x, center.y - point.y);
+      if (distance < bestDistance) {
+        best = item;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+
+  function pathEndpointTargetOptions(
+    path: PathItem,
+    endpointId: PathEndpointId,
+  ): ConnectableItem[] {
+    const other = otherEndpointOf(path, endpointId);
+    const blockedId = other.kind === 'connected' ? other.item_id : null;
+    return connectableItems.filter((item) => item.id !== blockedId);
+  }
+
+  function connectedEndpointTarget(endpoint: PathEndpoint): CanvasItem | null {
+    if (endpoint.kind !== 'connected') return null;
+    return sessionStore.items.get(endpoint.item_id) ?? null;
   }
 
   const selectedPanel = $derived.by((): Record<string, unknown> | null => {
@@ -371,6 +516,18 @@
   const sessionItem = $derived.by(() => {
     if (selectedPanelId === null) return null;
     return sessionStore.items.get(selectedPanelId) ?? null;
+  });
+  const canvasItemMap = $derived.by(() => new Map<string, CanvasItem>(sessionStore.items));
+  const connectableItems = $derived.by((): ConnectableItem[] =>
+    Array.from(sessionStore.items.values()).filter(isConnectableItem),
+  );
+  const singleLineGeometryItem = $derived.by((): LineItem | null => {
+    const it = selectionCount === 1 ? selectedItems[0] : undefined;
+    return it?.type === 'line' ? it : null;
+  });
+  const singlePathGeometryItem = $derived.by((): PathItem | null => {
+    const it = selectionCount === 1 ? selectedItems[0] : undefined;
+    return it?.type === 'path' ? it : null;
   });
 
   function numOr(value: unknown, fallback: string): string {
@@ -432,12 +589,30 @@
   }
 
   async function applyCommonNum(key: CommonNumKey, value: number): Promise<void> {
-    await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
-      // locked item 은 geometry 변경 skip (D7 정합). z 는 lock 과 무관 — UI 의
-      // ordering 만 영향이라 lock 된 item 도 z 갱신 OK.
-      if (it.locked && key !== 'z') return it;
-      return { ...it, [key]: value } as CanvasItem;
-    });
+    if (selectedItems.length === 0) return;
+    const ids = new Set(selectedIds);
+    await sessionStore.optimisticMutation(
+      (cur) => {
+        const itemMap = new Map<string, CanvasItem>(cur.items.map((it) => [it.id, it] as const));
+        return {
+          ...cur,
+          items: cur.items.map((it) => {
+            // locked item 은 geometry 변경 skip (D7 정합). z 는 lock 과 무관 — UI 의
+            // ordering 만 영향이라 lock 된 item 도 z 갱신 OK.
+            if (!ids.has(it.id)) return it;
+            if (it.locked && key !== 'z') return it;
+            if (it.type === 'path' && key !== 'z') {
+              return editPathGeometry(it, key, value, itemMap);
+            }
+            return { ...it, [key]: value } as CanvasItem;
+          }),
+        };
+      },
+      {
+        abortMessage: 'Edit aborted — session reconnect failed.',
+        failMessage: 'Inspector edit failed',
+      },
+    );
   }
 
   async function applyCommonLabel(next: string): Promise<void> {
@@ -605,11 +780,178 @@
     sessionStore.toggleMaximize(singleMaximizableItem.id);
   }
 
-  async function applyLineEndpoint(field: 'x2' | 'y2', value: number): Promise<void> {
+  async function applyLineEndpoint(field: 'x' | 'y' | 'x2' | 'y2', value: number): Promise<void> {
     await broadcastMutation('Edit aborted — session reconnect failed.', (it) => {
+      if (it.type !== 'line' || it.locked) return it;
+      const next = { ...(it as LineItem), [field]: value };
+      const box = lineBoxFromEndpoints(
+        { x: next.x, y: next.y },
+        { x: next.x2, y: next.y2 },
+      );
+      return { ...next, w: box.w, h: box.h } as LineItem;
+    });
+  }
+
+  async function applyLineHead(field: 'head_from' | 'head_to', value: Head): Promise<void> {
+    rememberPathStyle(field === 'head_from' ? { head_from: value } : { head_to: value });
+    await broadcastMutation('Line head edit aborted — session reconnect failed.', (it) => {
       if (it.type !== 'line' || it.locked) return it;
       return { ...(it as LineItem), [field]: value } as LineItem;
     });
+  }
+
+  async function applyPathMutation(
+    transform: (path: PathItem, itemMap: ReadonlyMap<string, CanvasItem>) => PathItem,
+    failMessage: string,
+  ): Promise<void> {
+    if (selectedItems.length === 0) return;
+    const ids = new Set(selectedIds);
+    await sessionStore.optimisticMutation(
+      (cur) => {
+        const itemMap = new Map<string, CanvasItem>(cur.items.map((it) => [it.id, it] as const));
+        return {
+          ...cur,
+          items: cur.items.map((it) => {
+            if (!ids.has(it.id) || it.type !== 'path' || it.locked) return it;
+            return transform(it, itemMap);
+          }),
+        };
+      },
+      {
+        abortMessage: 'Path edit aborted — session reconnect failed.',
+        failMessage,
+      },
+    );
+  }
+
+  async function applyPathRouting(routing: PathRouting): Promise<void> {
+    rememberPathStyle({ routing });
+    await applyPathMutation(
+      (path, itemMap) => updatePathBBoxCache({ ...path, routing }, itemMap),
+      'Path routing failed',
+    );
+  }
+
+  async function applyPathHead(field: 'head_from' | 'head_to', value: Head): Promise<void> {
+    rememberPathStyle(field === 'head_from' ? { head_from: value } : { head_to: value });
+    await applyPathMutation(
+      (path, itemMap) => updatePathBBoxCache({ ...path, [field]: value }, itemMap),
+      'Path head edit failed',
+    );
+  }
+
+  async function applyPathEndpointKind(
+    endpointId: PathEndpointId,
+    kind: PathEndpoint['kind'],
+  ): Promise<void> {
+    await applyPathMutation((path, itemMap) => {
+      const endpoint = endpointOf(path, endpointId);
+      if (endpoint.kind === kind) return path;
+      const point = resolveEndpoint(endpoint, itemMap);
+      if (kind === 'free') {
+        return updatePathBBoxCache(
+          setPathEndpoint(path, endpointId, { kind: 'free', point }),
+          itemMap,
+        );
+      }
+      const target = nearestConnectableTarget(path, endpointId, point, itemMap);
+      if (target === null) return path;
+      const anchor = nearestAnchor(target, point);
+      return updatePathBBoxCache(
+        setPathEndpoint(path, endpointId, {
+          kind: 'connected',
+          item_id: target.id,
+          anchor,
+          fallback_point: connectedEndpointPoint(target, anchor),
+        }),
+        itemMap,
+      );
+    }, 'Path endpoint edit failed');
+  }
+
+  async function applyPathEndpointTarget(
+    endpointId: PathEndpointId,
+    targetId: string,
+  ): Promise<void> {
+    await applyPathMutation((path, itemMap) => {
+      const target = itemMap.get(targetId);
+      if (target === undefined || !isConnectableItem(target)) return path;
+      const other = otherEndpointOf(path, endpointId);
+      if (other.kind === 'connected' && other.item_id === target.id) return path;
+      const point = resolveEndpoint(endpointOf(path, endpointId), itemMap);
+      const anchor = nearestAnchor(target, point);
+      return updatePathBBoxCache(
+        setPathEndpoint(path, endpointId, {
+          kind: 'connected',
+          item_id: target.id,
+          anchor,
+          fallback_point: connectedEndpointPoint(target, anchor),
+        }),
+        itemMap,
+      );
+    }, 'Path endpoint target failed');
+  }
+
+  async function applyPathEndpointAnchor(
+    endpointId: PathEndpointId,
+    anchor: Anchor,
+  ): Promise<void> {
+    await applyPathMutation((path, itemMap) => {
+      const endpoint = endpointOf(path, endpointId);
+      if (endpoint.kind !== 'connected') return path;
+      const target = itemMap.get(endpoint.item_id);
+      if (target === undefined || !isConnectableItem(target)) return path;
+      const offset = endpoint.offset;
+      return updatePathBBoxCache(
+        setPathEndpoint(path, endpointId, {
+          ...endpoint,
+          anchor,
+          fallback_point: connectedEndpointPoint(target, anchor, offset),
+        }),
+        itemMap,
+      );
+    }, 'Path endpoint anchor failed');
+  }
+
+  async function applyPathEndpointOffset(
+    endpointId: PathEndpointId,
+    axis: keyof Point,
+    value: number,
+  ): Promise<void> {
+    await applyPathMutation((path, itemMap) => {
+      const endpoint = endpointOf(path, endpointId);
+      if (endpoint.kind !== 'connected') return path;
+      const target = itemMap.get(endpoint.item_id);
+      if (target === undefined || !isConnectableItem(target)) return path;
+      const current = endpointOffset(endpoint);
+      const offset = normalizeEndpointOffset({ ...current, [axis]: value });
+      return updatePathBBoxCache(
+        setPathEndpoint(path, endpointId, {
+          ...endpoint,
+          offset,
+          fallback_point: connectedEndpointPoint(target, endpoint.anchor, offset),
+        }),
+        itemMap,
+      );
+    }, 'Path endpoint offset failed');
+  }
+
+  async function applyPathEndpointPoint(
+    endpointId: PathEndpointId,
+    axis: keyof Point,
+    value: number,
+  ): Promise<void> {
+    await applyPathMutation((path, itemMap) => {
+      const endpoint = endpointOf(path, endpointId);
+      const point = resolveEndpoint(endpoint, itemMap);
+      return updatePathBBoxCache(
+        setPathEndpoint(path, endpointId, {
+          kind: 'free',
+          point: { ...point, [axis]: value },
+        }),
+        itemMap,
+      );
+    }, 'Path endpoint point failed');
   }
 
   async function applyNoteColor(hex: string): Promise<void> {
@@ -746,17 +1088,26 @@
   ): Promise<void> {
     if (moves.size === 0) return;
     await sessionStore.optimisticMutation(
-      (cur) => ({
-        ...cur,
-        items: cur.items.map((it) => {
-          const m = moves.get(it.id);
-          if (m === undefined) return it;
-          if (it.type === 'line' && m.x2 !== undefined && m.y2 !== undefined) {
-            return { ...it, x: m.x, y: m.y, x2: m.x2, y2: m.y2 } as CanvasItem;
-          }
-          return { ...it, x: m.x, y: m.y } as CanvasItem;
-        }),
-      }),
+      (cur) => {
+        const itemMap = new Map<string, CanvasItem>(cur.items.map((it) => [it.id, it] as const));
+        return {
+          ...cur,
+          items: cur.items.map((it) => {
+            const m = moves.get(it.id);
+            if (m === undefined) return it;
+            if (it.type === 'line' && m.x2 !== undefined && m.y2 !== undefined) {
+              return { ...it, x: m.x, y: m.y, x2: m.x2, y2: m.y2 } as CanvasItem;
+            }
+            if (it.type === 'path') {
+              const movedX = editPathGeometry(it, 'x', m.x, itemMap);
+              const movedMap = new Map(itemMap);
+              movedMap.set(it.id, movedX);
+              return editPathGeometry(movedX, 'y', m.y, movedMap);
+            }
+            return { ...it, x: m.x, y: m.y } as CanvasItem;
+          }),
+        };
+      },
       { abortMessage, failMessage: 'Align failed' },
     );
   }
@@ -780,6 +1131,9 @@
     hex: string,
   ): Promise<void> {
     if (selectedItems.length === 0) return;
+    if (field === 'stroke' && selectedItems.some((it) => it.type === 'line' || it.type === 'path')) {
+      rememberPathStyle({ stroke: hex });
+    }
     const ids = new Set(selectedIds);
     await sessionStore.optimisticMutation(
       (cur) => ({
@@ -787,9 +1141,9 @@
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text') return it;
-          // line 에는 fill 이 없음 — 무시.
-          if (field === 'fill' && it.type === 'line') return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path') return it;
+          // line/path 에는 fill 이 없음 — 무시.
+          if (field === 'fill' && (it.type === 'line' || it.type === 'path')) return it;
           return { ...it, [field]: hex } as CanvasItem;
         }),
       }),
@@ -838,6 +1192,9 @@
   async function applyShapeStrokeWidth(width: number): Promise<void> {
     if (selectedItems.length === 0) return;
     const clamped = Math.max(1, Math.min(32, Math.round(width)));
+    if (selectedItems.some((it) => it.type === 'line' || it.type === 'path')) {
+      rememberPathStyle({ stroke_width: clamped });
+    }
     const ids = new Set(selectedIds);
     await sessionStore.optimisticMutation(
       (cur) => ({
@@ -845,8 +1202,13 @@
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text') return it;
-          return { ...it, stroke_width: clamped } as CanvasItem;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path') return it;
+          const next = { ...it, stroke_width: clamped } as CanvasItem;
+          if (next.type === 'path') {
+            const itemMap = new Map<string, CanvasItem>(cur.items.map((curItem) => [curItem.id, curItem] as const));
+            return updatePathBBoxCache(next, itemMap);
+          }
+          return next;
         }),
       }),
       {
@@ -858,6 +1220,9 @@
 
   async function applyShapeDash(dash: FigureStrokeDash | undefined): Promise<void> {
     if (selectedItems.length === 0) return;
+    if (selectedItems.some((it) => it.type === 'line' || it.type === 'path')) {
+      rememberPathStyle({ stroke_dash: dash ?? 'solid' });
+    }
     const ids = new Set(selectedIds);
     await sessionStore.optimisticMutation(
       (cur) => ({
@@ -865,7 +1230,7 @@
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text') return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path') return it;
           // undefined = solid → field 제거 (옵셔널 의미 보존)
           const next = { ...it } as CanvasItem & { stroke_dash?: FigureStrokeDash };
           if (dash === undefined || dash === 'solid') {
@@ -1267,46 +1632,146 @@
 
       <section class="prop-section">
         <div class="prop-head"><h4>Geometry</h4></div>
-        <div class="prop-row">
-          <InspectorField
-            type="number"
-            k="X"
-            value={(() => { const v = commonField('x'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
-            mixed={commonField('x') === 'Mixed'}
-            ariaLabel="x"
-            live={true}
-            oncommit={(s) => void applyCommonNum('x', Number(s))}
-          />
-          <InspectorField
-            type="number"
-            k="Y"
-            value={(() => { const v = commonField('y'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
-            mixed={commonField('y') === 'Mixed'}
-            ariaLabel="y"
-            live={true}
-            oncommit={(s) => void applyCommonNum('y', Number(s))}
-          />
-        </div>
-        <div class="prop-row">
-          <InspectorField
-            type="number"
-            k="W"
-            value={(() => { const v = commonField('w'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
-            mixed={commonField('w') === 'Mixed'}
-            ariaLabel="w"
-            live={true}
-            oncommit={(s) => void applyCommonNum('w', Number(s))}
-          />
-          <InspectorField
-            type="number"
-            k="H"
-            value={(() => { const v = commonField('h'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
-            mixed={commonField('h') === 'Mixed'}
-            ariaLabel="h"
-            live={true}
-            oncommit={(s) => void applyCommonNum('h', Number(s))}
-          />
-        </div>
+        {#if singleLineGeometryItem !== null}
+          {@const line = singleLineGeometryItem}
+          <div class="endpoint-geometry-row">
+            <span class="endpoint-label">from</span>
+            <InspectorField
+              type="number"
+              k="X"
+              value={String(Math.round(line.x))}
+              mixed={false}
+              ariaLabel="line from x"
+              disabled={line.locked}
+              live={true}
+              oncommit={(s) => void applyLineEndpoint('x', Number(s))}
+            />
+            <InspectorField
+              type="number"
+              k="Y"
+              value={String(Math.round(line.y))}
+              mixed={false}
+              ariaLabel="line from y"
+              disabled={line.locked}
+              live={true}
+              oncommit={(s) => void applyLineEndpoint('y', Number(s))}
+            />
+          </div>
+          <div class="endpoint-geometry-row">
+            <span class="endpoint-label">to</span>
+            <InspectorField
+              type="number"
+              k="X"
+              value={String(Math.round(line.x2))}
+              mixed={false}
+              ariaLabel="line to x"
+              disabled={line.locked}
+              live={true}
+              oncommit={(s) => void applyLineEndpoint('x2', Number(s))}
+            />
+            <InspectorField
+              type="number"
+              k="Y"
+              value={String(Math.round(line.y2))}
+              mixed={false}
+              ariaLabel="line to y"
+              disabled={line.locked}
+              live={true}
+              oncommit={(s) => void applyLineEndpoint('y2', Number(s))}
+            />
+          </div>
+        {:else if singlePathGeometryItem !== null}
+          {@const path = singlePathGeometryItem}
+          {@const fromPoint = resolveEndpoint(path.from, canvasItemMap)}
+          {@const toPoint = resolveEndpoint(path.to, canvasItemMap)}
+          <div class="endpoint-geometry-row">
+            <span class="endpoint-label">from</span>
+            <InspectorField
+              type="number"
+              k="X"
+              value={String(Math.round(fromPoint.x))}
+              mixed={false}
+              ariaLabel="path from x"
+              disabled={path.locked}
+              live={true}
+              oncommit={(s) => void applyPathEndpointPoint('from', 'x', Number(s))}
+            />
+            <InspectorField
+              type="number"
+              k="Y"
+              value={String(Math.round(fromPoint.y))}
+              mixed={false}
+              ariaLabel="path from y"
+              disabled={path.locked}
+              live={true}
+              oncommit={(s) => void applyPathEndpointPoint('from', 'y', Number(s))}
+            />
+          </div>
+          <div class="endpoint-geometry-row">
+            <span class="endpoint-label">to</span>
+            <InspectorField
+              type="number"
+              k="X"
+              value={String(Math.round(toPoint.x))}
+              mixed={false}
+              ariaLabel="path to x"
+              disabled={path.locked}
+              live={true}
+              oncommit={(s) => void applyPathEndpointPoint('to', 'x', Number(s))}
+            />
+            <InspectorField
+              type="number"
+              k="Y"
+              value={String(Math.round(toPoint.y))}
+              mixed={false}
+              ariaLabel="path to y"
+              disabled={path.locked}
+              live={true}
+              oncommit={(s) => void applyPathEndpointPoint('to', 'y', Number(s))}
+            />
+          </div>
+        {:else}
+          <div class="prop-row">
+            <InspectorField
+              type="number"
+              k="X"
+              value={(() => { const v = commonField('x'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
+              mixed={commonField('x') === 'Mixed'}
+              ariaLabel="x"
+              live={true}
+              oncommit={(s) => void applyCommonNum('x', Number(s))}
+            />
+            <InspectorField
+              type="number"
+              k="Y"
+              value={(() => { const v = commonField('y'); return typeof v === 'number' ? String(Math.round(v)) : '0'; })()}
+              mixed={commonField('y') === 'Mixed'}
+              ariaLabel="y"
+              live={true}
+              oncommit={(s) => void applyCommonNum('y', Number(s))}
+            />
+          </div>
+          <div class="prop-row">
+            <InspectorField
+              type="number"
+              k="W"
+              value={(() => { const v = commonField('w'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
+              mixed={commonField('w') === 'Mixed'}
+              ariaLabel="w"
+              live={true}
+              oncommit={(s) => void applyCommonNum('w', Number(s))}
+            />
+            <InspectorField
+              type="number"
+              k="H"
+              value={(() => { const v = commonField('h'); return typeof v === 'number' ? String(Math.round(v)) : ''; })()}
+              mixed={commonField('h') === 'Mixed'}
+              ariaLabel="h"
+              live={true}
+              oncommit={(s) => void applyCommonNum('h', Number(s))}
+            />
+          </div>
+        {/if}
         {#if selectionCount >= 2}
           <!-- ADR-0027 D4/D9 — alignment row. Distribute 는 N≥3. -->
           <div class="align-row" role="group" aria-label="Alignment">
@@ -1407,7 +1872,7 @@
         </section>
       {/if}
 
-      {#if sessionItem !== null && ((selectionCount === 1 && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets')) || (isMultiHomogeneous && (commonType === 'rect' || commonType === 'ellipse' || commonType === 'text')))}
+      {#if sessionItem !== null && ((selectionCount === 1 && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'path' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets')) || (isMultiHomogeneous && (commonType === 'rect' || commonType === 'ellipse' || commonType === 'text' || commonType === 'path')))}
         <section class="prop-section">
           <div class="prop-head"><h4>Item Payload</h4></div>
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
@@ -1537,7 +2002,7 @@
                       >
                         <span class="font-label">font</span>
                         <span class="font-value font-preview-{shapeFamily}">{fontLabel(shapeFamily)}</span>
-                        <span class="font-caret" aria-hidden="true">▾</span>
+                        <DropdownChevron />
                       </button>
                     {/snippet}
                     {#snippet menu({ close })}
@@ -1611,28 +2076,6 @@
             </div>
           {:else if sessionItem.type === 'line'}
             {@const line = sessionItem}
-            <div class="prop-row">
-              <InspectorField
-                type="number"
-                k="X2"
-                value={String(Math.round(line.x2))}
-                mixed={false}
-                ariaLabel="x2"
-                disabled={line.locked}
-                live={true}
-                oncommit={(s) => void applyLineEndpoint('x2', Number(s))}
-              />
-              <InspectorField
-                type="number"
-                k="Y2"
-                value={String(Math.round(line.y2))}
-                mixed={false}
-                ariaLabel="y2"
-                disabled={line.locked}
-                live={true}
-                oncommit={(s) => void applyLineEndpoint('y2', Number(s))}
-              />
-            </div>
             <!-- line stroke: figma-style group (no toggle, color + w + style 항상 노출) -->
             <div class="fig-group is-on">
               <div class="fig-group-head">
@@ -1662,6 +2105,376 @@
                   onpick={(next) => void applyShapeDash(next)}
                 />
               </div>
+            </div>
+            <div class="fig-group is-on">
+              <div class="fig-group-head">
+                <span class="k">heads</span>
+              </div>
+              <div class="fig-group-body">
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={line.locked}
+                        aria-label="Line start head"
+                        title={headLabel(line.head_from)}
+                        onclick={toggle}
+                      >
+                        <span class="font-label">from</span>
+                        <span class="font-value head-value"><HeadIcon head={line.head_from} /></span>
+                        <DropdownChevron />
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each HEAD_OPTIONS as option (option.value)}
+                        <button
+                          type="button"
+                          class="font-option"
+                          class:selected={(line.head_from ?? 'none') === option.value}
+                          disabled={line.locked}
+                          aria-label={option.label}
+                          title={option.label}
+                          onclick={() => {
+                            void applyLineHead('head_from', option.value);
+                            close();
+                          }}
+                        >
+                          <HeadIcon head={option.value} />
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={line.locked}
+                        aria-label="Line end head"
+                        title={headLabel(line.head_to)}
+                        onclick={toggle}
+                      >
+                        <span class="font-label">to</span>
+                        <span class="font-value head-value"><HeadIcon head={line.head_to} /></span>
+                        <DropdownChevron />
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each HEAD_OPTIONS as option (option.value)}
+                        <button
+                          type="button"
+                          class="font-option"
+                          class:selected={(line.head_to ?? 'none') === option.value}
+                          disabled={line.locked}
+                          aria-label={option.label}
+                          title={option.label}
+                          onclick={() => {
+                            void applyLineHead('head_to', option.value);
+                            close();
+                          }}
+                        >
+                          <HeadIcon head={option.value} />
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
+              </div>
+            </div>
+          {:else if sessionItem.type === 'path'}
+            {@const path = sessionItem}
+            <div class="fig-group is-on">
+              <div class="fig-group-head">
+                <span class="k">path</span>
+              </div>
+              <div class="fig-group-body">
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">routing</span>
+                  <div class="segmented-control icon-segments routing-segments" role="group" aria-label="Path routing">
+                    {#each ROUTING_OPTIONS as option (option.value)}
+                      <button
+                        type="button"
+                        class="seg-btn"
+                        class:active={path.routing === option.value}
+                        aria-pressed={path.routing === option.value}
+                        aria-label={option.label}
+                        title={option.label}
+                        disabled={path.locked}
+                        onclick={() => void applyPathRouting(option.value)}
+                      >
+                        <RoutingIcon routing={option.value} />
+                      </button>
+                    {/each}
+                  </div>
+                </div>
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={path.locked}
+                        aria-label="Path start head"
+                        title={headLabel(path.head_from)}
+                        onclick={toggle}
+                      >
+                        <span class="font-label">from</span>
+                        <span class="font-value head-value"><HeadIcon head={path.head_from} /></span>
+                        <DropdownChevron />
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each HEAD_OPTIONS as option (option.value)}
+                        <button
+                          type="button"
+                          class="font-option"
+                          class:selected={(path.head_from ?? 'none') === option.value}
+                          disabled={path.locked}
+                          aria-label={option.label}
+                          title={option.label}
+                          onclick={() => {
+                            void applyPathHead('head_from', option.value);
+                            close();
+                          }}
+                        >
+                          <HeadIcon head={option.value} />
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={path.locked}
+                        aria-label="Path end head"
+                        title={headLabel(path.head_to)}
+                        onclick={toggle}
+                      >
+                        <span class="font-label">to</span>
+                        <span class="font-value head-value"><HeadIcon head={path.head_to} /></span>
+                        <DropdownChevron />
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each HEAD_OPTIONS as option (option.value)}
+                        <button
+                          type="button"
+                          class="font-option"
+                          class:selected={(path.head_to ?? 'none') === option.value}
+                          disabled={path.locked}
+                          aria-label={option.label}
+                          title={option.label}
+                          onclick={() => {
+                            void applyPathHead('head_to', option.value);
+                            close();
+                          }}
+                        >
+                          <HeadIcon head={option.value} />
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
+              </div>
+            </div>
+            <div class="fig-group is-on">
+              <div class="fig-group-head">
+                <span class="k">stroke</span>
+              </div>
+              <div class="fig-group-body">
+                <ColorPicker
+                  value={path.stroke}
+                  live={true}
+                  allowAlpha={true}
+                  disabled={path.locked}
+                  oncommit={(hex) => void applyShapeColor('stroke', hex)}
+                />
+                <InspectorField
+                  type="number"
+                  k="width"
+                  value={String(path.stroke_width)}
+                  mixed={false}
+                  ariaLabel="Path stroke width"
+                  disabled={path.locked}
+                  live={true}
+                  oncommit={(s) => void applyShapeStrokeWidth(Number(s))}
+                />
+                <DashSegments
+                  value={path.stroke_dash ?? 'solid'}
+                  disabled={path.locked}
+                  onpick={(next) => void applyShapeDash(next)}
+                />
+              </div>
+            </div>
+            <div class="fig-group connect-endpoint-group" class:is-on={path.from.kind === 'connected'}>
+              <div class="fig-group-head">
+                <span class="k">connect from</span>
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={path.from.kind === 'connected'}
+                  disabled={path.locked || (path.from.kind !== 'connected' && pathEndpointTargetOptions(path, 'from').length === 0)}
+                  ariaLabel="Toggle path start connection"
+                  onchange={(next) => void applyPathEndpointKind('from', next ? 'connected' : 'free')}
+                />
+              </div>
+              {#if path.from.kind === 'connected'}
+                {@const fromTarget = connectedEndpointTarget(path.from)}
+                <div class="fig-group-body">
+                  <div class="font-dropdown">
+                    <Dropdown placement="bottom-start">
+                      {#snippet trigger({ toggle })}
+                        <button
+                          type="button"
+                          class="font-trigger"
+                          disabled={path.locked || pathEndpointTargetOptions(path, 'from').length === 0}
+                          aria-label="Path start component"
+                          title={fromTarget === null ? 'Missing' : itemOptionTitle(fromTarget)}
+                          onclick={toggle}
+                        >
+                          <span class="font-label">target</span>
+                          <span class="font-value">{fromTarget === null ? 'Missing' : itemOptionLabel(fromTarget)}</span>
+                          <DropdownChevron />
+                        </button>
+                      {/snippet}
+                      {#snippet menu({ close })}
+                        {#each pathEndpointTargetOptions(path, 'from') as item (item.id)}
+                          <button
+                            type="button"
+                            class="font-option"
+                            class:selected={path.from.kind === 'connected' && path.from.item_id === item.id}
+                            disabled={path.locked}
+                            title={itemOptionTitle(item)}
+                            onclick={() => {
+                              void applyPathEndpointTarget('from', item.id);
+                              close();
+                            }}
+                          >
+                            {itemOptionLabel(item)}
+                          </button>
+                        {/each}
+                      {/snippet}
+                    </Dropdown>
+                  </div>
+                  <PathAnchorPicker
+                    value={path.from.anchor}
+                    disabled={path.locked}
+                    ariaLabel="Path start anchor"
+                    onpick={(next) => void applyPathEndpointAnchor('from', next)}
+                  />
+                  <div class="endpoint-offset-row">
+                    <span class="endpoint-label">offset</span>
+                    <InspectorField
+                      type="number"
+                      k="X"
+                      value={String(Math.round(endpointOffset(path.from).x))}
+                      mixed={false}
+                      ariaLabel="Path start anchor offset x"
+                      disabled={path.locked}
+                      live={true}
+                      oncommit={(s) => void applyPathEndpointOffset('from', 'x', Number(s))}
+                    />
+                    <InspectorField
+                      type="number"
+                      k="Y"
+                      value={String(Math.round(endpointOffset(path.from).y))}
+                      mixed={false}
+                      ariaLabel="Path start anchor offset y"
+                      disabled={path.locked}
+                      live={true}
+                      oncommit={(s) => void applyPathEndpointOffset('from', 'y', Number(s))}
+                    />
+                  </div>
+                </div>
+              {/if}
+            </div>
+            <div class="fig-group connect-endpoint-group" class:is-on={path.to.kind === 'connected'}>
+              <div class="fig-group-head">
+                <span class="k">connect to</span>
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={path.to.kind === 'connected'}
+                  disabled={path.locked || (path.to.kind !== 'connected' && pathEndpointTargetOptions(path, 'to').length === 0)}
+                  ariaLabel="Toggle path end connection"
+                  onchange={(next) => void applyPathEndpointKind('to', next ? 'connected' : 'free')}
+                />
+              </div>
+              {#if path.to.kind === 'connected'}
+                {@const toTarget = connectedEndpointTarget(path.to)}
+                <div class="fig-group-body">
+                  <div class="font-dropdown">
+                    <Dropdown placement="bottom-start">
+                      {#snippet trigger({ toggle })}
+                        <button
+                          type="button"
+                          class="font-trigger"
+                          disabled={path.locked || pathEndpointTargetOptions(path, 'to').length === 0}
+                          aria-label="Path end component"
+                          title={toTarget === null ? 'Missing' : itemOptionTitle(toTarget)}
+                          onclick={toggle}
+                        >
+                          <span class="font-label">target</span>
+                          <span class="font-value">{toTarget === null ? 'Missing' : itemOptionLabel(toTarget)}</span>
+                          <DropdownChevron />
+                        </button>
+                      {/snippet}
+                      {#snippet menu({ close })}
+                        {#each pathEndpointTargetOptions(path, 'to') as item (item.id)}
+                          <button
+                            type="button"
+                            class="font-option"
+                            class:selected={path.to.kind === 'connected' && path.to.item_id === item.id}
+                            disabled={path.locked}
+                            title={itemOptionTitle(item)}
+                            onclick={() => {
+                              void applyPathEndpointTarget('to', item.id);
+                              close();
+                            }}
+                          >
+                            {itemOptionLabel(item)}
+                          </button>
+                        {/each}
+                      {/snippet}
+                    </Dropdown>
+                  </div>
+                  <PathAnchorPicker
+                    value={path.to.anchor}
+                    disabled={path.locked}
+                    ariaLabel="Path end anchor"
+                    onpick={(next) => void applyPathEndpointAnchor('to', next)}
+                  />
+                  <div class="endpoint-offset-row">
+                    <span class="endpoint-label">offset</span>
+                    <InspectorField
+                      type="number"
+                      k="X"
+                      value={String(Math.round(endpointOffset(path.to).x))}
+                      mixed={false}
+                      ariaLabel="Path end anchor offset x"
+                      disabled={path.locked}
+                      live={true}
+                      oncommit={(s) => void applyPathEndpointOffset('to', 'x', Number(s))}
+                    />
+                    <InspectorField
+                      type="number"
+                      k="Y"
+                      value={String(Math.round(endpointOffset(path.to).y))}
+                      mixed={false}
+                      ariaLabel="Path end anchor offset y"
+                      disabled={path.locked}
+                      live={true}
+                      oncommit={(s) => void applyPathEndpointOffset('to', 'y', Number(s))}
+                    />
+                  </div>
+                </div>
+              {/if}
             </div>
           {:else if sessionItem.type === 'text'}
             {@const txt = sessionItem}
@@ -1701,7 +2514,7 @@
                       >
                         <span class="font-label">font</span>
                         <span class="font-value font-preview-{family}">{fontLabel(family)}</span>
-                        <span class="font-caret" aria-hidden="true">▾</span>
+                        <DropdownChevron />
                       </button>
                     {/snippet}
                     {#snippet menu({ close })}
@@ -2333,6 +3146,47 @@
     --inspector-k-w: 18px;
   }
 
+  .endpoint-geometry-row {
+    display: grid;
+    grid-template-columns: 42px minmax(0, 1fr) minmax(0, 1fr);
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+    min-width: 0;
+  }
+
+  .endpoint-geometry-row > .endpoint-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.4px;
+    color: var(--color-fg-muted);
+    text-transform: uppercase;
+  }
+
+  .endpoint-geometry-row > :global(.inspector-input) {
+    --inspector-k-w: 14px;
+  }
+
+  .endpoint-offset-row {
+    display: grid;
+    grid-template-columns: 56px minmax(0, 1fr) minmax(0, 1fr);
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .endpoint-offset-row > .endpoint-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.4px;
+    color: var(--color-fg-muted);
+    text-transform: uppercase;
+  }
+
+  .endpoint-offset-row > :global(.inspector-input) {
+    --inspector-k-w: 14px;
+  }
+
   /* Read-only display row — InspectorField 의 시각 (.inspector-input) 과 정합. */
   .display-row {
     display: flex;
@@ -2353,7 +3207,7 @@
     transition: background var(--motion-fast) var(--motion-easing);
   }
 
-  .display-row:hover {
+  .display-row:not(.control-row):hover {
     background: var(--color-glass-1);
   }
 
@@ -2430,6 +3284,11 @@
   .fig-group-head > .fig-spacer {
     flex: 1 1 auto;
   }
+  .connect-endpoint-group .fig-group-head > .k {
+    flex: 0 1 auto;
+    width: auto;
+    white-space: nowrap;
+  }
   .fig-caret {
     flex: 0 0 14px;
     width: 14px;
@@ -2452,6 +3311,7 @@
   .fig-group-body > :global(.inspector-input),
   .fig-group-body > :global(.color-picker),
   .fig-group-body > :global(.style-dropdown),
+  .fig-group-body > :global(.anchor-picker),
   .fig-group-body > .font-dropdown {
     width: 100%;
     min-width: 0;
@@ -2525,6 +3385,7 @@
 
   .seg-btn:hover:not(:disabled):not(.active) {
     background: var(--color-glass-1);
+    color: var(--color-fg);
   }
 
   .seg-btn.active {
@@ -2543,23 +3404,58 @@
   }
 
   .font-dropdown {
+    --inspector-k-w: 56px;
+    --inspector-dropdown-menu-left: calc(var(--inspector-k-w) + 10px);
     width: 100%;
     min-width: 0;
   }
 
   .font-dropdown :global(.dropdown-host) {
+    position: relative;
     display: flex;
+    align-items: center;
+    gap: 4px;
     width: 100%;
     min-width: 0;
+    height: 24px;
+    padding: 0 0 0 6px;
+    box-sizing: border-box;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-fg);
+    transition: border-color var(--motion-fast) var(--motion-easing);
+  }
+
+  .font-dropdown :global(.dropdown-host:hover) {
+    border-color: var(--color-border-strong);
+  }
+
+  .font-dropdown :global(.dropdown-host.open) {
+    border-color: var(--color-accent);
   }
 
   .font-dropdown :global(.dropdown-menu) {
     box-sizing: border-box;
-    width: 100%;
+    width: auto;
     min-width: 0;
-    margin-top: 4px;
+    max-width: none;
+    max-height: min(280px, calc(100vh - 96px));
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    margin-top: 2px;
     padding: 2px;
+    background: var(--color-bg);
+    border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.16);
+  }
+
+  .font-dropdown :global(.dropdown-menu.dropdown-menu-bottom-start),
+  .font-dropdown :global(.dropdown-menu.dropdown-menu-bottom-end) {
+    left: var(--inspector-dropdown-menu-left);
+    right: 0;
   }
 
   .font-dropdown :global(.dropdown-menu button) {
@@ -2570,30 +3466,30 @@
     font-size: 11px;
   }
 
+  .font-dropdown :global(.dropdown-menu button.selected) {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
+  }
+
   .font-trigger {
     box-sizing: border-box;
     flex: 1 1 auto;
     min-width: 0;
     width: 100%;
-    height: 24px;
+    height: 100%;
     display: flex;
     align-items: center;
     gap: 4px;
-    padding: 0 6px;
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-sm);
-    background: var(--color-bg);
+    padding: 0 6px 0 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
     color: var(--color-fg);
     font-family: var(--font-mono);
     font-size: 11px;
     letter-spacing: 0.2px;
     cursor: pointer;
     text-align: left;
-    transition: border-color var(--motion-fast) var(--motion-easing);
-  }
-
-  .font-trigger:hover:not(:disabled) {
-    border-color: var(--color-border-strong);
   }
 
   .font-trigger:disabled {
@@ -2616,14 +3512,16 @@
     flex: 1 1 auto;
     min-width: 0;
     text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .font-caret {
-    flex: 0 0 14px;
-    width: 14px;
-    text-align: center;
-    color: var(--color-fg-muted);
-    font-family: var(--font-mono);
+  .head-value {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--color-fg);
   }
 
   .font-option.font-preview-sans,
@@ -2647,6 +3545,17 @@
 
   .icon-segments .seg-btn.active {
     color: var(--color-accent-fg);
+  }
+
+  .routing-segments :global(.routing-icon) {
+    width: 16px;
+    height: 16px;
+  }
+
+  .head-value :global(.head-icon),
+  .font-option :global(.head-icon) {
+    width: 14px;
+    height: 14px;
   }
 
   /* Read-only value — editable InspectorField (color-fg) 와 색 차별. */

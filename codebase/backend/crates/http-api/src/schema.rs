@@ -204,7 +204,7 @@ pub struct ItemCommon {
     pub minimized: bool,
 }
 
-/// 2D point — shared payload for `free_draw` and `connector` items.
+/// 2D point — shared payload for `free_draw` points and `path` endpoints.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Point {
@@ -229,13 +229,48 @@ pub struct SnippetEntry {
     pub body: String,
 }
 
+/// ADR-0043 D1 — one endpoint of a `path` item. A `free` endpoint pins to an
+/// absolute canvas point; a `connected` endpoint tracks another item's anchor
+/// and keeps a `fallback_point` (the last resolved anchor coordinate plus
+/// optional offset) so the endpoint can degrade to `free` when the target is
+/// deleted (ADR-0043 D7).
+///
+/// Wire form is internally tagged on `kind`: `{"kind":"free","point":{..}}`
+/// or `{"kind":"connected","item_id":..,"anchor":..,"offset"?:{..},"fallback_point":{..}}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PathEndpoint {
+    Free {
+        point: Point,
+    },
+    Connected {
+        item_id: String,
+        anchor: Anchor,
+        /// Optional delta from the resolved anchor point. Missing means `{0,0}`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<Point>,
+        fallback_point: Point,
+    },
+}
+
+/// ADR-0043 D9 — a path waypoint (intermediate routing point). Carries a
+/// stable UUID id (the endpoints use `from`/`to` themselves as identity, so
+/// only waypoints need an explicit id).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PathWaypoint {
+    pub id: String,
+    pub x: f64,
+    pub y: f64,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  Connector enums (ADR-0036 D1)
+//  Path / line shared enums (ADR-0043; supersedes ADR-0036 connector enums)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 9-point connector anchor — 8 cardinal/diagonal edges + center (ADR-0036 D2).
-/// Wire form uses the uppercase keyword for the 8 edges and lowercase
-/// `"center"` for the middle. The `"auto"` mode is P1+.
+/// 9-point anchor — 8 cardinal/diagonal edges + center (ADR-0043 D1, was
+/// ADR-0036 D2). Used by `path` connected endpoints. Wire form uses the
+/// uppercase keyword for the 8 edges and lowercase `"center"` for the middle.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub enum Anchor {
     #[serde(rename = "N")]
@@ -258,29 +293,29 @@ pub enum Anchor {
     Center,
 }
 
-/// Connector arrowhead direction mode (ADR-0036 D4). `head_from` / `head_to`
-/// may still override the default mapping per-end.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Direction {
-    Uni,
-    Bi,
-    None,
-}
-
-/// Per-end connector head marker (ADR-0036 D4).
+/// Per-end head marker for `path` / `line` (ADR-0043 D2/D3). `direction` was
+/// removed (ADR-0043 D3) — directionality is derived from the head pair:
+/// only `Arrow` carries direction meaning; `Circle` / `Diamond` are plain
+/// endpoint markers. Defaults to `None`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Head {
+    None,
     Arrow,
     Circle,
     Diamond,
-    None,
 }
 
-/// Connector routing style (ADR-0036 D3). MVP wires `Straight` only; the
-/// other two variants persist for round-trip but the FE renderer falls
-/// back to straight until P1.
+impl Default for Head {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Path routing style (ADR-0043 D9). The point chain
+/// `[from, ...waypoints, to]` is connected as straight segments
+/// (`Straight`), axis-aligned segments (`Orthogonal`), or a smooth spline
+/// (`Bezier`). New-path default is `Orthogonal` (ADR-0043 D13, FE-side).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Routing {
@@ -289,19 +324,9 @@ pub enum Routing {
     Bezier,
 }
 
-/// Connector stroke dash pattern (ADR-0036 D1 — optional, `null` for solid).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum StrokeDash {
-    Dash,
-    Dot,
-}
-
-/// Figure stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20 batch 5,
-/// rect / ellipse / line). Kept distinct from connector's [`StrokeDash`]
-/// because the figure form is a 4-variant enum with an explicit `Solid`
-/// default, while connector's wire uses `null` for solid (round-trip
-/// compatibility would break if the two were unified).
+/// Figure / path stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20
+/// batch 5; extended to `path` by ADR-0043). 4-variant enum with an explicit
+/// `Solid` default.
 ///
 /// Wire form is `snake_case`: `"solid" | "dash" | "dot" | "dash_dot"`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
@@ -559,6 +584,12 @@ pub enum Item {
         /// ADR-0018 D4 amend ① — stroke dash pattern. `None` = solid.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stroke_dash: Option<FigureStrokeDash>,
+        /// ADR-0043 D2 — per-end head markers. `#[serde(default)]` (→ `None`)
+        /// so legacy line records pre-dating ADR-0043 round-trip unchanged.
+        #[serde(default)]
+        head_from: Head,
+        #[serde(default)]
+        head_to: Head,
     },
     FreeDraw {
         #[serde(flatten)]
@@ -606,32 +637,29 @@ pub enum Item {
         path: String,
         kind: Option<String>,
     },
-    /// ADR-0018 D12 amend / ADR-0036 — Canvas component connector.
+    /// ADR-0043 — Canvas `path` component (supersedes ADR-0036 `connector`).
     ///
-    /// Endpoint-bound wire connecting two other items. `x/y/w/h` on `common`
-    /// is a *BBox cache* (not user input): `put_layout_handler` recomputes
-    /// it from the two anchor points before validation. `from_id` / `to_id`
-    /// must refer to non-connector items (refer-integrity + no chain), and
-    /// `from_id != to_id` (self-loop reject, MVP — ADR-0036 O2).
-    Connector {
+    /// A free-or-connected poly-path. Each endpoint (`from` / `to`) is either
+    /// a `free` absolute point or `connected` to another item's anchor. `x/y/
+    /// w/h` on `common` is a *BBox cache* (not user input): the PUT handler
+    /// degrades dangling endpoints then recomputes the cache from the actual
+    /// endpoint + waypoint chain before validation. Connected endpoints must
+    /// refer to a connectable item (ADR-0043 D5); a path connected to the
+    /// same item on both ends is rejected (self-loop, MVP — D5).
+    Path {
         #[serde(flatten)]
         common: ItemCommon,
-        from_id: String,
-        to_id: String,
-        from_anchor: Anchor,
-        to_anchor: Anchor,
-        direction: Direction,
+        from: PathEndpoint,
+        to: PathEndpoint,
+        routing: Routing,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        waypoints: Vec<PathWaypoint>,
+        head_from: Head,
+        head_to: Head,
         stroke: String,
         stroke_width: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        stroke_dash: Option<StrokeDash>,
-        head_from: Head,
-        head_to: Head,
-        routing: Routing,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        waypoints: Option<Vec<Point>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        label_offset: Option<Point>,
+        stroke_dash: Option<FigureStrokeDash>,
     },
     /// ADR-0038 — Snippet collection. A canvas-local registry of (key, body)
     /// pairs. Click a badge ⇒ copy `body` to clipboard (FE-side action,
@@ -662,27 +690,7 @@ impl Item {
             | Item::Image { common, .. }
             | Item::Document { common, .. }
             | Item::FilePath { common, .. }
-            | Item::Connector { common, .. }
-            | Item::Snippets { common, .. } => common,
-        }
-    }
-
-    /// Mutable borrow of the common fields — used by
-    /// [`recompute_connector_bboxes`] to rewrite the `x/y/w/h` cache on
-    /// connector variants.
-    fn common_mut(&mut self) -> &mut ItemCommon {
-        match self {
-            Item::Terminal { common }
-            | Item::Text { common, .. }
-            | Item::Note { common, .. }
-            | Item::Rect { common, .. }
-            | Item::Ellipse { common, .. }
-            | Item::Line { common, .. }
-            | Item::FreeDraw { common, .. }
-            | Item::Image { common, .. }
-            | Item::Document { common, .. }
-            | Item::FilePath { common, .. }
-            | Item::Connector { common, .. }
+            | Item::Path { common, .. }
             | Item::Snippets { common, .. } => common,
         }
     }
@@ -729,17 +737,26 @@ pub enum ValidationError {
     /// ADR-0018 D10 amend ① — inline-stored content exceeds the cap.
     #[error("document inline content exceeds {} bytes", DOCUMENT_INLINE_MAX_BYTES)]
     DocumentInlineTooLong,
-    /// ADR-0018 D12 / ADR-0036 — connector `from_id` or `to_id` does not
-    /// match any other item in this layout (refer-integrity violation).
-    #[error("connector endpoint id not found in items[]")]
-    ConnectorEndpointMissing,
-    /// ADR-0036 Q2 — connector endpoint references another connector
-    /// (chain reject, MVP).
-    #[error("connector endpoint cannot reference another connector")]
-    ConnectorInvalidEndpoint,
-    /// ADR-0036 Q3 / O2 — self-loop (`from_id == to_id`) reject for MVP.
-    #[error("connector from_id and to_id must differ (self-loop reject, MVP)")]
-    ConnectorSelfLoop,
+    /// ADR-0043 D7 — a `path` connected endpoint's `item_id` does not match
+    /// any item in this layout. (The PUT handler degrades dangling endpoints
+    /// to `free` *before* validate, so this fires only for raw validation of
+    /// a layout that bypassed the degrade transform.)
+    #[error("path connected endpoint item_id not found in items[]")]
+    PathEndpointMissing,
+    /// ADR-0043 D5 — a `path` connected endpoint targets a non-connectable
+    /// item (`line` / `path` / `free_draw`, or a group id).
+    #[error("path connected endpoint targets a non-connectable item")]
+    PathInvalidEndpoint,
+    /// ADR-0043 D5 — both endpoints connected to the same item (self-loop
+    /// reject, MVP).
+    #[error("path from and to must not connect to the same item (self-loop reject, MVP)")]
+    PathSelfLoop,
+    /// ADR-0043 D9 — a `path` waypoint id is not a UUID v4-shape string.
+    #[error("path waypoint id is not a UUID v4-shape lowercase string: {0:?}")]
+    PathWaypointBadId(String),
+    /// ADR-0043 D9 — duplicate waypoint id within a single `path`.
+    #[error("duplicate path waypoint id within a single path: {0:?}")]
+    PathDuplicateWaypointId(String),
     /// ADR-0018 D4 amend ① (2026-05-20 batch 5) — figure stroke_width is
     /// out of the inspector-enforced 1..=32 range. Rect / Ellipse / Line.
     #[error("figure stroke_width {width} must be in 1..=32")]
@@ -786,9 +803,11 @@ impl ValidationError {
             Self::DocumentMissingSource => "document_missing_source",
             Self::DocumentBothSources => "document_both_sources",
             Self::DocumentInlineTooLong => "document_inline_too_long",
-            Self::ConnectorEndpointMissing => "connector_endpoint_missing",
-            Self::ConnectorInvalidEndpoint => "connector_invalid_endpoint",
-            Self::ConnectorSelfLoop => "connector_self_loop",
+            Self::PathEndpointMissing => "path_endpoint_missing",
+            Self::PathInvalidEndpoint => "path_invalid_endpoint",
+            Self::PathSelfLoop => "path_self_loop",
+            Self::PathWaypointBadId(_) => "path_waypoint_bad_id",
+            Self::PathDuplicateWaypointId(_) => "path_duplicate_waypoint_id",
             Self::StrokeWidthOutOfRange { .. } => "stroke_width_out_of_range",
             Self::TextFontSizeOutOfRange { .. } => "text_font_size_out_of_range",
             Self::BadSnippetEntryId(_) => "bad_snippet_entry_id",
@@ -827,6 +846,25 @@ fn check_stroke_width(width: u32) -> Result<(), ValidationError> {
         return Err(ValidationError::StrokeWidthOutOfRange { width });
     }
     Ok(())
+}
+
+/// ADR-0043 D5 — whether an item is a valid `path` connection target.
+/// Box-like items are connectable; the wire/draw items (`line` / `path` /
+/// `free_draw`) are not. Group ids never reach this (groups live outside
+/// `items[]`, so a group reference fails the earlier existence check).
+fn is_connectable(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::Terminal { .. }
+            | Item::Text { .. }
+            | Item::Note { .. }
+            | Item::Rect { .. }
+            | Item::Ellipse { .. }
+            | Item::Image { .. }
+            | Item::Document { .. }
+            | Item::FilePath { .. }
+            | Item::Snippets { .. }
+    )
 }
 
 /// Validate a v2 [`Layout`] against ADR-0018 D8 rules. Returns the first
@@ -968,22 +1006,49 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                     }
                 }
             }
-            Item::Connector { from_id, to_id, .. } => {
-                // ADR-0036 Q3 — self-loop reject (MVP scope).
-                if from_id == to_id {
-                    return Err(ValidationError::ConnectorSelfLoop);
+            Item::Path {
+                from,
+                to,
+                waypoints,
+                ..
+            } => {
+                // ADR-0043 D9 — waypoint id shape + intra-path uniqueness.
+                let mut seen_wp: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for wp in waypoints {
+                    if !is_uuid_shape(&wp.id) {
+                        return Err(ValidationError::PathWaypointBadId(wp.id.clone()));
+                    }
+                    if !seen_wp.insert(&wp.id) {
+                        return Err(ValidationError::PathDuplicateWaypointId(wp.id.clone()));
+                    }
                 }
-                // ADR-0036 Q2 — endpoint must exist and not be another
-                // connector. `id_index` was built before this loop so this
-                // is O(1).
-                let from = id_index
-                    .get(from_id.as_str())
-                    .ok_or(ValidationError::ConnectorEndpointMissing)?;
-                let to = id_index
-                    .get(to_id.as_str())
-                    .ok_or(ValidationError::ConnectorEndpointMissing)?;
-                if matches!(from, Item::Connector { .. }) || matches!(to, Item::Connector { .. }) {
-                    return Err(ValidationError::ConnectorInvalidEndpoint);
+                // ADR-0043 D5 — connected endpoints must reference an existing
+                // connectable item (`id_index` is O(1), built before the loop).
+                // Each connected endpoint is checked independently; a free
+                // endpoint imposes no constraint.
+                let check_endpoint = |ep: &PathEndpoint| -> Result<(), ValidationError> {
+                    if let PathEndpoint::Connected { item_id, .. } = ep {
+                        let target = id_index
+                            .get(item_id.as_str())
+                            .ok_or(ValidationError::PathEndpointMissing)?;
+                        if !is_connectable(target) {
+                            return Err(ValidationError::PathInvalidEndpoint);
+                        }
+                    }
+                    Ok(())
+                };
+                check_endpoint(from)?;
+                check_endpoint(to)?;
+                // ADR-0043 D5 — both endpoints connected to the same item is a
+                // self-loop (MVP reject). One connected + one free is allowed.
+                if let (
+                    PathEndpoint::Connected { item_id: a, .. },
+                    PathEndpoint::Connected { item_id: b, .. },
+                ) = (from, to)
+                {
+                    if a == b {
+                        return Err(ValidationError::PathSelfLoop);
+                    }
                 }
             }
             Item::Snippets { entries, .. } => {
@@ -993,8 +1058,7 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                 if entries.len() > SNIPPETS_ENTRIES_CAP {
                     return Err(ValidationError::SnippetsEntriesTooMany);
                 }
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
                 for e in entries {
                     if !is_uuid_shape(&e.id) {
                         return Err(ValidationError::BadSnippetEntryId(e.id.clone()));
@@ -1020,60 +1084,159 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Recompute the `x/y/w/h` BBox cache on every `Item::Connector` from its
-/// two endpoint anchor points (ADR-0036 D1 / Q4-Q5). User-supplied
-/// connector geometry is ignored — the BE is the single source of truth
-/// for connector bounds so endpoint moves stay in sync without a FE
-/// round-trip.
+/// Padding (canvas px) added on every side of a `path`'s point-chain bbox to
+/// cover the stroke half-width plus head-marker overhang (ADR-0043 D6). The
+/// FE live bbox helper mirrors this constant so selection / hit-test / export
+/// stay aligned. The head allowance is added only when an end carries a
+/// non-`None` marker.
+pub const PATH_HEAD_MARKER_PAD: f64 = 12.0;
+
+/// ADR-0043 D7 — degrade `path` connected endpoints whose target item is no
+/// longer present in `items[]` to `free { point: fallback_point }`. The PUT
+/// handler runs this *before* [`recompute_path_bboxes`] + [`validate`] so a
+/// target deletion preserves the path (ADR-0043 R4) rather than failing
+/// validation. The path itself is always kept — even when both endpoints
+/// degrade to free.
+pub fn degrade_dangling_path_endpoints(layout: &mut Layout) {
+    // Fast path: most layouts carry no `path` items (panel drag, figure edit,
+    // snippets, …), so skip the O(N) id-set build + clone entirely when there
+    // is nothing to degrade. Saves N String clones + a HashSet on every PUT
+    // for the common path-less case.
+    if !layout.items.iter().any(|it| matches!(it, Item::Path { .. })) {
+        return;
+    }
+    let live_ids: std::collections::HashSet<String> = layout
+        .items
+        .iter()
+        .map(|it| it.common().id.clone())
+        .collect();
+    for it in layout.items.iter_mut() {
+        if let Item::Path { from, to, .. } = it {
+            degrade_endpoint(from, &live_ids);
+            degrade_endpoint(to, &live_ids);
+        }
+    }
+}
+
+/// Convert a connected endpoint whose target id is absent to a free endpoint
+/// pinned at its `fallback_point`. No-op for free endpoints and for connected
+/// endpoints whose target still exists.
+fn degrade_endpoint(ep: &mut PathEndpoint, live_ids: &std::collections::HashSet<String>) {
+    let degraded_point = match ep {
+        PathEndpoint::Connected {
+            item_id,
+            fallback_point,
+            ..
+        } if !live_ids.contains(item_id) => Some(*fallback_point),
+        _ => None,
+    };
+    if let Some(point) = degraded_point {
+        *ep = PathEndpoint::Free { point };
+    }
+}
+
+/// Recompute the `x/y/w/h` bbox cache on every `Item::Path` (ADR-0043 D6) and
+/// refresh each connected endpoint's `fallback_point` to the live anchor
+/// coordinate. User-supplied path geometry is ignored — the BE is canonical
+/// so endpoint / target moves stay in sync without a FE round-trip.
 ///
 /// Two-pass to keep the borrow checker happy:
-///   1. Build `endpoint_geom: HashMap<&str, (x, y, w, h)>` from the
-///      non-connector items.
-///   2. Walk connectors mutably and write the recomputed BBox.
+///   1. Snapshot every non-path item's geometry by id.
+///   2. Walk paths mutably; resolve each endpoint to an actual point (free →
+///      its point; connected → target anchor, also written back into
+///      `fallback_point`), build the `[from, ...waypoints, to]` chain bbox,
+///      and pad by stroke half-width + head-marker allowance.
 ///
-/// Connectors whose endpoint is missing or also-a-connector are left
-/// untouched — `validate()` will reject the layout shortly after.
-pub fn recompute_connector_bboxes(layout: &mut Layout) {
-    // Pass 1 — snapshot every non-connector item's geometry by id.
+/// A connected endpoint whose target is missing keeps its `fallback_point`
+/// (the PUT path degrades such endpoints to `free` first via
+/// [`degrade_dangling_path_endpoints`]; standalone callers just reuse the
+/// cached point).
+pub fn recompute_path_bboxes(layout: &mut Layout) {
+    // Fast path: no `path` items → nothing to recompute. Skips the O(N)
+    // geometry-index build + id clones that Pass 2 would never consume.
+    if !layout.items.iter().any(|it| matches!(it, Item::Path { .. })) {
+        return;
+    }
+    // Pass 1 — snapshot every non-path item's geometry by id.
     let endpoint_geom: std::collections::HashMap<String, (f64, f64, f64, f64)> = layout
         .items
         .iter()
-        .filter(|it| !matches!(it, Item::Connector { .. }))
+        .filter(|it| !matches!(it, Item::Path { .. }))
         .map(|it| {
             let c = it.common();
             (c.id.clone(), (c.x, c.y, c.w, c.h))
         })
         .collect();
 
-    // Pass 2 — walk connectors and rewrite the BBox cache.
+    // Pass 2 — walk paths and rewrite the bbox cache + fallback points.
     for it in layout.items.iter_mut() {
-        let (from_id, to_id, from_anchor, to_anchor) = match it {
-            Item::Connector {
-                from_id,
-                to_id,
-                from_anchor,
-                to_anchor,
-                ..
-            } => (from_id.clone(), to_id.clone(), *from_anchor, *to_anchor),
-            _ => continue,
-        };
-        let Some(&from_geom) = endpoint_geom.get(&from_id) else {
+        let Item::Path {
+            common,
+            from,
+            to,
+            waypoints,
+            head_from,
+            head_to,
+            stroke_width,
+            ..
+        } = it
+        else {
             continue;
         };
-        let Some(&to_geom) = endpoint_geom.get(&to_id) else {
-            continue;
+        let (fx, fy) = resolve_path_endpoint(from, &endpoint_geom);
+        let (tx, ty) = resolve_path_endpoint(to, &endpoint_geom);
+        let mut min_x = fx.min(tx);
+        let mut max_x = fx.max(tx);
+        let mut min_y = fy.min(ty);
+        let mut max_y = fy.max(ty);
+        for wp in waypoints.iter() {
+            min_x = min_x.min(wp.x);
+            max_x = max_x.max(wp.x);
+            min_y = min_y.min(wp.y);
+            max_y = max_y.max(wp.y);
+        }
+        let head_pad = if *head_from != Head::None || *head_to != Head::None {
+            PATH_HEAD_MARKER_PAD
+        } else {
+            0.0
         };
-        let (fx, fy) = anchor_point(from_geom, from_anchor);
-        let (tx, ty) = anchor_point(to_geom, to_anchor);
-        let x = fx.min(tx);
-        let y = fy.min(ty);
-        let w = (fx - tx).abs();
-        let h = (fy - ty).abs();
-        let common = it.common_mut();
-        common.x = x;
-        common.y = y;
-        common.w = w;
-        common.h = h;
+        let pad = (*stroke_width as f64) / 2.0 + head_pad;
+        common.x = min_x - pad;
+        common.y = min_y - pad;
+        common.w = (max_x - min_x) + 2.0 * pad;
+        common.h = (max_y - min_y) + 2.0 * pad;
+    }
+}
+
+/// Resolve a path endpoint to its actual canvas point. For a connected
+/// endpoint with a live target this also refreshes `fallback_point` to the
+/// resolved anchor coordinate (ADR-0043 D7); a connected endpoint with a
+/// missing target falls back to the stored `fallback_point`.
+fn resolve_path_endpoint(
+    ep: &mut PathEndpoint,
+    geom: &std::collections::HashMap<String, (f64, f64, f64, f64)>,
+) -> (f64, f64) {
+    match ep {
+        PathEndpoint::Free { point } => (point.x, point.y),
+        PathEndpoint::Connected {
+            item_id,
+            anchor,
+            offset,
+            fallback_point,
+        } => {
+            if let Some(&g) = geom.get(item_id) {
+                let (ax, ay) = anchor_point(g, *anchor);
+                let dx = offset.as_ref().map_or(0.0, |point| point.x);
+                let dy = offset.as_ref().map_or(0.0, |point| point.y);
+                let px = ax + dx;
+                let py = ay + dy;
+                fallback_point.x = px;
+                fallback_point.y = py;
+                (px, py)
+            } else {
+                (fallback_point.x, fallback_point.y)
+            }
+        }
     }
 }
 
@@ -1595,198 +1758,423 @@ mod tests {
         }
     }
 
-    fn connector_between(
-        id: &str,
-        from_id: &str,
-        to_id: &str,
-        from_anchor: Anchor,
-        to_anchor: Anchor,
-    ) -> Item {
-        Item::Connector {
-            common: item_common(id),
-            from_id: from_id.into(),
-            to_id: to_id.into(),
-            from_anchor,
-            to_anchor,
-            direction: Direction::Uni,
-            stroke: "#0d99ff".into(),
-            stroke_width: 2,
-            stroke_dash: None,
-            head_from: Head::None,
-            head_to: Head::Arrow,
-            routing: Routing::Straight,
-            waypoints: None,
-            label_offset: None,
+    const WP_1: &str = "aaaa0000-0000-4000-8000-000000000010";
+    const WP_2: &str = "bbbb0000-0000-4000-8000-000000000011";
+
+    /// Connected endpoint helper with a zeroed `fallback_point`.
+    fn connected(item_id: &str, anchor: Anchor) -> PathEndpoint {
+        PathEndpoint::Connected {
+            item_id: item_id.into(),
+            anchor,
+            offset: None,
+            fallback_point: Point { x: 0.0, y: 0.0 },
         }
     }
 
-    /// §D row 1 — Connector with two existing non-connector endpoints
-    /// validates cleanly.
+    /// `path` connecting two items end-to-end (both endpoints connected).
+    fn path_between(id: &str, from_id: &str, to_id: &str, fa: Anchor, ta: Anchor) -> Item {
+        Item::Path {
+            common: item_common(id),
+            from: connected(from_id, fa),
+            to: connected(to_id, ta),
+            routing: Routing::Straight,
+            waypoints: vec![],
+            head_from: Head::None,
+            head_to: Head::Arrow,
+            stroke: "#0d99ff".into(),
+            stroke_width: 2,
+            stroke_dash: None,
+        }
+    }
+
+    /// ADR-0043 D1 — a free/free path with waypoints + heads round-trips
+    /// losslessly through serialize → deserialize.
     #[test]
-    fn connector_valid_endpoints_ok() {
+    fn path_free_round_trips() {
+        let raw = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "path",
+                "id": UUID_C, "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0, "z": 5,
+                "visibility": "visible", "locked": false,
+                "label": "", "description": "", "minimized": false,
+                "from": { "kind": "free", "point": { "x": 10.0, "y": 20.0 } },
+                "to": { "kind": "free", "point": { "x": 200.0, "y": 80.0 } },
+                "routing": "orthogonal",
+                "waypoints": [
+                    { "id": WP_1, "x": 100.0, "y": 20.0 },
+                    { "id": WP_2, "x": 100.0, "y": 80.0 }
+                ],
+                "head_from": "none", "head_to": "arrow",
+                "stroke": "#0d99ff", "stroke_width": 2,
+                "stroke_dash": "dash"
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        let parsed: Layout = serde_json::from_value(raw).expect("parses");
+        let Item::Path {
+            from,
+            to,
+            routing,
+            waypoints,
+            head_to,
+            stroke_dash,
+            ..
+        } = &parsed.items[0]
+        else {
+            panic!("expected Item::Path");
+        };
+        assert!(matches!(from, PathEndpoint::Free { .. }));
+        assert!(matches!(to, PathEndpoint::Free { .. }));
+        assert_eq!(*routing, Routing::Orthogonal);
+        assert_eq!(waypoints.len(), 2);
+        assert_eq!(*head_to, Head::Arrow);
+        assert_eq!(*stroke_dash, Some(FigureStrokeDash::Dash));
+        // Round-trip equality.
+        let v = serde_json::to_value(&parsed).unwrap();
+        let reparsed: Layout = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed, reparsed);
+    }
+
+    /// ADR-0043 D5 — a connected/connected path between two rects validates
+    /// and round-trips.
+    #[test]
+    fn path_connected_round_trips() {
         let l = Layout {
             schema_version: 2,
             groups: vec![],
             items: vec![
                 rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
                 rect_at(UUID_B, 300.0, 200.0, 80.0, 40.0),
-                connector_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W),
+                path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W),
             ],
             viewport: Viewport::default(),
         };
         assert_eq!(validate(&l), Ok(()));
+        let v = serde_json::to_value(&l).unwrap();
+        let reparsed: Layout = serde_json::from_value(v).unwrap();
+        assert_eq!(l, reparsed);
     }
 
-    /// §D row 2 — `from_id` does not appear in items[] → reject.
+    /// ADR-0043 D7 — raw validation rejects a connected endpoint whose target
+    /// id is absent (the PUT path degrades these to free *before* validate).
     #[test]
-    fn connector_endpoint_missing_rejected() {
+    fn path_rejects_missing_endpoint() {
         let l = Layout {
             schema_version: 2,
             groups: vec![],
             items: vec![
                 rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
-                // UUID_B is referenced but never defined.
-                connector_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W),
+                // UUID_B referenced by the path but never defined.
+                path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W),
             ],
             viewport: Viewport::default(),
         };
-        assert_eq!(validate(&l), Err(ValidationError::ConnectorEndpointMissing));
+        assert_eq!(validate(&l), Err(ValidationError::PathEndpointMissing));
     }
 
-    /// §D row 3 — `from_id == to_id` → reject (MVP self-loop).
+    /// ADR-0043 D5 — a connected endpoint targeting a non-connectable item
+    /// (`line`) is rejected.
     #[test]
-    fn connector_self_loop_rejected() {
+    fn path_rejects_invalid_endpoint_type() {
+        let line_id = "cccc0000-0000-4000-8000-000000000012";
         let l = Layout {
             schema_version: 2,
             groups: vec![],
             items: vec![
                 rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
-                connector_between(UUID_C, UUID_A, UUID_A, Anchor::N, Anchor::S),
+                Item::Line {
+                    common: item_common(line_id),
+                    stroke: "#000".into(),
+                    stroke_width: 2,
+                    x2: 100.0,
+                    y2: 0.0,
+                    stroke_dash: None,
+                    head_from: Head::None,
+                    head_to: Head::None,
+                },
+                path_between(UUID_C, UUID_A, line_id, Anchor::E, Anchor::W),
             ],
             viewport: Viewport::default(),
         };
-        assert_eq!(validate(&l), Err(ValidationError::ConnectorSelfLoop));
+        assert_eq!(validate(&l), Err(ValidationError::PathInvalidEndpoint));
     }
 
-    /// §D row 4 — connector endpoint points at another connector → reject
-    /// (Q2 chain ban).
+    /// ADR-0043 D5 — both endpoints connected to the same item is a self-loop
+    /// reject (MVP).
     #[test]
-    fn connector_invalid_endpoint_rejected() {
-        // First connector C1 ties UUID_A → UUID_B. A second connector C2
-        // tries to attach UUID_A → C1, which is a connector → reject.
-        let c1 = "11110000-0000-4111-8222-000000000005";
-        let c2 = "22220000-0000-4111-8222-000000000006";
+    fn path_rejects_self_loop() {
         let l = Layout {
             schema_version: 2,
             groups: vec![],
             items: vec![
                 rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
-                rect_at(UUID_B, 200.0, 100.0, 80.0, 40.0),
-                connector_between(c1, UUID_A, UUID_B, Anchor::E, Anchor::W),
-                connector_between(c2, UUID_A, c1, Anchor::E, Anchor::W),
+                path_between(UUID_C, UUID_A, UUID_A, Anchor::N, Anchor::S),
             ],
             viewport: Viewport::default(),
         };
-        assert_eq!(validate(&l), Err(ValidationError::ConnectorInvalidEndpoint));
+        assert_eq!(validate(&l), Err(ValidationError::PathSelfLoop));
     }
 
-    /// §D row 5 — user-supplied BBox is ignored; `recompute_connector_bboxes`
-    /// rewrites `x/y/w/h` from the two anchor points. ADR-0036 Q4.
+    /// ADR-0043 D9 — a non-UUID waypoint id is rejected.
     #[test]
-    fn connector_bbox_recomputed() {
+    fn path_rejects_bad_waypoint_id() {
+        let mut p = path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W);
+        if let Item::Path { waypoints, .. } = &mut p {
+            waypoints.push(PathWaypoint {
+                id: "not-a-uuid".into(),
+                x: 50.0,
+                y: 50.0,
+            });
+        }
+        let l = Layout {
+            schema_version: 2,
+            groups: vec![],
+            items: vec![
+                rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
+                rect_at(UUID_B, 300.0, 200.0, 80.0, 40.0),
+                p,
+            ],
+            viewport: Viewport::default(),
+        };
+        assert_eq!(
+            validate(&l),
+            Err(ValidationError::PathWaypointBadId("not-a-uuid".into()))
+        );
+    }
+
+    /// ADR-0043 D9 — duplicate waypoint ids within one path are rejected.
+    #[test]
+    fn path_rejects_duplicate_waypoint_id() {
+        let mut p = path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W);
+        if let Item::Path { waypoints, .. } = &mut p {
+            waypoints.push(PathWaypoint {
+                id: WP_1.into(),
+                x: 50.0,
+                y: 50.0,
+            });
+            waypoints.push(PathWaypoint {
+                id: WP_1.into(),
+                x: 60.0,
+                y: 60.0,
+            });
+        }
+        let l = Layout {
+            schema_version: 2,
+            groups: vec![],
+            items: vec![
+                rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
+                rect_at(UUID_B, 300.0, 200.0, 80.0, 40.0),
+                p,
+            ],
+            viewport: Viewport::default(),
+        };
+        assert_eq!(
+            validate(&l),
+            Err(ValidationError::PathDuplicateWaypointId(WP_1.into()))
+        );
+    }
+
+    /// ADR-0043 D6/D7 — `recompute_path_bboxes` overwrites the FE-supplied
+    /// bbox cache from the endpoint chain and refreshes connected
+    /// `fallback_point`s to the live anchor coordinates.
+    #[test]
+    fn path_recomputes_bbox_and_fallback() {
         // Anchor A:E = (100, 25). Anchor B:W = (300, 220).
-        // BBox = (100, 25, 200, 195).
+        // Chain bbox = (100, 25)..(300, 220). head_to=arrow → pad =
+        // stroke_width/2 (1) + PATH_HEAD_MARKER_PAD (12) = 13.
         let mut l = Layout {
             schema_version: 2,
             groups: vec![],
             items: vec![
                 rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
                 rect_at(UUID_B, 300.0, 200.0, 80.0, 40.0),
-                {
-                    // Build a connector with deliberately wrong x/y/w/h so
-                    // we can prove the recompute overwrites them.
-                    let mut c = connector_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W);
-                    let cc = c.common_mut();
-                    cc.x = -9999.0;
-                    cc.y = -9999.0;
-                    cc.w = 1.0;
-                    cc.h = 1.0;
-                    c
-                },
+                path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W),
             ],
             viewport: Viewport::default(),
         };
-        recompute_connector_bboxes(&mut l);
-        let con = l
+        recompute_path_bboxes(&mut l);
+        let path = l
             .items
             .iter()
-            .find(|it| matches!(it, Item::Connector { .. }))
+            .find(|it| matches!(it, Item::Path { .. }))
             .unwrap();
-        let cc = con.common();
-        assert_eq!(cc.x, 100.0);
-        assert_eq!(cc.y, 25.0);
-        assert_eq!(cc.w, 200.0);
-        assert_eq!(cc.h, 195.0);
-        // validate must still pass after the recompute (endpoints exist,
-        // no chain, no self-loop).
+        let c = path.common();
+        assert_eq!((c.x, c.y, c.w, c.h), (87.0, 12.0, 226.0, 221.0));
+        let Item::Path { from, to, .. } = path else {
+            panic!("expected Item::Path");
+        };
+        // Connected fallback_points refreshed to the live anchor coords.
+        assert_eq!(
+            *from,
+            PathEndpoint::Connected {
+                item_id: UUID_A.into(),
+                anchor: Anchor::E,
+                offset: None,
+                fallback_point: Point { x: 100.0, y: 25.0 },
+            }
+        );
+        assert_eq!(
+            *to,
+            PathEndpoint::Connected {
+                item_id: UUID_B.into(),
+                anchor: Anchor::W,
+                offset: None,
+                fallback_point: Point { x: 300.0, y: 220.0 },
+            }
+        );
         assert_eq!(validate(&l), Ok(()));
     }
 
-    /// §D row 6 — JSON example from ADR-0036 D1 deserializes and round-trips
-    /// to an identical Value. Confirms enum rename mappings (Anchor's
-    /// uppercase keywords, Direction lowercase, etc.).
+    /// Connected endpoint offset is resolved relative to the target anchor and
+    /// included in the refreshed fallback point.
     #[test]
-    fn connector_serde_roundtrip() {
-        let raw = json!({
-            "schema_version": 2,
-            "groups": [],
-            "items": [
-                {
-                    "type": "rect",
-                    "id": UUID_A, "parent_id": null,
-                    "x": 0.0, "y": 0.0, "w": 100.0, "h": 50.0, "z": 0,
-                    "visibility": "visible", "locked": false,
-                    "label": "", "description": "", "minimized": false,
-                    "stroke": "#000", "fill": "#fff", "stroke_width": 1,
-                },
-                {
-                    "type": "rect",
-                    "id": UUID_B, "parent_id": null,
-                    "x": 300.0, "y": 200.0, "w": 80.0, "h": 40.0, "z": 0,
-                    "visibility": "visible", "locked": false,
-                    "label": "", "description": "", "minimized": false,
-                    "stroke": "#000", "fill": "#fff", "stroke_width": 1,
-                },
-                {
-                    "type": "connector",
-                    "id": UUID_C, "parent_id": null,
-                    "x": 100.0, "y": 25.0, "w": 200.0, "h": 195.0, "z": 12,
-                    "visibility": "visible", "locked": false,
-                    "label": "data flow", "description": "", "minimized": false,
-                    "from_id": UUID_A, "to_id": UUID_B,
-                    "from_anchor": "E", "to_anchor": "W",
-                    "direction": "uni",
-                    "stroke": "#0d99ff", "stroke_width": 2,
-                    "head_from": "none", "head_to": "arrow",
-                    "routing": "straight",
-                },
+    fn path_connected_endpoint_offset_updates_fallback() {
+        let mut p = path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W);
+        if let Item::Path { from, .. } = &mut p {
+            *from = PathEndpoint::Connected {
+                item_id: UUID_A.into(),
+                anchor: Anchor::E,
+                offset: Some(Point { x: 12.0, y: -6.0 }),
+                fallback_point: Point { x: 0.0, y: 0.0 },
+            };
+        }
+        let mut l = Layout {
+            schema_version: 2,
+            groups: vec![],
+            items: vec![
+                rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0),
+                rect_at(UUID_B, 300.0, 200.0, 80.0, 40.0),
+                p,
             ],
-            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 },
+            viewport: Viewport::default(),
+        };
+        recompute_path_bboxes(&mut l);
+        let Item::Path { from, .. } = l.items.last().unwrap() else {
+            panic!("expected Item::Path");
+        };
+        assert_eq!(
+            *from,
+            PathEndpoint::Connected {
+                item_id: UUID_A.into(),
+                anchor: Anchor::E,
+                offset: Some(Point { x: 12.0, y: -6.0 }),
+                fallback_point: Point { x: 112.0, y: 19.0 },
+            }
+        );
+    }
+
+    /// ADR-0043 D7 / R4 — deleting a connected target degrades that endpoint
+    /// to `free` at its `fallback_point` and keeps the path.
+    #[test]
+    fn path_target_deletion_degrades_to_free() {
+        let mut p = path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W);
+        // Seed the `to` endpoint's fallback so the degrade has a point to
+        // fall back to (normally set by a prior recompute).
+        if let Item::Path { to, .. } = &mut p {
+            *to = PathEndpoint::Connected {
+                item_id: UUID_B.into(),
+                anchor: Anchor::W,
+                offset: None,
+                fallback_point: Point { x: 300.0, y: 220.0 },
+            };
+        }
+        // UUID_B is *not* present → it was deleted.
+        let mut l = Layout {
+            schema_version: 2,
+            groups: vec![],
+            items: vec![rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0), p],
+            viewport: Viewport::default(),
+        };
+        degrade_dangling_path_endpoints(&mut l);
+        let Item::Path { from, to, .. } = l
+            .items
+            .iter()
+            .find(|it| matches!(it, Item::Path { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        // `from` (→ live UUID_A) stays connected; `to` (→ deleted UUID_B)
+        // degrades to free at its fallback_point. The path survives.
+        assert!(matches!(from, PathEndpoint::Connected { .. }));
+        assert_eq!(
+            *to,
+            PathEndpoint::Free {
+                point: Point { x: 300.0, y: 220.0 }
+            }
+        );
+        // After degrade the layout validates (no dangling endpoint).
+        recompute_path_bboxes(&mut l);
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// ADR-0043 D2 — `line` head fields round-trip, and a legacy line record
+    /// without them defaults both to `none`.
+    #[test]
+    fn line_head_fields_round_trip() {
+        let raw = json!({
+            "type": "line",
+            "id": UUID_A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 100.0, "h": 0.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "stroke_width": 2, "x2": 100.0, "y2": 0.0,
+            "head_from": "circle", "head_to": "arrow"
         });
-        let parsed: Layout = serde_json::from_value(raw.clone()).expect("parses");
-        let v: Value = serde_json::to_value(&parsed).expect("serializes");
-        // Re-parse the round-tripped form so we compare logical equality
-        // (field ordering differences are fine).
-        let reparsed: Layout = serde_json::from_value(v.clone()).expect("re-parses");
-        assert_eq!(parsed, reparsed);
-        // Spot-check the wire shape — connector keywords survive the trip.
-        let conn = &v["items"][2];
-        assert_eq!(conn["type"], "connector");
-        assert_eq!(conn["from_anchor"], "E");
-        assert_eq!(conn["to_anchor"], "W");
-        assert_eq!(conn["direction"], "uni");
-        assert_eq!(conn["head_to"], "arrow");
-        assert_eq!(conn["routing"], "straight");
+        let item: Item = serde_json::from_value(raw).unwrap();
+        let Item::Line {
+            head_from, head_to, ..
+        } = &item
+        else {
+            panic!("expected Item::Line");
+        };
+        assert_eq!(*head_from, Head::Circle);
+        assert_eq!(*head_to, Head::Arrow);
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["head_from"], "circle");
+        assert_eq!(v["head_to"], "arrow");
+
+        // Legacy line (no head fields) → both default to None.
+        let legacy = json!({
+            "type": "line",
+            "id": UUID_B, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 100.0, "h": 0.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "stroke": "#000", "stroke_width": 2, "x2": 100.0, "y2": 0.0
+        });
+        let old: Item = serde_json::from_value(legacy).unwrap();
+        let Item::Line {
+            head_from, head_to, ..
+        } = &old
+        else {
+            panic!("expected Item::Line");
+        };
+        assert_eq!(*head_from, Head::None);
+        assert_eq!(*head_to, Head::None);
+    }
+
+    /// ADR-0043 D1 — the legacy `connector` type was removed; a record
+    /// carrying it no longer deserializes against the current schema.
+    #[test]
+    fn connector_type_no_longer_deserializes() {
+        let raw = json!({
+            "type": "connector",
+            "id": UUID_C, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0, "z": 0,
+            "visibility": "visible", "locked": false,
+            "label": "", "description": "", "minimized": false,
+            "from_id": UUID_A, "to_id": UUID_B,
+            "from_anchor": "E", "to_anchor": "W",
+            "direction": "uni",
+            "stroke": "#0d99ff", "stroke_width": 2,
+            "head_from": "none", "head_to": "arrow", "routing": "straight"
+        });
+        let parsed: Result<Item, _> = serde_json::from_value(raw);
+        assert!(parsed.is_err(), "connector type must no longer deserialize");
     }
 
     // ── ADR-0018 D4 amend ① — Rect / Ellipse / Line schema batch 5 ──
@@ -2039,6 +2427,8 @@ mod tests {
             x2: 100.0,
             y2: 0.0,
             stroke_dash: None,
+            head_from: Head::None,
+            head_to: Head::None,
         });
         assert_eq!(validate(&l), Ok(()));
     }
@@ -2368,12 +2758,18 @@ mod tests {
     /// identical for these single-word variants).
     #[test]
     fn font_family_snake_case_wire() {
-        assert_eq!(serde_json::to_string(&FontFamily::Sans).unwrap(), "\"sans\"");
+        assert_eq!(
+            serde_json::to_string(&FontFamily::Sans).unwrap(),
+            "\"sans\""
+        );
         assert_eq!(
             serde_json::to_string(&FontFamily::Serif).unwrap(),
             "\"serif\""
         );
-        assert_eq!(serde_json::to_string(&FontFamily::Mono).unwrap(), "\"mono\"");
+        assert_eq!(
+            serde_json::to_string(&FontFamily::Mono).unwrap(),
+            "\"mono\""
+        );
         let parsed: FontFamily = serde_json::from_str("\"serif\"").unwrap();
         assert_eq!(parsed, FontFamily::Serif);
     }
@@ -2592,10 +2988,7 @@ mod tests {
             common: item_common(UUID_A),
             entries,
         });
-        assert_eq!(
-            validate(&l),
-            Err(ValidationError::SnippetsEntriesTooMany)
-        );
+        assert_eq!(validate(&l), Err(ValidationError::SnippetsEntriesTooMany));
     }
 
     #[test]
@@ -2652,13 +3045,14 @@ mod tests {
         assert_eq!(err.code(), "bad_snippet_entry_id");
     }
 
-    /// ADR-0042 interim cross-language drift guard. The OpenAPI codegen chain
-    /// does not carry the canvas `Item` schema (gen-openapi is a stub), so the
-    /// BE/FE contract is hand-mirrored. This test anchors the shared golden
-    /// fixture against the *live* `schema.rs` types: if a field is dropped or
-    /// renamed here while the fixture (the FE-facing contract) still carries
-    /// it, deserialize/validate/round-trip breaks loudly. See
-    /// `shared/contract/README.md` + `.scratch/openapi-schema-contract/`.
+    /// ADR-0042 cross-language drift guard. The OpenAPI codegen chain now
+    /// carries the canvas `Item` schema, but FE still hand-mirrors the complex
+    /// variants, so this shared golden fixture stays a cross-language
+    /// regression sample. It anchors the fixture against the *live* `schema.rs`
+    /// types: if a field is dropped or renamed here while the fixture (the
+    /// FE-facing contract) still carries it, deserialize/validate/round-trip
+    /// breaks loudly. See `shared/contract/README.md` +
+    /// `.scratch/openapi-schema-contract/`.
     #[test]
     fn contract_sample_layout_deserializes_validates_and_round_trips() {
         const SAMPLE: &str =
@@ -2674,7 +3068,7 @@ mod tests {
         assert_eq!(once, twice_val, "contract sample must round-trip stably");
         assert_eq!(
             once["items"].as_array().map(|a| a.len()),
-            Some(4),
+            Some(5),
             "contract sample item count drifted — update fixture + this guard together"
         );
     }

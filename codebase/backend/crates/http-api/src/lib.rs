@@ -69,9 +69,10 @@ pub use file_open::{
     FileOpenContext,
 };
 pub use schema::{
-    detect_shape, migrate_v1_to_v2, recompute_connector_bboxes, validate as validate_layout_v2,
-    Anchor, Direction, Group, Head, Item, ItemCommon, Layout, Point, Routing, SchemaShape,
-    StrokeDash, ValidationError, Viewport, Visibility, SCHEMA_VERSION,
+    degrade_dangling_path_endpoints, detect_shape, migrate_v1_to_v2, recompute_path_bboxes,
+    validate as validate_layout_v2, Anchor, Group, Head, Item, ItemCommon, Layout, PathEndpoint,
+    PathWaypoint, Point, Routing, SchemaShape, ValidationError, Viewport, Visibility,
+    SCHEMA_VERSION,
 };
 pub use session_lock::{fresh_server_id, Lease, LockError, LockGuard, LockState};
 pub use sessions::{SessionCache, SessionError, SessionLayout};

@@ -13,9 +13,9 @@
 //   - Select / Hand 는 mode 라서 항상 sticky (one-shot 적용 X) — 사용 중에는
 //     lock 무관, mode 자체가 "지속".
 //
-// 도구 12개 (Stage 5 / ADR-0018 D4 의 type 과 1:1):
+// 도구 13개 (Stage 5 / ADR-0018 D4 + ADR-0043 의 type 과 1:1):
 //   select / hand / terminal / text / note / rect / ellipse / line /
-//   free_draw / image / document / file_path
+//   path / free_draw / image / document / file_path
 
 export type ToolId =
   | 'select'
@@ -26,6 +26,7 @@ export type ToolId =
   | 'rect'
   | 'ellipse'
   | 'line'
+  | 'path'
   | 'free_draw'
   | 'image'
   | 'document'

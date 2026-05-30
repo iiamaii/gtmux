@@ -14,7 +14,7 @@
 //
 // clipboardShortcuts / ContextMenu / (Phase B) editingShortcuts 의 공통 helper.
 
-import type { CanvasItem, CanvasLayout, LineItem } from '$lib/types/canvas';
+import type { CanvasItem, CanvasLayout, LineItem, PathEndpoint, PathItem } from '$lib/types/canvas';
 import type { Group } from '$lib/types/group';
 import type { ClipboardPayload } from '$lib/stores/clipboardStore.svelte';
 import { descendantItems, descendantGroups } from '$lib/types/group';
@@ -113,6 +113,15 @@ export async function pasteItems(
       const lineOut = out as LineItem;
       lineOut.x2 = (it as LineItem).x2 + dx;
       lineOut.y2 = (it as LineItem).y2 + dy;
+    } else if (out.type === 'path') {
+      const pathOut = out as PathItem;
+      pathOut.from = offsetPathEndpoint(pathOut.from, dx, dy);
+      pathOut.to = offsetPathEndpoint(pathOut.to, dx, dy);
+      pathOut.waypoints = pathOut.waypoints?.map((p) => ({
+        ...p,
+        x: p.x + dx,
+        y: p.y + dy,
+      }));
     }
     return out;
   });
@@ -223,13 +232,46 @@ function cloneSubtree(
     const parentInPool = src.parent_id !== null && sourceGroupIds.has(src.parent_id);
     const newParentId = parentInPool ? idMap.get(src.parent_id!)! : anchorParentId;
     if (!parentInPool) topLevelIds.push(newId);
-    const base = { ...cloned, id: newId, parent_id: newParentId };
+    let base = { ...cloned, id: newId, parent_id: newParentId } as CanvasItem;
+    if (src.type === 'path' && base.type === 'path') {
+      base = remapClonedPath(base, idMap);
+    }
     // ADR-0040 D9: label_auto intentionally differs from the id-only clone rule
     // so pasted text-capable items derive their label on the next text edit.
     return src.type === 'text' || src.type === 'rect' || src.type === 'ellipse'
       ? ({ ...base, label_auto: true } as CanvasItem)
-      : (base as CanvasItem);
+      : base;
   });
 
   return { items: newItems, groups: newGroups, topLevelIds };
+}
+
+function offsetPathEndpoint(endpoint: PathEndpoint, dx: number, dy: number): PathEndpoint {
+  if (endpoint.kind === 'free') {
+    return { kind: 'free', point: { x: endpoint.point.x + dx, y: endpoint.point.y + dy } };
+  }
+  return {
+    ...endpoint,
+    fallback_point: {
+      x: endpoint.fallback_point.x + dx,
+      y: endpoint.fallback_point.y + dy,
+    },
+  };
+}
+
+function remapClonedPath(path: PathItem, idMap: ReadonlyMap<string, string>): PathItem {
+  const remapEndpoint = (endpoint: PathEndpoint): PathEndpoint => {
+    if (endpoint.kind === 'free') return endpoint;
+    const nextId = idMap.get(endpoint.item_id);
+    if (nextId === undefined) {
+      return { kind: 'free', point: endpoint.fallback_point };
+    }
+    return { ...endpoint, item_id: nextId };
+  };
+  return {
+    ...path,
+    from: remapEndpoint(path.from),
+    to: remapEndpoint(path.to),
+    waypoints: path.waypoints?.map((p) => ({ ...p, id: generateUuidV4() })),
+  };
 }

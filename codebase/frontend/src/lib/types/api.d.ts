@@ -8,24 +8,16 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
-         * @description 9-point connector anchor — 8 cardinal/diagonal edges + center (ADR-0036 D2).
-         *     Wire form uses the uppercase keyword for the 8 edges and lowercase
-         *     `"center"` for the middle. The `"auto"` mode is P1+.
+         * @description 9-point anchor — 8 cardinal/diagonal edges + center (ADR-0043 D1, was
+         *     ADR-0036 D2). Used by `path` connected endpoints. Wire form uses the
+         *     uppercase keyword for the 8 edges and lowercase `"center"` for the middle.
          * @enum {string}
          */
         Anchor: "N" | "NE" | "E" | "SE" | "S" | "SW" | "W" | "NW" | "center";
         /**
-         * @description Connector arrowhead direction mode (ADR-0036 D4). `head_from` / `head_to`
-         *     may still override the default mapping per-end.
-         * @enum {string}
-         */
-        Direction: "uni" | "bi" | "none";
-        /**
-         * @description Figure stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20 batch 5,
-         *     rect / ellipse / line). Kept distinct from connector's [`StrokeDash`]
-         *     because the figure form is a 4-variant enum with an explicit `Solid`
-         *     default, while connector's wire uses `null` for solid (round-trip
-         *     compatibility would break if the two were unified).
+         * @description Figure / path stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20
+         *     batch 5; extended to `path` by ADR-0043). 4-variant enum with an explicit
+         *     `Solid` default.
          *
          *     Wire form is `snake_case`: `"solid" | "dash" | "dot" | "dash_dot"`.
          * @enum {string}
@@ -67,10 +59,13 @@ export interface components {
             visibility: components["schemas"]["Visibility"];
         };
         /**
-         * @description Per-end connector head marker (ADR-0036 D4).
+         * @description Per-end head marker for `path` / `line` (ADR-0043 D2/D3). `direction` was
+         *     removed (ADR-0043 D3) — directionality is derived from the head pair:
+         *     only `Arrow` carries direction meaning; `Circle` / `Diamond` are plain
+         *     endpoint markers. Defaults to `None`.
          * @enum {string}
          */
-        Head: "arrow" | "circle" | "diamond" | "none";
+        Head: "none" | "arrow" | "circle" | "diamond";
         /**
          * @description Canvas Item discriminated union (ADR-0018 D1, D4).
          *
@@ -220,6 +215,12 @@ export interface components {
             /** @enum {string} */
             type: "ellipse";
         }) | (components["schemas"]["ItemCommon"] & {
+            /**
+             * @description ADR-0043 D2 — per-end head markers. `#[serde(default)]` (→ `None`)
+             *     so legacy line records pre-dating ADR-0043 round-trip unchanged.
+             */
+            head_from?: components["schemas"]["Head"];
+            head_to?: components["schemas"]["Head"];
             stroke: string;
             stroke_dash?: null | components["schemas"]["FigureStrokeDash"];
             /** Format: int32 */
@@ -278,23 +279,19 @@ export interface components {
             /** @enum {string} */
             type: "file_path";
         }) | (components["schemas"]["ItemCommon"] & {
-            direction: components["schemas"]["Direction"];
-            from_anchor: components["schemas"]["Anchor"];
-            from_id: string;
+            from: components["schemas"]["PathEndpoint"];
             head_from: components["schemas"]["Head"];
             head_to: components["schemas"]["Head"];
-            label_offset?: null | components["schemas"]["Point"];
             routing: components["schemas"]["Routing"];
             stroke: string;
-            stroke_dash?: null | components["schemas"]["StrokeDash"];
+            stroke_dash?: null | components["schemas"]["FigureStrokeDash"];
             /** Format: int32 */
             stroke_width: number;
-            to_anchor: components["schemas"]["Anchor"];
-            to_id: string;
-            waypoints?: components["schemas"]["Point"][] | null;
+            to: components["schemas"]["PathEndpoint"];
+            waypoints?: components["schemas"]["PathWaypoint"][];
         } & {
             /** @enum {string} */
-            type: "connector";
+            type: "path";
         }) | (components["schemas"]["ItemCommon"] & {
             /**
              * @description 0..[`SNIPPETS_ENTRIES_CAP`] entries. Order is preserved verbatim;
@@ -347,7 +344,41 @@ export interface components {
             /** @description Canvas viewport state (pan + zoom). */
             viewport?: components["schemas"]["Viewport"];
         };
-        /** @description 2D point — shared payload for `free_draw` and `connector` items. */
+        /**
+         * @description ADR-0043 D1 — one endpoint of a `path` item. A `free` endpoint pins to an
+         *     absolute canvas point; a `connected` endpoint tracks another item's anchor
+         *     and keeps a `fallback_point` (the last resolved anchor coordinate plus
+         *     optional offset) so the endpoint can degrade to `free` when the target is
+         *     deleted (ADR-0043 D7).
+         *
+         *     Wire form is internally tagged on `kind`: `{"kind":"free","point":{..}}`
+         *     or `{"kind":"connected","item_id":..,"anchor":..,"offset"?:{..},"fallback_point":{..}}`.
+         */
+        PathEndpoint: {
+            /** @enum {string} */
+            kind: "free";
+            point: components["schemas"]["Point"];
+        } | {
+            anchor: components["schemas"]["Anchor"];
+            fallback_point: components["schemas"]["Point"];
+            item_id: string;
+            /** @enum {string} */
+            kind: "connected";
+            offset?: null | components["schemas"]["Point"];
+        };
+        /**
+         * @description ADR-0043 D9 — a path waypoint (intermediate routing point). Carries a
+         *     stable UUID id (the endpoints use `from`/`to` themselves as identity, so
+         *     only waypoints need an explicit id).
+         */
+        PathWaypoint: {
+            id: string;
+            /** Format: double */
+            x: number;
+            /** Format: double */
+            y: number;
+        };
+        /** @description 2D point — shared payload for `free_draw` points and `path` endpoints. */
         Point: {
             /** Format: double */
             x: number;
@@ -355,9 +386,10 @@ export interface components {
             y: number;
         };
         /**
-         * @description Connector routing style (ADR-0036 D3). MVP wires `Straight` only; the
-         *     other two variants persist for round-trip but the FE renderer falls
-         *     back to straight until P1.
+         * @description Path routing style (ADR-0043 D9). The point chain
+         *     `[from, ...waypoints, to]` is connected as straight segments
+         *     (`Straight`), axis-aligned segments (`Orthogonal`), or a smooth spline
+         *     (`Bezier`). New-path default is `Orthogonal` (ADR-0043 D13, FE-side).
          * @enum {string}
          */
         Routing: "straight" | "orthogonal" | "bezier";
@@ -383,11 +415,6 @@ export interface components {
              */
             key: string;
         };
-        /**
-         * @description Connector stroke dash pattern (ADR-0036 D1 — optional, `null` for solid).
-         * @enum {string}
-         */
-        StrokeDash: "dash" | "dot";
         /**
          * @description Horizontal alignment for text Canvas Items. Defaults to center so newly
          *     created empty text boxes edit from their visual center.

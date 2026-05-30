@@ -27,9 +27,17 @@ import type {
   FreeDrawItem,
   Point,
   SnippetsItem,
+  PathItem,
 } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { generateUuidV4 } from '$lib/uuid';
+import {
+  autoRoutePath,
+  bestAnchorPair,
+  computePathBBox,
+  type ConnectableItem,
+} from './pathGeometry';
+import { getPathStyleMemory, type PathStyleMemory } from './pathStyleMemory';
 
 /** 신규 item 의 기본 좌표 + 크기 default. ADR-0018 D7 의 z 정책은 commit 시점에 결정. */
 export const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
@@ -393,7 +401,94 @@ export function createLineItem(
     stroke_width: 2,
     x2: end.x,
     y2: end.y,
+    head_from: 'none',
+    head_to: 'none',
   };
+}
+
+const DEFAULT_PATH_DELTA = { dx: 240, dy: 80 };
+
+export function createPathItem(
+  pos: { x: number; y: number },
+  to?: { x: number; y: number },
+  options: Partial<PathStyleMemory> = {},
+): PathItem {
+  const style = { ...getPathStyleMemory(), ...options };
+  const end = to ?? { x: pos.x + DEFAULT_PATH_DELTA.dx, y: pos.y + DEFAULT_PATH_DELTA.dy };
+  const base: PathItem = {
+    id: freshId(),
+    parent_id: null,
+    x: pos.x,
+    y: pos.y,
+    w: 1,
+    h: 1,
+    z: 0,
+    visibility: 'visible',
+    locked: false,
+    minimized: false,
+    type: 'path',
+    from: { kind: 'free', point: pos },
+    to: {
+      kind: 'free',
+      point: end,
+    },
+    routing: style.routing,
+    head_from: style.head_from,
+    head_to: style.head_to,
+    stroke: style.stroke,
+    stroke_width: style.stroke_width,
+    stroke_dash: style.stroke_dash === 'solid' ? undefined : style.stroke_dash,
+  };
+  const box = computePathBBox(base, new Map());
+  return { ...base, ...box };
+}
+
+export function createConnectedPath(
+  fromItem: ConnectableItem,
+  toItem: ConnectableItem,
+  style: Partial<PathStyleMemory> = {},
+  canvasItems?: ReadonlyMap<string, CanvasItem>,
+): PathItem | null {
+  if (fromItem.id === toItem.id) return null;
+  const resolvedStyle = { ...getPathStyleMemory(), ...style };
+  const anchors = bestAnchorPair(fromItem, toItem);
+  const fromPoint = {
+    kind: 'connected' as const,
+    item_id: fromItem.id,
+    anchor: anchors.from,
+    fallback_point: { x: 0, y: 0 },
+  };
+  const toPoint = {
+    kind: 'connected' as const,
+    item_id: toItem.id,
+    anchor: anchors.to,
+    fallback_point: { x: 0, y: 0 },
+  };
+  const base: PathItem = {
+    id: freshId(),
+    parent_id: fromItem.parent_id === toItem.parent_id ? fromItem.parent_id : null,
+    x: 0,
+    y: 0,
+    w: 1,
+    h: 1,
+    z: 0,
+    visibility: 'visible',
+    locked: false,
+    minimized: false,
+    type: 'path',
+    from: fromPoint,
+    to: toPoint,
+    routing: resolvedStyle.routing,
+    head_from: resolvedStyle.head_from,
+    head_to: resolvedStyle.head_to,
+    stroke: resolvedStyle.stroke,
+    stroke_width: resolvedStyle.stroke_width,
+    stroke_dash: resolvedStyle.stroke_dash === 'solid' ? undefined : resolvedStyle.stroke_dash,
+  };
+  const itemMap = new Map<string, CanvasItem>(canvasItems ?? []);
+  itemMap.set(fromItem.id, fromItem);
+  itemMap.set(toItem.id, toItem);
+  return autoRoutePath(base, itemMap);
 }
 
 /**

@@ -11,14 +11,17 @@
    * pill 을 overlay 한다.
    */
 
-  import { NodeResizer } from '@xyflow/svelte';
+  import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { pickLocalFile } from '$lib/files/localFilePicker';
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, ImageItem } from '$lib/types/canvas';
   import CanvasCloseButton from './CanvasCloseButton.svelte';
-  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
+  import {
+    constrainResizeAspectIfShift,
+    scheduleLiveAspectResize,
+  } from './resizeConstraint';
 
   interface ImageNodeData {
     id: string;
@@ -56,6 +59,7 @@
     parentId?: string;
   } = $props();
 
+  const { updateNode } = useSvelteFlow();
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
@@ -63,15 +67,44 @@
   const imageLabel = $derived(data.label ?? 'image');
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
+  const RESIZE_MIN_W = 120;
+  const RESIZE_MIN_H = 80;
+
+  function sourceAspect(): number {
+    return data.original_w !== undefined && data.original_h !== undefined && data.original_h > 0
+      ? data.original_w / data.original_h
+      : data.w / data.h;
+  }
+
+  function applyLiveResize(next: ResizeParams): void {
+    updateNode(data.id, (node) => ({
+      position: { ...node.position, x: next.x, y: next.y },
+      width: Math.max(RESIZE_MIN_W, next.width),
+      height: Math.max(RESIZE_MIN_H, next.height),
+    }));
+  }
+
+  function onResize(event: unknown, params: ResizeParams): void {
+    scheduleLiveAspectResize(
+      event,
+      params,
+      data,
+      sourceAspect(),
+      RESIZE_MIN_W,
+      RESIZE_MIN_H,
+      applyLiveResize,
+    );
+  }
 
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
-    const sourceAspect =
-      data.original_w !== undefined && data.original_h !== undefined && data.original_h > 0
-        ? data.original_w / data.original_h
-        : data.w / data.h;
-    const constrained = resizeEventShiftKey(event)
-      ? constrainResizeAspect(params, data, sourceAspect, 120, 80)
-      : params;
+    const constrained = constrainResizeAspectIfShift(
+      event,
+      params,
+      data,
+      sourceAspect(),
+      RESIZE_MIN_W,
+      RESIZE_MIN_H,
+    );
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -81,8 +114,8 @@
                 ...it,
                 x: constrained.x,
                 y: constrained.y,
-                w: Math.max(120, constrained.width),
-                h: Math.max(80, constrained.height),
+                w: Math.max(RESIZE_MIN_W, constrained.width),
+                h: Math.max(RESIZE_MIN_H, constrained.height),
               } as ImageItem)
             : it,
         ),
@@ -157,6 +190,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResize}
       {onResizeEnd}
     />
     <CanvasCloseButton id={data.id} variant={hasAsset ? 'dark' : 'light'} disabled={isLocked} />

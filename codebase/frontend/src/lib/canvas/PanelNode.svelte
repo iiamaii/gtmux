@@ -16,7 +16,7 @@
   //   + PUT /api/sessions/<name>/layout 으로 영속화.
   // - visibility=false → 렌더 X.
 
-  import { NodeResizer } from '@xyflow/svelte';
+  import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import PanelDanglingOverlay from './PanelDanglingOverlay.svelte';
   import XtermHost from './XtermHost.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
@@ -29,7 +29,10 @@
   import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
-  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
+  import {
+    constrainResizeAspectIfShift,
+    scheduleLiveAspectResize,
+  } from './resizeConstraint';
   import {
     MINIMIZED_TERMINAL_PANEL_HEIGHT,
     type CanvasItem,
@@ -82,6 +85,7 @@
     parentId?: string;
   } = $props();
 
+  const { updateNode } = useSvelteFlow();
   const isVisible = $derived(data.visibility !== false);
   // Keep XtermHost mounted while minimized. Recreating xterm on restore drops
   // its screen buffer and leaves the panel blank until new output arrives.
@@ -108,6 +112,38 @@
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
   const isLocked = $derived(data.locked === true);
+  const RESIZE_MIN_W = 240;
+  const RESIZE_MIN_H = 140;
+
+  function currentResizeBounds(params: ResizeParams) {
+    return {
+      x: data.x ?? params.x,
+      y: data.y ?? params.y,
+      w: data.w ?? params.width,
+      h: data.h ?? params.height,
+    };
+  }
+
+  function applyLiveResize(next: ResizeParams): void {
+    updateNode(data.id, (node) => ({
+      position: { ...node.position, x: next.x, y: next.y },
+      width: Math.max(RESIZE_MIN_W, next.width),
+      height: Math.max(RESIZE_MIN_H, next.height),
+    }));
+  }
+
+  function onResize(event: unknown, params: ResizeParams): void {
+    const current = currentResizeBounds(params);
+    scheduleLiveAspectResize(
+      event,
+      params,
+      current,
+      current.w / current.h,
+      RESIZE_MIN_W,
+      RESIZE_MIN_H,
+      applyLiveResize,
+    );
+  }
 
   // NodeResizer onResizeEnd — { event, params: { x, y, width, height } }.
   // Resize 도중에는 SvelteFlow 가 controlled width/height 를 자체 업데이트
@@ -118,17 +154,17 @@
   // + 큰 h 로 인한 빈 contents* 회귀가 source 차원에서 차단됨. 사용자가
   // resize 하려면 minimize 먼저 toggle 풀어야 함 (명료한 mental model).
   function onResizeEnd(event: unknown, params: ResizeParams) {
-    const current = {
-      x: data.x ?? params.x,
-      y: data.y ?? params.y,
-      w: data.w ?? params.width,
-      h: data.h ?? params.height,
-    };
-    const constrained = resizeEventShiftKey(event)
-      ? constrainResizeAspect(params, current, current.w / current.h, 240, 140)
-      : params;
-    const nextW = Math.max(240, constrained.width);
-    const nextH = Math.max(140, constrained.height);
+    const current = currentResizeBounds(params);
+    const constrained = constrainResizeAspectIfShift(
+      event,
+      params,
+      current,
+      current.w / current.h,
+      RESIZE_MIN_W,
+      RESIZE_MIN_H,
+    );
+    const nextW = Math.max(RESIZE_MIN_W, constrained.width);
+    const nextH = Math.max(RESIZE_MIN_H, constrained.height);
     void sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -382,6 +418,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResize}
       {onResizeEnd}
     />
     <header class="panel-header" aria-label={`Drag handle for ${headerLabel}`}>

@@ -11,6 +11,7 @@ import { shortcutRegistry, type ShortcutDescriptor } from './shortcutRegistry.sv
 const TOOL_BINDINGS: Array<{
   actionId: string;
   key: string;
+  shift?: boolean;
   tool: ToolId;
   description: string;
 }> = [
@@ -20,6 +21,7 @@ const TOOL_BINDINGS: Array<{
   { actionId: 'tool.rect', key: 'r', tool: 'rect', description: 'Rectangle tool' },
   { actionId: 'tool.ellipse', key: 'o', tool: 'ellipse', description: 'Ellipse tool' },
   { actionId: 'tool.line', key: 'l', tool: 'line', description: 'Line tool' },
+  { actionId: 'tool.path', key: 'l', shift: true, tool: 'path', description: 'Path tool' },
   { actionId: 'tool.free_draw', key: 'p', tool: 'free_draw', description: 'Free draw tool' },
   { actionId: 'tool.note', key: 'n', tool: 'note', description: 'Note tool' },
   { actionId: 'tool.snippets', key: 's', tool: 'snippets', description: 'Snippets tool' },
@@ -40,6 +42,7 @@ export function bindToolShortcuts(): () => void {
     const descriptor: ShortcutDescriptor = {
       actionId: t.actionId,
       key: t.key,
+      shift: t.shift,
       category: 'Tool',
       customizable: true,
       description: t.description,

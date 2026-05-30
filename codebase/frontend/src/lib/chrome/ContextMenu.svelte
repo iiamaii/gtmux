@@ -38,10 +38,12 @@
     createShapeItem,
     createLineItem,
     createTerminalItem,
+    createConnectedPath,
   } from '$lib/canvas/itemFactory';
   import { toolStore } from '$lib/stores/toolStore.svelte';
   import { useSvelteFlow } from '@xyflow/svelte';
   import type { CanvasItem, CanvasItemType } from '$lib/types/canvas';
+  import { isConnectableItem } from '$lib/canvas/pathGeometry';
   import {
     alignItems,
     distributeItems,
@@ -248,6 +250,21 @@
     return effectiveItems.every((it) => it.type === first) ? first : null;
   });
   const targetIds = $derived(effectiveItems.map((it) => it.id));
+  const selectedConnectableItems = $derived.by((): CanvasItem[] => {
+    if (ctxMode !== 'multi') return [];
+    const out: CanvasItem[] = [];
+    for (const id of sessionStore.M) {
+      const item = sessionStore.items.get(id);
+      if (item !== undefined && isConnectableItem(item)) out.push(item);
+    }
+    return out;
+  });
+  const canConnect = $derived(
+    ctxMode === 'multi' &&
+      selectedConnectableItems.length === 2 &&
+      selectedEntityIds.length === 2 &&
+      selectedConnectableItems[0]?.id !== selectedConnectableItems[1]?.id,
+  );
 
   function onHide(): void {
     doToggleVisibility(effectiveToggleIds());
@@ -469,6 +486,29 @@
     const moves = distributeItems(effectiveItems, mode);
     close();
     await applyAlignBatch(moves, 'Distribute aborted — session reconnect failed.');
+  }
+
+  async function onConnect(): Promise<void> {
+    if (!canConnect || sessionStore.active === null) return;
+    const from = selectedConnectableItems[0];
+    const to = selectedConnectableItems[1];
+    if (from === undefined || to === undefined || !isConnectableItem(from) || !isConnectableItem(to)) return;
+    const path = createConnectedPath(from, to, {}, sessionStore.items);
+    if (path === null) return;
+    close();
+    let committed = path;
+    const result = await sessionStore.applyMutation(
+      (cur) => {
+        const maxZ = cur.items.reduce((m, it) => (it.z > m ? it.z : m), 0);
+        committed = { ...path, z: maxZ + 1 };
+        return { ...cur, items: [...cur.items, committed] };
+      },
+      {
+        abortMessage: 'Connect aborted — session reconnect failed.',
+        failMessage: 'Connect failed',
+      },
+    );
+    if (result.ok) sessionStore.setM([committed.id]);
   }
 
   /* ── "Add ___" sub-menu (pane right-click only) ──────────────────── */
@@ -810,6 +850,11 @@
       {#if canCopyPaneId}
         <button type="button" class="ctx-item" onclick={onCopyPaneId}>
           <span class="label">Copy panel id</span>
+        </button>
+      {/if}
+      {#if canConnect}
+        <button type="button" class="ctx-item" onclick={() => void onConnect()}>
+          <span class="label">Connect</span>
         </button>
       {/if}
       <div class="ctx-sep"></div>

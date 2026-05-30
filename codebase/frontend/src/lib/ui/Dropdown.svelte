@@ -67,7 +67,7 @@
   });
 </script>
 
-<div class="dropdown-host" bind:this={host}>
+<div class="dropdown-host" class:open bind:this={host}>
   {@render trigger({ open, toggle })}
   {#if open}
     <div class="dropdown-menu dropdown-menu-{placement}" role="menu">
@@ -83,8 +83,14 @@
   }
 
   .dropdown-menu {
+    box-sizing: border-box;
     position: absolute;
-    min-width: 180px;
+    min-width: var(--dropdown-menu-min-width, 180px);
+    max-width: var(--dropdown-menu-max-width, min(320px, calc(100vw - 24px)));
+    max-height: var(--dropdown-menu-max-height, min(320px, calc(100vh - 96px)));
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     margin-top: var(--space-16);
     background: var(--color-surface-2);
     border: 1px solid var(--color-border-strong);
@@ -118,7 +124,7 @@
 
   /* Slotted items get a default item style — children opt out by
    * setting their own class. white-space: nowrap 으로 label wrap 차단 —
-   * 메뉴는 가장 긴 라벨에 맞춰 가로로 자라 (`min-width: 180px` 가 floor). */
+   * 메뉴는 공통 max width 안에서 가장 긴 라벨을 ellipsis 처리한다. */
   .dropdown-menu :global(button),
   .dropdown-menu :global(a) {
     display: flex;
@@ -134,6 +140,8 @@
     font-family: inherit;
     text-align: left;
     white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
     cursor: pointer;
     transition: background var(--motion-fast) var(--motion-easing);
   }
@@ -141,7 +149,8 @@
   .dropdown-menu :global(button > span),
   .dropdown-menu :global(a > span) {
     white-space: nowrap;
-    overflow: visible;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .dropdown-menu :global(button:hover:not(:disabled)),

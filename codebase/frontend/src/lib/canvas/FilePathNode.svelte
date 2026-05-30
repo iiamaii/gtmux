@@ -8,12 +8,15 @@
   // 전역 filePicker 으로 picker modal 진입 → 선택 시 applyMutation.
   // InlineEdit 패턴 폐기 (path 의 free-form typing 은 traversal / typo risk).
 
-  import { NodeResizer } from '@xyflow/svelte';
+  import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import type { FilePathItem, CanvasItem } from '$lib/types/canvas';
   import CanvasCloseButton from './CanvasCloseButton.svelte';
-  import { constrainResizeAspect, resizeEventShiftKey } from './resizeConstraint';
+  import {
+    constrainResizeAspectIfShift,
+    scheduleLiveAspectResize,
+  } from './resizeConstraint';
 
   interface FilePathNodeData {
     id: string;
@@ -48,11 +51,14 @@
     parentId?: string;
   } = $props();
 
+  const { updateNode } = useSvelteFlow();
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
+  const RESIZE_MIN_W = 200;
+  const RESIZE_MIN_H = 80;
 
   // ref/frontend-design/components-v5 §03 — display 시 path/name 분리:
   //   path = "/foo/bar/baz.ts" → fp-path "foo/bar/" + fp-name "baz.ts"
@@ -118,10 +124,35 @@
     );
   }
 
+  function applyLiveResize(next: ResizeParams): void {
+    updateNode(data.id, (node) => ({
+      position: { ...node.position, x: next.x, y: next.y },
+      width: Math.max(RESIZE_MIN_W, next.width),
+      height: Math.max(RESIZE_MIN_H, next.height),
+    }));
+  }
+
+  function onResize(event: unknown, params: ResizeParams): void {
+    scheduleLiveAspectResize(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      RESIZE_MIN_W,
+      RESIZE_MIN_H,
+      applyLiveResize,
+    );
+  }
+
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
-    const constrained = resizeEventShiftKey(event)
-      ? constrainResizeAspect(params, data, data.w / data.h, 200, 80)
-      : params;
+    const constrained = constrainResizeAspectIfShift(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      RESIZE_MIN_W,
+      RESIZE_MIN_H,
+    );
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -131,8 +162,8 @@
                 ...it,
                 x: constrained.x,
                 y: constrained.y,
-                w: Math.max(200, constrained.width),
-                h: Math.max(80, constrained.height),
+                w: Math.max(RESIZE_MIN_W, constrained.width),
+                h: Math.max(RESIZE_MIN_H, constrained.height),
               } as FilePathItem)
             : it,
         ),
@@ -163,6 +194,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResize}
       {onResizeEnd}
     />
     <CanvasCloseButton id={data.id} disabled={isLocked} />

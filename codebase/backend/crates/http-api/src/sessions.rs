@@ -164,8 +164,11 @@ fn sha256_128(bytes: &[u8]) -> ([u8; 16], String) {
     let mut raw = [0u8; 16];
     raw.copy_from_slice(&full[..16]);
     let mut hex = String::with_capacity(32);
-    for b in raw.iter() {
-        hex.push_str(&format!("{b:02x}"));
+    {
+        use std::fmt::Write as _;
+        for b in raw.iter() {
+            let _ = write!(hex, "{b:02x}");
+        }
     }
     (raw, hex)
 }
@@ -1372,14 +1375,28 @@ pub async fn delete_item_handler(
             )
                 .into_response();
         }
-        let new_snap = SessionLayout::new(snap.layout.clone());
         let path = match wm.session_path(&name) {
             Ok(p) => p,
             Err(e) => return SessionError::Workspace(e).into_response(),
         };
-        let bytes = canonical_bytes(&new_snap.layout);
-        if let Err(e) = atomic_write_session(&path, &bytes) {
-            return SessionError::Workspace(e).into_response();
+        // Mirror the PUT path (ADR-0006 D13): serialize the layout *once*
+        // (`new_with_bytes` reuses the buffer for the ETag SHA instead of
+        // re-serializing), and move the synchronous fsync+rename onto the
+        // blocking pool so the tokio worker isn't stalled while the per-session
+        // write lock is held.
+        let bytes = canonical_bytes(&snap.layout);
+        let new_snap = SessionLayout::new_with_bytes(snap.layout.clone(), &bytes);
+        let write_path = path.clone();
+        let write_bytes = bytes;
+        match tokio::task::spawn_blocking(move || atomic_write_session(&write_path, &write_bytes))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return SessionError::Workspace(e).into_response(),
+            Err(join_err) => {
+                tracing::error!(error = %join_err, "delete_item: atomic_write spawn_blocking panicked");
+                return service_unavailable("write_failed");
+            }
         }
         new_etag_quoted = format!("\"{}\"", new_snap.etag_hex);
         *snap = new_snap;
@@ -1567,17 +1584,18 @@ pub async fn layout_put_handler(
 
     // 3. Parse + recompute connector BBoxes + validate.
     //
-    // ADR-0036 Q4/Q5: connector `x/y/w/h` is a BBox cache derived from the
-    // two endpoint anchor points. Recompute it *before* validate() so the
-    // persisted layout is always self-consistent (FE-supplied values are
-    // ignored — server is canonical). Orphan connectors survive the
-    // recompute untouched (no endpoint to anchor against); the subsequent
-    // validate() arm rejects them with `connector_endpoint_missing`.
+    // ADR-0043 D6/D7: `path` `x/y/w/h` is a bbox cache derived from the
+    // endpoint + waypoint chain. The server is canonical (FE-supplied cache
+    // values are ignored), so before validate() we (1) degrade any path
+    // endpoint whose connected target was deleted to a free endpoint at its
+    // fallback_point — preserving the path (R4) instead of rejecting it —
+    // then (2) recompute every path's bbox cache + connected fallback points.
     let mut layout: Layout = match serde_json::from_slice::<Layout>(&body_bytes) {
         Ok(l) => l,
         Err(e) => return SessionError::BadJson(e.to_string()).into_response(),
     };
-    schema::recompute_connector_bboxes(&mut layout);
+    schema::degrade_dangling_path_endpoints(&mut layout);
+    schema::recompute_path_bboxes(&mut layout);
     if let Err(e) = schema::validate(&layout) {
         return SessionError::Validation(e).into_response();
     }
@@ -1763,18 +1781,25 @@ enum BodyReadError {
     Io(String),
 }
 
-async fn read_bounded_body(req: Request<Body>, cap: usize) -> Result<Vec<u8>, BodyReadError> {
+async fn read_bounded_body(
+    req: Request<Body>,
+    cap: usize,
+) -> Result<axum::body::Bytes, BodyReadError> {
     use http_body_util::BodyExt;
     let body = req.into_body();
     let collected = body
         .collect()
         .await
         .map_err(|e| BodyReadError::Io(format!("body read: {e}")))?;
+    // `to_bytes()` already yields a contiguous `Bytes`; return it directly so
+    // the (up to 16 MiB) request body isn't copied again into a `Vec`. The
+    // caller passes `&body_bytes` to `serde_json::from_slice` (Bytes derefs to
+    // `&[u8]`).
     let bytes = collected.to_bytes();
     if bytes.len() > cap {
         return Err(BodyReadError::TooLarge);
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 // Quiet axum's unused-field warning when only one handler in a module reads

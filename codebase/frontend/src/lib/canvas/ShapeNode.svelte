@@ -26,14 +26,18 @@
   // viewport / transform 무관하게 user units 고정 → drag 중에도 안정. dash
   // pattern 도 stretch 안 됨 (부수 개선).
 
-  import { NodeResizer } from '@xyflow/svelte';
+  import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { CanvasItem, EllipseItem, FigureStrokeDash, FontFamily, FontWeight, RectItem, TextAlign, TextVerticalAlign } from '$lib/types/canvas';
   import { deriveLabel, shouldDeriveLabel } from './labelDerive';
   import { fontFamilyVar } from './fontFamily';
   import { fontWeightCss, textDecorationCss } from './textStyle';
-  import { constrainResizeSquare, resizeEventShiftKey } from './resizeConstraint';
+  import {
+    constrainResizeSquare,
+    resizeEventShiftKey,
+    scheduleLiveSquareResize,
+  } from './resizeConstraint';
   import { strokeDashArray } from './strokeDash';
 
   interface ShapeNodeData {
@@ -89,6 +93,7 @@
     parentId?: string;
   } = $props();
 
+  const { updateNode } = useSvelteFlow();
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
@@ -153,13 +158,32 @@
   let editing = $state(false);
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
+  const SHAPE_MIN_SIZE = 20;
+
+  function applyLiveResize(next: ResizeParams): void {
+    updateNode(data.id, (node) => ({
+      position: { ...node.position, x: next.x, y: next.y },
+      width: Math.max(SHAPE_MIN_SIZE, next.width),
+      height: Math.max(SHAPE_MIN_SIZE, next.height),
+    }));
+  }
+
+  function onResize(event: unknown, params: ResizeParams): void {
+    scheduleLiveSquareResize(
+      event,
+      params,
+      data,
+      SHAPE_MIN_SIZE,
+      applyLiveResize,
+    );
+  }
 
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
     const constrained = resizeEventShiftKey(event)
-      ? constrainResizeSquare(params, data, 20)
+      ? constrainResizeSquare(params, data, SHAPE_MIN_SIZE)
       : params;
-    const nextW = Math.max(20, constrained.width);
-    const nextH = Math.max(20, constrained.height);
+    const nextW = Math.max(SHAPE_MIN_SIZE, constrained.width);
+    const nextH = Math.max(SHAPE_MIN_SIZE, constrained.height);
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
@@ -241,11 +265,12 @@
     <NodeResizer
       nodeId={data.id}
       isVisible={isInM && !isLocked}
-      minWidth={20}
-      minHeight={20}
+      minWidth={SHAPE_MIN_SIZE}
+      minHeight={SHAPE_MIN_SIZE}
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResize}
       {onResizeEnd}
     />
     <svg

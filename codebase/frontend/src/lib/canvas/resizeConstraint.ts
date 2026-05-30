@@ -62,6 +62,45 @@ export function constrainResizeAspect(
   };
 }
 
+export function constrainResizeAspectIfShift(
+  event: unknown,
+  params: ResizeParams,
+  current: CurrentBounds,
+  aspect: number,
+  minWidth: number,
+  minHeight: number,
+): ResizeParams {
+  return resizeEventShiftKey(event)
+    ? constrainResizeAspect(params, current, aspect, minWidth, minHeight)
+    : params;
+}
+
+export function scheduleLiveAspectResize(
+  event: unknown,
+  params: ResizeParams,
+  current: CurrentBounds,
+  aspect: number,
+  minWidth: number,
+  minHeight: number,
+  apply: (next: ResizeParams) => void,
+): void {
+  if (!resizeEventShiftKey(event)) return;
+  const constrained = constrainResizeAspect(params, current, aspect, minWidth, minHeight);
+  queueMicrotask(() => apply(constrained));
+}
+
+export function scheduleLiveSquareResize(
+  event: unknown,
+  params: ResizeParams,
+  current: CurrentBounds,
+  minSize: number,
+  apply: (next: ResizeParams) => void,
+): void {
+  if (!resizeEventShiftKey(event)) return;
+  const constrained = constrainResizeSquare(params, current, minSize);
+  queueMicrotask(() => apply(constrained));
+}
+
 export function constrainResizeSquare(
   params: ResizeParams,
   current: CurrentBounds,
