@@ -60,6 +60,7 @@
     type CanvasItem,
     type FigureStrokeDash,
     type FontFamily,
+    type FreeDrawItem,
     type Head,
     type LineItem,
     type NoteItem,
@@ -297,10 +298,192 @@
   }
 
   type TextStylableItem = TextItem | RectItem | EllipseItem;
+  type BoxStylableItem = TextItem | RectItem | EllipseItem;
+  type StrokeStylableItem =
+    | RectItem
+    | EllipseItem
+    | LineItem
+    | PathItem
+    | FreeDrawItem
+    | TextItem;
+  type StrokeDashStylableItem = RectItem | EllipseItem | LineItem | PathItem | TextItem;
+  type HeadStylableItem = LineItem | PathItem;
 
   function isTextStylable(it: CanvasItem): it is TextStylableItem {
     return it.type === 'text' || it.type === 'rect' || it.type === 'ellipse';
   }
+
+  function isBoxStylable(it: CanvasItem): it is BoxStylableItem {
+    return it.type === 'text' || it.type === 'rect' || it.type === 'ellipse';
+  }
+
+  function isStrokeStylable(it: CanvasItem): it is StrokeStylableItem {
+    return (
+      it.type === 'rect' ||
+      it.type === 'ellipse' ||
+      it.type === 'line' ||
+      it.type === 'path' ||
+      it.type === 'free_draw' ||
+      it.type === 'text'
+    );
+  }
+
+  function isStrokeDashStylable(it: CanvasItem): it is StrokeDashStylableItem {
+    return (
+      it.type === 'rect' ||
+      it.type === 'ellipse' ||
+      it.type === 'line' ||
+      it.type === 'path' ||
+      it.type === 'text'
+    );
+  }
+
+  function isHeadStylable(it: CanvasItem): it is HeadStylableItem {
+    return it.type === 'line' || it.type === 'path';
+  }
+
+  function commonMapped<T, V>(
+    items: readonly T[],
+    reader: (item: T) => V,
+  ): V | 'Mixed' | null {
+    const head = items[0];
+    if (head === undefined) return null;
+    const first = reader(head);
+    for (const it of items) {
+      if (!Object.is(reader(it), first)) return 'Mixed';
+    }
+    return first;
+  }
+
+  function allLocked(items: readonly CanvasItem[]): boolean {
+    return items.length === 0 || items.every((it) => it.locked);
+  }
+
+  function boxFillEnabled(it: BoxStylableItem): boolean {
+    return it.type === 'text' ? it.fill_enabled === true : it.fill_enabled !== false;
+  }
+
+  function boxStrokeEnabled(it: BoxStylableItem): boolean {
+    return it.type === 'text' ? it.stroke_enabled === true : it.stroke_enabled !== false;
+  }
+
+  function boxFillColor(it: BoxStylableItem): string {
+    return it.type === 'text' ? (it.fill ?? 'var(--color-surface)') : it.fill;
+  }
+
+  function strokeColor(it: StrokeStylableItem): string {
+    return it.type === 'text' ? (it.stroke ?? 'var(--color-fg)') : it.stroke;
+  }
+
+  function strokeWidth(it: StrokeStylableItem): number {
+    return it.type === 'text' ? (it.stroke_width ?? 2) : it.stroke_width;
+  }
+
+  const textStyleItems = $derived.by((): TextStylableItem[] =>
+    selectedItems.filter(isTextStylable),
+  );
+  const boxStyleItems = $derived.by((): BoxStylableItem[] =>
+    selectedItems.filter(isBoxStylable),
+  );
+  const strokeStyleItems = $derived.by((): StrokeStylableItem[] =>
+    selectedItems.filter(isStrokeStylable),
+  );
+  const strokeDashStyleItems = $derived.by((): StrokeDashStylableItem[] =>
+    selectedItems.filter(isStrokeDashStylable),
+  );
+  const headStyleItems = $derived.by((): HeadStylableItem[] =>
+    selectedItems.filter(isHeadStylable),
+  );
+  const pathStyleItems = $derived.by((): PathItem[] =>
+    selectedItems.filter((it): it is PathItem => it.type === 'path'),
+  );
+  const roundedStyleItems = $derived.by((): Array<TextItem | RectItem> =>
+    selectedItems.filter((it): it is TextItem | RectItem => it.type === 'text' || it.type === 'rect'),
+  );
+
+  const hasSharedTextStyle = $derived(selectionCount > 1 && textStyleItems.length > 0);
+  const hasSharedFillStyle = $derived(selectionCount > 1 && boxStyleItems.length > 0);
+  const hasSharedStrokeStyle = $derived(selectionCount > 1 && strokeStyleItems.length > 0);
+  const hasSharedHeadStyle = $derived(selectionCount > 1 && headStyleItems.length > 0);
+  const hasSharedPathRouting = $derived(selectionCount > 1 && pathStyleItems.length > 0);
+  const hasSharedRoundedStyle = $derived(selectionCount > 1 && roundedStyleItems.length > 0);
+  const hasSharedStyleSection = $derived(
+    hasSharedTextStyle ||
+      hasSharedFillStyle ||
+      hasSharedStrokeStyle ||
+      hasSharedHeadStyle ||
+      hasSharedPathRouting ||
+      hasSharedRoundedStyle,
+  );
+
+  const textStyleLocked = $derived(allLocked(textStyleItems));
+  const boxStyleLocked = $derived(allLocked(boxStyleItems));
+  const strokeStyleLocked = $derived(allLocked(strokeStyleItems));
+  const strokeDashStyleLocked = $derived(allLocked(strokeDashStyleItems));
+  const headStyleLocked = $derived(allLocked(headStyleItems));
+  const pathStyleLocked = $derived(allLocked(pathStyleItems));
+  const roundedStyleLocked = $derived(allLocked(roundedStyleItems));
+  const canToggleSharedStroke = $derived(
+    strokeStyleItems.length > 0 && strokeStyleItems.every(isBoxStylable),
+  );
+
+  const sharedTextFontFamily = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.font_family ?? 'sans'),
+  );
+  const sharedTextFontSize = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.font_size ?? 14),
+  );
+  const sharedTextColor = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.color ?? 'var(--color-fg)'),
+  );
+  const sharedTextWeight = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.font_weight ?? 'normal'),
+  );
+  const sharedTextItalic = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.italic === true),
+  );
+  const sharedTextUnderline = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.underline === true),
+  );
+  const sharedTextStrike = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.strikethrough === true),
+  );
+  const sharedTextAlign = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.text_align ?? 'center'),
+  );
+  const sharedTextVerticalAlign = $derived.by(() =>
+    commonMapped(textStyleItems, (it) => it.text_vertical_align ?? 'middle'),
+  );
+  const sharedFillEnabled = $derived.by(() =>
+    commonMapped(boxStyleItems, boxFillEnabled),
+  );
+  const sharedFillColor = $derived.by(() =>
+    commonMapped(boxStyleItems, boxFillColor),
+  );
+  const sharedStrokeEnabled = $derived.by(() =>
+    commonMapped(boxStyleItems, boxStrokeEnabled),
+  );
+  const sharedStrokeColor = $derived.by(() =>
+    commonMapped(strokeStyleItems, strokeColor),
+  );
+  const sharedStrokeWidth = $derived.by(() =>
+    commonMapped(strokeStyleItems, strokeWidth),
+  );
+  const sharedStrokeDash = $derived.by(() =>
+    commonMapped(strokeDashStyleItems, (it) => it.stroke_dash ?? 'solid'),
+  );
+  const sharedRounded = $derived.by(() =>
+    commonMapped(roundedStyleItems, (it) => it.corner_rounded === true),
+  );
+  const sharedHeadFrom = $derived.by(() =>
+    commonMapped(headStyleItems, (it) => it.head_from ?? 'none'),
+  );
+  const sharedHeadTo = $derived.by(() =>
+    commonMapped(headStyleItems, (it) => it.head_to ?? 'none'),
+  );
+  const sharedPathRouting = $derived.by(() =>
+    commonMapped(pathStyleItems, (it) => it.routing),
+  );
 
   function fontLabel(family: FontFamily | undefined): string {
     if (family === 'serif') return 'Serif';
@@ -337,6 +520,36 @@
 
   function headLabel(head: Head | undefined): string {
     return HEAD_OPTIONS.find((option) => option.value === (head ?? 'none'))?.label ?? 'None';
+  }
+
+  function fontValueLabel(value: FontFamily | 'Mixed' | null): string {
+    if (value === 'Mixed' || value === null) return 'Mixed';
+    return fontLabel(value);
+  }
+
+  function headValueLabel(value: Head | 'Mixed' | null): string {
+    if (value === 'Mixed' || value === null) return 'Mixed';
+    return headLabel(value);
+  }
+
+  function concreteHead(value: Head | 'Mixed' | null): Head {
+    return value === 'Mixed' || value === null ? 'none' : value;
+  }
+
+  function concreteDash(value: FigureStrokeDash | 'Mixed' | null): FigureStrokeDash {
+    return value === 'Mixed' || value === null ? 'solid' : value;
+  }
+
+  function mixedColorValue(value: string | 'Mixed' | null, fallback: string): string {
+    return value === 'Mixed' || value === null ? fallback : value;
+  }
+
+  function mixedNumberValue(value: number | 'Mixed' | null): string {
+    return typeof value === 'number' ? String(value) : '';
+  }
+
+  function toggleFromMixed(value: boolean | 'Mixed' | null): boolean {
+    return value !== true;
   }
 
   function fileStem(fileName: string): string {
@@ -840,6 +1053,34 @@
     );
   }
 
+  async function applySharedHead(field: 'head_from' | 'head_to', value: Head): Promise<void> {
+    if (selectedItems.length === 0) return;
+    rememberPathStyle(field === 'head_from' ? { head_from: value } : { head_to: value });
+    const ids = new Set(selectedIds);
+    await sessionStore.optimisticMutation(
+      (cur) => {
+        const itemMap = new Map<string, CanvasItem>(cur.items.map((it) => [it.id, it] as const));
+        return {
+          ...cur,
+          items: cur.items.map((it) => {
+            if (!ids.has(it.id) || it.locked) return it;
+            if (it.type === 'line') {
+              return { ...it, [field]: value } as LineItem;
+            }
+            if (it.type === 'path') {
+              return updatePathBBoxCache({ ...it, [field]: value } as PathItem, itemMap);
+            }
+            return it;
+          }),
+        };
+      },
+      {
+        abortMessage: 'Head edit aborted — session reconnect failed.',
+        failMessage: 'Head edit failed',
+      },
+    );
+  }
+
   async function applyPathEndpointKind(
     endpointId: PathEndpointId,
     kind: PathEndpoint['kind'],
@@ -1141,9 +1382,9 @@
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path') return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path' && it.type !== 'free_draw') return it;
           // line/path 에는 fill 이 없음 — 무시.
-          if (field === 'fill' && (it.type === 'line' || it.type === 'path')) return it;
+          if (field === 'fill' && (it.type === 'line' || it.type === 'path' || it.type === 'free_draw')) return it;
           return { ...it, [field]: hex } as CanvasItem;
         }),
       }),
@@ -1202,7 +1443,7 @@
         items: cur.items.map((it) => {
           if (!ids.has(it.id)) return it;
           if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path') return it;
+          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path' && it.type !== 'free_draw') return it;
           const next = { ...it, stroke_width: clamped } as CanvasItem;
           if (next.type === 'path') {
             const itemMap = new Map<string, CanvasItem>(cur.items.map((curItem) => [curItem.id, curItem] as const));
@@ -1872,7 +2113,323 @@
         </section>
       {/if}
 
-      {#if sessionItem !== null && ((selectionCount === 1 && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'path' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets')) || (isMultiHomogeneous && (commonType === 'rect' || commonType === 'ellipse' || commonType === 'text' || commonType === 'path')))}
+      {#if selectionCount > 1 && hasSharedStyleSection}
+        <section class="prop-section">
+          <div class="prop-head"><h4>Shared Style</h4></div>
+
+          {#if hasSharedTextStyle}
+            <div class="fig-group is-on">
+              <div class="fig-group-head">
+                <span class="k">text</span>
+              </div>
+              <div class="fig-group-body">
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={textStyleLocked}
+                        aria-label="Font family"
+                        title="Font family"
+                        onclick={toggle}
+                      >
+                        <span class="font-label">font</span>
+                        <span class="font-value" class:mixed={sharedTextFontFamily === 'Mixed'}>
+                          {fontValueLabel(sharedTextFontFamily)}
+                        </span>
+                        <DropdownChevron />
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each FONT_FAMILIES as f}
+                        <button
+                          type="button"
+                          class="font-option font-preview-{f}"
+                          class:selected={sharedTextFontFamily === f}
+                          disabled={textStyleLocked}
+                          onclick={() => {
+                            void applyTextFontFamily(f);
+                            close();
+                          }}
+                        >
+                          {fontLabel(f)}
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
+                <InspectorField
+                  type="number"
+                  k="size"
+                  value={mixedNumberValue(sharedTextFontSize)}
+                  mixed={sharedTextFontSize === 'Mixed'}
+                  ariaLabel="Font size"
+                  disabled={textStyleLocked}
+                  live={true}
+                  oncommit={(s) => void applyTextFontSize(Number(s))}
+                />
+                <ColorPicker
+                  value={mixedColorValue(sharedTextColor, 'var(--color-fg)')}
+                  mixed={sharedTextColor === 'Mixed'}
+                  live={true}
+                  allowAlpha={true}
+                  disabled={textStyleLocked}
+                  oncommit={(hex) => void applyTextColor(hex)}
+                />
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">weight</span>
+                  <div class="segmented-control" role="group" aria-label="Font weight">
+                    <button type="button" class="seg-btn weight-btn weight-light" class:active={sharedTextWeight === 'light'} aria-pressed={sharedTextWeight === 'light'} title="Light (300)" aria-label="Light weight" disabled={textStyleLocked} onclick={() => void applyTextFontWeight('light')}>L</button>
+                    <button type="button" class="seg-btn weight-btn weight-normal" class:active={sharedTextWeight === 'normal'} aria-pressed={sharedTextWeight === 'normal'} title="Normal (400)" aria-label="Normal weight" disabled={textStyleLocked} onclick={() => void applyTextFontWeight('normal')}>N</button>
+                    <button type="button" class="seg-btn weight-btn weight-bold" class:active={sharedTextWeight === 'bold'} aria-pressed={sharedTextWeight === 'bold'} title="Bold (700)" aria-label="Bold weight" disabled={textStyleLocked} onclick={() => void applyTextFontWeight('bold')}>B</button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">style</span>
+                  <div class="segmented-control multi" role="group" aria-label="Text style">
+                    <button type="button" class="seg-btn style-btn style-italic" class:active={sharedTextItalic === true} aria-pressed={sharedTextItalic === true} title="Italic" aria-label="Toggle italic" disabled={textStyleLocked} onclick={() => void applyTextBoolean('italic', toggleFromMixed(sharedTextItalic))}>I</button>
+                    <button type="button" class="seg-btn style-btn style-underline" class:active={sharedTextUnderline === true} aria-pressed={sharedTextUnderline === true} title="Underline" aria-label="Toggle underline" disabled={textStyleLocked} onclick={() => void applyTextBoolean('underline', toggleFromMixed(sharedTextUnderline))}>U</button>
+                    <button type="button" class="seg-btn style-btn style-strike" class:active={sharedTextStrike === true} aria-pressed={sharedTextStrike === true} title="Strikethrough" aria-label="Toggle strikethrough" disabled={textStyleLocked} onclick={() => void applyTextBoolean('strikethrough', toggleFromMixed(sharedTextStrike))}>S</button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">align</span>
+                  <div class="segmented-control" role="group" aria-label="Horizontal alignment">
+                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'left'} aria-pressed={sharedTextAlign === 'left'} title="Align left" aria-label="Align left" disabled={textStyleLocked} onclick={() => void applyTextAlign('left')}>L</button>
+                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'center'} aria-pressed={sharedTextAlign === 'center'} title="Align center" aria-label="Align center" disabled={textStyleLocked} onclick={() => void applyTextAlign('center')}>C</button>
+                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'right'} aria-pressed={sharedTextAlign === 'right'} title="Align right" aria-label="Align right" disabled={textStyleLocked} onclick={() => void applyTextAlign('right')}>R</button>
+                  </div>
+                </div>
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">v-align</span>
+                  <div class="segmented-control" role="group" aria-label="Vertical alignment">
+                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'top'} aria-pressed={sharedTextVerticalAlign === 'top'} title="Align top" aria-label="Align top" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('top')}>T</button>
+                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'middle'} aria-pressed={sharedTextVerticalAlign === 'middle'} title="Align middle" aria-label="Align middle" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('middle')}>M</button>
+                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'bottom'} aria-pressed={sharedTextVerticalAlign === 'bottom'} title="Align bottom" aria-label="Align bottom" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('bottom')}>B</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          {/if}
+
+          {#if hasSharedFillStyle}
+            <div class="fig-group" class:is-on={sharedFillEnabled !== false}>
+              <div class="fig-group-head">
+                <span class="k">fill</span>
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={sharedFillEnabled === true}
+                  disabled={boxStyleLocked}
+                  ariaLabel="Toggle fill"
+                  onchange={(next) => void applyShapeBoolean('fill_enabled', next)}
+                />
+              </div>
+              {#if sharedFillEnabled !== false}
+                <div class="fig-group-body">
+                  <ColorPicker
+                    value={mixedColorValue(sharedFillColor, 'var(--color-surface)')}
+                    mixed={sharedFillColor === 'Mixed'}
+                    live={true}
+                    allowAlpha={true}
+                    allowTransparent={true}
+                    disabled={boxStyleLocked}
+                    oncommit={(hex) => void applyShapeColor('fill', hex)}
+                  />
+                </div>
+              {/if}
+            </div>
+          {/if}
+
+          {#if hasSharedPathRouting}
+            <div class="fig-group is-on">
+              <div class="fig-group-head">
+                <span class="k">path</span>
+              </div>
+              <div class="fig-group-body">
+                <div class="display-row control-row fig-body-row">
+                  <span class="control-label">routing</span>
+                  <div class="segmented-control icon-segments routing-segments" role="group" aria-label="Path routing">
+                    {#each ROUTING_OPTIONS as option (option.value)}
+                      <button
+                        type="button"
+                        class="seg-btn"
+                        class:active={sharedPathRouting === option.value}
+                        aria-pressed={sharedPathRouting === option.value}
+                        aria-label={option.label}
+                        title={option.label}
+                        disabled={pathStyleLocked}
+                        onclick={() => void applyPathRouting(option.value)}
+                      >
+                        <RoutingIcon routing={option.value} />
+                      </button>
+                    {/each}
+                  </div>
+                </div>
+              </div>
+            </div>
+          {/if}
+
+          {#if hasSharedStrokeStyle}
+            {@const showStrokeBody = !canToggleSharedStroke || sharedStrokeEnabled !== false}
+            <div class="fig-group" class:is-on={showStrokeBody}>
+              <div class="fig-group-head">
+                <span class="k">stroke</span>
+                <span class="fig-spacer"></span>
+                {#if canToggleSharedStroke}
+                  <Toggle
+                    checked={sharedStrokeEnabled === true}
+                    disabled={boxStyleLocked}
+                    ariaLabel="Toggle stroke"
+                    onchange={(next) => void applyShapeBoolean('stroke_enabled', next)}
+                  />
+                {/if}
+              </div>
+              {#if showStrokeBody}
+                <div class="fig-group-body">
+                  <ColorPicker
+                    value={mixedColorValue(sharedStrokeColor, 'var(--color-fg)')}
+                    mixed={sharedStrokeColor === 'Mixed'}
+                    live={true}
+                    allowAlpha={true}
+                    disabled={strokeStyleLocked}
+                    oncommit={(hex) => void applyShapeColor('stroke', hex)}
+                  />
+                  <InspectorField
+                    type="number"
+                    k="width"
+                    value={mixedNumberValue(sharedStrokeWidth)}
+                    mixed={sharedStrokeWidth === 'Mixed'}
+                    ariaLabel="Stroke width"
+                    disabled={strokeStyleLocked}
+                    live={true}
+                    oncommit={(s) => void applyShapeStrokeWidth(Number(s))}
+                  />
+                  {#if strokeDashStyleItems.length > 0}
+                    <DashSegments
+                      value={concreteDash(sharedStrokeDash)}
+                      mixed={sharedStrokeDash === 'Mixed'}
+                      disabled={strokeDashStyleLocked}
+                      onpick={(next) => void applyShapeDash(next)}
+                    />
+                  {/if}
+                </div>
+              {/if}
+            </div>
+          {/if}
+
+          {#if hasSharedHeadStyle}
+            <div class="fig-group is-on">
+              <div class="fig-group-head">
+                <span class="k">heads</span>
+              </div>
+              <div class="fig-group-body">
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={headStyleLocked}
+                        aria-label="Start head"
+                        title={headValueLabel(sharedHeadFrom)}
+                        onclick={toggle}
+                      >
+                        <span class="font-label">from</span>
+                        <span class="font-value head-value" class:mixed={sharedHeadFrom === 'Mixed'}>
+                          {#if sharedHeadFrom === 'Mixed'}
+                            Mixed
+                          {:else}
+                            <HeadIcon head={concreteHead(sharedHeadFrom)} />
+                          {/if}
+                        </span>
+                        <DropdownChevron />
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each HEAD_OPTIONS as option (option.value)}
+                        <button
+                          type="button"
+                          class="font-option"
+                          class:selected={sharedHeadFrom === option.value}
+                          disabled={headStyleLocked}
+                          aria-label={option.label}
+                          title={option.label}
+                          onclick={() => {
+                            void applySharedHead('head_from', option.value);
+                            close();
+                          }}
+                        >
+                          <HeadIcon head={option.value} />
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
+                <div class="font-dropdown">
+                  <Dropdown placement="bottom-start">
+                    {#snippet trigger({ toggle })}
+                      <button
+                        type="button"
+                        class="font-trigger"
+                        disabled={headStyleLocked}
+                        aria-label="End head"
+                        title={headValueLabel(sharedHeadTo)}
+                        onclick={toggle}
+                      >
+                        <span class="font-label">to</span>
+                        <span class="font-value head-value" class:mixed={sharedHeadTo === 'Mixed'}>
+                          {#if sharedHeadTo === 'Mixed'}
+                            Mixed
+                          {:else}
+                            <HeadIcon head={concreteHead(sharedHeadTo)} />
+                          {/if}
+                        </span>
+                        <DropdownChevron />
+                      </button>
+                    {/snippet}
+                    {#snippet menu({ close })}
+                      {#each HEAD_OPTIONS as option (option.value)}
+                        <button
+                          type="button"
+                          class="font-option"
+                          class:selected={sharedHeadTo === option.value}
+                          disabled={headStyleLocked}
+                          aria-label={option.label}
+                          title={option.label}
+                          onclick={() => {
+                            void applySharedHead('head_to', option.value);
+                            close();
+                          }}
+                        >
+                          <HeadIcon head={option.value} />
+                        </button>
+                      {/each}
+                    {/snippet}
+                  </Dropdown>
+                </div>
+              </div>
+            </div>
+          {/if}
+
+          {#if hasSharedRoundedStyle}
+            <div class="fig-group" class:is-on={sharedRounded === true}>
+              <div class="fig-group-head">
+                <span class="k">rounded</span>
+                <span class="fig-spacer"></span>
+                <Toggle
+                  checked={sharedRounded === true}
+                  disabled={roundedStyleLocked}
+                  ariaLabel="Toggle rounded corners"
+                  onchange={(next) => void applyShapeBoolean('corner_rounded', next)}
+                />
+              </div>
+            </div>
+          {/if}
+        </section>
+      {/if}
+
+      {#if sessionItem !== null && selectionCount === 1 && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'path' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets')}
         <section class="prop-section">
           <div class="prop-head"><h4>Item Payload</h4></div>
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
@@ -3515,6 +4072,10 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .font-value.mixed {
+    color: var(--color-fg-muted);
+    font-style: italic;
   }
 
   .head-value {
