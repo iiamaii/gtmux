@@ -34,9 +34,8 @@
   import { fontFamilyVar } from './fontFamily';
   import { fontWeightCss, textDecorationCss } from './textStyle';
   import {
-    constrainResizeSquare,
-    resizeEventShiftKey,
-    scheduleLiveSquareResize,
+    constrainResizeAspectIfShift,
+    scheduleLiveAspectResize,
   } from './resizeConstraint';
   import { strokeDashArray } from './strokeDash';
 
@@ -169,19 +168,26 @@
   }
 
   function onResize(event: unknown, params: ResizeParams): void {
-    scheduleLiveSquareResize(
+    scheduleLiveAspectResize(
       event,
       params,
       data,
+      data.w / data.h,
+      SHAPE_MIN_SIZE,
       SHAPE_MIN_SIZE,
       applyLiveResize,
     );
   }
 
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
-    const constrained = resizeEventShiftKey(event)
-      ? constrainResizeSquare(params, data, SHAPE_MIN_SIZE)
-      : params;
+    const constrained = constrainResizeAspectIfShift(
+      event,
+      params,
+      data,
+      data.w / data.h,
+      SHAPE_MIN_SIZE,
+      SHAPE_MIN_SIZE,
+    );
     const nextW = Math.max(SHAPE_MIN_SIZE, constrained.width);
     const nextH = Math.max(SHAPE_MIN_SIZE, constrained.height);
     await sessionStore.applyMutation(

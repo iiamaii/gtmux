@@ -3,10 +3,7 @@ import {
   resizeEventShiftKey,
   constrainResizeAspect,
   constrainResizeAspectIfShift,
-  constrainResizeSquare,
   scheduleLiveAspectResize,
-  scheduleLiveSquareResize,
-  squarePointFromDrag,
   projectPointToAngle,
 } from '$lib/canvas/resizeConstraint';
 
@@ -26,20 +23,6 @@ describe('resizeEventShiftKey', () => {
   });
 });
 
-describe('constrainResizeSquare (rect/ellipse 1:1)', () => {
-  it('forces a square from a non-square drag, top-left anchored', () => {
-    const out = constrainResizeSquare(
-      { x: 0, y: 0, width: 150, height: 120 },
-      { x: 0, y: 0, w: 100, h: 100 },
-      20,
-    );
-    expect(out.width).toBe(out.height);
-    expect(out.width).toBe(150); // dominant (width) axis wins
-    expect(out.x).toBe(0);
-    expect(out.y).toBe(0);
-  });
-});
-
 describe('constrainResizeAspect (image source-aspect / current-aspect lock)', () => {
   it('maintains a 2:1 aspect ratio', () => {
     const out = constrainResizeAspect(
@@ -54,6 +37,17 @@ describe('constrainResizeAspect (image source-aspect / current-aspect lock)', ()
   it('passes through on non-finite/zero aspect', () => {
     const params = { x: 1, y: 2, width: 30, height: 40 };
     expect(constrainResizeAspect(params, { x: 0, y: 0, w: 10, h: 10 }, 0, 1, 1)).toEqual(params);
+  });
+  it('preserves a non-square shape aspect for rect/ellipse resize', () => {
+    const out = constrainResizeAspect(
+      { x: 0, y: 0, width: 360, height: 180 },
+      { x: 0, y: 0, w: 240, h: 120 },
+      240 / 120,
+      20,
+      20,
+    );
+    expect(out.width / out.height).toBeCloseTo(2, 5);
+    expect(out.width).not.toBe(out.height);
   });
 });
 
@@ -82,30 +76,6 @@ describe('scheduleLiveAspectResize', () => {
     expect(calls).toEqual([]);
     await Promise.resolve();
     expect(calls[0]!.width / calls[0]!.height).toBeCloseTo(2, 5);
-  });
-});
-
-describe('scheduleLiveSquareResize', () => {
-  it('schedules live square geometry while Shift is held', async () => {
-    const calls: { x: number; y: number; width: number; height: number }[] = [];
-    scheduleLiveSquareResize(
-      { shiftKey: true },
-      { x: 0, y: 0, width: 170, height: 120 },
-      { x: 0, y: 0, w: 100, h: 100 },
-      20,
-      (next) => calls.push(next),
-    );
-    expect(calls).toEqual([]);
-    await Promise.resolve();
-    expect(calls[0]!.width).toBe(calls[0]!.height);
-    expect(calls[0]!.width).toBe(170);
-  });
-});
-
-describe('squarePointFromDrag (figure Shift+draw)', () => {
-  it('snaps to the dominant axis preserving sign', () => {
-    expect(squarePointFromDrag({ x: 0, y: 0 }, { x: 30, y: 10 })).toEqual({ x: 30, y: 30 });
-    expect(squarePointFromDrag({ x: 0, y: 0 }, { x: -30, y: 10 })).toEqual({ x: -30, y: 30 });
   });
 });
 

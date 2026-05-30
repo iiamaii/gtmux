@@ -70,7 +70,7 @@
     DEFAULT_SNIPPETS_SIZE,
   } from './itemFactory';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
-  import { projectPointToAngle, squarePointFromDrag } from './resizeConstraint';
+  import { projectPointToAngle } from './resizeConstraint';
   import {
     anchorPoint,
     autoRoutePath,
@@ -536,14 +536,6 @@
         y2: cy - top,
         path: '',
       };
-    }
-    if (
-      dragState.shiftKey &&
-      (dragState.tool === 'rect' || dragState.tool === 'ellipse')
-    ) {
-      const square = squarePointFromDrag(dragState.startLocal, dragState.currentLocal);
-      cx = square.x;
-      cy = square.y;
     }
     return {
       tool: dragState.tool,
@@ -1338,9 +1330,6 @@
           : endFlow;
       item = createLineItem(state.startFlow, p2);
     } else {
-      if (e.shiftKey && (state.tool === 'rect' || state.tool === 'ellipse')) {
-        endFlow = squarePointFromDrag(state.startFlow, endFlow);
-      }
       const constrainedDx = endFlow.x - state.startFlow.x;
       const constrainedDy = endFlow.y - state.startFlow.y;
       // Rect/Ellipse: bounding box 정규화 (drag 방향 무관, w/h ≥ 0).
