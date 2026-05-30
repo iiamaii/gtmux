@@ -19,11 +19,12 @@
 
   interface Props {
     value: FigureStrokeDash;
+    mixed?: boolean;
     disabled?: boolean;
     onpick: (next: FigureStrokeDash) => void;
   }
 
-  const { value, disabled = false, onpick }: Props = $props();
+  const { value, mixed = false, disabled = false, onpick }: Props = $props();
 
   const PATTERNS: { id: FigureStrokeDash; title: string; dashArray: string; linecap: 'round' | 'butt' }[] = [
     { id: 'solid',    title: 'Solid',    dashArray: 'none',      linecap: 'round' },
@@ -69,14 +70,14 @@
   }
 </script>
 
-<div bind:this={rootEl} class="style-dropdown inspector-input" class:disabled class:open>
+<div bind:this={rootEl} class="style-dropdown inspector-input" class:disabled class:open class:mixed>
   <span class="k" aria-hidden="true">style</span>
   <button
     type="button"
     class="style-trigger"
     aria-haspopup="listbox"
     aria-expanded={open}
-    aria-label="Stroke style — {current.title}"
+    aria-label="Stroke style — {mixed ? 'Mixed' : current.title}"
     {disabled}
     onclick={() => { if (!disabled) open = !open; }}
   >
@@ -88,8 +89,8 @@
         y2="6"
         stroke="currentColor"
         stroke-width="1.6"
-        stroke-dasharray={current.dashArray}
-        stroke-linecap={current.linecap}
+        stroke-dasharray={mixed ? '2 3' : current.dashArray}
+        stroke-linecap={mixed ? 'round' : current.linecap}
       />
     </svg>
     <DropdownChevron />
@@ -100,9 +101,9 @@
         <button
           type="button"
           class="style-option"
-          class:selected={value === p.id}
+          class:selected={!mixed && value === p.id}
           role="option"
-          aria-selected={value === p.id}
+          aria-selected={!mixed && value === p.id}
           title={p.title}
           onclick={() => pick(p.id)}
         >
@@ -178,6 +179,9 @@
     height: 12px;
     min-width: 0;
     color: var(--color-fg);
+  }
+  .style-dropdown.mixed .style-preview {
+    color: var(--color-fg-muted);
   }
   .style-popover {
     position: absolute;
