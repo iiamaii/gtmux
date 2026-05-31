@@ -537,6 +537,7 @@ describe('pathGeometry', () => {
 
   it('moves selected waypoints only', () => {
     const p = path({
+      routing: 'straight',
       waypoints: [
         { id: 'a', x: 10, y: 10 },
         { id: 'b', x: 20, y: 20 },
@@ -545,6 +546,42 @@ describe('pathGeometry', () => {
     expect(moveWaypoints(p, new Set(['b']), { x: 5, y: -2 }).waypoints).toEqual([
       { id: 'a', x: 10, y: 10 },
       { id: 'b', x: 25, y: 18 },
+    ]);
+  });
+
+  it('constrains selected orthogonal horizontal waypoint segments to vertical movement', () => {
+    const p = path({
+      waypoints: [
+        { id: 'a', x: 20, y: 40 },
+        { id: 'b', x: 80, y: 40 },
+      ],
+    });
+    expect(moveWaypoints(p, new Set(['a', 'b']), { x: 12, y: 8 }).waypoints).toEqual([
+      { id: 'a', x: 20, y: 48 },
+      { id: 'b', x: 80, y: 48 },
+    ]);
+  });
+
+  it('constrains selected orthogonal vertical waypoint segments to horizontal movement', () => {
+    const p = path({
+      waypoints: [
+        { id: 'a', x: 40, y: 20 },
+        { id: 'b', x: 40, y: 80 },
+      ],
+    });
+    expect(moveWaypoints(p, new Set(['a', 'b']), { x: 12, y: 8 }).waypoints).toEqual([
+      { id: 'a', x: 52, y: 20 },
+      { id: 'b', x: 52, y: 80 },
+    ]);
+  });
+
+  it('keeps straight and smooth waypoint edits freeform', () => {
+    const p = path({
+      routing: 'bezier',
+      waypoints: [{ id: 'a', x: 20, y: 40 }],
+    });
+    expect(moveWaypoints(p, new Set(['a']), { x: 12, y: 8 }).waypoints).toEqual([
+      { id: 'a', x: 32, y: 48 },
     ]);
   });
 

@@ -4,13 +4,16 @@
   // 사용자 입력 path 의 visual reference. 실제 OS-level open 은 ADR-0023 의
   // confirm + allowlist 흐름 (FileOpenConfirmModal — BE-NEW-12 의존, P2).
   //
-  // ADR-0035 D1 (2026-05-17 amend) — path 의 *직접 입력 제거*. 더블 클릭 →
-  // 전역 filePicker 으로 picker modal 진입 → 선택 시 applyMutation.
-  // InlineEdit 패턴 폐기 (path 의 free-form typing 은 traversal / typo risk).
+  // ADR-0035 D1/D1.1 — path 의 *직접 입력 제거*. Spawn/change 는
+  // explicit picker action 이 담당하고, 기존 item 의 double-click 은 full
+  // path 를 clipboard 로 복사한다. InlineEdit 패턴 폐기 (path 의 free-form
+  // typing 은 traversal / typo risk).
 
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { FilePathItem, CanvasItem } from '$lib/types/canvas';
   import CanvasCloseButton from './CanvasCloseButton.svelte';
   import {
@@ -103,6 +106,27 @@
     e.stopPropagation();
     filePicker.openFor('', (path) => {
       void onCommit(path);
+    });
+  }
+
+  async function onCopyPathDblClick(e: MouseEvent): Promise<void> {
+    e.stopPropagation();
+    const path = (data.path ?? '').trim();
+    if (path.length === 0) {
+      toastStore.show({
+        message: 'No file path to copy.',
+        tone: 'warning',
+        durationMs: 2_000,
+      });
+      return;
+    }
+    const result = await copyTextToSystemClipboard(path);
+    toastStore.show({
+      message: result.ok
+        ? 'Copied file path to clipboard.'
+        : `Clipboard failed: ${result.reason ?? 'browser security blocked copy'}`,
+      tone: result.ok ? 'success' : 'error',
+      durationMs: result.ok ? 2_000 : 4_000,
     });
   }
 
@@ -215,7 +239,7 @@
     {/if}
     <div class="fp-card">
       <!-- Main row — icon + meta (path / name) (시안 §03 fp-main). -->
-      <div class="fp-main" ondblclick={onPickClick} role="presentation">
+      <div class="fp-main" ondblclick={(e) => void onCopyPathDblClick(e)} role="presentation">
         <div class="fp-icon" aria-hidden="true">
           <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round">
             {#if data.kind === 'directory'}
@@ -228,7 +252,7 @@
         </div>
         <div class="fp-meta">
           {#if data.path.length === 0}
-            <span class="path-placeholder">Double-click to pick a file…</span>
+            <span class="path-placeholder">Use the change button to pick a file…</span>
           {:else}
             {#if splitPath.dir.length > 0}
               <div class="fp-path" title={data.path}>{splitPath.dir}</div>

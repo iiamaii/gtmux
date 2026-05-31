@@ -23,7 +23,7 @@
   import { attachConfirm, UnauthorizedError } from '$lib/http/sessions';
   import { killTerminal } from '$lib/http/terminals';
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
-  import type { Anchor, CanvasItem, CanvasLayout, PathEndpoint, Point } from '$lib/types/canvas';
+  import type { Anchor, CanvasItem, CanvasLayout, Head, PathEndpoint, PathItem, Point } from '$lib/types/canvas';
   import {
     descendantGroups,
     descendantItems,
@@ -74,15 +74,19 @@
   import {
     anchorPoint,
     autoRoutePath,
+    buildPathD,
     connectableTargetAtPoint,
     computePathBBox,
     hasConnectedEndpoint,
     isPathConnectedToAny,
     nearestAnchor,
+    resolveEndpoint,
     translatePath,
     updatePathBBoxCache,
   } from './pathGeometry';
   import { pathEditStore } from '$lib/stores/pathEditStore.svelte';
+  import { strokeDashArray } from './strokeDash';
+  import PathHeadMarker from './PathHeadMarker.svelte';
 
   interface CanvasProps {
     /** ContextMenu trigger — `+page.svelte` 가 호스팅하는 ContextMenu
@@ -124,6 +128,24 @@
     local: Point;
   }
   let pathCreateStart = $state<PathCreateStart | null>(null);
+  type PathCreatePreview = {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+    viewBoxW: number;
+    viewBoxH: number;
+    d: string;
+    stroke: string;
+    strokeWidth: number;
+    dashArray: string | undefined;
+    headFrom: Head;
+    headTo: Head;
+    fromX: number;
+    fromY: number;
+    toX: number;
+    toY: number;
+  };
   type PathAnchorCandidate = {
     endpoint: PathEndpoint;
     point: Point;
@@ -556,24 +578,32 @@
     return pathAnchorCandidateAt(hoverFlow, pathCreateBlockedTargetId());
   });
 
-  const pathCreatePreview = $derived.by(() => {
-    const endLocal = pathCreateAnchorPreview?.local ?? hoverScreen;
-    if (pathCreateStart === null || endLocal === null) return null;
-    const sx = pathCreateStart.local.x;
-    const sy = pathCreateStart.local.y;
-    const cx = endLocal.x;
-    const cy = endLocal.y;
-    const left = Math.min(sx, cx) - GHOST_LINE_PADDING;
-    const top = Math.min(sy, cy) - GHOST_LINE_PADDING;
+  const pathCreatePreview = $derived.by((): PathCreatePreview | null => {
+    if (pathCreateStart === null || hoverFlow === null) return null;
+    const end = pathCreateAnchorPreview ?? pathEndpointAt(hoverFlow, flowToLocal(hoverFlow));
+    const draft = pathCreateDraft(pathCreateStart, end);
+    const box = computePathBBox(draft, sessionStore.items);
+    const boxLocal = flowToLocal({ x: box.x, y: box.y });
+    const zoom = sessionStore.viewport.zoom;
+    const from = resolvePathEndpointForPreview(draft.from);
+    const to = resolvePathEndpointForPreview(draft.to);
     return {
-      left,
-      top,
-      width: Math.max(Math.abs(cx - sx), 1) + GHOST_LINE_PADDING * 2,
-      height: Math.max(Math.abs(cy - sy), 1) + GHOST_LINE_PADDING * 2,
-      x1: sx - left,
-      y1: sy - top,
-      x2: cx - left,
-      y2: cy - top,
+      left: boxLocal.x,
+      top: boxLocal.y,
+      width: Math.max(box.w * zoom, 1),
+      height: Math.max(box.h * zoom, 1),
+      viewBoxW: box.w,
+      viewBoxH: box.h,
+      d: buildPathD(draft, sessionStore.items, box),
+      stroke: draft.stroke,
+      strokeWidth: draft.stroke_width,
+      dashArray: strokeDashArray(draft.stroke_dash, draft.stroke_width),
+      headFrom: draft.head_from,
+      headTo: draft.head_to,
+      fromX: from.x - box.x,
+      fromY: from.y - box.y,
+      toX: to.x - box.x,
+      toY: to.y - box.y,
     };
   });
 
@@ -672,6 +702,25 @@
       point,
       local,
     };
+  }
+
+  function pathCreateDraft(start: PathCreateStart, end: PathCreateStart): PathItem {
+    const parentId = pathParentForEndpoints(start.endpoint, end.endpoint);
+    const item = autoRoutePath(
+      {
+        ...createPathItem(start.point, end.point),
+        id: 'path-create-preview',
+        parent_id: parentId,
+        from: start.endpoint,
+        to: end.endpoint,
+      },
+      sessionStore.items,
+    );
+    return item;
+  }
+
+  function resolvePathEndpointForPreview(endpoint: PathEndpoint): Point {
+    return resolveEndpoint(endpoint, sessionStore.items);
   }
 
   function pathParentForEndpoints(from: PathEndpoint, to: PathEndpoint): string | null {
@@ -2943,21 +2992,36 @@
       <svg
         width={pathCreatePreview.width}
         height={pathCreatePreview.height}
-        viewBox={`0 0 ${pathCreatePreview.width} ${pathCreatePreview.height}`}
-        preserveAspectRatio="none"
+        viewBox={`0 0 ${pathCreatePreview.viewBoxW} ${pathCreatePreview.viewBoxH}`}
+        preserveAspectRatio="xMidYMid meet"
       >
-        <line
-          x1={pathCreatePreview.x1}
-          y1={pathCreatePreview.y1}
-          x2={pathCreatePreview.x2}
-          y2={pathCreatePreview.y2}
-          stroke="var(--color-accent)"
-          stroke-width={2}
+        <defs>
+          <PathHeadMarker
+            id="path-create-preview-marker-start"
+            head={pathCreatePreview.headFrom}
+            stroke={pathCreatePreview.stroke}
+            orient="auto-start-reverse"
+          />
+          <PathHeadMarker
+            id="path-create-preview-marker-end"
+            head={pathCreatePreview.headTo}
+            stroke={pathCreatePreview.stroke}
+          />
+        </defs>
+        <path
+          d={pathCreatePreview.d}
+          fill="none"
+          stroke={pathCreatePreview.stroke}
+          stroke-width={pathCreatePreview.strokeWidth}
           stroke-linecap="round"
-          stroke-dasharray="6 4"
+          stroke-linejoin="round"
+          stroke-dasharray={pathCreatePreview.dashArray}
+          marker-start={pathCreatePreview.headFrom === 'none' ? undefined : 'url(#path-create-preview-marker-start)'}
+          marker-end={pathCreatePreview.headTo === 'none' ? undefined : 'url(#path-create-preview-marker-end)'}
+          vector-effect="non-scaling-stroke"
         />
-        <circle cx={pathCreatePreview.x1} cy={pathCreatePreview.y1} r="3.5" />
-        <circle cx={pathCreatePreview.x2} cy={pathCreatePreview.y2} r="3.5" />
+        <circle cx={pathCreatePreview.fromX} cy={pathCreatePreview.fromY} r="3.5" />
+        <circle cx={pathCreatePreview.toX} cy={pathCreatePreview.toY} r="3.5" />
       </svg>
     </div>
   {/if}

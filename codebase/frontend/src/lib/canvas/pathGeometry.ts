@@ -951,11 +951,57 @@ export function moveWaypoints(
   path: PathItem,
   waypointIds: ReadonlySet<string>,
   delta: Point,
-  _routing: PathRouting = path.routing,
+  itemMap: ReadonlyMap<string, CanvasItem> = new Map(),
+  routing: PathRouting = path.routing,
 ): PathItem {
   if (waypointIds.size === 0) return path;
+  const constrainedDelta = constrainWaypointDelta(path, waypointIds, delta, itemMap, routing);
   const waypoints: PathWaypoint[] = (path.waypoints ?? []).map((p) =>
-    waypointIds.has(p.id) ? { ...p, x: p.x + delta.x, y: p.y + delta.y } : p,
+    waypointIds.has(p.id) ? { ...p, x: p.x + constrainedDelta.x, y: p.y + constrainedDelta.y } : p,
   );
   return { ...path, waypoints };
+}
+
+function constrainWaypointDelta(
+  path: PathItem,
+  waypointIds: ReadonlySet<string>,
+  delta: Point,
+  itemMap: ReadonlyMap<string, CanvasItem>,
+  routing: PathRouting,
+): Point {
+  if (routing !== 'orthogonal') return delta;
+  const waypoints = path.waypoints ?? [];
+  const selectedIndexes = waypoints
+    .map((p, index) => (waypointIds.has(p.id) ? index : -1))
+    .filter((index) => index >= 0);
+  if (selectedIndexes.length === 0) return delta;
+
+  if (selectedIndexes.length >= 2 && selectedIndexes.every((index, i) =>
+    i === 0 || index === selectedIndexes[i - 1]! + 1
+  )) {
+    const selected = selectedIndexes.map((index) => waypoints[index]!);
+    if (selected.every((p) => p.y === selected[0]!.y)) return { x: 0, y: delta.y };
+    if (selected.every((p) => p.x === selected[0]!.x)) return { x: delta.x, y: 0 };
+  }
+
+  if (selectedIndexes.length !== 1) return dominantAxisDelta(delta);
+
+  const waypointIndex = selectedIndexes[0]!;
+  const point = waypoints[waypointIndex]!;
+  const prev = waypointIndex === 0
+    ? resolveEndpoint(path.from, itemMap)
+    : waypoints[waypointIndex - 1]!;
+  const next = waypointIndex === waypoints.length - 1
+    ? resolveEndpoint(path.to, itemMap)
+    : waypoints[waypointIndex + 1]!;
+
+  if (prev.y === point.y && next.y === point.y) return { x: 0, y: delta.y };
+  if (prev.x === point.x && next.x === point.x) return { x: delta.x, y: 0 };
+  return dominantAxisDelta(delta);
+}
+
+function dominantAxisDelta(delta: Point): Point {
+  return Math.abs(delta.x) >= Math.abs(delta.y)
+    ? { x: delta.x, y: 0 }
+    : { x: 0, y: delta.y };
 }

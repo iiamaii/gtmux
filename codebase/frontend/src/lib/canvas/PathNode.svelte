@@ -21,6 +21,7 @@
     connectableTargetAtPoint,
     connectPathEndpoint,
     insertWaypointNearPoint,
+    moveWaypoints,
     nearestAnchor,
     removeWaypoints,
     resolveEndpoint,
@@ -322,12 +323,7 @@
     }
     const dx = flow.x - state.startFlow.x;
     const dy = flow.y - state.startFlow.y;
-    draft = {
-      ...state.startPath,
-      waypoints: (state.startPath.waypoints ?? []).map((p) =>
-        state.waypointIds.has(p.id) ? { ...p, x: p.x + dx, y: p.y + dy } : p,
-      ),
-    };
+    draft = moveWaypoints(state.startPath, state.waypointIds, { x: dx, y: dy }, itemMap);
   }
 
   function onWindowPointerUp(e: PointerEvent): void {
