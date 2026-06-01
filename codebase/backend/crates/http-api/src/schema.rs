@@ -608,38 +608,67 @@ pub enum Item {
         stroke_width: u32,
         points: Vec<Point>,
     },
+    /// ADR-0047 D1 (amends ADR-0018 D4) — image item = **workspace(B) file
+    /// reference** (`path`) or a **legacy content-hash asset** (`asset_id`,
+    /// read-only — ADR-0033 superseded). Exactly one of `path` / `asset_id`
+    /// is set; `validate()` enforces it (`ImageMissingSource` /
+    /// `ImageBothSources`). New items use `path` (B-relative — see
+    /// [`is_clean_relative_workspace_path`]); the FE resolves it → absolute
+    /// against the session's effective `workspace_root` and fetches the bytes
+    /// via `GET /api/fs/file`. `mime` is optional (sniffed at serve time).
     Image {
         #[serde(flatten)]
         common: ItemCommon,
-        asset_id: String,
-        mime: String,
+        /// ADR-0047 D1 — workspace(B)-relative path to the source file. The
+        /// new origin for image items.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// Legacy content-hash asset id (ADR-0033, superseded by ADR-0047).
+        /// Read-only: existing records keep rendering via
+        /// `GET /api/assets/{asset_id}`. New items never set this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asset_id: Option<String>,
+        /// Optional MIME hint. New `path` items may omit it (the serve
+        /// endpoint sniffs magic bytes); legacy asset records carry it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
         original_w: Option<u32>,
         original_h: Option<u32>,
     },
-    /// ADR-0018 D10 amend ① — two-mode document item:
-    ///   * (a) asset-based — `asset_id` is `Some(sha256)`, `content` is
-    ///     `None`. The actual bytes live behind `/api/assets/<asset_id>`
-    ///     (Stage 2, ADR-0030 to-be).
-    ///   * (b) inline-stored — `asset_id` is `None`, `content` is
-    ///     `Some(<utf-8 markdown>)` capped at [`DOCUMENT_INLINE_MAX_BYTES`].
-    /// The two modes are *mutually exclusive*; `validate()` enforces this
+    /// ADR-0047 D1 (amends ADR-0018 D10) — three-origin document item, exactly
+    /// one of:
+    ///   * (c) **workspace file** — `path` is `Some(<B-relative>)` (new; the
+    ///     bytes are read live via `GET /api/fs/file`). md/pdf/txt/html.
+    ///   * (b) **inline-stored** — `content` is `Some(<utf-8 markdown>)`
+    ///     capped at [`DOCUMENT_INLINE_MAX_BYTES`] (kept — canvas-authored).
+    ///   * (a) **legacy asset** — `asset_id` is `Some(sha256)` (read-only,
+    ///     ADR-0033 superseded; renders via `/api/assets/<asset_id>`).
+    /// The three origins are *mutually exclusive*; `validate()` enforces this
     /// (`DocumentMissingSource` / `DocumentBothSources`).
     Document {
         #[serde(flatten)]
         common: ItemCommon,
-        /// (a) asset-based mode: sha256 → `/api/assets/<asset_id>`.
-        /// (b) inline-stored mode: `None`.
+        /// (c) workspace-file origin: B-relative path. New documents from the
+        /// file explorer / Files-tab drag use this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// (a) legacy asset-based origin: sha256 → `/api/assets/<asset_id>`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         asset_id: Option<String>,
-        mime: String,
-        file_name: String,
-        /// (a) asset-based: real binary size.
-        /// (b) inline-stored: `content.len()` bytes.
-        size_bytes: u64,
         /// (b) inline-stored UTF-8 markdown, capped at
-        /// [`DOCUMENT_INLINE_MAX_BYTES`]. (a) is `None`.
+        /// [`DOCUMENT_INLINE_MAX_BYTES`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
+        /// Optional MIME hint (sniffed at serve time for `path` items).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
+        /// Optional display name (derived from `path` basename when absent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_name: Option<String>,
+        /// Optional size in bytes — `content.len()` (inline) or the real file
+        /// size (legacy asset). `path` items may omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_bytes: Option<u64>,
     },
     FilePath {
         #[serde(flatten)]
@@ -736,17 +765,32 @@ pub enum ValidationError {
     TextTooLong,
     #[error("free_draw exceeds {} points", FREE_DRAW_POINT_CAP)]
     FreeDrawTooManyPoints,
-    /// ADR-0018 D10 amend ① — Document item carries neither an `asset_id`
-    /// (asset-based mode) nor a `content` (inline-stored mode).
-    #[error("document item must carry either asset_id or content")]
+    /// ADR-0047 D1 — image item carries neither a `path` (workspace file ref)
+    /// nor a legacy `asset_id`.
+    #[error("image item must carry either path or asset_id")]
+    ImageMissingSource,
+    /// ADR-0047 D1 — image item carries *both* `path` and `asset_id`. The two
+    /// origins are mutually exclusive.
+    #[error("image item must not carry both path and asset_id")]
+    ImageBothSources,
+    /// ADR-0047 D1 (amends ADR-0018 D10) — document item carries none of its
+    /// three origins (`path` / `content` / `asset_id`).
+    #[error("document item must carry one of path, content, or asset_id")]
     DocumentMissingSource,
-    /// ADR-0018 D10 amend ① — Document item carries *both* `asset_id` and
-    /// `content`. The two modes are mutually exclusive.
-    #[error("document item must not carry both asset_id and content")]
+    /// ADR-0047 D1 (amends ADR-0018 D10) — document item carries more than one
+    /// of its three origins (`path` / `content` / `asset_id`). They are
+    /// mutually exclusive.
+    #[error("document item must carry exactly one of path, content, or asset_id")]
     DocumentBothSources,
     /// ADR-0018 D10 amend ① — inline-stored content exceeds the cap.
     #[error("document inline content exceeds {} bytes", DOCUMENT_INLINE_MAX_BYTES)]
     DocumentInlineTooLong,
+    /// ADR-0047 D1 / F1a — an image/document `path` is not a clean
+    /// workspace(B)-relative path (empty, absolute, NUL, or `.`/`..`
+    /// traversal). The runtime A+denylist boundary is enforced separately at
+    /// serve time (`GET /api/fs/file`).
+    #[error("workspace-relative resource path is invalid (empty/absolute/traversal)")]
+    WorkspacePathInvalid,
     /// ADR-0043 D7 — a `path` connected endpoint's `item_id` does not match
     /// any item in this layout. (The PUT handler degrades dangling endpoints
     /// to `free` *before* validate, so this fires only for raw validation of
@@ -810,9 +854,12 @@ impl ValidationError {
             Self::DescriptionTooLong => "description_too_long",
             Self::TextTooLong => "text_too_long",
             Self::FreeDrawTooManyPoints => "free_draw_too_many_points",
+            Self::ImageMissingSource => "image_missing_source",
+            Self::ImageBothSources => "image_both_sources",
             Self::DocumentMissingSource => "document_missing_source",
             Self::DocumentBothSources => "document_both_sources",
             Self::DocumentInlineTooLong => "document_inline_too_long",
+            Self::WorkspacePathInvalid => "workspace_path_invalid",
             Self::PathEndpointMissing => "path_endpoint_missing",
             Self::PathInvalidEndpoint => "path_invalid_endpoint",
             Self::PathSelfLoop => "path_self_loop",
@@ -828,6 +875,30 @@ impl ValidationError {
             Self::DuplicateSnippetEntryId(_) => "duplicate_snippet_entry_id",
         }
     }
+}
+
+/// ADR-0047 D1 / F1a — whether `p` is a *clean* workspace(B)-relative path
+/// usable as an image/document resource reference: non-empty, **relative**
+/// (not absolute), no NUL, and every component a plain name (no `.` / `..`
+/// traversal, no root). This guarantees `B.join(p)` stays lexically inside
+/// B ⊆ A; the hard canonicalize + A-scope + denylist boundary is still
+/// enforced when the bytes are actually read (`GET /api/fs/file`).
+///
+/// `Path::components()` yields `Component::Normal` for ordinary segments and
+/// `CurDir` / `ParentDir` / `RootDir` for `.` / `..` / a leading `/` — so
+/// requiring every component to be `Normal` rejects absolute paths and all
+/// traversal in one pass. (A leading dot in a *filename*, e.g. `.config`, is
+/// a `Normal` component and is allowed.)
+fn is_clean_relative_workspace_path(p: &str) -> bool {
+    if p.is_empty() || p.contains('\0') {
+        return false;
+    }
+    let path = std::path::Path::new(p);
+    if path.is_absolute() {
+        return false;
+    }
+    path.components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 /// Shared text-payload byte cap check (ADR-0018 D8). Reused by `Item::Text`
@@ -987,33 +1058,55 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                     return Err(ValidationError::FreeDrawTooManyPoints);
                 }
             }
-            Item::Document {
-                asset_id, content, ..
+            Item::Image {
+                path, asset_id, ..
             } => {
-                // ADR-0018 D10 amend ① — exactly one of (a) `asset_id` or
-                // (b) `content` must be set. The two modes are mutually
-                // exclusive; the `asset_id` form references a future
-                // `/api/assets/<sha256>` (Stage 2), and the `content` form
-                // inlines a small markdown payload in the layout JSON.
-                match (asset_id.as_ref(), content.as_ref()) {
-                    (None, None) => {
-                        return Err(ValidationError::DocumentMissingSource);
+                // ADR-0047 D1 — exactly one of (new) `path` or (legacy)
+                // `asset_id`. The hard A+denylist boundary is enforced at
+                // serve time (`GET /api/fs/file`); here we only assert the
+                // structural contract so a bad reference never persists.
+                match (path.as_ref(), asset_id.as_ref()) {
+                    (None, None) => return Err(ValidationError::ImageMissingSource),
+                    (Some(_), Some(_)) => return Err(ValidationError::ImageBothSources),
+                    (Some(p), None) => {
+                        if !is_clean_relative_workspace_path(p) {
+                            return Err(ValidationError::WorkspacePathInvalid);
+                        }
                     }
-                    (Some(_), Some(_)) => {
-                        return Err(ValidationError::DocumentBothSources);
+                    (None, Some(_)) => {
+                        // Legacy content-hash asset — read-only, accept any
+                        // non-empty string so existing records keep loading
+                        // (the sha256 shape was never validated on the wire).
                     }
-                    (None, Some(c)) => {
+                }
+            }
+            Item::Document {
+                path,
+                asset_id,
+                content,
+                ..
+            } => {
+                // ADR-0047 D1 (amends ADR-0018 D10) — exactly one of the three
+                // origins: (c) workspace `path`, (b) inline `content`, or
+                // (a) legacy `asset_id`. As with image, the path's hard
+                // A+denylist guard lives in `GET /api/fs/file`.
+                match (path.as_ref(), content.as_ref(), asset_id.as_ref()) {
+                    (None, None, None) => return Err(ValidationError::DocumentMissingSource),
+                    (Some(p), None, None) => {
+                        if !is_clean_relative_workspace_path(p) {
+                            return Err(ValidationError::WorkspacePathInvalid);
+                        }
+                    }
+                    (None, Some(c), None) => {
                         if c.len() > DOCUMENT_INLINE_MAX_BYTES {
                             return Err(ValidationError::DocumentInlineTooLong);
                         }
                     }
-                    (Some(_), None) => {
-                        // asset-based mode. The sha256 hex-string shape
-                        // check lands alongside `/api/assets/*` ship —
-                        // until then we accept any non-empty string so the
-                        // existing on-disk records (asset_id strings the FE
-                        // never validated either) keep loading.
+                    (None, None, Some(_)) => {
+                        // Legacy asset-based mode — read-only, accept.
                     }
+                    // Any combination of two or more origins is ambiguous.
+                    _ => return Err(ValidationError::DocumentBothSources),
                 }
             }
             Item::Path {
@@ -1573,90 +1666,230 @@ mod tests {
         assert_eq!(validate(&l), Err(ValidationError::FreeDrawTooManyPoints));
     }
 
-    // ── ADR-0018 D10 amend ① — Document inline-stored mode ──
+    // ── ADR-0047 D1 (amends ADR-0018 D10) — Document three origins ──
 
-    /// Inline-stored mode: `asset_id=None`, `content=Some(...)`. ADR's
-    /// (b) branch. Must validate cleanly.
+    /// Inline-stored origin (b): `content=Some(...)`, everything else `None`.
     #[test]
     fn document_inline_stored_validates() {
         let mut l = Layout::empty();
         l.items.push(Item::Document {
             common: item_common(UUID_A),
+            path: None,
             asset_id: None,
-            mime: "text/markdown".into(),
-            file_name: "notes.md".into(),
-            size_bytes: 5,
             content: Some("# Hi\n".into()),
+            mime: Some("text/markdown".into()),
+            file_name: Some("notes.md".into()),
+            size_bytes: Some(5),
         });
         assert_eq!(validate(&l), Ok(()));
     }
 
-    /// Asset-based mode: `asset_id=Some(...)`, `content=None`. ADR's (a)
-    /// branch. Must validate cleanly. The `asset_id` shape is intentionally
-    /// not regex-checked yet — the `/api/assets/*` ship will add that
-    /// alongside the binary endpoint (Stage 2, ADR-0030 to-be).
+    /// Legacy asset-based origin (a): `asset_id=Some(...)` only. Read-only;
+    /// the sha256 shape is intentionally not regex-checked so existing
+    /// records keep loading (ADR-0047 D7).
     #[test]
     fn document_asset_based_validates() {
         let mut l = Layout::empty();
         l.items.push(Item::Document {
             common: item_common(UUID_A),
+            path: None,
             asset_id: Some("dead".repeat(16)), // placeholder 64-char hex-ish
-            mime: "application/pdf".into(),
-            file_name: "spec.pdf".into(),
-            size_bytes: 12345,
             content: None,
+            mime: Some("application/pdf".into()),
+            file_name: Some("spec.pdf".into()),
+            size_bytes: Some(12345),
         });
         assert_eq!(validate(&l), Ok(()));
     }
 
-    /// Neither field set → ADR's "mode is undefined". The handler should
-    /// surface this as a deterministic `document_missing_source` code so
-    /// the FE can render a precise error message.
+    /// Workspace-file origin (c): `path=Some(<B-relative>)` only (ADR-0047 D1).
+    #[test]
+    fn document_workspace_path_validates() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Document {
+            common: item_common(UUID_A),
+            path: Some("docs/spec.md".into()),
+            asset_id: None,
+            content: None,
+            mime: None,
+            file_name: None,
+            size_bytes: None,
+        });
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// No origin set → deterministic `document_missing_source`.
     #[test]
     fn document_missing_source_rejected() {
         let mut l = Layout::empty();
         l.items.push(Item::Document {
             common: item_common(UUID_A),
+            path: None,
             asset_id: None,
-            mime: "text/plain".into(),
-            file_name: "ghost.txt".into(),
-            size_bytes: 0,
             content: None,
+            mime: Some("text/plain".into()),
+            file_name: Some("ghost.txt".into()),
+            size_bytes: Some(0),
         });
         assert_eq!(validate(&l), Err(ValidationError::DocumentMissingSource));
     }
 
-    /// Both fields set → ADR's "mutually exclusive" rule is violated. The
-    /// FE must pick exactly one mode for a given Document.
+    /// More than one origin set → `document_both_sources` (mutually exclusive).
     #[test]
     fn document_both_sources_rejected() {
         let mut l = Layout::empty();
         l.items.push(Item::Document {
             common: item_common(UUID_A),
+            path: None,
             asset_id: Some("abc".into()),
-            mime: "text/markdown".into(),
-            file_name: "conflicted.md".into(),
-            size_bytes: 4,
             content: Some("body".into()),
+            mime: Some("text/markdown".into()),
+            file_name: Some("conflicted.md".into()),
+            size_bytes: Some(4),
         });
         assert_eq!(validate(&l), Err(ValidationError::DocumentBothSources));
+        // path + content is also rejected.
+        let mut l2 = Layout::empty();
+        l2.items.push(Item::Document {
+            common: item_common(UUID_A),
+            path: Some("a.md".into()),
+            asset_id: None,
+            content: Some("x".into()),
+            mime: None,
+            file_name: None,
+            size_bytes: None,
+        });
+        assert_eq!(validate(&l2), Err(ValidationError::DocumentBothSources));
     }
 
-    /// Inline-stored content over [`DOCUMENT_INLINE_MAX_BYTES`] is
-    /// rejected; the FE is expected to switch to asset-based mode at that
-    /// scale (Stage 2 prerequisite).
+    /// A document `path` that escapes B via `..` (or is absolute) → rejected.
+    #[test]
+    fn document_path_traversal_rejected() {
+        for bad in ["../secret.md", "/etc/passwd", "a/../../b.md", ""] {
+            let mut l = Layout::empty();
+            l.items.push(Item::Document {
+                common: item_common(UUID_A),
+                path: Some(bad.into()),
+                asset_id: None,
+                content: None,
+                mime: None,
+                file_name: None,
+                size_bytes: None,
+            });
+            assert_eq!(
+                validate(&l),
+                Err(ValidationError::WorkspacePathInvalid),
+                "expected reject for path {bad:?}"
+            );
+        }
+    }
+
+    /// Inline-stored content over [`DOCUMENT_INLINE_MAX_BYTES`] is rejected.
     #[test]
     fn document_inline_cap_enforced() {
         let mut l = Layout::empty();
         l.items.push(Item::Document {
             common: item_common(UUID_A),
+            path: None,
             asset_id: None,
-            mime: "text/markdown".into(),
-            file_name: "huge.md".into(),
-            size_bytes: (DOCUMENT_INLINE_MAX_BYTES + 1) as u64,
             content: Some("a".repeat(DOCUMENT_INLINE_MAX_BYTES + 1)),
+            mime: Some("text/markdown".into()),
+            file_name: Some("huge.md".into()),
+            size_bytes: Some((DOCUMENT_INLINE_MAX_BYTES + 1) as u64),
         });
         assert_eq!(validate(&l), Err(ValidationError::DocumentInlineTooLong));
+    }
+
+    // ── ADR-0047 D1 — Image path/asset_id xor ──
+
+    /// New origin: `path=Some(<B-relative>)`, `asset_id=None`.
+    #[test]
+    fn image_workspace_path_validates() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Image {
+            common: item_common(UUID_A),
+            path: Some("assets/logo.png".into()),
+            asset_id: None,
+            mime: None,
+            original_w: Some(100),
+            original_h: Some(50),
+        });
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// Legacy origin: `asset_id=Some(...)`, `path=None` (read-only).
+    #[test]
+    fn image_legacy_asset_validates() {
+        let mut l = Layout::empty();
+        l.items.push(Item::Image {
+            common: item_common(UUID_A),
+            path: None,
+            asset_id: Some("beef".repeat(16)),
+            mime: Some("image/png".into()),
+            original_w: None,
+            original_h: None,
+        });
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// Neither / both / traversal → precise errors.
+    #[test]
+    fn image_source_xor_and_path_enforced() {
+        let none = {
+            let mut l = Layout::empty();
+            l.items.push(Item::Image {
+                common: item_common(UUID_A),
+                path: None,
+                asset_id: None,
+                mime: None,
+                original_w: None,
+                original_h: None,
+            });
+            validate(&l)
+        };
+        assert_eq!(none, Err(ValidationError::ImageMissingSource));
+
+        let both = {
+            let mut l = Layout::empty();
+            l.items.push(Item::Image {
+                common: item_common(UUID_A),
+                path: Some("a.png".into()),
+                asset_id: Some("x".into()),
+                mime: None,
+                original_w: None,
+                original_h: None,
+            });
+            validate(&l)
+        };
+        assert_eq!(both, Err(ValidationError::ImageBothSources));
+
+        let traversal = {
+            let mut l = Layout::empty();
+            l.items.push(Item::Image {
+                common: item_common(UUID_A),
+                path: Some("../escape.png".into()),
+                asset_id: None,
+                mime: None,
+                original_w: None,
+                original_h: None,
+            });
+            validate(&l)
+        };
+        assert_eq!(traversal, Err(ValidationError::WorkspacePathInvalid));
+    }
+
+    #[test]
+    fn clean_relative_workspace_path_predicate() {
+        assert!(is_clean_relative_workspace_path("a.png"));
+        assert!(is_clean_relative_workspace_path("dir/sub/a.png"));
+        assert!(is_clean_relative_workspace_path(".config/x")); // dotfile name ok
+        assert!(is_clean_relative_workspace_path("a/./b.png")); // inner CurDir normalized away
+        assert!(!is_clean_relative_workspace_path(""));
+        assert!(!is_clean_relative_workspace_path("/abs/a.png"));
+        assert!(!is_clean_relative_workspace_path("../a.png"));
+        assert!(!is_clean_relative_workspace_path("a/../../b.png"));
+        assert!(!is_clean_relative_workspace_path("./a.png")); // leading CurDir
+        assert!(!is_clean_relative_workspace_path("a\0b.png"));
     }
 
     #[test]

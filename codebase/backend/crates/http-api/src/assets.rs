@@ -1,51 +1,35 @@
-//! `/api/assets` — content-addressed binary store for image/document items
-//! (ADR-0033, 0080 BE handover).
+//! `/api/assets` — **legacy** content-addressed binary store for image/document
+//! items (ADR-0033). **Superseded by ADR-0047 (D7):** image/document items now
+//! reference real files in the session Workspace(B) (uploaded via
+//! `POST /api/fs/upload`, served by `GET /api/fs/file`). This module is kept
+//! only for *read* back-compat of pre-ADR-0047 layouts.
 //!
 //! Endpoints:
-//!   * `POST   /api/assets`             — multipart upload, sha256 dedupe.
-//!   * `POST   /api/assets/from-path`   — copy a workspace file into assets.
-//!   * `GET    /api/assets/{asset_id}`  — serve raw bytes, immutable cache.
+//!   * `POST   /api/assets`             — **deprecated, `410 Gone`** (no new assets).
+//!   * `POST   /api/assets/from-path`   — **deprecated, `410 Gone`**.
+//!   * `GET    /api/assets/{asset_id}`  — serve raw bytes, immutable cache (legacy read).
 //!
-//! Storage layout: `<workspace>/.assets/<sha256_hex>`. The file is named by
-//! its sha256 digest so identical bytes uploaded twice hit the same record
-//! (idempotent). `asset_id` is validated against `[a-f0-9]{64}` before any
-//! path resolution, so `..`-style traversal is impossible by construction.
+//! Storage layout: `<store>/.assets/<sha256_hex>` — phased out (no new writes).
+//! `asset_id` is validated against `[a-f0-9]{64}` before any path resolution,
+//! so `..`-style traversal is impossible by construction.
 //!
-//! MIME policy (0080 §3 — MVP scope):
-//!   * `kind=image`    → png / jpeg / gif / webp / svg+xml
-//!   * `kind=document` → text/plain · text/markdown · application/json · application/pdf
-//!
-//! Detection is magic-byte based — the multipart `Content-Type` field is
-//! never trusted on its own. SVG falls back to a lightweight text-shape
-//! check (must start with `<?xml` or `<svg`).
-//!
-//! Size cap: configurable via `Config.assets.max_size_bytes` (default 50 MiB).
-//! Enforced by a route-scoped
-//! [`axum::extract::DefaultBodyLimit`] *and* a defensive recount inside the
-//! handler (axum's limit is best-effort against chunked uploads). Over-cap
-//! → 413.
-//!
-//! For images we also extract `original_w` / `original_h` so the FE can
-//! seed the panel with the natural aspect ratio. PNG / JPEG / GIF / WebP
-//! parse a few bytes each; SVG declines (parsing the root `width=` /
-//! `viewBox=` attribute reliably needs a real XML parser — skipped for MVP).
+//! MIME (serve): magic-byte sniff — png / jpeg / gif / webp / svg+xml /
+//! text/plain · application/json · application/pdf, else octet-stream. The
+//! same sniff backs `GET /api/fs/file` ([`sniff_any`]) and upload gating
+//! ([`sniff_allowed_upload`]).
 //!
 //! Auth: this module piggybacks on the bearer/cookie middleware in
 //! `lib.rs::bearer_auth_middleware` — `/api/*` is gated at the router
 //! level, so handlers here can assume the request is authenticated.
 
-use std::path::{Path, PathBuf};
-
-use axum::extract::{Multipart, Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use ring::digest::{Context as DigestContext, SHA256};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::warn;
 
-use crate::{AppState, WorkspaceManager};
+use crate::AppState;
 
 /// Multipart framing headroom added on top of configured asset byte limit.
 pub(crate) const ASSET_MULTIPART_HEADROOM_BYTES: usize = 1024 * 1024;
@@ -53,336 +37,33 @@ pub(crate) const ASSET_MULTIPART_HEADROOM_BYTES: usize = 1024 * 1024;
 /// Stored asset filename = 64 lowercase hex characters of sha256(bytes).
 const ASSET_ID_HEX_LEN: usize = 64;
 
-/// Asset upload response — ADR-0033 D5 + 0080 §2.1.
-#[derive(Debug, Serialize)]
-struct UploadResponse {
-    asset_id: String,
-    mime: &'static str,
-    file_name: String,
-    size_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    original_w: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    original_h: Option<u32>,
+/// `POST /api/assets` — **deprecated (ADR-0047 D7).** The content-hash asset
+/// store (ADR-0033) is superseded by workspace-file references: image/document
+/// items now live inside the session Workspace(B) and are uploaded via
+/// `POST /api/fs/upload`, then referenced by relative `path`. No new assets are
+/// created — always `410 Gone`. (`GET /api/assets/{id}` still serves the legacy
+/// records that pre-date ADR-0047.)
+pub async fn upload_handler(State(_state): State<AppState>) -> Response {
+    assets_deprecated_response()
 }
 
-/// `POST /api/assets/from-path` request body.
-#[derive(Debug, Deserialize)]
-pub struct UploadFromPathRequest {
-    path: String,
-    kind: String,
-}
-
-/// `POST /api/assets` — multipart upload of an image or document file.
-///
-/// Fields:
-///   * `file` (required) — the file binary.
-///   * `kind` (required) — `"image"` or `"document"`.
-///
-/// Returns 201 on first write *and* on idempotent re-upload (same bytes
-/// → same `asset_id`). The handler does not distinguish between these two
-/// cases on the wire — same sha256 always returns the same shape. ADR-0033
-/// D8 (deduplication) is the underlying guarantee.
-pub async fn upload_handler(State(state): State<AppState>, mut multipart: Multipart) -> Response {
-    let Some(wm) = state.workspace.as_ref().cloned() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workspace_not_configured" })),
-        )
-            .into_response();
-    };
-    let max_size_bytes = state.config.assets.max_size_bytes;
-
-    let mut file_bytes: Option<Vec<u8>> = None;
-    let mut file_name: Option<String> = None;
-    let mut kind: Option<String> = None;
-
-    loop {
-        let field = match multipart.next_field().await {
-            Ok(Some(f)) => f,
-            Ok(None) => break,
-            Err(e) => {
-                // axum's MultipartError covers oversize + malformed boundaries
-                // both. Surface the size case as 413 explicitly so the FE can
-                // tell a hostile boundary apart from "your file is too big".
-                let msg = e.to_string();
-                let (status, code) =
-                    if e.status() == StatusCode::PAYLOAD_TOO_LARGE || msg.contains("size limit") {
-                        (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
-                    } else {
-                        (StatusCode::BAD_REQUEST, "bad_multipart")
-                    };
-                return (status, Json(json!({ "error": code, "message": msg }))).into_response();
-            }
-        };
-        match field.name() {
-            Some("file") => {
-                if file_bytes.is_some() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": "duplicate_file_field" })),
-                    )
-                        .into_response();
-                }
-                file_name = field.file_name().map(|s| s.to_string());
-                match field.bytes().await {
-                    Ok(b) => {
-                        if b.len() as u64 > max_size_bytes {
-                            return (
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                Json(json!({ "error": "payload_too_large" })),
-                            )
-                                .into_response();
-                        }
-                        file_bytes = Some(b.to_vec());
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        let (status, code) = if e.status() == StatusCode::PAYLOAD_TOO_LARGE
-                            || msg.contains("size limit")
-                        {
-                            (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
-                        } else {
-                            (StatusCode::BAD_REQUEST, "bad_multipart")
-                        };
-                        return (status, Json(json!({ "error": code, "message": msg })))
-                            .into_response();
-                    }
-                }
-            }
-            Some("kind") => match field.text().await {
-                Ok(t) => kind = Some(t),
-                Err(_) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": "bad_multipart" })),
-                    )
-                        .into_response();
-                }
-            },
-            _ => {
-                // Drain unknown fields so the next_field loop advances.
-                let _ = field.bytes().await;
-            }
-        }
-    }
-
-    let Some(bytes) = file_bytes else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "missing_file" })),
-        )
-            .into_response();
-    };
-    if bytes.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "empty_file" })),
-        )
-            .into_response();
-    }
-    let kind = match kind.as_deref() {
-        Some("image") => AssetKind::Image,
-        Some("document") => AssetKind::Document,
-        Some(other) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_kind", "kind": other })),
-            )
-                .into_response();
-        }
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "missing_kind" })),
-            )
-                .into_response();
-        }
-    };
-
-    store_asset_response(
-        &wm,
-        bytes,
-        file_name.unwrap_or_else(|| "asset".to_string()),
-        kind,
+/// `410 Gone` body shared by the deprecated asset-upload endpoints (ADR-0047 D7).
+fn assets_deprecated_response() -> Response {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "assets_deprecated",
+            "message": "the asset store is superseded by workspace file references (ADR-0047); \
+                        upload via POST /api/fs/upload and reference the file by path",
+        })),
     )
+        .into_response()
 }
 
-/// `POST /api/assets/from-path` — copy a workspace file into the asset store.
-///
-/// This is the server-side counterpart to the existing file-system picker:
-/// the picker returns an absolute path inside the configured workspace, and
-/// this handler reads that file, validates its MIME against `kind`, then stores
-/// it through the same content-addressed path as multipart upload.
-pub async fn upload_from_path_handler(
-    State(state): State<AppState>,
-    Json(req): Json<UploadFromPathRequest>,
-) -> Response {
-    let Some(wm) = state.workspace.as_ref().cloned() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "workspace_not_configured" })),
-        )
-            .into_response();
-    };
-    let max_size_bytes = state.config.assets.max_size_bytes;
-
-    let kind = match req.kind.as_str() {
-        "image" => AssetKind::Image,
-        "document" => AssetKind::Document,
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_kind", "kind": other })),
-            )
-                .into_response();
-        }
-    };
-
-    let raw = PathBuf::from(&req.path);
-    let canonical = match raw.canonicalize() {
-        Ok(path) => path,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "source_not_found" })),
-            )
-                .into_response();
-        }
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_source_path" })),
-            )
-                .into_response();
-        }
-    };
-
-    // ADR-0046 D3/§보안 — the unified file explorer materializes image/document
-    // selections through this endpoint, so the source must be clamped to the
-    // **Server Workspace(A)** sandbox + M2 denylist (the same single guard as
-    // the picker / mkdir / rmdir / workspace_root), NOT to the Store(C). The
-    // previous `starts_with(wm.path())` rooted this at the Store and 403'd every
-    // real project file (the same bug ADR-0046 D3 fixed for `fs_list`).
-    if !crate::fs_guard::is_path_allowed(
-        &canonical,
-        state.server_workspace.as_path(),
-        &state.fs_denylist,
-    ) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "source_not_allowed" })),
-        )
-            .into_response();
-    }
-    if !canonical.is_file() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "source_not_file" })),
-        )
-            .into_response();
-    }
-
-    let meta = match std::fs::metadata(&canonical) {
-        Ok(meta) => meta,
-        Err(e) => {
-            warn!(error = %e, path = %canonical.display(), "assets: stat source failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "source_stat_failed" })),
-            )
-                .into_response();
-        }
-    };
-    if meta.len() > max_size_bytes {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(json!({ "error": "payload_too_large" })),
-        )
-            .into_response();
-    }
-
-    let bytes = match std::fs::read(&canonical) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            warn!(error = %e, path = %canonical.display(), "assets: read source failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "source_read_failed" })),
-            )
-                .into_response();
-        }
-    };
-    if bytes.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "empty_file" })),
-        )
-            .into_response();
-    }
-
-    let file_name = canonical
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("asset")
-        .to_string();
-    store_asset_response(&wm, bytes, file_name, kind)
-}
-
-fn store_asset_response(
-    wm: &WorkspaceManager,
-    bytes: Vec<u8>,
-    file_name: String,
-    kind: AssetKind,
-) -> Response {
-    let mime = match sniff_mime(&bytes, kind) {
-        Some(m) => m,
-        None => {
-            return (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                Json(json!({ "error": "unsupported_media_type", "kind": kind.as_str() })),
-            )
-                .into_response();
-        }
-    };
-
-    let asset_id = sha256_hex(&bytes);
-    let dest = match wm.ensure_assets_dir() {
-        Ok(dir) => dir.join(&asset_id),
-        Err(e) => {
-            warn!(error = %e, "assets: ensure_assets_dir failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "save_failed" })),
-            )
-                .into_response();
-        }
-    };
-
-    if let Err(e) = atomic_write_asset(&dest, &bytes) {
-        warn!(error = %e, path = %dest.display(), "assets: write failed");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "save_failed" })),
-        )
-            .into_response();
-    }
-
-    let (original_w, original_h) = if matches!(kind, AssetKind::Image) {
-        image_dimensions(mime, &bytes).unwrap_or((None, None))
-    } else {
-        (None, None)
-    };
-
-    let resp = UploadResponse {
-        asset_id,
-        mime,
-        file_name,
-        size_bytes: bytes.len() as u64,
-        original_w,
-        original_h,
-    };
-    (StatusCode::CREATED, Json(resp)).into_response()
+/// `POST /api/assets/from-path` — **deprecated (ADR-0047 D7).** See
+/// [`upload_handler`]. Always `410 Gone`.
+pub async fn upload_from_path_handler(State(_state): State<AppState>) -> Response {
+    assets_deprecated_response()
 }
 
 /// `GET /api/assets/{asset_id}` — serve raw bytes with the stored MIME.
@@ -445,9 +126,7 @@ pub async fn serve_handler(
     // Re-sniff at serve time so a tampered-with on-disk file can't masquerade
     // as a different content type. Falls back to application/octet-stream if
     // sniff fails (which shouldn't happen — uploads are sniff-gated).
-    let mime = sniff_mime(&bytes, AssetKind::Image)
-        .or_else(|| sniff_mime(&bytes, AssetKind::Document))
-        .unwrap_or("application/octet-stream");
+    let mime = sniff_any(&bytes);
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -463,7 +142,7 @@ pub async fn serve_handler(
         // any inline <script>, foreignObject script, or event handler.
         builder = builder.header(
             "Content-Security-Policy",
-            HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+            HeaderValue::from_static(SVG_SERVE_CSP),
         );
     }
 
@@ -476,30 +155,31 @@ pub async fn serve_handler(
 //  Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
-enum AssetKind {
-    Image,
-    Document,
+/// ADR-0047 D3 — sniff any allowed image *or* document MIME, falling back to
+/// `application/octet-stream`. Used by `GET /api/fs/file` to serve arbitrary
+/// workspace files (the source is the user's own project dir, so an unknown
+/// type is served opaquely rather than rejected). The magic-byte logic is the
+/// same allowlist the asset store used (ADR-0033 D4).
+pub(crate) fn sniff_any(bytes: &[u8]) -> &'static str {
+    sniff_image(bytes)
+        .or_else(|| sniff_document(bytes))
+        .unwrap_or("application/octet-stream")
 }
 
-impl AssetKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Image => "image",
-            Self::Document => "document",
-        }
-    }
+/// ADR-0047 D2 — sniff an *uploadable* MIME: `Some` iff the bytes are an
+/// allowed image or document type (the ADR-0033 D3 allowlist), else `None`
+/// (caller → 415). `POST /api/fs/upload` gates on this so the workspace only
+/// ever receives the same content classes the asset store accepted.
+pub(crate) fn sniff_allowed_upload(bytes: &[u8]) -> Option<&'static str> {
+    sniff_image(bytes).or_else(|| sniff_document(bytes))
 }
 
-/// Detect the MIME from magic bytes. Returns the canonical static string
-/// matching the allowlist for `kind`, or `None` if the content doesn't
-/// belong to the declared kind.
-fn sniff_mime(bytes: &[u8], kind: AssetKind) -> Option<&'static str> {
-    match kind {
-        AssetKind::Image => sniff_image(bytes),
-        AssetKind::Document => sniff_document(bytes),
-    }
-}
+/// ADR-0033 D6 / ADR-0047 D8 — the CSP that neutralises scripts in a directly
+/// navigated SVG (inside `<img>` the browser already sandboxes it, but typing
+/// the URL renders it as a top-level document where inline `<script>` /
+/// `foreignObject` / event handlers would otherwise execute). Shared by the
+/// legacy asset serve and the workspace-file serve (`GET /api/fs/file`).
+pub(crate) const SVG_SERVE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 fn sniff_image(b: &[u8]) -> Option<&'static str> {
     if b.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -560,165 +240,8 @@ fn strip_utf8_bom(b: &[u8]) -> &[u8] {
     b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(b)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut ctx = DigestContext::new(&SHA256);
-    ctx.update(bytes);
-    let d = ctx.finish();
-    let mut hex = String::with_capacity(ASSET_ID_HEX_LEN);
-    {
-        use std::fmt::Write as _;
-        for b in d.as_ref() {
-            let _ = write!(hex, "{b:02x}");
-        }
-    }
-    hex
-}
-
 fn is_valid_asset_id(s: &str) -> bool {
     s.len() == ASSET_ID_HEX_LEN && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// Best-effort dimension extraction. Returns `(Some(w), Some(h))` for
-/// formats we can parse cheaply (PNG / JPEG / GIF / WebP-VP8X) and
-/// `(None, None)` for everything else.
-fn image_dimensions(mime: &str, b: &[u8]) -> Option<(Option<u32>, Option<u32>)> {
-    let dims = match mime {
-        "image/png" => png_dimensions(b),
-        "image/jpeg" => jpeg_dimensions(b),
-        "image/gif" => gif_dimensions(b),
-        "image/webp" => webp_dimensions(b),
-        _ => None,
-    };
-    Some((dims.map(|d| d.0), dims.map(|d| d.1)))
-}
-
-fn png_dimensions(b: &[u8]) -> Option<(u32, u32)> {
-    // 8-byte signature + 4-byte chunk-size + "IHDR" + width(BE u32) + height(BE u32)
-    if b.len() < 24 || !b.starts_with(b"\x89PNG\r\n\x1a\n") || &b[12..16] != b"IHDR" {
-        return None;
-    }
-    let w = u32::from_be_bytes(b[16..20].try_into().ok()?);
-    let h = u32::from_be_bytes(b[20..24].try_into().ok()?);
-    Some((w, h))
-}
-
-fn jpeg_dimensions(b: &[u8]) -> Option<(u32, u32)> {
-    // Walk JPEG markers until SOF0..SOF15 (excluding SOF4 / SOF8 / SOF12 which
-    // are reserved/non-frame). The Start-Of-Frame block carries height
-    // (2 bytes BE) then width (2 bytes BE) at offsets 5–8 from the marker.
-    if b.len() < 4 || !b.starts_with(b"\xFF\xD8") {
-        return None;
-    }
-    let mut i = 2;
-    while i + 4 <= b.len() {
-        if b[i] != 0xFF {
-            return None;
-        }
-        // Skip fill bytes (0xFF 0xFF padding).
-        let mut j = i + 1;
-        while j < b.len() && b[j] == 0xFF {
-            j += 1;
-        }
-        if j >= b.len() {
-            return None;
-        }
-        let marker = b[j];
-        i = j + 1;
-        // Standalone markers (no payload) — should not appear before SOF.
-        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
-            continue;
-        }
-        if i + 2 > b.len() {
-            return None;
-        }
-        let seg_len = u16::from_be_bytes([b[i], b[i + 1]]) as usize;
-        if seg_len < 2 || i + seg_len > b.len() {
-            return None;
-        }
-        let is_sof = matches!(marker,
-            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF);
-        if is_sof {
-            if seg_len < 7 {
-                return None;
-            }
-            let h = u16::from_be_bytes([b[i + 3], b[i + 4]]) as u32;
-            let w = u16::from_be_bytes([b[i + 5], b[i + 6]]) as u32;
-            return Some((w, h));
-        }
-        i += seg_len;
-    }
-    None
-}
-
-fn gif_dimensions(b: &[u8]) -> Option<(u32, u32)> {
-    if b.len() < 10 || !(b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a")) {
-        return None;
-    }
-    let w = u16::from_le_bytes([b[6], b[7]]) as u32;
-    let h = u16::from_le_bytes([b[8], b[9]]) as u32;
-    Some((w, h))
-}
-
-fn webp_dimensions(b: &[u8]) -> Option<(u32, u32)> {
-    // RIFF / WebP container — minimum 30 bytes for VP8/VP8L/VP8X header.
-    if b.len() < 30 || &b[..4] != b"RIFF" || &b[8..12] != b"WEBP" {
-        return None;
-    }
-    match &b[12..16] {
-        // Lossy VP8: width @ 26 (14 bits LE), height @ 28 (14 bits LE).
-        b"VP8 " => {
-            if b.len() < 30 {
-                return None;
-            }
-            let w = u16::from_le_bytes([b[26], b[27]]) as u32 & 0x3FFF;
-            let h = u16::from_le_bytes([b[28], b[29]]) as u32 & 0x3FFF;
-            Some((w, h))
-        }
-        // Lossless VP8L: 14-bit width-1, then 14-bit height-1 starting at byte 21.
-        b"VP8L" => {
-            if b.len() < 25 {
-                return None;
-            }
-            let v = u32::from_le_bytes([b[21], b[22], b[23], b[24]]);
-            let w = (v & 0x3FFF) + 1;
-            let h = ((v >> 14) & 0x3FFF) + 1;
-            Some((w, h))
-        }
-        // Extended VP8X: 24-bit width-1 @ byte 24, 24-bit height-1 @ byte 27.
-        b"VP8X" => {
-            if b.len() < 30 {
-                return None;
-            }
-            let w = (b[24] as u32 | ((b[25] as u32) << 8) | ((b[26] as u32) << 16)) + 1;
-            let h = (b[27] as u32 | ((b[28] as u32) << 8) | ((b[29] as u32) << 16)) + 1;
-            Some((w, h))
-        }
-        _ => None,
-    }
-}
-
-/// Atomic write: tempfile + rename. Idempotent — re-uploading the same
-/// bytes overwrites the file with identical content. The directory is
-/// already guaranteed mode 0700 by [`WorkspaceManager::ensure_assets_dir`].
-fn atomic_write_asset(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt as StdOpenOptionsExt;
-
-    use atomic_write_file::unix::OpenOptionsExt as AwfOpenOptionsExt;
-    use atomic_write_file::OpenOptions as AwfOpenOptions;
-
-    // Mark the silly-import for non-unix targets — this module is unix-only
-    // until ADR-0033 carves out cross-platform support.
-    let _: fn(&mut std::fs::OpenOptions, u32) -> &mut std::fs::OpenOptions =
-        StdOpenOptionsExt::mode;
-
-    let mut f = AwfOpenOptions::new()
-        .mode(0o600)
-        .preserve_mode(false)
-        .open(dest)?;
-    f.write_all(bytes)?;
-    f.commit()?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -835,23 +358,4 @@ mod unit_tests {
         assert!(!is_valid_asset_id(&bad));
     }
 
-    #[test]
-    fn sha256_hex_known_vector() {
-        // sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-        assert_eq!(
-            sha256_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn image_dimensions_png_jpeg_gif_webp() {
-        assert_eq!(png_dimensions(&make_png(100, 200)), Some((100, 200)));
-        assert_eq!(gif_dimensions(&make_gif(8, 9)), Some((8, 9)));
-        assert_eq!(webp_dimensions(&make_webp_vp8x(99, 199)), Some((100, 200)));
-    }
 }

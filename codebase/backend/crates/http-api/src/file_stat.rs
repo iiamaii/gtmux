@@ -81,8 +81,20 @@ pub async fn file_stat_handler(
         }
     };
 
-    // 2. ADR-0023 allowlist gate (ADR-0034 D2). Empty allowlist denies all.
-    {
+    // 2. Gate — ADR-0047 F3: file-stat accepts a path that passes *either*
+    //    boundary:
+    //      (i) the workspace **sandbox** (inside Server Workspace(A) + outside
+    //          the M2 denylist, ADR-0045 D6) — Files-tab / workspace-file stat;
+    //      (ii) the file-path **open allowlist** (ADR-0023 ext+prefix) — the
+    //          `file_path` foot-meta, whose target may legitimately live
+    //          *outside* A.
+    //    The sandbox check is cheap (no lock) so it runs first.
+    let in_sandbox = crate::fs_guard::is_path_allowed(
+        &canonical,
+        state.server_workspace.as_path(),
+        &state.fs_denylist,
+    );
+    if !in_sandbox {
         let alist = state.file_open.allowlist.read().await;
         if !matches!(alist.check(&canonical), AllowlistMatch::Allowed(_)) {
             return (
@@ -455,6 +467,32 @@ mod tests {
         let v: Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(v["error"], "path_not_allowed");
+    }
+
+    /// ADR-0047 F3 — a path *inside* the Server Workspace(A) sandbox is stat-able
+    /// with an **empty** file-open allowlist (Files-tab / workspace-file meta).
+    /// The `file_path` foot-meta path (which may be outside A) still flows
+    /// through the allowlist branch, exercised by the 0034-1/-2 gates above.
+    #[tokio::test]
+    async fn file_stat_accepts_sandbox_path_without_allowlist() {
+        let (mut state, token, tmp) = integration_state();
+        // A = the temp root; the probe lives inside it. No allowlist entry.
+        let canonical_a = std::fs::canonicalize(tmp.path()).unwrap();
+        state.server_workspace = std::sync::Arc::new(canonical_a);
+        let probe = tmp.path().join("inside.md");
+        std::fs::write(&probe, b"a\nb\n").unwrap();
+
+        let app = crate::router_with_state(state);
+        let canonical_probe = std::fs::canonicalize(&probe).unwrap();
+        let resp = app
+            .oneshot(fs_request(&token, canonical_probe.to_str().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(v["kind"], "file");
+        assert_eq!(v["lines"], 2);
     }
 
     /// Gate 0034-3 — `path_not_found`. `canonicalize` fails before the

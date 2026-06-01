@@ -735,6 +735,9 @@ pub async fn attach_handler(
         }
     };
 
+    // ADR-0047 F1b — effective Workspace(B) for FE relative→absolute path
+    // resolution (image/document render via `GET /api/fs/file`).
+    let workspace_root = session_effective_workspace(&state, wm, &name).await;
     (
         StatusCode::OK,
         Json(json!({
@@ -743,6 +746,7 @@ pub async fn attach_handler(
             "server_id": &*state.server_id,
             "matched": matched,
             "unmatched": unmatched,
+            "workspace_root": workspace_root.to_string_lossy(),
         })),
     )
         .into_response()
@@ -1051,6 +1055,9 @@ async fn reuse_existing_attach_response(
         Ok(pair) => pair,
         Err(e) => return e.into_response(),
     };
+    // ADR-0047 F1b — expose the effective Workspace(B) so the FE can resolve
+    // image/document B-relative paths → absolute for `GET /api/fs/file`.
+    let workspace_root = session_effective_workspace(state, wm, name).await;
     (
         StatusCode::OK,
         Json(json!({
@@ -1059,6 +1066,7 @@ async fn reuse_existing_attach_response(
             "server_id": &*state.server_id,
             "matched": matched,
             "unmatched": unmatched,
+            "workspace_root": workspace_root.to_string_lossy(),
         })),
     )
         .into_response()

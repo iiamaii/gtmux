@@ -48,6 +48,7 @@ mod attach_index;
 mod auth;
 mod file_open;
 mod file_stat;
+mod fs_file;
 mod fs_guard;
 mod fs_list;
 pub mod schema;
@@ -814,6 +815,19 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             // ADR-0046 D3 — remove an *empty* directory inside A (guarded).
             "/api/fs/rmdir",
             axum::routing::post(fs_list::fs_rmdir_handler),
+        )
+        .route(
+            // ADR-0047 D3 — serve a workspace file's bytes (image/document
+            // render source). A-scope + denylist guard, magic-byte MIME sniff.
+            "/api/fs/file",
+            get(fs_file::fs_file_serve_handler),
+        )
+        .route(
+            // ADR-0047 D2 — multipart upload into a workspace dir. Shares the
+            // asset byte ceiling (`config.assets.max_size_bytes` + headroom).
+            "/api/fs/upload",
+            axum::routing::post(fs_file::fs_upload_handler)
+                .layer(DefaultBodyLimit::max(asset_body_limit)),
         )
         .route(
             "/api/shutdown",
@@ -4203,6 +4217,63 @@ mod tests {
         resp.status()
     }
 
+    /// ADR-0047 F1b — the (primary) attach response carries the session's
+    /// effective Workspace(B) absolute path so the FE can resolve a canvas
+    /// image/document's B-relative `path` → absolute for `GET /api/fs/file`.
+    #[tokio::test]
+    async fn attach_response_includes_effective_workspace_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // Create the session (no attach yet) with workspace_root = project dir.
+        let create = serde_json::to_vec(
+            &json!({ "name": "demo", "workspace_root": project.to_str().unwrap() }),
+        )
+        .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(create))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // First attach → primary `attach_success` path.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/demo/attach")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header("x-gtmux-webpage-id", "demo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let expected = std::fs::canonicalize(&project).unwrap();
+        assert_eq!(
+            v["workspace_root"].as_str().unwrap(),
+            expected.to_str().unwrap(),
+            "attach response must expose the effective workspace_root (F1b)"
+        );
+    }
+
     async fn detach_as_webpage(
         app: &Router,
         token: &TokenString,
@@ -5705,37 +5776,68 @@ mod tests {
             .unwrap()
     }
 
-    /// 0080 §5 — image upload → GET bytes roundtrip. Verifies idempotent
-    /// content addressing as a side benefit (the same asset_id is reachable
-    /// via GET right away).
+    /// ADR-0033 test helper — seed a *legacy* asset directly on disk
+    /// (sha256-named, as the now-deprecated upload endpoints used to) so the
+    /// serve path can be exercised without `POST /api/assets*` (ADR-0047 D7).
+    /// Returns the asset_id (64-char lowercase hex).
+    fn seed_asset(store_dir: &Path, bytes: &[u8]) -> String {
+        use ring::digest::{Context, SHA256};
+        let mut ctx = Context::new(&SHA256);
+        ctx.update(bytes);
+        let mut id = String::with_capacity(64);
+        for b in ctx.finish().as_ref() {
+            use std::fmt::Write as _;
+            let _ = write!(id, "{b:02x}");
+        }
+        let assets_dir = store_dir.join(".assets");
+        std::fs::create_dir_all(&assets_dir).unwrap();
+        std::fs::write(assets_dir.join(&id), bytes).unwrap();
+        id
+    }
+
+    /// ADR-0047 D7 — `POST /api/assets` is deprecated; no new content-hash
+    /// assets are created. Always 410 Gone (upload via `POST /api/fs/upload`).
     #[tokio::test]
-    async fn assets_image_upload_and_get_roundtrip() {
+    async fn assets_upload_deprecated_returns_410() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
         let png = fixture_png_1x1();
         let body = build_multipart("boundary42", "tiny.png", "image/png", &png, "image");
         let resp = app
-            .clone()
             .oneshot(upload_request(&token, body, "boundary42"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        let asset_id = v["asset_id"].as_str().unwrap().to_string();
-        assert_eq!(asset_id.len(), 64);
-        assert!(asset_id
-            .bytes()
-            .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
-        assert_eq!(v["mime"], "image/png");
-        assert_eq!(v["file_name"], "tiny.png");
-        assert_eq!(v["size_bytes"], png.len() as u64);
-        assert_eq!(v["original_w"], 1);
-        assert_eq!(v["original_h"], 1);
+        assert_eq!(resp.status(), StatusCode::GONE);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(v["error"], "assets_deprecated");
+    }
 
-        // GET the same id — bytes must be byte-identical.
+    /// ADR-0047 D7 — `POST /api/assets/from-path` is likewise deprecated → 410.
+    #[tokio::test]
+    async fn assets_from_path_deprecated_returns_410() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let source = dir.path().join("picked.png");
+        std::fs::write(&source, fixture_png_1x1()).unwrap();
         let resp = app
-            .clone()
+            .oneshot(upload_from_path_request(&token, &source, "image"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::GONE);
+    }
+
+    /// ADR-0047 D7 — legacy `asset_id` records keep rendering read-only:
+    /// `GET /api/assets/{id}` serves the stored bytes with a sniffed MIME and
+    /// the immutable cache header. Seeded directly on disk (no upload endpoint).
+    #[tokio::test]
+    async fn assets_serve_legacy_image_roundtrip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+        let png = fixture_png_1x1();
+        let asset_id = seed_asset(&store_dir, &png);
+
+        let resp = app
             .oneshot(
                 HttpRequest::builder()
                     .uri(format!("/api/assets/{asset_id}"))
@@ -5762,129 +5864,7 @@ mod tests {
             .await
             .unwrap()
             .to_vec();
-        assert_eq!(got, png, "GET must return identical bytes");
-    }
-
-    /// Existing file-system picker flow: FE selects a workspace path, then
-    /// asks the API to copy that file into the content-addressed asset store.
-    #[tokio::test]
-    async fn assets_from_path_image_roundtrip() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (app, token, _store) = make_app_with_workspace(&dir);
-        let png = fixture_png_1x1();
-        // A picked file lives inside the Server Workspace(A) (= dir.path()),
-        // not the Store. ADR-0046 D3/§보안 — from-path is A-scoped + denylist.
-        let source = dir.path().join("picked.png");
-        std::fs::write(&source, &png).unwrap();
-
-        let resp = app
-            .clone()
-            .oneshot(upload_from_path_request(&token, &source, "image"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["mime"], "image/png");
-        assert_eq!(v["file_name"], "picked.png");
-        let asset_id = v["asset_id"].as_str().unwrap();
-
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri(format!("/api/assets/{asset_id}"))
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::AUTHORIZATION, bearer(&token))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let got = to_bytes(resp.into_body(), 64 * 1024)
-            .await
-            .unwrap()
-            .to_vec();
-        assert_eq!(got, png);
-    }
-
-    #[tokio::test]
-    async fn assets_from_path_rejects_outside_workspace() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
-        let (app, token, _) = make_app_with_workspace(&dir);
-        let source = outside.path().join("picked.png");
-        std::fs::write(&source, fixture_png_1x1()).unwrap();
-
-        let resp = app
-            .oneshot(upload_from_path_request(&token, &source, "image"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    }
-
-    /// ADR-0046 D3/§보안 regression — a source *inside the Store* (on the M2
-    /// denylist) must be rejected even though it is inside A. This locks in the
-    /// fix for the Store-rooted from-path bug (the explorer materialize path
-    /// must not let the user import gtmux's own control-plane files).
-    #[tokio::test]
-    async fn assets_from_path_rejects_inside_store() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (app, token, store_dir) = make_app_with_workspace(&dir);
-        let source = store_dir.join("picked.png");
-        std::fs::write(&source, fixture_png_1x1()).unwrap();
-
-        let resp = app
-            .oneshot(upload_from_path_request(&token, &source, "image"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-    }
-
-    /// 0080 §5 — same bytes uploaded twice yield the same asset_id (the
-    /// sha256 deduplication of ADR-0033 D8). Both responses are 201.
-    #[tokio::test]
-    async fn assets_idempotent_same_bytes() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (app, token, _) = make_app_with_workspace(&dir);
-        let png = fixture_png_1x1();
-
-        let upload_once = || async {
-            let body = build_multipart("b1", "x.png", "image/png", &png, "image");
-            let resp = app
-                .clone()
-                .oneshot(upload_request(&token, body, "b1"))
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::CREATED);
-            let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
-            let v: Value = serde_json::from_slice(&bytes).unwrap();
-            v["asset_id"].as_str().unwrap().to_string()
-        };
-        let id1 = upload_once().await;
-        let id2 = upload_once().await;
-        assert_eq!(id1, id2, "same bytes must dedupe to the same asset_id");
-    }
-
-    /// 0080 §5 — oversize upload returns 413. We send a body that exceeds
-    /// configured `assets.max_size_bytes` after the size check inside the
-    /// handler runs (axum's DefaultBodyLimit may also fire — both map to 413).
-    #[tokio::test]
-    async fn assets_oversize_returns_413() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let (app, token, _) = make_app_with_workspace(&dir);
-        // Just over the configured cap. Either handler-level recount or
-        // DefaultBodyLimit may reject it; both paths must surface 413.
-        let big = vec![0u8; gtmux_config::default_asset_max_size_bytes() as usize + 16];
-        let mut payload = Vec::with_capacity(big.len() + 16);
-        payload.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-        payload.extend_from_slice(&big);
-        let body = build_multipart("bo", "big.png", "image/png", &payload, "image");
-        let resp = app
-            .oneshot(upload_request(&token, body, "bo"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(got, png, "legacy serve must return identical bytes");
     }
 
     /// 0080 §5 — invalid `asset_id` path returns 400 (not 404). Anything that
@@ -5965,43 +5945,285 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// MIME / kind mismatch: client claims `kind=document` but the bytes are
-    /// a PNG → 415. Magic-byte sniff is the source of truth (ADR-0033 D4).
+    // ── ADR-0047 D2/D3 — `/api/fs/file` (serve) + `/api/fs/upload` ─────────
+
+    /// `GET /api/fs/file?path=<abs>` request.
+    fn fs_file_request(token: &TokenString, abs_path: &str) -> HttpRequest<Body> {
+        // The router parses `path` via serde_urlencoded — percent-encode the
+        // URL-reserved bytes; tmpdir paths are otherwise plain ASCII.
+        let mut q = String::new();
+        for b in abs_path.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                    q.push(b as char)
+                }
+                _ => q.push_str(&format!("%{b:02X}")),
+            }
+        }
+        HttpRequest::builder()
+            .uri(format!("/api/fs/file?path={q}"))
+            .header(header::HOST, TEST_HOST)
+            .header(header::AUTHORIZATION, bearer(token))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Build a `POST /api/fs/upload` multipart body: a `dir` field, optional
+    /// `on_conflict`, and one-or-more `file` parts.
+    fn build_fs_upload(
+        boundary: &str,
+        dir: &str,
+        on_conflict: Option<&str>,
+        files: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"dir\"\r\n\r\n");
+        body.extend_from_slice(dir.as_bytes());
+        body.extend_from_slice(b"\r\n");
+        if let Some(oc) = on_conflict {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(b"Content-Disposition: form-data; name=\"on_conflict\"\r\n\r\n");
+            body.extend_from_slice(oc.as_bytes());
+            body.extend_from_slice(b"\r\n");
+        }
+        for (name, bytes) in files {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n")
+                    .as_bytes(),
+            );
+            body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    fn fs_upload_request(token: &TokenString, body: Vec<u8>, boundary: &str) -> HttpRequest<Body> {
+        HttpRequest::builder()
+            .method("POST")
+            .uri("/api/fs/upload")
+            .header(header::HOST, TEST_HOST)
+            .header(header::AUTHORIZATION, bearer(token))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// ADR-0047 D3 — serve a workspace image: 200, sniffed MIME, ETag, bytes
+    /// match; a matching `If-None-Match` → 304.
     #[tokio::test]
-    async fn assets_kind_mime_mismatch_returns_415() {
+    async fn fs_file_serves_workspace_image_with_etag_and_304() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
         let png = fixture_png_1x1();
-        let body = build_multipart("bm", "x.png", "image/png", &png, "document");
+        let file = dir.path().join("logo.png");
+        std::fs::write(&file, &png).unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        let abs = canonical.to_str().unwrap();
+
         let resp = app
-            .oneshot(upload_request(&token, body, "bm"))
+            .clone()
+            .oneshot(fs_file_request(&token, abs))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let got = to_bytes(resp.into_body(), 64 * 1024).await.unwrap().to_vec();
+        assert_eq!(got, png);
+
+        // Revalidate with the ETag → 304.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(fs_file_request(&token, abs).uri().clone())
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::IF_NONE_MATCH, &etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    /// ADR-0047 D3 — a path outside A, or inside the Store (denylist), or
+    /// missing → 403 / 403 / 404 respectively.
+    #[tokio::test]
+    async fn fs_file_guard_rejects_outside_store_and_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+
+        // Outside A.
+        let out_file = outside.path().join("x.png");
+        std::fs::write(&out_file, fixture_png_1x1()).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(fs_file_request(
+                &token,
+                std::fs::canonicalize(&out_file).unwrap().to_str().unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Inside the Store (on the denylist) — even though it is inside A.
+        let store_file = store_dir.join("secret.png");
+        std::fs::write(&store_file, fixture_png_1x1()).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(fs_file_request(
+                &token,
+                std::fs::canonicalize(&store_file).unwrap().to_str().unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Missing file inside A → 404.
+        let missing = dir.path().join("nope.png");
+        let resp = app
+            .oneshot(fs_file_request(&token, missing.to_str().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// ADR-0047 D2 — upload a PNG into a workspace dir → 201, file on disk,
+    /// response carries absolute path + sniffed MIME + size.
+    #[tokio::test]
+    async fn fs_upload_writes_into_workspace_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let target = dir.path().join("proj");
+        std::fs::create_dir_all(&target).unwrap();
+        let canonical_dir = std::fs::canonicalize(&target).unwrap();
+        let png = fixture_png_1x1();
+        let body = build_fs_upload(
+            "up1",
+            canonical_dir.to_str().unwrap(),
+            None,
+            &[("logo.png", &png)],
+        );
+        let resp = app
+            .oneshot(fs_upload_request(&token, body, "up1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        let f = &v["files"][0];
+        assert_eq!(f["name"], "logo.png");
+        assert_eq!(f["mime"], "image/png");
+        assert_eq!(f["size"], png.len() as u64);
+        assert_eq!(f["conflict"], false);
+        assert_eq!(
+            f["path"].as_str().unwrap(),
+            canonical_dir.join("logo.png").to_str().unwrap()
+        );
+        assert_eq!(std::fs::read(canonical_dir.join("logo.png")).unwrap(), png);
+    }
+
+    /// ADR-0047 D2 — bytes that aren't an allowed image/document type → 415.
+    #[tokio::test]
+    async fn fs_upload_unsupported_media_type_415() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        // A binary blob with NUL bytes: not an image, and the document sniff
+        // rejects NUL → unsupported.
+        let blob: &[u8] = &[0x00, 0x01, 0x02, 0x00, 0xFF];
+        let body = build_fs_upload(
+            "up2",
+            canonical_dir.to_str().unwrap(),
+            None,
+            &[("blob.bin", blob)],
+        );
+        let resp = app
+            .oneshot(fs_upload_request(&token, body, "up2"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
-    /// Asset-based document upload — PDF magic bytes round-trip with
-    /// `mime: application/pdf`. Backs the FE `DocumentNode` asset-mode wire.
+    /// ADR-0047 D2 — `reject` (default) returns 409 on a name collision and
+    /// writes nothing; `rename` resolves to `name (2).ext`.
     #[tokio::test]
-    async fn assets_document_pdf_roundtrip() {
+    async fn fs_upload_conflict_reject_then_rename() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        let pdf = b"%PDF-1.4\n%minimal\n%%EOF\n".to_vec();
-        let body = build_multipart("bd", "brief.pdf", "application/pdf", &pdf, "document");
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(canonical_dir.join("a.png"), b"existing").unwrap();
+        let png = fixture_png_1x1();
+
+        // Default reject → 409.
+        let body = build_fs_upload("up3", canonical_dir.to_str().unwrap(), None, &[("a.png", &png)]);
         let resp = app
             .clone()
-            .oneshot(upload_request(&token, body, "bd"))
+            .oneshot(fs_upload_request(&token, body, "up3"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        // Original untouched.
+        assert_eq!(
+            std::fs::read(canonical_dir.join("a.png")).unwrap(),
+            b"existing"
+        );
+
+        // rename → 201, lands at "a (2).png".
+        let body = build_fs_upload(
+            "up4",
+            canonical_dir.to_str().unwrap(),
+            Some("rename"),
+            &[("a.png", &png)],
+        );
+        let resp = app
+            .oneshot(fs_upload_request(&token, body, "up4"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
-        let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["mime"], "application/pdf");
-        assert_eq!(v["file_name"], "brief.pdf");
-        assert_eq!(v["size_bytes"], pdf.len() as u64);
-        // Documents must not carry image dimensions.
-        assert!(v.get("original_w").is_none() || v["original_w"].is_null());
-        assert!(v.get("original_h").is_none() || v["original_h"].is_null());
+        let v: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        assert_eq!(v["files"][0]["name"], "a (2).png");
+        assert_eq!(v["files"][0]["conflict"], true);
+        assert_eq!(std::fs::read(canonical_dir.join("a (2).png")).unwrap(), png);
+    }
+
+    /// ADR-0047 D2 — uploading into a dir outside A → 403 dir_not_allowed.
+    #[tokio::test]
+    async fn fs_upload_dir_outside_workspace_403() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let canonical_outside = std::fs::canonicalize(outside.path()).unwrap();
+        let body = build_fs_upload(
+            "up5",
+            canonical_outside.to_str().unwrap(),
+            None,
+            &[("a.png", &fixture_png_1x1())],
+        );
+        let resp = app
+            .oneshot(fs_upload_request(&token, body, "up5"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // ─────────────────────────────────────────────────────────────────────

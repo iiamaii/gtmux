@@ -241,34 +241,52 @@ export interface components {
             /** @enum {string} */
             type: "free_draw";
         }) | (components["schemas"]["ItemCommon"] & {
-            asset_id: string;
-            mime: string;
+            /**
+             * @description Legacy content-hash asset id (ADR-0033, superseded by ADR-0047).
+             *     Read-only: existing records keep rendering via
+             *     `GET /api/assets/{asset_id}`. New items never set this.
+             */
+            asset_id?: string | null;
+            /**
+             * @description Optional MIME hint. New `path` items may omit it (the serve
+             *     endpoint sniffs magic bytes); legacy asset records carry it.
+             */
+            mime?: string | null;
             /** Format: int32 */
             original_h?: number | null;
             /** Format: int32 */
             original_w?: number | null;
+            /**
+             * @description ADR-0047 D1 — workspace(B)-relative path to the source file. The
+             *     new origin for image items.
+             */
+            path?: string | null;
         } & {
             /** @enum {string} */
             type: "image";
         }) | (components["schemas"]["ItemCommon"] & {
-            /**
-             * @description (a) asset-based mode: sha256 → `/api/assets/<asset_id>`.
-             *     (b) inline-stored mode: `None`.
-             */
+            /** @description (a) legacy asset-based origin: sha256 → `/api/assets/<asset_id>`. */
             asset_id?: string | null;
             /**
              * @description (b) inline-stored UTF-8 markdown, capped at
-             *     [`DOCUMENT_INLINE_MAX_BYTES`]. (a) is `None`.
+             *     [`DOCUMENT_INLINE_MAX_BYTES`].
              */
             content?: string | null;
-            file_name: string;
-            mime: string;
+            /** @description Optional display name (derived from `path` basename when absent). */
+            file_name?: string | null;
+            /** @description Optional MIME hint (sniffed at serve time for `path` items). */
+            mime?: string | null;
+            /**
+             * @description (c) workspace-file origin: B-relative path. New documents from the
+             *     file explorer / Files-tab drag use this.
+             */
+            path?: string | null;
             /**
              * Format: int64
-             * @description (a) asset-based: real binary size.
-             *     (b) inline-stored: `content.len()` bytes.
+             * @description Optional size in bytes — `content.len()` (inline) or the real file
+             *     size (legacy asset). `path` items may omit it.
              */
-            size_bytes: number;
+            size_bytes?: number | null;
         } & {
             /** @enum {string} */
             type: "document";
@@ -343,6 +361,16 @@ export interface components {
             schema_version: number;
             /** @description Canvas viewport state (pan + zoom). */
             viewport?: components["schemas"]["Viewport"];
+            /**
+             * @description Session Workspace(B) absolute path — that project's working directory
+             *     inside the Server Workspace(A). ADR-0045 D4 / ADR-0046 D1 (amends
+             *     ADR-0018 D3). `None` on legacy/edge records; the effective workspace is
+             *     then resolved via the fallback chain
+             *     `workspace_root ?? config.default_session_workspace ?? $HOME`. New
+             *     sessions always set it (ADR-0046 D5). v2 stays additive — a missing
+             *     field round-trips to `None`.
+             */
+            workspace_root?: string | null;
         };
         /**
          * @description ADR-0043 D1 — one endpoint of a `path` item. A `free` endpoint pins to an
