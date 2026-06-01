@@ -188,7 +188,7 @@
     top: calc(100% + 2px);
     left: var(--inspector-dropdown-menu-left);
     right: 0;
-    z-index: 30;
+    z-index: var(--z-context-menu);
     display: flex;
     flex-direction: column;
     gap: 1px;

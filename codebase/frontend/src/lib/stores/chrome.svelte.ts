@@ -66,13 +66,19 @@ class ChromeStore {
     this.persist();
   }
 
-  /** Switch the active tab in the right panel. The allowed tab is coupled
-   *  to the left panel domain: Files owns Preview, canvas tabs own Inspect. */
+  /** Switch the active tab in the right panel and sync the left panel domain:
+   *  Preview owns Files; Inspect owns Layers/Terminals. */
   setRightPanelTab(tab: RightPanelTab): void {
-    const allowed = rightPanelTabForLeft(this.state.leftPanelTab);
+    const leftPanelTab = leftPanelTabForRight(tab, this.state.leftPanelTab);
+    if (leftPanelTab === 'files' && this.state.leftPanelTab !== 'files') {
+      sessionStore.clearM();
+      sessionStore.clearDrill();
+    }
     this.state = {
       ...this.state,
-      rightPanelTab: tab === allowed ? tab : allowed,
+      leftPanelTab,
+      rightPanelTab: tab,
+      sidebarCollapsed: false,
       paneInfoCollapsed: false,
     };
     this.persist();
@@ -161,6 +167,11 @@ function normalizeState(state: ChromeState): ChromeState {
 
 function rightPanelTabForLeft(tab: LeftPanelTab): RightPanelTab {
   return tab === 'files' ? 'preview' : 'inspect';
+}
+
+function leftPanelTabForRight(tab: RightPanelTab, current: LeftPanelTab): LeftPanelTab {
+  if (tab === 'preview') return 'files';
+  return current === 'files' ? 'layers' : current;
 }
 
 function clamp(value: number, min: number, max: number): number {

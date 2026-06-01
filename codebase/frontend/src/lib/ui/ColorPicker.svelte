@@ -73,6 +73,8 @@
    *   - ADR-0016 (design tokens) amend 후속 (token-aware preset palette 정책)
    */
 
+  import { tick } from 'svelte';
+
   interface Props {
     value: string | null | undefined;
     oncommit: (value: string) => void;
@@ -93,6 +95,15 @@
     allowAlpha = false,
     live = false,
   }: Props = $props();
+
+  function portal(node: HTMLElement): { destroy: () => void } {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      },
+    };
+  }
 
   // ── Helpers (parse / normalize) ─────────────────────────────────
   function isTransparentValue(s: string): boolean {
@@ -511,22 +522,22 @@
   // ── Click-outside close + popover position tracking ─────────────
   $effect(() => {
     if (!open) return;
+    if (typeof window === 'undefined') return;
     function onDocPointerDown(e: PointerEvent): void {
       const target = e.target as Node;
-      if (containerEl?.contains(target)) return;
       if (popoverEl?.contains(target)) return;
+      if (containerEl?.contains(target)) return;
       formatMenuOpen = false;
       if (pinned) return;
       open = false;
     }
     const onReflow = () => updatePopoverPos();
-    queueMicrotask(() => {
-      document.addEventListener('pointerdown', onDocPointerDown, true);
-      updatePopoverPos();
-    });
+    document.addEventListener('pointerdown', onDocPointerDown, true);
+    const raf = window.requestAnimationFrame(updatePopoverPos);
     window.addEventListener('resize', onReflow);
     window.addEventListener('scroll', onReflow, true);
     return () => {
+      window.cancelAnimationFrame(raf);
       document.removeEventListener('pointerdown', onDocPointerDown, true);
       window.removeEventListener('resize', onReflow);
       window.removeEventListener('scroll', onReflow, true);
@@ -538,6 +549,17 @@
     formatMenuOpen = false;
     pinned = false;
     open = false;
+  }
+
+  async function togglePopover(): Promise<void> {
+    if (disabled) return;
+    open = !open;
+    if (!open) {
+      formatMenuOpen = false;
+      return;
+    }
+    await tick();
+    updatePopoverPos();
   }
 
   function commitColor(next: string): void {
@@ -833,7 +855,7 @@
     aria-expanded={open}
     onclick={(e) => {
       e.stopPropagation();
-      if (!disabled) open = !open;
+      void togglePopover();
     }}
   >
     <span
@@ -913,6 +935,7 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       class="shape-colorpicker"
+      use:portal
       bind:this={popoverEl}
       style="--cp-hue: {effectiveHueColor}; top: {popoverPos.top}px; left: {popoverPos.left}px;"
       role="dialog"
@@ -1310,7 +1333,7 @@
   /* ── Popover ────────────────────────────────────────────────── */
   .shape-colorpicker {
     position: fixed;
-    z-index: var(--z-popover, 100);
+    z-index: var(--z-context-menu);
     width: 240px;
     background: var(--color-surface);
     border: 1px solid var(--color-border);

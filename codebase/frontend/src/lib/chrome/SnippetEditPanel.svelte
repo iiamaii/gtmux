@@ -297,12 +297,14 @@
 {/if}
 
 <style>
-  /* ColorPicker-style chassis: single surface bg (no surface-2 strip), head
+  /* Floating picker/editor panel contract: 32px header, 24px icon actions,
+     compact 24px footer buttons. Full modals use Modal.svelte footer instead.
+     ColorPicker-style chassis: single surface bg (no surface-2 strip), head
      and body share the same surface so the panel reads as a *non-movable*
      popover rather than a chrome-strip window. */
   .snippet-edit-panel {
     position: fixed;
-    z-index: var(--z-popover, 100);
+    z-index: var(--z-context-menu);
     background: var(--color-surface);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-md);
@@ -397,23 +399,34 @@
   .sep-actions {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: var(--space-6);
+    margin: var(--space-2) calc(var(--space-12) * -1) calc(var(--space-12) * -1);
+    padding: var(--space-8) var(--space-12) var(--space-10);
+    border-top: 1px solid var(--color-border);
+    background: color-mix(in srgb, var(--color-surface-2) 45%, transparent);
   }
   .sep-spacer {
     flex: 1;
   }
   .sep-btn {
-    font-family: var(--font-mono);
-    font-size: 10.5px;
-    padding: 4px 10px;
+    box-sizing: border-box;
+    min-width: 44px;
+    height: 24px;
+    padding: 0 var(--space-8);
+    font-family: inherit;
+    font-size: var(--text-sm);
+    font-weight: var(--weight-medium);
     border-radius: var(--radius-sm);
     border: 1px solid var(--color-border);
     background: var(--color-surface);
     color: var(--color-fg);
     cursor: pointer;
-    letter-spacing: 0.3px;
-    line-height: 1.3;
-    transition: background 0.12s, color 0.12s, border-color 0.12s;
+    letter-spacing: 0;
+    line-height: var(--leading-normal);
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing),
+      border-color var(--motion-fast) var(--motion-easing);
   }
   .sep-btn:disabled {
     opacity: 0.5;
@@ -434,7 +447,7 @@
     background: var(--color-accent);
     color: var(--color-accent-fg);
     border-color: var(--color-accent);
-    font-weight: 540;
+    font-weight: var(--weight-medium);
   }
   .sep-btn.save:hover:not(:disabled) {
     background: color-mix(in srgb, var(--color-accent) 85%, black);

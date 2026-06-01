@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import type { Anchor } from '$lib/types/canvas';
 
   interface Props {
@@ -35,8 +36,25 @@
 
   const current = $derived(ANCHORS.find((anchor) => anchor.value === value) ?? ANCHORS[4]!);
 
+  function portal(node: HTMLElement): { destroy: () => void } {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      },
+    };
+  }
+
   function close(): void {
     open = false;
+  }
+
+  async function toggle(): Promise<void> {
+    if (disabled) return;
+    open = !open;
+    if (!open) return;
+    await tick();
+    updatePopoverPos();
   }
 
   function updatePopoverPos(): void {
@@ -71,8 +89,8 @@
     if (!open || typeof window === 'undefined') return;
     function onDocPointerDown(e: PointerEvent): void {
       const target = e.target as Node;
-      if (rootEl?.contains(target)) return;
       if (popoverEl?.contains(target)) return;
+      if (rootEl?.contains(target)) return;
       close();
     }
     function onDocKey(e: KeyboardEvent): void {
@@ -81,14 +99,13 @@
       close();
     }
     const onReflow = () => updatePopoverPos();
-    queueMicrotask(() => {
-      document.addEventListener('pointerdown', onDocPointerDown, true);
-      document.addEventListener('keydown', onDocKey);
-      updatePopoverPos();
-    });
+    document.addEventListener('pointerdown', onDocPointerDown, true);
+    document.addEventListener('keydown', onDocKey);
+    const raf = window.requestAnimationFrame(updatePopoverPos);
     window.addEventListener('resize', onReflow);
     window.addEventListener('scroll', onReflow, true);
     return () => {
+      window.cancelAnimationFrame(raf);
       document.removeEventListener('pointerdown', onDocPointerDown, true);
       document.removeEventListener('keydown', onDocKey);
       window.removeEventListener('resize', onReflow);
@@ -115,7 +132,7 @@
     {disabled}
     onclick={(e) => {
       e.stopPropagation();
-      if (!disabled) open = !open;
+      void toggle();
     }}
   >
     <span class="anchor-mini" aria-hidden="true">
@@ -132,6 +149,7 @@
   {#if open}
     <div
       class="anchor-popover"
+      use:portal
       bind:this={popoverEl}
       style="top: {popoverPos.top}px; left: {popoverPos.left}px;"
       role="dialog"
@@ -296,7 +314,7 @@
 
   .anchor-popover {
     position: fixed;
-    z-index: var(--z-popover, 100);
+    z-index: var(--z-context-menu);
     display: grid;
     width: 240px;
     box-sizing: border-box;

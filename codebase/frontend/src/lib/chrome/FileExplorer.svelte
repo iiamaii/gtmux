@@ -525,8 +525,8 @@
         {mode === 'dir' ? 'Select current or child directory.' : 'Select a file.'}
       {/if}
       </span>
-      <Button variant="ghost" size="sm" onclick={onCancel} disabled={mutating}>Cancel</Button>
-      <Button variant="primary" size="sm" onclick={onPickClick} disabled={!canPick}>
+      <Button variant="ghost" onclick={onCancel} disabled={mutating}>Cancel</Button>
+      <Button variant="primary" onclick={onPickClick} disabled={!canPick}>
         {mode === 'dir' ? 'Select this folder' : 'Open file'}
       </Button>
     </div>
@@ -555,8 +555,8 @@
     </div>
   {/snippet}
   {#snippet footer()}
-    <Button variant="ghost" size="sm" onclick={() => (pendingRemoveDir = null)} disabled={mutating}>Cancel</Button>
-    <Button variant="danger" size="sm" onclick={() => void confirmRemoveDirectory()} disabled={mutating}>Delete</Button>
+    <Button variant="ghost" onclick={() => (pendingRemoveDir = null)} disabled={mutating}>Cancel</Button>
+    <Button variant="danger" onclick={() => void confirmRemoveDirectory()} disabled={mutating}>Delete</Button>
   {/snippet}
 </Modal>
 
@@ -869,19 +869,22 @@
     color: var(--color-fg-muted);
   }
 
+  /* Flush-body modal footer follows Modal.svelte spacing/button contract while
+     keeping the selected path as the left-side status slot. */
   .fx-foot {
     display: flex;
     align-items: center;
-    gap: var(--space-10);
-    padding: var(--space-10) var(--space-14);
+    flex-wrap: wrap;
+    gap: var(--space-8);
+    padding: var(--space-12) var(--space-24) var(--space-16);
     border-top: 1px solid var(--color-border);
-    background: var(--color-surface);
+    background: color-mix(in srgb, var(--color-surface-2) 60%, transparent);
   }
 
   .selected {
     flex: 1 1 auto;
     margin-right: auto;
-    font-size: var(--text-sm);
+    font-size: var(--text-base);
     color: var(--color-fg-muted);
     letter-spacing: 0;
   }
