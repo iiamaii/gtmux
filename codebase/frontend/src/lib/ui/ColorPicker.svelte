@@ -14,9 +14,16 @@
       if (raw === null) return [];
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
-      return parsed
-        .filter((v): v is string => typeof v === 'string' && /^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(v))
-        .slice(0, MAX);
+      const out: string[] = [];
+      for (const value of parsed) {
+        if (typeof value !== 'string') continue;
+        if (!/^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(value)) continue;
+        const norm = value.toLowerCase();
+        if (out.includes(norm)) continue;
+        out.push(norm);
+        if (out.length >= MAX) break;
+      }
+      return out;
     } catch {
       return [];
     }
@@ -828,14 +835,14 @@
     { token: 'var(--color-danger)', label: 'Danger' },
     { token: 'var(--color-info)', label: 'Info' },
   ];
-  const documentSwatches = $derived.by((): readonly { hex: string; label: string }[] => {
+  const documentSwatches = $derived.by((): readonly { token: string; hex: string; label: string }[] => {
     if (!open) return []; // popover 열린 후 에야 measure
     return TOKEN_NAMES
       .map(({ token, label }) => {
         const hex = resolveCssColor(token);
-        return hex !== null ? { hex: hexRgb(hex), label } : null;
+        return hex !== null ? { token, hex: hexRgb(hex), label } : null;
       })
-      .filter((v): v is { hex: string; label: string } => v !== null);
+      .filter((v): v is { token: string; hex: string; label: string } => v !== null);
   });
   const recentSwatches = $derived(recentColorList());
 </script>
@@ -1146,7 +1153,7 @@
             <span>Document</span>
           </div>
           <div class="grid">
-            {#each documentSwatches as sw (sw.hex)}
+            {#each documentSwatches as sw (sw.token)}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <span
                 class="sw"
@@ -1176,7 +1183,7 @@
           <div class="grp">
             <div class="lbl"><span>Recent</span></div>
             <div class="grid">
-              {#each recentSwatches as sw (sw)}
+              {#each recentSwatches as sw, i (`${sw}:${i}`)}
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <span
                   class="sw"
