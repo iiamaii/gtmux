@@ -708,7 +708,7 @@
     border-radius: var(--radius-sm);
     color: var(--color-fg);
     font-size: var(--text-base);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
   }
 
   .text-input:focus {
@@ -762,7 +762,7 @@
     cursor: pointer;
     font-family: var(--font-sans);
     font-size: var(--text-md);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
   }
 
   .explorer-row:hover {
@@ -847,7 +847,7 @@
   .state-desc {
     max-width: 280px;
     font-size: var(--text-base);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
     color: var(--color-fg-muted);
   }
 
@@ -883,7 +883,7 @@
     margin-right: auto;
     font-size: var(--text-sm);
     color: var(--color-fg-muted);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
   }
 
   .selected b {

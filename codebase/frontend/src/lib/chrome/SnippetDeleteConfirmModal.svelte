@@ -25,10 +25,10 @@
   dismissOnBackdrop={false}
 >
   {#snippet body()}
-    <p class="lead">
+    <p class="modal-lead">
       The snippet entry will be removed from this node.
     </p>
-    <p class="note">
+    <p class="modal-note note">
       You can undo with <kbd>⌘</kbd><kbd>Z</kbd> immediately after.
     </p>
   {/snippet}
@@ -39,21 +39,12 @@
 </Modal>
 
 <style>
-  .lead {
-    margin: 0 0 var(--space-8);
-    font-size: var(--text-md);
+  .modal-lead {
+    margin-bottom: var(--space-8);
     color: var(--color-fg);
-    line-height: var(--leading-normal);
   }
+
   .note {
-    margin: 0;
-    padding: var(--space-10) var(--space-12);
-    background: var(--color-surface-2);
-    border-left: 3px solid var(--color-warning);
-    border-radius: var(--radius-sm);
-    font-size: var(--text-base);
-    color: var(--color-fg-muted);
-    line-height: var(--leading-normal);
     display: flex;
     align-items: center;
     gap: 6px;

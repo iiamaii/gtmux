@@ -273,7 +273,7 @@
   }
 
   .empty {
-    padding: var(--space-12);
+    padding: calc(var(--space-12) + var(--space-6)) var(--space-12) var(--space-12);
     color: var(--color-fg-muted);
   }
 

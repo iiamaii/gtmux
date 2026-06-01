@@ -65,7 +65,7 @@
   dismissOnBackdrop={false}
 >
   {#snippet body()}
-    <p class="lead">
+    <p class="modal-lead lead">
       {isBatch
         ? 'Selection includes terminal(s). Choose what happens to them:'
         : 'Choose what happens to the underlying terminal:'}
@@ -119,9 +119,6 @@
 <style>
   .lead {
     margin: 0 0 var(--space-12);
-    font-size: var(--text-md);
-    color: var(--color-fg-muted);
-    line-height: var(--leading-normal);
   }
 
   .choice-list {

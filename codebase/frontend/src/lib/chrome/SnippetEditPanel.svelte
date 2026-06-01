@@ -324,7 +324,7 @@
   .sep-title {
     font-size: 12px;
     font-weight: var(--weight-medium);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
   }
   .sep-close {
     margin-left: auto;

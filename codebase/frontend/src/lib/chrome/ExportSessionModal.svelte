@@ -83,7 +83,7 @@
 <Modal {open} onclose={close} title="Export session">
   {#snippet body()}
     {#if activeName === null}
-      <p class="hint">No active session — open a session first.</p>
+      <p class="modal-state">No active session — open a session first.</p>
     {:else}
       <div class="section">
         <div class="kv">
@@ -131,11 +131,6 @@
 </Modal>
 
 <style>
-  .hint {
-    color: var(--color-fg-muted);
-    margin: 0;
-  }
-
   .section {
     display: grid;
     gap: var(--space-6);

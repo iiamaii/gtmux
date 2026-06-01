@@ -21,19 +21,28 @@
 
   const collapsed = $derived(chromeStore.state.paneInfoCollapsed);
   const activeTab = $derived(chromeStore.state.rightPanelTab);
+  const leftTab = $derived(chromeStore.state.leftPanelTab);
   const panelWidth = $derived(chromeStore.state.rightPanelWidth);
   // No active session 시 inspect tab + body 는 의미 없음. fold/expand 만 유지.
   const noActiveSession = $derived(sessionStore.active === null);
+  const inspectEnabled = $derived(!noActiveSession && leftTab !== 'files');
+  const previewEnabled = $derived(!noActiveSession && leftTab === 'files');
 
   let panelEl = $state<HTMLElement | null>(null);
   let resizing = $state(false);
 
   function selectTab(tab: RightPanelTab): void {
+    if (!rightTabEnabled(tab)) return;
     chromeStore.setRightPanelTab(tab);
   }
 
   function expandAndSelect(tab: RightPanelTab): void {
+    if (!rightTabEnabled(tab)) return;
     chromeStore.setRightPanelTab(tab); // also flips paneInfoCollapsed → false
+  }
+
+  function rightTabEnabled(tab: RightPanelTab): boolean {
+    return tab === 'preview' ? previewEnabled : inspectEnabled;
   }
 
   function onResizePointerDown(e: PointerEvent): void {
@@ -83,9 +92,11 @@
       type="button"
       class="rail-btn"
       class:active={activeTab === 'inspect'}
-      title={noActiveSession ? 'Connect a session to inspect items' : 'Inspect'}
+      title={noActiveSession
+        ? 'Connect a session to inspect items'
+        : inspectEnabled ? 'Inspect' : 'Inspect is available from Layers or Terminals'}
       aria-label="Open Inspect tab"
-      disabled={noActiveSession}
+      disabled={!inspectEnabled}
       onclick={() => expandAndSelect('inspect')}
     >
       <!-- info circle -->
@@ -99,9 +110,11 @@
       type="button"
       class="rail-btn"
       class:active={activeTab === 'preview'}
-      title={noActiveSession ? 'Connect a session to preview files' : 'Preview'}
+      title={noActiveSession
+        ? 'Connect a session to preview files'
+        : previewEnabled ? 'Preview' : 'Preview is available from Files'}
       aria-label="Open Preview tab"
-      disabled={noActiveSession}
+      disabled={!previewEnabled}
       onclick={() => expandAndSelect('preview')}
     >
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -133,8 +146,10 @@
           class="panel-tab"
           class:active={activeTab === 'inspect'}
           aria-selected={activeTab === 'inspect'}
-          disabled={noActiveSession}
-          title={noActiveSession ? 'Connect a session to inspect items' : ''}
+          disabled={!inspectEnabled}
+          title={noActiveSession
+            ? 'Connect a session to inspect items'
+            : inspectEnabled ? '' : 'Inspect is available from Layers or Terminals'}
           onclick={() => selectTab('inspect')}
         >Inspect</button>
         <button
@@ -143,8 +158,10 @@
           class="panel-tab"
           class:active={activeTab === 'preview'}
           aria-selected={activeTab === 'preview'}
-          disabled={noActiveSession}
-          title={noActiveSession ? 'Connect a session to preview files' : ''}
+          disabled={!previewEnabled}
+          title={noActiveSession
+            ? 'Connect a session to preview files'
+            : previewEnabled ? '' : 'Preview is available from Files'}
           onclick={() => selectTab('preview')}
         >Preview</button>
       </div>
@@ -252,7 +269,7 @@
       border-color var(--motion-fast) var(--motion-easing);
   }
 
-  .panel-tab:hover {
+  .panel-tab:hover:not(:disabled) {
     color: var(--color-fg);
   }
 
@@ -330,7 +347,7 @@
       color var(--motion-fast) var(--motion-easing);
   }
 
-  .rail-btn:hover {
+  .rail-btn:hover:not(:disabled) {
     background: var(--color-glass-2);
     color: var(--color-fg);
   }

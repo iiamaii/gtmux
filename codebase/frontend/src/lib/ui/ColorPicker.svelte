@@ -1096,7 +1096,7 @@
         {#if formatMenuOpen}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div class="cp-format-menu is-open" role="menu" aria-label="Color format">
-            {#each ['hex', 'rgb', 'hsl', 'oklch'] as const as m}
+            {#each ['hex', 'rgb', 'hsl', 'oklch'] as const as m (m)}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <div
                 class="item"
@@ -1123,7 +1123,7 @@
             <span>Document</span>
           </div>
           <div class="grid">
-            {#each documentSwatches as sw}
+            {#each documentSwatches as sw (sw.hex)}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <span
                 class="sw"
@@ -1153,7 +1153,7 @@
           <div class="grp">
             <div class="lbl"><span>Recent</span></div>
             <div class="grid">
-              {#each recentSwatches as sw}
+              {#each recentSwatches as sw (sw)}
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <span
                   class="sw"
@@ -1332,7 +1332,7 @@
   .cp-title {
     font-size: 12px;
     font-weight: var(--weight-medium);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
   }
   .cp-actions {
     margin-left: auto;

@@ -8,6 +8,8 @@
 // State persists in localStorage so the preference survives reload.
 // Web-only state, no backend round-trip.
 
+import { sessionStore } from '$lib/stores/sessionStore.svelte';
+
 export type LeftPanelTab = 'layers' | 'terminals' | 'files';
 export type RightPanelTab = 'inspect' | 'preview';
 
@@ -21,7 +23,7 @@ export type ChromeState = {
 };
 
 const STORAGE_KEY = 'gtmux-chrome';
-const LEFT_PANEL_MIN_WIDTH = 268;
+const LEFT_PANEL_MIN_WIDTH = 230;
 const LEFT_PANEL_MAX_WIDTH = 520;
 const RIGHT_PANEL_MIN_WIDTH = 240;
 const RIGHT_PANEL_MAX_WIDTH = 560;
@@ -46,7 +48,16 @@ class ChromeStore {
   /** Switch the active tab in the left panel. Always expands the panel
    *  too (matches the "rail icon click → expand + select" UX). */
   setLeftPanelTab(tab: LeftPanelTab): void {
-    this.state = { ...this.state, leftPanelTab: tab, sidebarCollapsed: false };
+    if (tab === 'files') {
+      sessionStore.clearM();
+      sessionStore.clearDrill();
+    }
+    this.state = {
+      ...this.state,
+      leftPanelTab: tab,
+      rightPanelTab: rightPanelTabForLeft(tab),
+      sidebarCollapsed: false,
+    };
     this.persist();
   }
 
@@ -55,11 +66,15 @@ class ChromeStore {
     this.persist();
   }
 
-  /** Switch the active tab in the right panel. Always expands the panel
-   *  too (matches the LeftPanel rail UX). Currently a single tab, but
-   *  the chrome stays symmetric so adding tabs later is purely additive. */
+  /** Switch the active tab in the right panel. The allowed tab is coupled
+   *  to the left panel domain: Files owns Preview, canvas tabs own Inspect. */
   setRightPanelTab(tab: RightPanelTab): void {
-    this.state = { ...this.state, rightPanelTab: tab, paneInfoCollapsed: false };
+    const allowed = rightPanelTabForLeft(this.state.leftPanelTab);
+    this.state = {
+      ...this.state,
+      rightPanelTab: tab === allowed ? tab : allowed,
+      paneInfoCollapsed: false,
+    };
     this.persist();
   }
 
@@ -139,8 +154,13 @@ function normalizeState(state: ChromeState): ChromeState {
   return {
     ...state,
     leftPanelWidth: clamp(state.leftPanelWidth, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
+    rightPanelTab: rightPanelTabForLeft(state.leftPanelTab),
     rightPanelWidth: clamp(state.rightPanelWidth, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
   };
+}
+
+function rightPanelTabForLeft(tab: LeftPanelTab): RightPanelTab {
+  return tab === 'files' ? 'preview' : 'inspect';
 }
 
 function clamp(value: number, min: number, max: number): number {

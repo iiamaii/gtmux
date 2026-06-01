@@ -149,9 +149,9 @@
   }
 
   .choice-title {
-    font-size: var(--text-lg);
+    font-size: var(--text-md);
     font-weight: var(--weight-medium);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
     color: var(--color-fg);
   }
 

@@ -46,9 +46,9 @@
 >
   {#snippet body()}
     {#if summary === null}
-      <p class="state">Loading attach summary…</p>
+      <p class="modal-state">Loading attach summary…</p>
     {:else}
-      <p class="lead">
+      <p class="modal-lead lead">
         This session's layout doesn't fully match the server's live terminals.
         Continuing will adjust the canvas:
       </p>
@@ -103,16 +103,6 @@
 <style>
   .lead {
     margin: 0 0 var(--space-12);
-    font-size: var(--text-md);
-    color: var(--color-fg-muted);
-    line-height: var(--leading-normal);
-  }
-
-  .state {
-    margin: 0;
-    padding: var(--space-16) 0;
-    text-align: center;
-    color: var(--color-fg-muted);
   }
 
   .changes {

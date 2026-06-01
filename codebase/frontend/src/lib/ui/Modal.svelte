@@ -13,13 +13,18 @@
    * Usage:
    *   <Modal open={showModal} onclose={() => (showModal = false)} title="Confirm">
    *     {#snippet body()}
-   *       <p>Are you sure?</p>
+   *       <div class="modal-stack">
+   *         <p class="modal-lead">Are you sure?</p>
+   *       </div>
    *     {/snippet}
    *     {#snippet footer()}
    *       <Button variant="ghost" onclick={cancel}>Cancel</Button>
    *       <Button variant="danger" onclick={confirm}>OK</Button>
    *     {/snippet}
    *   </Modal>
+   *
+   * Common body utility classes: modal-stack, modal-lead/modal-copy,
+   * modal-state, modal-note.
    */
 
   import type { Snippet } from 'svelte';
@@ -173,12 +178,16 @@
   }
 
   .modal-dialog {
+    box-sizing: border-box;
     width: 100%;
+    max-height: min(86vh, 760px);
     background: var(--color-surface);
     color: var(--color-fg);
     border: 1px solid var(--color-border-strong);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
     overflow: hidden;
     animation: dialog-in var(--motion-slow) var(--motion-easing);
   }
@@ -207,8 +216,11 @@
   }
 
   .modal-body {
+    min-height: 0;
+    overflow-y: auto;
     padding: var(--space-12) var(--space-24);
     font-size: var(--text-base);
+    line-height: var(--leading-normal);
     color: var(--color-fg-muted);
   }
 
@@ -218,11 +230,53 @@
 
   .modal-footer {
     display: flex;
+    align-items: center;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: var(--space-8);
     padding: var(--space-12) var(--space-24) var(--space-16);
     border-top: 1px solid var(--color-border);
     background: color-mix(in srgb, var(--color-surface-2) 60%, transparent);
+  }
+
+  :global(.modal-stack) {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-12);
+  }
+
+  :global(.modal-copy),
+  :global(.modal-lead) {
+    margin: 0;
+    color: var(--color-fg-muted);
+    font-size: var(--text-md);
+    line-height: var(--leading-normal);
+  }
+
+  :global(.modal-copy strong),
+  :global(.modal-lead strong) {
+    color: var(--color-fg);
+    font-weight: var(--weight-semibold);
+  }
+
+  :global(.modal-state) {
+    margin: 0;
+    padding: var(--space-24) 0;
+    color: var(--color-fg-muted);
+    font-size: var(--text-md);
+    line-height: var(--leading-normal);
+    text-align: center;
+  }
+
+  :global(.modal-note) {
+    margin: 0;
+    padding: var(--space-10) var(--space-12);
+    background: var(--color-surface-2);
+    border-left: 3px solid var(--color-warning);
+    border-radius: var(--radius-sm);
+    color: var(--color-fg-muted);
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
   }
 
   @keyframes backdrop-in {

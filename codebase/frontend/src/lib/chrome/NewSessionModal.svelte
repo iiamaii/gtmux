@@ -232,7 +232,7 @@
 <style>
   .form-stack {
     display: grid;
-    gap: var(--space-16);
+    gap: var(--space-12);
   }
 
   .field {
@@ -265,22 +265,30 @@
   }
 
   .text-input {
+    box-sizing: border-box;
     width: 100%;
     min-width: 0;
-    height: 30px;
-    padding: 0 var(--space-10);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-sm);
-    background: var(--color-surface-2);
+    height: 32px;
+    padding: 0 var(--space-12);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
     color: var(--color-fg);
-    font: inherit;
-    font-size: var(--text-lg);
-    letter-spacing: -0.1px;
+    font-family: inherit;
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
+    letter-spacing: 0;
+    transition: border-color var(--motion-fast) var(--motion-easing);
   }
 
-  .text-input:focus {
-    outline: none;
-    border-color: var(--color-accent);
+  .text-input:hover:not(:disabled) {
+    border-color: var(--color-fg-subtle);
+  }
+
+  .text-input:focus-visible {
+    outline: 2px solid var(--color-info);
+    outline-offset: 1px;
+    border-color: var(--color-info);
     background: var(--color-surface);
   }
 
@@ -290,7 +298,7 @@
 
   .mono {
     font-family: var(--font-mono);
-    font-size: var(--text-md);
+    font-size: var(--text-base);
   }
 
   .field-hint,
@@ -298,7 +306,7 @@
   .field-error,
   .footer-reason {
     font-size: var(--text-sm);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
   }
 
   .field-hint {

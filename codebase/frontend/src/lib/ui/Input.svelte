@@ -64,7 +64,7 @@
   .input-field {
     display: flex;
     flex-direction: column;
-    gap: var(--space-16);
+    gap: var(--space-6);
   }
 
   .input-label {
@@ -74,6 +74,7 @@
   }
 
   .input-control {
+    box-sizing: border-box;
     height: 32px;
     padding: 0 var(--space-12);
     background: var(--color-surface);
@@ -82,6 +83,7 @@
     border-radius: var(--radius-md);
     font-family: inherit;
     font-size: var(--text-base);
+    line-height: var(--leading-normal);
     transition: border-color var(--motion-fast) var(--motion-easing);
   }
 

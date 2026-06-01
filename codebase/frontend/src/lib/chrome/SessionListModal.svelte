@@ -84,7 +84,8 @@
 
   let sessions = $derived(workspaceManifest.sessions);
   let folders = $derived(workspaceManifest.folders);
-  let rows = $derived.by(() => buildRows());
+  let inUseRows = $derived.by(() => buildInUseRows());
+  let rows = $derived.by(() => buildSelectableRows());
   let renameInputError = $derived(
     pendingRenameSession === null
       ? null
@@ -206,9 +207,12 @@
       .some((child) => folderHasVisibleContent(child, visible));
   }
 
-  function folderChildCount(folderId: string): number {
-    const directSessions = sessions.filter((session) => session.folder_id === folderId).length;
-    const directFolders = folders.filter((folder) => folder.parent_id === folderId).length;
+  function folderChildCount(folderId: string, visible: EnrichedSession[]): number {
+    const directSessions = visible.filter((session) => session.folder_id === folderId).length;
+    const directFolders = folders
+      .filter((folder) => folder.parent_id === folderId)
+      .filter((folder) => folderHasVisibleContent(folder, visible))
+      .length;
     return directSessions + directFolders;
   }
 
@@ -225,8 +229,24 @@
       .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
   }
 
-  function buildRows(): TreeRow[] {
-    const visible = visibleSessions();
+  function buildInUseRows(): SessionRow[] {
+    return visibleSessions()
+      .filter((session) => session.active)
+      .sort((a, b) =>
+        workspaceManifest.folderPath(a.folder_id).localeCompare(workspaceManifest.folderPath(b.folder_id)) ||
+        a.order - b.order ||
+        a.name.localeCompare(b.name),
+      )
+      .map((session) => ({
+        kind: 'session',
+        id: `in-use:${session.name}`,
+        session,
+        depth: 0,
+      }));
+  }
+
+  function buildSelectableRows(): TreeRow[] {
+    const visible = visibleSessions().filter((session) => !session.active);
     const out: TreeRow[] = [];
 
     const appendFolder = (folder: WorkspaceFolder, depth: number): void => {
@@ -235,7 +255,7 @@
         id: `folder:${folder.id}`,
         folder,
         depth,
-        childCount: folderChildCount(folder.id),
+        childCount: folderChildCount(folder.id, visible),
       });
       if (folder.collapsed) return;
       for (const child of sortedFolders(folder.id, visible)) appendFolder(child, depth + 1);
@@ -527,6 +547,92 @@
   </svg>
 {/snippet}
 
+{#snippet sessionRow(row: SessionRow)}
+  <li class="session-row-wrap" class:in-use={row.session.active} style={`padding-left: ${row.depth * 18}px`}>
+    <button
+      type="button"
+      class:disabled={row.session.active}
+      class="session-row"
+      disabled={row.session.active}
+      title={row.session.active ? 'In use by another webpage' : undefined}
+      onclick={() => onSelect(row.session.name)}
+    >
+      <span class="session-main">
+        <span class="session-title">
+          <span class="session-name">{row.session.name}</span>
+        </span>
+        <span class="session-chips">
+          <span class="chip folder-chip" title={folderChipLabel(row.session)}>
+            <span class="chip-icon">{@render sessionFolderIcon()}</span>
+            <span class="chip-text">{folderChipLabel(row.session)}</span>
+          </span>
+          <span class="chip workspace-chip" title={workspacePath(row.session)}>
+            <span class="chip-icon">{@render workspaceIcon()}</span>
+            <span class="chip-text">{compactWorkspacePath(row.session)}</span>
+          </span>
+        </span>
+        <span class="session-meta">{sessionMeta(row.session)}</span>
+      </span>
+      {#if row.session.active}
+        <span class="badge">in use</span>
+      {/if}
+    </button>
+    <Dropdown>
+      {#snippet trigger({ toggle })}
+        <IconButton aria-label="Session actions" title="Session actions" size="sm" onclick={toggle}>
+          {@render moreIcon()}
+        </IconButton>
+      {/snippet}
+      {#snippet menu({ close })}
+        <button
+          type="button"
+          disabled={!canRenameOrDuplicate(row.session)}
+          onclick={() => {
+            beginRename(row.session);
+            close();
+          }}
+        >
+          <span class="glyph" aria-hidden="true">{@render editIcon()}</span>
+          <span>Rename</span>
+        </button>
+        <button
+          type="button"
+          disabled={!canRenameOrDuplicate(row.session)}
+          onclick={() => {
+            beginDuplicate(row.session);
+            close();
+          }}
+        >
+          <span class="glyph" aria-hidden="true">{@render duplicateIcon()}</span>
+          <span>Duplicate</span>
+        </button>
+        <button
+          type="button"
+          onclick={() => {
+            pendingWorkspaceSession = row.session;
+            close();
+          }}
+        >
+          <span class="glyph" aria-hidden="true">{@render workspaceIcon()}</span>
+          <span>Change workspace</span>
+        </button>
+        <button
+          type="button"
+          class="danger"
+          disabled={row.session.active || !canDelete(row.session.name)}
+          onclick={() => {
+            pendingDeleteName = row.session.name;
+            close();
+          }}
+        >
+          <span class="glyph" aria-hidden="true">{@render trashIcon()}</span>
+          <span>Remove</span>
+        </button>
+      {/snippet}
+    </Dropdown>
+  </li>
+{/snippet}
+
 <Modal
   {open}
   onclose={onClose}
@@ -556,137 +662,75 @@
       <p class="state error" role="alert">{errorMessage}</p>
     {:else if sessions.length === 0}
       <p class="state">No sessions yet.</p>
-    {:else if rows.length === 0}
+    {:else if inUseRows.length === 0 && rows.length === 0}
       <p class="state">No matching sessions.</p>
     {:else}
-      <ul class="tree" role="listbox" aria-label="Workspace sessions">
-        {#each rows as row (row.id)}
-          {#if row.kind === 'folder'}
-            <li class="folder-row" style={`padding-left: ${row.depth * 18}px`}>
-              <button type="button" class="folder-main" onclick={() => void toggleFolder(row.folder)}>
-                <span class="glyph" aria-hidden="true">{row.folder.collapsed ? '›' : '⌄'}</span>
-                <span class="glyph folder-glyph" aria-hidden="true">{@render sessionFolderIcon()}</span>
-                <span class="folder-name">{row.folder.name}</span>
-                <span class="count">{row.childCount}</span>
-              </button>
-              <Dropdown>
-                {#snippet trigger({ toggle })}
-                  <IconButton aria-label="Folder actions" title="Folder actions" size="sm" onclick={toggle}>
-                    {@render moreIcon()}
-                  </IconButton>
-                {/snippet}
-                {#snippet menu({ close })}
-                  <button
-                    type="button"
-                    onclick={() => {
-                      onCreateInFolder?.(row.folder.id);
-                      close();
-                    }}
-                  >
-                    <span class="glyph" aria-hidden="true">{@render plusIcon()}</span>
-                    <span>New session here</span>
-                  </button>
-                  <button
-                    type="button"
-                    class="danger"
-                    onclick={() => {
-                      pendingDeleteFolder = row.folder;
-                      close();
-                    }}
-                  >
-                    <span class="glyph" aria-hidden="true">{@render trashIcon()}</span>
-                    <span>Delete folder</span>
-                  </button>
-                {/snippet}
-              </Dropdown>
-            </li>
+      <div class="session-sections">
+        {#if inUseRows.length > 0}
+          <section class="session-section in-use-section" aria-label="In-use sessions">
+            <h3 class="section-title">In use</h3>
+            <ul class="tree" role="listbox" aria-label="In-use sessions">
+              {#each inUseRows as row (row.id)}
+                {@render sessionRow(row)}
+              {/each}
+            </ul>
+          </section>
+        {/if}
+
+        <section class="session-section selectable-section" aria-label="Selectable sessions">
+          <h3 class="section-title">Available</h3>
+          {#if rows.length === 0}
+            <p class="section-note">No selectable sessions.</p>
           {:else}
-            <li class="session-row-wrap" style={`padding-left: ${row.depth * 18}px`}>
-              <button
-                type="button"
-                class:disabled={row.session.active}
-                class="session-row"
-                disabled={row.session.active}
-                title={row.session.active ? 'In use by another webpage' : undefined}
-                onclick={() => onSelect(row.session.name)}
-              >
-                <span class="session-main">
-                  <span class="session-title">
-                    <span class="session-name">{row.session.name}</span>
-                  </span>
-                  <span class="session-chips">
-                    <span class="chip folder-chip" title={folderChipLabel(row.session)}>
-                      <span class="chip-icon">{@render sessionFolderIcon()}</span>
-                      <span class="chip-text">{folderChipLabel(row.session)}</span>
-                    </span>
-                    <span class="chip workspace-chip" title={workspacePath(row.session)}>
-                      <span class="chip-icon">{@render workspaceIcon()}</span>
-                      <span class="chip-text">{compactWorkspacePath(row.session)}</span>
-                    </span>
-                  </span>
-                  <span class="session-meta">{sessionMeta(row.session)}</span>
-                </span>
-                {#if row.session.active}
-                  <span class="badge">in use</span>
+            <ul class="tree" role="listbox" aria-label="Selectable sessions">
+              {#each rows as row (row.id)}
+                {#if row.kind === 'folder'}
+                  <li class="folder-row" style={`padding-left: ${row.depth * 18}px`}>
+                    <button type="button" class="folder-main" onclick={() => void toggleFolder(row.folder)}>
+                      <span class="glyph" aria-hidden="true">{row.folder.collapsed ? '›' : '⌄'}</span>
+                      <span class="glyph folder-glyph" aria-hidden="true">{@render sessionFolderIcon()}</span>
+                      <span class="folder-name">{row.folder.name}</span>
+                      <span class="count">{row.childCount}</span>
+                    </button>
+                    <Dropdown>
+                      {#snippet trigger({ toggle })}
+                        <IconButton aria-label="Folder actions" title="Folder actions" size="sm" onclick={toggle}>
+                          {@render moreIcon()}
+                        </IconButton>
+                      {/snippet}
+                      {#snippet menu({ close })}
+                        <button
+                          type="button"
+                          onclick={() => {
+                            onCreateInFolder?.(row.folder.id);
+                            close();
+                          }}
+                        >
+                          <span class="glyph" aria-hidden="true">{@render plusIcon()}</span>
+                          <span>New session here</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="danger"
+                          onclick={() => {
+                            pendingDeleteFolder = row.folder;
+                            close();
+                          }}
+                        >
+                          <span class="glyph" aria-hidden="true">{@render trashIcon()}</span>
+                          <span>Delete folder</span>
+                        </button>
+                      {/snippet}
+                    </Dropdown>
+                  </li>
+                {:else}
+                  {@render sessionRow(row)}
                 {/if}
-              </button>
-              <Dropdown>
-                {#snippet trigger({ toggle })}
-                  <IconButton aria-label="Session actions" title="Session actions" size="sm" onclick={toggle}>
-                    {@render moreIcon()}
-                  </IconButton>
-                {/snippet}
-                {#snippet menu({ close })}
-                  <button
-                    type="button"
-                    disabled={!canRenameOrDuplicate(row.session)}
-                    onclick={() => {
-                      beginRename(row.session);
-                      close();
-                    }}
-                  >
-                    <span class="glyph" aria-hidden="true">{@render editIcon()}</span>
-                    <span>Rename</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!canRenameOrDuplicate(row.session)}
-                    onclick={() => {
-                      beginDuplicate(row.session);
-                      close();
-                    }}
-                  >
-                    <span class="glyph" aria-hidden="true">{@render duplicateIcon()}</span>
-                    <span>Duplicate</span>
-                  </button>
-                  <button
-                    type="button"
-                    onclick={() => {
-                      pendingWorkspaceSession = row.session;
-                      close();
-                    }}
-                  >
-                    <span class="glyph" aria-hidden="true">{@render workspaceIcon()}</span>
-                    <span>Change workspace</span>
-                  </button>
-                  <button
-                    type="button"
-                    class="danger"
-                    disabled={row.session.active || !canDelete(row.session.name)}
-                    onclick={() => {
-                      pendingDeleteName = row.session.name;
-                      close();
-                    }}
-                  >
-                    <span class="glyph" aria-hidden="true">{@render trashIcon()}</span>
-                    <span>Remove</span>
-                  </button>
-                {/snippet}
-              </Dropdown>
-            </li>
+              {/each}
+            </ul>
           {/if}
-        {/each}
-      </ul>
+        </section>
+      </div>
     {/if}
   {/snippet}
   {#snippet footer()}
@@ -861,6 +905,7 @@
     text-align: center;
     color: var(--color-fg-muted);
     font-size: var(--text-md);
+    line-height: var(--leading-normal);
   }
 
   .state.error {
@@ -876,7 +921,8 @@
   .modal-copy {
     margin: 0;
     color: var(--color-fg-muted);
-    font-size: var(--text-base);
+    font-size: var(--text-md);
+    line-height: var(--leading-normal);
   }
 
   .mono {
@@ -887,7 +933,7 @@
   .select-field {
     display: flex;
     flex-direction: column;
-    gap: var(--space-16);
+    gap: var(--space-6);
   }
 
   .select-label {
@@ -918,6 +964,44 @@
     cursor: not-allowed;
   }
 
+  .session-sections {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-16);
+    max-height: min(58vh, 560px);
+    overflow: auto;
+    padding-right: 2px;
+  }
+
+  .session-section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
+    min-width: 0;
+  }
+
+  .selectable-section {
+    padding-top: var(--space-12);
+    border-top: 1px solid var(--color-border);
+  }
+
+  .section-title {
+    margin: 0;
+    color: var(--color-fg-subtle);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: var(--weight-medium);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+  }
+
+  .section-note {
+    margin: 0;
+    padding: var(--space-8) var(--space-4);
+    color: var(--color-fg-subtle);
+    font-size: var(--text-sm);
+  }
+
   .tree {
     list-style: none;
     padding: 0;
@@ -925,8 +1009,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
-    max-height: min(58vh, 560px);
-    overflow: auto;
   }
 
   .folder-row,
@@ -1033,7 +1115,7 @@
     border-radius: var(--radius-sm);
     font-family: var(--font-mono);
     font-size: 10px;
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
     white-space: nowrap;
   }
 
@@ -1072,6 +1154,10 @@
   .session-row.disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  .session-row-wrap.in-use .session-row.disabled {
+    opacity: 0.72;
   }
 
   .glyph {

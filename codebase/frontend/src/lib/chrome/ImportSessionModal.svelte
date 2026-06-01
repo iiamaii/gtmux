@@ -273,7 +273,7 @@
 >
   {#snippet body()}
     {#if stage === 'pick'}
-      <p class="lead">
+      <p class="modal-lead">
         Pick a <code>.gtmux-session.json</code> file exported from gtmux.
       </p>
       <label class="file-pick">
@@ -357,7 +357,7 @@
         {/if}
       {/if}
     {:else if stage === 'done' && importedName !== null}
-      <p class="lead">
+      <p class="modal-lead">
         Imported as <strong class="mono">{importedName}</strong>.
         {#if sessionStore.active !== null}
           Opening it will close the current session
@@ -390,13 +390,12 @@
 </Modal>
 
 <style>
-  .lead {
-    margin: 0 0 var(--space-12);
+  .modal-lead {
+    margin-bottom: var(--space-12);
     color: var(--color-fg);
-    font-size: var(--text-md);
   }
 
-  .lead code {
+  .modal-lead code {
     font-family: var(--font-mono);
     font-size: 0.95em;
     background: var(--color-surface-2);
@@ -503,14 +502,17 @@
   }
 
   .text-input {
-    height: 30px;
-    padding: 0 8px;
+    box-sizing: border-box;
+    height: 32px;
+    padding: 0 var(--space-12);
     background: var(--color-surface);
     color: var(--color-fg);
     border: 1px solid var(--color-border-strong);
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-md);
     width: 100%;
-    box-sizing: border-box;
+    font-family: inherit;
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
   }
 
   .text-input:focus {
