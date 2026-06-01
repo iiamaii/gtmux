@@ -28,6 +28,7 @@
   import { buildChildBlocks, normalizeLayout } from '$lib/stores/zSpace';
   import { directParentGroupId, effectiveLocked } from '$lib/types/group';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
+  import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
 
   interface ContextMenuHolder {
     openAt: (args: {
@@ -188,17 +189,28 @@
       }
     | { kind: 'panel'; id: string; depth: number; panel: PanelData };
 
-  // 펼침 상태 — component-local. P1+에서 ephemeralStore 또는 web-store 영속화 검토.
-  const expanded = $state(new SvelteSet<string>());
+  const LAYER_TREE_EXPANSION_STORAGE_KEY = 'gtmux:layer-tree-expanded:v1';
+  const MAX_LAYER_TREE_EXPANSIONS = 200;
+
+  const activeSessionName = $derived(sessionStore.active?.name ?? null);
+
+  // 펼침 상태 — 세션별로 localStorage 에 저장해 탭 전환/새로고침 후에도 복원.
+  const expanded = new SvelteSet<string>();
+  let restoredExpansionKey = $state<string | null | undefined>(undefined);
 
   function expandAncestorsOf(id: string): void {
     let parentId = directParentGroupId(id, sessionStore.items, sessionStore.groups);
     const seen = new Set<string>();
+    let changed = false;
     while (parentId !== null && !seen.has(parentId)) {
       seen.add(parentId);
-      expanded.add(parentId);
+      if (!expanded.has(parentId)) {
+        expanded.add(parentId);
+        changed = true;
+      }
       parentId = directParentGroupId(parentId, sessionStore.items, sessionStore.groups);
     }
+    if (changed) persistExpandedGroups();
   }
 
   $effect(() => {
@@ -401,6 +413,7 @@
   function toggleExpand(id: string): void {
     if (expanded.has(id)) expanded.delete(id);
     else expanded.add(id);
+    persistExpandedGroups();
   }
 
   /**
@@ -409,6 +422,36 @@
    * shift-click 이 fallback 으로 target 만 add.
    */
   let selectionAnchor = $state<string | null>(null);
+
+  $effect(() => {
+    if (activeSessionName === restoredExpansionKey) return;
+    restoredExpansionKey = activeSessionName;
+    selectionAnchor = null;
+    expanded.clear();
+    for (const id of readExpandedTreeState(
+      LAYER_TREE_EXPANSION_STORAGE_KEY,
+      layerTreeStateKey(activeSessionName),
+    )) {
+      expanded.add(id);
+    }
+  });
+
+  $effect(() => {
+    if (sessionStore.M.size === 0) selectionAnchor = null;
+  });
+
+  function layerTreeStateKey(sessionName: string | null): string | null {
+    return sessionName;
+  }
+
+  function persistExpandedGroups(): void {
+    writeExpandedTreeState(
+      LAYER_TREE_EXPANSION_STORAGE_KEY,
+      layerTreeStateKey(activeSessionName),
+      expanded,
+      MAX_LAYER_TREE_EXPANSIONS,
+    );
+  }
 
   function applyDrillForTreeSelection(ids: readonly string[]): void {
     const parentIds = ids.map((rowId) =>

@@ -24,6 +24,8 @@
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import Modal from '$lib/ui/Modal.svelte';
+  import Button from '$lib/ui/Button.svelte';
   import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
   import type { TerminalInfo } from '$lib/types/terminals';
 
@@ -38,6 +40,7 @@
     if (!it || it.type !== 'terminal') return null;
     return it;
   });
+  const modalOpen = $derived(open && currentItem !== null);
 
   // Alive pool minus the current binding; sorted by recency (newest first).
   const candidates = $derived.by((): TerminalInfo[] => {
@@ -118,11 +121,8 @@
   onMount(() => terminalPool.subscribe());
 
   function onWindowKey(e: KeyboardEvent): void {
-    if (!open) return;
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      close();
-    } else if (e.key === 'Enter') {
+    if (!modalOpen) return;
+    if (e.key === 'Enter') {
       const first = candidates[0];
       if (first && !isAlreadyOnCanvas(first.id)) {
         e.preventDefault();
@@ -133,38 +133,26 @@
 
   $effect(() => {
     if (typeof window === 'undefined') return;
-    if (!open) return;
+    if (!modalOpen) return;
     window.addEventListener('keydown', onWindowKey);
     return () => window.removeEventListener('keydown', onWindowKey);
   });
 </script>
 
-{#if open && currentItem !== null}
-  <div
-    class="modal-backdrop"
-    role="presentation"
-    onclick={close}
-    onkeydown={() => {}}
-  >
-    <div
-      class="modal"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="change-terminal-title"
-      tabindex="-1"
-      onclick={(e: MouseEvent) => e.stopPropagation()}
-      onkeydown={() => {}}
-    >
-      <header class="modal-head">
-        <h2 id="change-terminal-title">Change terminal</h2>
-        <button type="button" class="close" aria-label="Close" onclick={close}>×</button>
-      </header>
-
-      <div class="modal-body">
-        <p class="hint">
+<Modal
+  open={modalOpen}
+  onclose={close}
+  title="Change terminal"
+  dismissOnBackdrop={!committing}
+  dismissOnEsc={!committing}
+>
+  {#snippet body()}
+    {#if currentItem !== null}
+      <div class="modal-stack">
+        <p class="modal-copy">
           Replace the binding of this panel with a different terminal. The
-          previous terminal stays alive in the pool — only this panel's
-          stream switches.
+          previous terminal stays alive in the pool; only this panel's stream
+          switches.
         </p>
         <div class="current">
           <span class="k mono">current</span>
@@ -202,90 +190,21 @@
           </ul>
         {/if}
       </div>
+    {/if}
+  {/snippet}
 
-      <footer class="modal-foot">
-        <button type="button" class="btn-secondary" onclick={close} disabled={committing}>
-          Cancel
-        </button>
-      </footer>
-    </div>
-  </div>
-{/if}
+  {#snippet footer()}
+    <Button variant="ghost" onclick={close} disabled={committing}>Cancel</Button>
+  {/snippet}
+</Modal>
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: transparent;
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
-    z-index: var(--z-modal);
-    display: grid;
-    place-items: center;
-  }
-
-  .modal {
-    width: min(440px, 92vw);
-    max-height: 80vh;
-    background: var(--color-surface);
-    color: var(--color-fg);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-lg);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .modal-head {
-    display: flex;
-    align-items: center;
-    gap: var(--space-8);
-    padding: var(--space-12) var(--space-12) var(--space-8);
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  .modal-head h2 {
-    flex: 1 1 auto;
-    margin: 0;
-    font-size: var(--text-lg);
-    font-weight: var(--weight-medium);
-  }
-
-  .close {
-    width: 24px;
-    height: 24px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--color-fg-muted);
-    font-size: 18px;
-    line-height: 1;
-    cursor: pointer;
-  }
-
-  .close:hover {
-    background: var(--color-glass-2);
-    color: var(--color-fg);
-  }
-
-  .modal-body {
-    padding: var(--space-12);
-    overflow-y: auto;
-    min-height: 0;
-  }
-
-  .hint {
-    margin: 0 0 var(--space-8);
-    color: var(--color-fg-muted);
-    font-size: var(--text-base);
-  }
-
   .current {
     display: inline-flex;
     align-items: center;
     gap: var(--space-6);
     padding: var(--space-4) var(--space-8);
-    margin-bottom: var(--space-12);
+    align-self: flex-start;
     border-radius: var(--radius-sm);
     background: var(--color-surface-2);
     font-size: var(--text-base);
@@ -303,10 +222,12 @@
   }
 
   .placeholder {
-    margin: var(--space-12) 0;
+    margin: 0;
+    padding: var(--space-16) 0;
     text-align: center;
     color: var(--color-fg-subtle);
     font-style: italic;
+    font-size: var(--text-md);
   }
 
   .pick-list {
@@ -327,6 +248,7 @@
     background: transparent;
     color: inherit;
     font: inherit;
+    font-size: var(--text-base);
     text-align: left;
     cursor: pointer;
     transition: background var(--motion-fast) var(--motion-easing);
@@ -382,33 +304,5 @@
   .badge.muted {
     background: var(--color-surface-2);
     color: var(--color-fg-subtle);
-  }
-
-  .modal-foot {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-8);
-    padding: var(--space-8) var(--space-12) var(--space-12);
-    border-top: 1px solid var(--color-border);
-  }
-
-  .btn-secondary {
-    padding: var(--space-6) var(--space-12);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--color-fg);
-    font: inherit;
-    cursor: pointer;
-    transition: background var(--motion-fast) var(--motion-easing);
-  }
-
-  .btn-secondary:hover:not(:disabled) {
-    background: var(--color-glass-1);
-  }
-
-  .btn-secondary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
   }
 </style>

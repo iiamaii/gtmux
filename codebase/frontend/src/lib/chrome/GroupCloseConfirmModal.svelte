@@ -32,6 +32,8 @@
   import { UnauthorizedError } from '$lib/http/sessions';
   import { killTerminal } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import Modal from '$lib/ui/Modal.svelte';
+  import Button from '$lib/ui/Button.svelte';
   import type { CanvasItem } from '$lib/types/canvas';
   import { pruneEmptyGroups } from '$lib/types/group';
 
@@ -45,6 +47,7 @@
     if (groupId === null) return null;
     return sessionStore.groups.get(groupId) ?? null;
   });
+  const modalOpen = $derived(open && group !== null);
 
   /** Descendant group + item ids via parent_id BFS. */
   const descendants = $derived.by(() => {
@@ -199,21 +202,6 @@
   // Pool subscription so mirrored counts stay fresh while modal is open.
   onMount(() => terminalPool.subscribe());
 
-  function onWindowKey(e: KeyboardEvent): void {
-    if (!open) return;
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      close();
-    }
-  }
-
-  $effect(() => {
-    if (typeof window === 'undefined') return;
-    if (!open) return;
-    window.addEventListener('keydown', onWindowKey);
-    return () => window.removeEventListener('keydown', onWindowKey);
-  });
-
   $effect(() => {
     if (!open || groupId === null) {
       autoCommittedGroupId = null;
@@ -229,29 +217,17 @@
   const groupLabel = $derived(group?.label ?? (groupId !== null ? groupId.slice(0, 8) : ''));
 </script>
 
-{#if open && group !== null}
-  <div
-    class="modal-backdrop"
-    role="presentation"
-    onclick={close}
-    onkeydown={() => {}}
-  >
-    <div
-      class="modal"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="group-close-title"
-      tabindex="-1"
-      onclick={(e: MouseEvent) => e.stopPropagation()}
-      onkeydown={() => {}}
-    >
-      <header class="modal-head">
-        <h2 id="group-close-title">Close group</h2>
-        <button type="button" class="close" aria-label="Close" onclick={close}>×</button>
-      </header>
-
-      <div class="modal-body">
-        <p class="hint">
+<Modal
+  open={modalOpen}
+  onclose={close}
+  title="Close group"
+  dismissOnBackdrop={!committing}
+  dismissOnEsc={!committing}
+>
+  {#snippet body()}
+    {#if group !== null}
+      <div class="modal-stack">
+        <p class="modal-lead">
           Closing <strong>{groupLabel}</strong> removes the group and its
           descendants from this canvas.
         </p>
@@ -287,107 +263,33 @@
           </div>
         {/if}
       </div>
+    {/if}
+  {/snippet}
 
-      <footer class="modal-foot">
-        <button
-          type="button"
-          class="btn-secondary"
-          onclick={close}
-          disabled={committing}
-        >Cancel</button>
-        <button
-          type="button"
-          class="btn-secondary"
-          onclick={() => void commitPanelsOnly()}
-          disabled={committing}
-          title="Remove group + descendant panels. Terminals stay alive in the pool."
-        >Panels only</button>
-        <button
-          type="button"
-          class="btn-danger"
-          onclick={() => void commitWithTerminals()}
-          disabled={committing || terminalDescendants.length === 0}
-          title={terminalDescendants.length === 0
-            ? 'No descendant terminals to kill.'
-            : `Remove panels + kill ${terminalDescendants.length} terminal(s).`}
-        >Panels + Terminals</button>
-      </footer>
-    </div>
-  </div>
-{/if}
+  {#snippet footer()}
+    <Button variant="ghost" onclick={close} disabled={committing}>Cancel</Button>
+    <Button
+      variant="secondary"
+      onclick={() => void commitPanelsOnly()}
+      disabled={committing}
+      title="Remove group + descendant panels. Terminals stay alive in the pool."
+    >Panels only</Button>
+    <Button
+      variant="danger"
+      onclick={() => void commitWithTerminals()}
+      disabled={committing || terminalDescendants.length === 0}
+      title={terminalDescendants.length === 0
+        ? 'No descendant terminals to kill.'
+        : `Remove panels + kill ${terminalDescendants.length} terminal(s).`}
+    >Panels + Terminals</Button>
+  {/snippet}
+</Modal>
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    background: transparent;
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
-    z-index: var(--z-modal);
-    display: grid;
-    place-items: center;
-  }
-
-  .modal {
-    width: min(480px, 92vw);
-    max-height: 80vh;
-    background: var(--color-surface);
-    color: var(--color-fg);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-lg);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .modal-head {
-    display: flex;
-    align-items: center;
-    gap: var(--space-8);
-    padding: var(--space-12) var(--space-12) var(--space-8);
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  .modal-head h2 {
-    flex: 1 1 auto;
-    margin: 0;
-    font-size: var(--text-lg);
-    font-weight: var(--weight-medium);
-  }
-
-  .close {
-    width: 24px;
-    height: 24px;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--color-fg-muted);
-    font-size: 18px;
-    line-height: 1;
-    cursor: pointer;
-  }
-
-  .close:hover {
-    background: var(--color-glass-2);
-    color: var(--color-fg);
-  }
-
-  .modal-body {
-    padding: var(--space-12);
-    overflow-y: auto;
-    min-height: 0;
-  }
-
-  .hint {
-    margin: 0 0 var(--space-12);
-    color: var(--color-fg);
-    font-size: var(--text-md);
-  }
-
   .counts {
     list-style: none;
     padding: 0;
-    margin: 0 0 var(--space-12);
+    margin: 0;
     display: grid;
     gap: var(--space-4);
   }
@@ -420,6 +322,7 @@
     border-left: 3px solid var(--color-warning);
     border-radius: var(--radius-sm);
     font-size: var(--text-base);
+    line-height: var(--leading-normal);
     color: var(--color-fg);
   }
 
@@ -427,50 +330,5 @@
     margin: var(--space-6) 0 0;
     padding-left: var(--space-16);
     color: var(--color-fg-muted);
-  }
-
-  .modal-foot {
-    display: flex;
-    justify-content: flex-end;
-    gap: var(--space-8);
-    padding: var(--space-8) var(--space-12) var(--space-12);
-    border-top: 1px solid var(--color-border);
-  }
-
-  .btn-secondary,
-  .btn-danger {
-    padding: var(--space-6) var(--space-12);
-    border-radius: var(--radius-sm);
-    font: inherit;
-    cursor: pointer;
-    transition:
-      background var(--motion-fast) var(--motion-easing),
-      color var(--motion-fast) var(--motion-easing);
-  }
-
-  .btn-secondary {
-    border: 1px solid var(--color-border);
-    background: transparent;
-    color: var(--color-fg);
-  }
-
-  .btn-secondary:hover:not(:disabled) {
-    background: var(--color-glass-1);
-  }
-
-  .btn-danger {
-    border: 1px solid transparent;
-    background: var(--color-danger);
-    color: white;
-  }
-
-  .btn-danger:hover:not(:disabled) {
-    filter: brightness(0.95);
-  }
-
-  .btn-secondary:disabled,
-  .btn-danger:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
   }
 </style>

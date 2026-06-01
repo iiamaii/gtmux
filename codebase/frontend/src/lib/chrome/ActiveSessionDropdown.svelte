@@ -17,6 +17,7 @@
   import { onMount } from 'svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
+  import { workspaceManifest } from '$lib/stores/workspaceManifest.svelte';
 
   interface Props {
     /** 클릭 시 호출 — 부모가 SessionListModal 띄움. */
@@ -26,6 +27,12 @@
   const { onSwitch }: Props = $props();
 
   let active = $derived(sessionStore.active);
+  let activeLabel = $derived.by(() => {
+    if (active === null) return null;
+    const session = workspaceManifest.sessions.find((candidate) => candidate.name === active.name);
+    const path = workspaceManifest.folderPath(session?.folder_id ?? null);
+    return path.length > 0 ? `${path} / ${active.name}` : active.name;
+  });
   // Badge — 활성 session 의 canvas 에 attach 된 terminal 수 (server-wide pool size 아님).
   // sessionStore.items 중 type==='terminal' 카운트 = 현 canvas 의 terminal panel 수.
   let sessionTerminalCount = $derived.by(() => {
@@ -50,7 +57,7 @@
   <span class="dot" aria-hidden="true" class:on={active !== null}></span>
   <span class="name">
     {#if active}
-      {active.name}
+      {activeLabel}
     {:else}
       <em>No session</em>
     {/if}

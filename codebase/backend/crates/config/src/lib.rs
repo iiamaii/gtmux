@@ -93,12 +93,26 @@ pub struct Config {
     /// `gtmux start` 시 `GTMUX_FRONTEND_DIST` env 또는 TOML 필드로 지정.
     #[serde(default)]
     pub frontend_dist: Option<std::path::PathBuf>,
-    /// Workspace storage 디렉터리의 절대 경로 (ADR-0019 D2). `None` 이면
-    /// boot 시 `${XDG_DATA_HOME:-~/.local/share}/gtmux/workspace/` 가 기본값.
-    /// CLI `--workspace <path>` 는 본 필드보다 우선 — runtime 변경 불가
-    /// (ADR-0019 D11, boot-immutable).
+    /// Store(C) 저장 디렉터리의 절대 경로 (ADR-0045 D5 — 종전 "Workspace"가
+    /// 가리키던 gtmux 내부 제어-평면 저장소). `None` 이면 boot 시 instance-격리
+    /// `${XDG_DATA_HOME:-~/.local/share}/gtmux/store/<instance>/` 가 기본값
+    /// (legacy `workspaces/<instance>` / `workspace/` back-compat 포함).
+    /// CLI `--workspace` 는 더 이상 본 필드(Store)를 가리키지 않는다 — 그 flag 는
+    /// 이제 Server Workspace(A)를 지정한다. (추후 `store_path` 로 rename 예정.)
     #[serde(default)]
     pub workspace_path: Option<std::path::PathBuf>,
+    /// Server Workspace(A) 의 절대 경로 (ADR-0045 D3 / ADR-0046 D7) — 이 Instance
+    /// 가 browse/spawn/open 할 수 있는 file system 상한(샌드박스 root). CLI
+    /// `--workspace <path>` 가 본 필드보다 우선. 둘 다 `None` 이면 boot 시
+    /// `$HOME` 가 기본값. boot-immutable, boot 시 존재 확인(미존재 → hard error).
+    #[serde(default)]
+    pub server_workspace: Option<std::path::PathBuf>,
+    /// Session 의 effective workspace(B) fallback chain 중간값 (ADR-0046 D1/D7):
+    /// `session.workspace_root ?? default_session_workspace ?? $HOME`. 설정 시
+    /// Server Workspace(A) 내부여야 한다. `None` 이면 `$HOME` 로 fallback
+    /// 하되, `$HOME` 이 A 밖이면 안전하게 A-root 로 닫는다.
+    #[serde(default)]
+    pub default_session_workspace: Option<std::path::PathBuf>,
     /// Cookie-기반 인증 lifecycle 설정 (ADR-0020). 생략 시 default —
     /// `token` mode, 7d rolling, rate limit 5/5min.
     #[serde(default)]
@@ -324,6 +338,8 @@ pub fn load_with_overrides(
         cloud: None,
         frontend_dist: None,
         workspace_path: None,
+        server_workspace: None,
+        default_session_workspace: None,
         auth: AuthConfig::default(),
         assets: AssetsConfig::default(),
     };
@@ -428,6 +444,8 @@ struct DefaultsSeed {
     cloud: Option<CloudConfig>,
     frontend_dist: Option<std::path::PathBuf>,
     workspace_path: Option<std::path::PathBuf>,
+    server_workspace: Option<std::path::PathBuf>,
+    default_session_workspace: Option<std::path::PathBuf>,
     auth: AuthConfig,
     assets: AssetsConfig,
 }

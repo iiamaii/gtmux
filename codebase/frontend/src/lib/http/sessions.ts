@@ -24,6 +24,8 @@ import type {
   CreateSessionRequest,
   CreateSessionResponse,
   DetachResponse,
+  DuplicateSessionRequest,
+  DuplicateSessionResponse,
   SessionInfo,
   SessionListResponse,
 } from '$lib/types/sessions';
@@ -49,12 +51,49 @@ export class UnauthorizedError extends Error {
   }
 }
 
+export class SessionConflictError extends Error {
+  code: 'session_active' | 'name_conflict' | 'session_already_exists' | 'conflict';
+
+  constructor(code: SessionConflictError['code'], message: string) {
+    super(message);
+    this.name = 'SessionConflictError';
+    this.code = code;
+  }
+}
+
+export class WorkspaceUpdateUnavailableError extends Error {
+  constructor(message = 'Session workspace changes are not available on this server.') {
+    super(message);
+    this.name = 'WorkspaceUpdateUnavailableError';
+  }
+}
+
 async function json<T>(res: Response): Promise<T> {
   try {
     return (await res.json()) as T;
   } catch (e) {
     throw new Error(`response JSON parse failed: ${String(e)}`);
   }
+}
+
+function normalizeSessionInfo(
+  raw: Partial<SessionInfo> & { name: string; active?: boolean },
+  index: number,
+): SessionInfo {
+  return {
+    name: raw.name,
+    workspace_root: typeof raw.workspace_root === 'string' ? raw.workspace_root : '',
+    active: raw.active ?? false,
+    folder_id: raw.folder_id ?? null,
+    order: raw.order ?? index,
+    tags: Array.isArray(raw.tags) ? [...raw.tags] : [],
+    favorite: raw.favorite ?? false,
+    item_count: raw.item_count ?? 0,
+    terminal_count: raw.terminal_count ?? 0,
+    modified_at: raw.modified_at ?? 0,
+    last_used_at: raw.last_used_at,
+    active_server_pid: raw.active_server_pid,
+  };
 }
 
 async function responseErrorMessage(res: Response, prefix: string): Promise<string> {
@@ -89,16 +128,17 @@ export async function listSessions(): Promise<SessionListResponse> {
   // while this tab held local state, and the registered handler nukes
   // store + reconnect hint so the user falls back to session selection.
   observeServerId(res.headers.get('x-gtmux-server-id'));
-  // BE shape (sessions.rs:296): bare array `[{ name, active }, ...]`.
-  // Normalise to `{ sessions: SessionInfo[] }` for stable FE consumption.
-  const arr = await json<Array<{ name: string; active?: boolean }>>(res);
-  const sessions: SessionInfo[] = arr.map((s) => ({
-    name: s.name,
-    active: s.active ?? false,
-    // BE 가 last_used_at / item_count 를 아직 미노출. 없는 값은 생략해서
-    // SessionListModal 이 unknown metadata 로 처리하게 한다.
-  }));
-  return { sessions };
+  const body = await json<SessionListResponse | Array<{ name: string; active?: boolean }>>(res);
+  if (Array.isArray(body)) {
+    // Back-compat with the pre-manifest BE during local bisects.
+    const sessions: SessionInfo[] = body.map((s, index) => normalizeSessionInfo(s, index));
+    return { folders: [], sessions, manifest_etag: '' };
+  }
+  return {
+    folders: body.folders ?? [],
+    sessions: body.sessions.map((s, index) => normalizeSessionInfo(s, index)),
+    manifest_etag: body.manifest_etag ?? '',
+  };
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -114,6 +154,9 @@ export async function createSession(req: CreateSessionRequest): Promise<CreateSe
       `session name "${req.name}" must match ${SESSION_NAME_REGEX.source}`,
     );
   }
+  if (req.workspace_root.trim().length === 0) {
+    throw new Error('workspace root is required');
+  }
   const res = await fetch('/api/sessions', {
     method: 'POST',
     headers: JSON_HEADERS,
@@ -122,15 +165,92 @@ export async function createSession(req: CreateSessionRequest): Promise<CreateSe
   });
   if (res.status === 401) throw new UnauthorizedError();
   if (res.status === 409) throw new Error(`session "${req.name}" already exists`);
-  if (!res.ok) throw new Error(`POST /api/sessions returned ${res.status}`);
+  if (!res.ok) throw new Error(await responseErrorMessage(res, 'POST /api/sessions returned'));
   // BE shape (sessions.rs:510-513): flat `{ name }` (201 CREATED).
   const body = await json<{ name: string }>(res);
   return {
     session: {
       name: body.name,
+      workspace_root: req.workspace_root,
       active: false,
+      folder_id: null,
+      order: 0,
+      tags: [],
+      favorite: false,
+      item_count: 0,
+      terminal_count: 0,
+      modified_at: Math.floor(Date.now() / 1000),
     },
   };
+}
+
+export async function changeWorkspace(
+  name: string,
+  workspaceRoot: string,
+): Promise<{ name: string; workspace_root: string }> {
+  const next = workspaceRoot.trim();
+  if (next.length === 0) throw new Error('workspace root is required');
+  const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/workspace`, {
+    method: 'PUT',
+    headers: JSON_HEADERS,
+    credentials: 'include',
+    body: JSON.stringify({ workspace_root: next }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 404 || res.status === 405) throw new WorkspaceUpdateUnavailableError();
+  if (!res.ok) throw new Error(await responseErrorMessage(res, 'PUT session workspace returned'));
+  return json<{ name: string; workspace_root: string }>(res);
+}
+
+export async function renameSession(name: string, newName: string): Promise<{ name: string }> {
+  if (!SESSION_NAME_REGEX.test(newName)) {
+    throw new Error(`session name "${newName}" must match ${SESSION_NAME_REGEX.source}`);
+  }
+  const res = await fetch(`/api/sessions/${encodeURIComponent(name)}`, {
+    method: 'PATCH',
+    headers: JSON_HEADERS,
+    credentials: 'include',
+    body: JSON.stringify({ name: newName }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 409) {
+    const body = await json<{ error?: string; message?: string }>(res).catch(
+      (): { error?: string; message?: string } => ({}),
+    );
+    const code = body.error === 'session_active' || body.error === 'name_conflict'
+      ? body.error
+      : 'conflict';
+    throw new SessionConflictError(code, body.message ?? `rename conflict for "${name}"`);
+  }
+  if (!res.ok) throw new Error(await responseErrorMessage(res, 'PATCH session returned'));
+  return json<{ name: string }>(res);
+}
+
+export async function duplicateSession(
+  name: string,
+  req: DuplicateSessionRequest,
+): Promise<DuplicateSessionResponse> {
+  if (!SESSION_NAME_REGEX.test(req.new_name)) {
+    throw new Error(`session name "${req.new_name}" must match ${SESSION_NAME_REGEX.source}`);
+  }
+  const res = await fetch(`/api/sessions/${encodeURIComponent(name)}/duplicate`, {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    credentials: 'include',
+    body: JSON.stringify(req),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 409) {
+    const body = await json<{ error?: string; message?: string }>(res).catch(
+      (): { error?: string; message?: string } => ({}),
+    );
+    const code = body.error === 'session_active' || body.error === 'name_conflict'
+      ? body.error
+      : 'conflict';
+    throw new SessionConflictError(code, body.message ?? `duplicate conflict for "${name}"`);
+  }
+  if (!res.ok) throw new Error(await responseErrorMessage(res, 'POST duplicate returned'));
+  return json<DuplicateSessionResponse>(res);
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */

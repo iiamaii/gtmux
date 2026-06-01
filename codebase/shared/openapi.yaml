@@ -724,6 +724,18 @@ components:
         viewport:
           $ref: '#/components/schemas/Viewport'
           description: Canvas viewport state (pan + zoom).
+        workspace_root:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Session Workspace(B) absolute path — that project's working directory
+            inside the Server Workspace(A). ADR-0045 D4 / ADR-0046 D1 (amends
+            ADR-0018 D3). `None` on legacy/edge records; the effective workspace is
+            then resolved via the fallback chain
+            `workspace_root ?? config.default_session_workspace ?? A-root`. New
+            sessions always set it (ADR-0046 D5). v2 stays additive — a missing
+            field round-trips to `None`.
       additionalProperties: false
     PathEndpoint:
       oneOf:

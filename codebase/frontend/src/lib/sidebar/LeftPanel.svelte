@@ -2,7 +2,7 @@
   /**
    * LeftPanel — unified floating panel on the left edge.
    *
-   * Hosts two tabs of content (Layers / Terminals) inside a single
+   * Hosts tabbed content (Layers / Terminals / Files) inside a single
    * floating chrome (ref/frontend-design `panel-tabs` pattern). The
    * previously-split `Sidebar` + `TerminalsPanel` are now embedded as
    * `LayerTreeView` and `TerminalListView` — outer chrome, fold button,
@@ -22,6 +22,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import LayerTreeView from './LayerTreeView.svelte';
   import TerminalListView from './TerminalListView.svelte';
+  import FileTreeView from './FileTreeView.svelte';
   import PanelFoldButton from '$lib/chrome/PanelFoldButton.svelte';
 
   const collapsed = $derived(chromeStore.state.sidebarCollapsed);
@@ -114,6 +115,19 @@
         <line x1="12" y1="19" x2="20" y2="19"/>
       </svg>
     </button>
+    <button
+      type="button"
+      class="rail-btn"
+      class:active={activeTab === 'files'}
+      title={noActiveSession ? 'Connect a session to browse files' : 'Files'}
+      aria-label="Open Files tab"
+      disabled={noActiveSession}
+      onclick={() => expandAndSelect('files')}
+    >
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 6.5A2.5 2.5 0 0 1 5.5 4H10l2 2h6.5A2.5 2.5 0 0 1 21 8.5v8A2.5 2.5 0 0 1 18.5 19h-13A2.5 2.5 0 0 1 3 16.5v-10z"/>
+      </svg>
+    </button>
   </aside>
 {:else}
   <aside
@@ -124,6 +138,11 @@
     style:width={`${panelWidth}px`}
   >
     <header class="left-panel-head">
+      <PanelFoldButton
+        direction="left"
+        onclick={() => chromeStore.toggleSidebar()}
+        aria-label="Collapse left panel"
+      />
       <div class="panel-tabs" role="tablist" aria-label="Left panel tabs">
         <button
           type="button"
@@ -145,20 +164,27 @@
           title={noActiveSession ? 'Connect a session to view terminals' : ''}
           onclick={() => selectTab('terminals')}
         >Terminals</button>
+        <button
+          type="button"
+          role="tab"
+          class="panel-tab"
+          class:active={activeTab === 'files'}
+          aria-selected={activeTab === 'files'}
+          disabled={noActiveSession}
+          title={noActiveSession ? 'Connect a session to browse files' : ''}
+          onclick={() => selectTab('files')}
+        >Files</button>
       </div>
       <span class="head-spacer"></span>
-      <PanelFoldButton
-        direction="left"
-        onclick={() => chromeStore.toggleSidebar()}
-        aria-label="Collapse left panel"
-      />
     </header>
 
     <div class="left-panel-body" class:no-session={noActiveSession} inert={noActiveSession}>
       {#if activeTab === 'layers'}
         <LayerTreeView />
-      {:else}
+      {:else if activeTab === 'terminals'}
         <TerminalListView />
+      {:else}
+        <FileTreeView />
       {/if}
     </div>
     <button
@@ -225,7 +251,7 @@
     display: flex;
     align-items: stretch;
     gap: var(--space-6);
-    padding: 0 var(--space-8) 0 var(--space-12);
+    padding: 0 var(--space-12) 0 var(--space-8);
     border-bottom: 1px solid var(--color-border);
     flex: 0 0 auto;
     background: var(--color-surface);

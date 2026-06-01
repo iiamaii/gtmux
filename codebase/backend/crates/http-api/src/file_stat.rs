@@ -354,6 +354,8 @@ mod tests {
             cloud: None,
             frontend_dist: None,
             workspace_path: None,
+            server_workspace: None,
+            default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
         };

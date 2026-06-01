@@ -648,7 +648,7 @@
     font-family: var(--font-sans);
     font-size: var(--text-lg);
     line-height: 1.55;
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
     color: var(--color-fg);
     white-space: pre-wrap;
     word-break: break-word;

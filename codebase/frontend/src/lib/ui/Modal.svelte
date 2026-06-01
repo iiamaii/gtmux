@@ -13,13 +13,19 @@
    * Usage:
    *   <Modal open={showModal} onclose={() => (showModal = false)} title="Confirm">
    *     {#snippet body()}
-   *       <p>Are you sure?</p>
+   *       <div class="modal-stack">
+   *         <p class="modal-lead">Are you sure?</p>
+   *       </div>
    *     {/snippet}
    *     {#snippet footer()}
+   *       <span class="modal-footer-status">Optional status text</span>
    *       <Button variant="ghost" onclick={cancel}>Cancel</Button>
    *       <Button variant="danger" onclick={confirm}>OK</Button>
    *     {/snippet}
    *   </Modal>
+   *
+   * Common body utility classes: modal-stack, modal-lead/modal-copy,
+   * modal-state, modal-note.
    */
 
   import type { Snippet } from 'svelte';
@@ -35,6 +41,12 @@
     dismissOnBackdrop?: boolean;
     /** Whether the Esc key should close. Default true. */
     dismissOnEsc?: boolean;
+    /** Width preset for the dialog shell. */
+    size?: 'sm' | 'md' | 'wide';
+    /** Let complex modal bodies own their own padding/header/footer bands. */
+    flushBody?: boolean;
+    /** Optional line under the title for contextual, potentially long text. */
+    subtitle?: Snippet;
     body: Snippet;
     footer?: Snippet;
   }
@@ -45,6 +57,9 @@
     title,
     dismissOnBackdrop = true,
     dismissOnEsc = true,
+    size = 'md',
+    flushBody = false,
+    subtitle,
     body,
     footer,
   }: Props = $props();
@@ -132,14 +147,19 @@
       role="dialog"
       aria-modal="true"
       aria-labelledby={title ? titleId : undefined}
-      class="modal-dialog"
+      class="modal-dialog modal-dialog-{size}"
     >
       {#if title}
         <header class="modal-header">
           <h2 id={titleId} class="modal-title">{title}</h2>
+          {#if subtitle}
+            <div class="modal-subtitle">
+              {@render subtitle()}
+            </div>
+          {/if}
         </header>
       {/if}
-      <div class="modal-body">
+      <div class="modal-body" class:modal-body-flush={flushBody}>
         {@render body()}
       </div>
       {#if footer}
@@ -167,19 +187,36 @@
   }
 
   .modal-dialog {
+    box-sizing: border-box;
     width: 100%;
-    max-width: 480px;
+    max-height: min(86vh, 760px);
     background: var(--color-surface);
     color: var(--color-fg);
     border: 1px solid var(--color-border-strong);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-lg);
+    display: flex;
+    flex-direction: column;
     overflow: hidden;
     animation: dialog-in var(--motion-slow) var(--motion-easing);
   }
 
+  .modal-dialog-sm {
+    max-width: 360px;
+  }
+
+  .modal-dialog-md {
+    max-width: 480px;
+  }
+
+  .modal-dialog-wide {
+    max-width: 560px;
+  }
+
   .modal-header {
     padding: var(--space-16) var(--space-24) var(--space-8);
+    display: grid;
+    gap: var(--space-6);
   }
 
   .modal-title {
@@ -189,19 +226,89 @@
     line-height: var(--leading-tight);
   }
 
+  .modal-subtitle {
+    min-width: 0;
+    color: var(--color-fg-muted);
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
+  }
+
   .modal-body {
+    min-height: 0;
+    overflow-y: auto;
     padding: var(--space-12) var(--space-24);
     font-size: var(--text-base);
+    line-height: var(--leading-normal);
     color: var(--color-fg-muted);
+  }
+
+  .modal-body-flush {
+    padding: 0;
   }
 
   .modal-footer {
     display: flex;
+    align-items: center;
+    flex-wrap: wrap;
     justify-content: flex-end;
     gap: var(--space-8);
     padding: var(--space-12) var(--space-24) var(--space-16);
     border-top: 1px solid var(--color-border);
     background: color-mix(in srgb, var(--color-surface-2) 60%, transparent);
+  }
+
+  .modal-footer > :global(.modal-footer-status),
+  .modal-footer > :global(.footer-reason) {
+    flex: 1 1 0;
+    min-width: 0;
+    margin-right: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .modal-footer > :global(button) {
+    flex: 0 0 auto;
+  }
+
+  :global(.modal-stack) {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-12);
+  }
+
+  :global(.modal-copy),
+  :global(.modal-lead) {
+    margin: 0;
+    color: var(--color-fg-muted);
+    font-size: var(--text-md);
+    line-height: var(--leading-normal);
+  }
+
+  :global(.modal-copy strong),
+  :global(.modal-lead strong) {
+    color: var(--color-fg);
+    font-weight: var(--weight-semibold);
+  }
+
+  :global(.modal-state) {
+    margin: 0;
+    padding: var(--space-24) 0;
+    color: var(--color-fg-muted);
+    font-size: var(--text-md);
+    line-height: var(--leading-normal);
+    text-align: center;
+  }
+
+  :global(.modal-note) {
+    margin: 0;
+    padding: var(--space-10) var(--space-12);
+    background: var(--color-surface-2);
+    border-left: 3px solid var(--color-warning);
+    border-radius: var(--radius-sm);
+    color: var(--color-fg-muted);
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
   }
 
   @keyframes backdrop-in {

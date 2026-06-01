@@ -31,6 +31,7 @@
   import { toolStore, type ToolId } from '$lib/stores/toolStore.svelte';
   import ActiveSessionDropdown from '$lib/chrome/ActiveSessionDropdown.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
+  import { chromeStore } from '$lib/stores/chrome.svelte';
   import { historyStore } from '$lib/stores/historyStore.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { shortcutRegistry, type ShortcutBinding } from '$lib/keyboard/shortcutRegistry.svelte';
@@ -190,6 +191,12 @@
     return binding ? formatBinding(binding) : fallback ?? '';
   }
 
+  function returnToLayerTabForCanvasWork(): void {
+    if (chromeStore.state.leftPanelTab === 'files') {
+      chromeStore.setLeftPanelTab('layers');
+    }
+  }
+
   function onkeydown(e: KeyboardEvent): void {
     // Q toggles lock (only if a non-mode tool is active).
     if (e.key === 'q' || e.key === 'Q') {
@@ -242,6 +249,7 @@
             disabled={noActiveSession}
             data-tool-id={tool.id}
             onclick={(e) => {
+              returnToLayerTabForCanvasWork();
               toolStore.set(tool.id);
               // 클릭 후 button focus retention 차단 — ESC 로 tool 취소 시 옛 button 의
               // :focus-visible outline 잔류 회피. Tab navigation focus 는 그대로.

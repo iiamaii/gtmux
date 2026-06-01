@@ -45,3 +45,36 @@ export async function uploadAsset(file: File, kind: 'image' | 'document'): Promi
     original_h: body.original_h,
   };
 }
+
+export async function uploadAssetFromPath(
+  path: string,
+  kind: 'image' | 'document',
+): Promise<UploadedAsset> {
+  const res = await fetch('/api/assets/from-path', {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    credentials: 'include',
+    body: JSON.stringify({ path, kind }),
+  });
+
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 404 || res.status === 405) throw new AssetUploadUnavailableError();
+  if (!res.ok) throw new Error(`POST /api/assets/from-path returned ${res.status}`);
+
+  const body = await res.json() as Partial<UploadedAsset>;
+  if (typeof body.asset_id !== 'string' || body.asset_id.length === 0) {
+    throw new Error('POST /api/assets/from-path response missing asset_id');
+  }
+
+  return {
+    asset_id: body.asset_id,
+    mime: body.mime ?? '',
+    file_name: body.file_name ?? path.split('/').pop() ?? 'asset',
+    size_bytes: body.size_bytes ?? 0,
+    original_w: body.original_w,
+    original_h: body.original_h,
+  };
+}

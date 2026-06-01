@@ -604,11 +604,7 @@ async fn handle_socket(
         Bytes::from(payload::encode_layout_changed(&hello_etag)),
     );
     if let Ok(buf) = hello.encode() {
-        if sink
-            .send(Message::Binary(buf))
-            .await
-            .is_err()
-        {
+        if sink.send(Message::Binary(buf)).await.is_err() {
             debug!("ws hello send failed; peer hung up early");
             return;
         }
@@ -632,11 +628,7 @@ async fn handle_socket(
                 Bytes::from(payload::encode_terminal_spawned(&uuid, pane_id)),
             );
             if let Ok(buf) = env.encode() {
-                if sink
-                    .send(Message::Binary(buf))
-                    .await
-                    .is_err()
-                {
+                if sink.send(Message::Binary(buf)).await.is_err() {
                     debug!("ws catch-up terminal-spawned send failed; peer hung up");
                     return;
                 }
@@ -667,11 +659,7 @@ async fn handle_socket(
             )),
         );
         if let Ok(buf) = spawned.encode() {
-            if sink
-                .send(Message::Binary(buf))
-                .await
-                .is_err()
-            {
+            if sink.send(Message::Binary(buf)).await.is_err() {
                 debug!("ws catch-up spawned send failed; peer hung up during replay");
                 return;
             }
@@ -686,11 +674,7 @@ async fn handle_socket(
                     )),
                 );
                 if let Ok(buf) = env.encode() {
-                    if sink
-                        .send(Message::Binary(buf))
-                        .await
-                        .is_err()
-                    {
+                    if sink.send(Message::Binary(buf)).await.is_err() {
                         debug!("ws catch-up pane-out send failed; peer hung up during replay");
                         return;
                     }

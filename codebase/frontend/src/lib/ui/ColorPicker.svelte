@@ -14,9 +14,16 @@
       if (raw === null) return [];
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [];
-      return parsed
-        .filter((v): v is string => typeof v === 'string' && /^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(v))
-        .slice(0, MAX);
+      const out: string[] = [];
+      for (const value of parsed) {
+        if (typeof value !== 'string') continue;
+        if (!/^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(value)) continue;
+        const norm = value.toLowerCase();
+        if (out.includes(norm)) continue;
+        out.push(norm);
+        if (out.length >= MAX) break;
+      }
+      return out;
     } catch {
       return [];
     }
@@ -73,6 +80,8 @@
    *   - ADR-0016 (design tokens) amend 후속 (token-aware preset palette 정책)
    */
 
+  import { tick } from 'svelte';
+
   interface Props {
     value: string | null | undefined;
     oncommit: (value: string) => void;
@@ -93,6 +102,15 @@
     allowAlpha = false,
     live = false,
   }: Props = $props();
+
+  function portal(node: HTMLElement): { destroy: () => void } {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      },
+    };
+  }
 
   // ── Helpers (parse / normalize) ─────────────────────────────────
   function isTransparentValue(s: string): boolean {
@@ -511,22 +529,22 @@
   // ── Click-outside close + popover position tracking ─────────────
   $effect(() => {
     if (!open) return;
+    if (typeof window === 'undefined') return;
     function onDocPointerDown(e: PointerEvent): void {
       const target = e.target as Node;
-      if (containerEl?.contains(target)) return;
       if (popoverEl?.contains(target)) return;
+      if (containerEl?.contains(target)) return;
       formatMenuOpen = false;
       if (pinned) return;
       open = false;
     }
     const onReflow = () => updatePopoverPos();
-    queueMicrotask(() => {
-      document.addEventListener('pointerdown', onDocPointerDown, true);
-      updatePopoverPos();
-    });
+    document.addEventListener('pointerdown', onDocPointerDown, true);
+    const raf = window.requestAnimationFrame(updatePopoverPos);
     window.addEventListener('resize', onReflow);
     window.addEventListener('scroll', onReflow, true);
     return () => {
+      window.cancelAnimationFrame(raf);
       document.removeEventListener('pointerdown', onDocPointerDown, true);
       window.removeEventListener('resize', onReflow);
       window.removeEventListener('scroll', onReflow, true);
@@ -538,6 +556,17 @@
     formatMenuOpen = false;
     pinned = false;
     open = false;
+  }
+
+  async function togglePopover(): Promise<void> {
+    if (disabled) return;
+    open = !open;
+    if (!open) {
+      formatMenuOpen = false;
+      return;
+    }
+    await tick();
+    updatePopoverPos();
   }
 
   function commitColor(next: string): void {
@@ -806,14 +835,14 @@
     { token: 'var(--color-danger)', label: 'Danger' },
     { token: 'var(--color-info)', label: 'Info' },
   ];
-  const documentSwatches = $derived.by((): readonly { hex: string; label: string }[] => {
+  const documentSwatches = $derived.by((): readonly { token: string; hex: string; label: string }[] => {
     if (!open) return []; // popover 열린 후 에야 measure
     return TOKEN_NAMES
       .map(({ token, label }) => {
         const hex = resolveCssColor(token);
-        return hex !== null ? { hex: hexRgb(hex), label } : null;
+        return hex !== null ? { token, hex: hexRgb(hex), label } : null;
       })
-      .filter((v): v is { hex: string; label: string } => v !== null);
+      .filter((v): v is { token: string; hex: string; label: string } => v !== null);
   });
   const recentSwatches = $derived(recentColorList());
 </script>
@@ -833,7 +862,7 @@
     aria-expanded={open}
     onclick={(e) => {
       e.stopPropagation();
-      if (!disabled) open = !open;
+      void togglePopover();
     }}
   >
     <span
@@ -913,6 +942,7 @@
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div
       class="shape-colorpicker"
+      use:portal
       bind:this={popoverEl}
       style="--cp-hue: {effectiveHueColor}; top: {popoverPos.top}px; left: {popoverPos.left}px;"
       role="dialog"
@@ -1096,7 +1126,7 @@
         {#if formatMenuOpen}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div class="cp-format-menu is-open" role="menu" aria-label="Color format">
-            {#each ['hex', 'rgb', 'hsl', 'oklch'] as const as m}
+            {#each ['hex', 'rgb', 'hsl', 'oklch'] as const as m (m)}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <div
                 class="item"
@@ -1123,7 +1153,7 @@
             <span>Document</span>
           </div>
           <div class="grid">
-            {#each documentSwatches as sw}
+            {#each documentSwatches as sw (sw.token)}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <span
                 class="sw"
@@ -1153,7 +1183,7 @@
           <div class="grp">
             <div class="lbl"><span>Recent</span></div>
             <div class="grid">
-              {#each recentSwatches as sw}
+              {#each recentSwatches as sw, i (`${sw}:${i}`)}
                 <!-- svelte-ignore a11y_click_events_have_key_events -->
                 <span
                   class="sw"
@@ -1310,7 +1340,7 @@
   /* ── Popover ────────────────────────────────────────────────── */
   .shape-colorpicker {
     position: fixed;
-    z-index: var(--z-popover, 100);
+    z-index: var(--z-context-menu);
     width: 240px;
     background: var(--color-surface);
     border: 1px solid var(--color-border);
@@ -1332,7 +1362,7 @@
   .cp-title {
     font-size: 12px;
     font-weight: var(--weight-medium);
-    letter-spacing: -0.1px;
+    letter-spacing: 0;
   }
   .cp-actions {
     margin-left: auto;

@@ -34,6 +34,27 @@ export class DirNotFoundError extends Error {
   }
 }
 
+export class FsApiUnavailableError extends Error {
+  constructor(message = 'Workspace file operations are not available on this server.') {
+    super(message);
+    this.name = 'FsApiUnavailableError';
+  }
+}
+
+export class DirAlreadyExistsError extends Error {
+  constructor(message = 'Directory already exists.') {
+    super(message);
+    this.name = 'DirAlreadyExistsError';
+  }
+}
+
+export class DirNotEmptyError extends Error {
+  constructor(message = 'Directory is not empty.') {
+    super(message);
+    this.name = 'DirNotEmptyError';
+  }
+}
+
 export interface ListDirOptions {
   /** ADR-0035 D7 — per-request override of `Settings.picker_show_hidden`.
    * `undefined` → use Settings default; `true`/`false` → override. */
@@ -56,4 +77,52 @@ export async function listDir(dir: string, options: ListDirOptions = {}): Promis
   if (res.status === 404) throw new DirNotFoundError();
   if (!res.ok) throw new Error(`GET /api/fs/list returned ${res.status}`);
   return res.json() as Promise<FsListResponse>;
+}
+
+async function errorMessage(res: Response, prefix: string): Promise<string> {
+  const text = await res.text().catch(() => '');
+  if (text.trim().length === 0) return `${prefix} ${res.status}`;
+  try {
+    const body = JSON.parse(text) as { error?: unknown; message?: unknown; reason?: unknown };
+    const code = typeof body.error === 'string' ? body.error : null;
+    const message = typeof body.message === 'string'
+      ? body.message
+      : typeof body.reason === 'string'
+        ? body.reason
+        : null;
+    if (code !== null && message !== null) return `${prefix} ${res.status}: ${code}: ${message}`;
+    if (code !== null) return `${prefix} ${res.status}: ${code}`;
+  } catch {
+    // Fall through.
+  }
+  return `${prefix} ${res.status}: ${text.slice(0, 500)}`;
+}
+
+async function mutateDir(endpoint: 'mkdir' | 'rmdir', path: string): Promise<void> {
+  const res = await fetch(`/api/fs/${endpoint}`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    credentials: 'include',
+    body: JSON.stringify({ path }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 403) throw new DirNotAllowedError();
+  if (res.status === 404 || res.status === 405) throw new FsApiUnavailableError();
+  if (res.status === 409) {
+    const body = await res.json().catch(() => ({})) as { error?: string };
+    if (body.error === 'dir_not_empty') throw new DirNotEmptyError();
+    throw new DirAlreadyExistsError();
+  }
+  if (!res.ok) throw new Error(await errorMessage(res, `POST /api/fs/${endpoint} returned`));
+}
+
+export async function mkdirFs(path: string): Promise<void> {
+  await mutateDir('mkdir', path);
+}
+
+export async function rmdirFs(path: string): Promise<void> {
+  await mutateDir('rmdir', path);
 }

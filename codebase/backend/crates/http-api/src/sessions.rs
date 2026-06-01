@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, State};
@@ -41,10 +42,50 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
+use crate::fs_guard;
 use crate::schema::{self, Layout};
 use crate::workspace::{
-    atomic_write_session, validate_session_name, WorkspaceError, WorkspaceManager,
+    atomic_write_session, validate_session_name, SessionInfo, SessionOrg, WorkspaceError,
+    WorkspaceFolder, WorkspaceManager, WorkspaceManifest,
 };
+
+/// Resolve a session's effective Workspace(B) (ADR-0046 D1) for use as a
+/// terminal cwd: load the record's `workspace_root`, then run it through the
+/// fallback chain + A-scope/denylist guard. Returns the Server Workspace(A)
+/// root when the record is missing/unloadable (terminals still spawn somewhere
+/// safe inside A). The result is always inside A by construction.
+async fn session_effective_workspace(
+    state: &crate::AppState,
+    wm: &Arc<WorkspaceManager>,
+    name: &str,
+) -> std::path::PathBuf {
+    let record_root = match state.session_cache.get_or_load(wm.as_ref(), name).await {
+        Ok(arc) => arc.read().await.layout.workspace_root.clone(),
+        Err(_) => None,
+    };
+    fs_guard::effective_workspace(
+        record_root.as_deref(),
+        state.config.default_session_workspace.as_deref(),
+        &state.server_workspace,
+        &state.fs_denylist,
+    )
+}
+
+/// Resolve the cwd for a *respawn* (keyed by terminal UUID, no session in the
+/// request). A terminal can be mirrored across sessions (N:N); we pick any
+/// session that currently references the UUID (via `attach_index`) and reuse
+/// its effective Workspace(B). Returns `None` when there is no workspace
+/// configured or no referencing session — the spawn then falls back to the
+/// pty-backend default (`$HOME`), matching pre-ADR-0046 behaviour for orphans.
+pub(crate) async fn terminal_respawn_cwd(
+    state: &crate::AppState,
+    uuid: &str,
+) -> Option<std::path::PathBuf> {
+    let wm = state.workspace.as_ref()?;
+    let sessions = state.attach_index.read_attached_sessions(uuid);
+    let name = sessions.first()?;
+    Some(session_effective_workspace(state, wm, name.as_str()).await)
+}
 
 const WEBPAGE_ID_HEADER: &str = "x-gtmux-webpage-id";
 
@@ -323,7 +364,9 @@ impl SessionError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::AlreadyExists(_) => StatusCode::CONFLICT,
             Self::Validation(_) | Self::BadJson(_) => StatusCode::BAD_REQUEST,
-            Self::Workspace(WorkspaceError::InvalidSessionName(_)) => StatusCode::BAD_REQUEST,
+            Self::Workspace(
+                WorkspaceError::InvalidSessionName(_) | WorkspaceError::InvalidManifest(_),
+            ) => StatusCode::BAD_REQUEST,
             Self::Workspace(_) | Self::Io(_) | Self::Corrupt(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -339,6 +382,7 @@ impl SessionError {
             Self::AlreadyExists(_) => "session_already_exists",
             Self::Validation(v) => v.code(),
             Self::Workspace(WorkspaceError::InvalidSessionName(_)) => "invalid_session_name",
+            Self::Workspace(WorkspaceError::InvalidManifest(_)) => "invalid_manifest",
             Self::Workspace(_) => "workspace_error",
             Self::Io(_) => "io_error",
             Self::Corrupt(_) => "session_corrupt",
@@ -371,22 +415,53 @@ pub async fn list_handler(State(state): State<crate::AppState>) -> Response {
     let Some(wm) = state.workspace.as_ref() else {
         return service_unavailable("workspace_not_configured");
     };
-    let infos = match wm.enumerate_sessions() {
+    let (infos, manifest, manifest_etag) = match manifest_snapshot(&state, wm).await {
         Ok(v) => v,
-        Err(e) => return SessionError::Workspace(e).into_response(),
+        Err(e) => return e.into_response(),
     };
     let locks_dir = wm.locks_dir();
-    let body: Vec<Value> = infos
-        .into_iter()
-        .map(|i| {
-            let active = matches!(
-                crate::session_lock::peek(&locks_dir, &i.name),
-                crate::session_lock::LockState::InUse(_)
-                    | crate::session_lock::LockState::InUseRaceyBody
-            );
-            json!({ "name": i.name, "active": active })
-        })
-        .collect();
+    let mut sessions = Vec::with_capacity(infos.len());
+    for info in infos {
+        let active = matches!(
+            crate::session_lock::peek(&locks_dir, &info.name),
+            crate::session_lock::LockState::InUse(_)
+                | crate::session_lock::LockState::InUseRaceyBody
+        );
+        let org = manifest
+            .sessions
+            .get(&info.name)
+            .cloned()
+            .unwrap_or_default();
+        let counts = match session_counts(&state, wm, &info.name).await {
+            Ok(v) => v,
+            Err(e) => return e.into_response(),
+        };
+        // Effective Workspace(B) — resolved from the record's raw workspace_root
+        // (captured by the same counts parse) via the fallback chain (D1).
+        let effective = fs_guard::effective_workspace(
+            counts.workspace_root.as_deref(),
+            state.config.default_session_workspace.as_deref(),
+            &state.server_workspace,
+            &state.fs_denylist,
+        );
+        sessions.push(SessionListEntry {
+            name: info.name,
+            active,
+            folder_id: org.folder_id,
+            order: org.order,
+            tags: org.tags,
+            favorite: org.favorite,
+            item_count: counts.item_count,
+            terminal_count: counts.terminal_count,
+            modified_at: system_time_unix(counts.modified_at),
+            workspace_root: effective.to_string_lossy().into_owned(),
+        });
+    }
+    let body = SessionsListResponse {
+        folders: manifest.folders,
+        sessions,
+        manifest_etag,
+    };
     // 0074 Phase 1 — server boot identity. FE compares this with its
     // `sessionStorage.observed_server_id` on every list refresh; mismatch
     // means the Server restarted while a stale tab kept its local state,
@@ -396,6 +471,91 @@ pub async fn list_handler(State(state): State<crate::AppState>) -> Response {
     let mut resp = Json(body).into_response();
     if let Ok(val) = HeaderValue::from_str(&state.server_id) {
         resp.headers_mut().insert("x-gtmux-server-id", val);
+    }
+    resp
+}
+
+/// `GET /api/workspace/manifest` — manifest-only fetch for organization UI.
+pub async fn manifest_get_handler(State(state): State<crate::AppState>) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    let (_infos, manifest, manifest_etag) = match manifest_snapshot(&state, wm).await {
+        Ok(v) => v,
+        Err(e) => return e.into_response(),
+    };
+    Json(WorkspaceManifestResponse {
+        manifest,
+        manifest_etag,
+    })
+    .into_response()
+}
+
+/// `PUT /api/workspace/manifest` — replace folders/session organization with
+/// an ETag precondition. Server-owned counts are intentionally not accepted.
+pub async fn manifest_put_handler(
+    State(state): State<crate::AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceManifest>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    let if_match = match headers.get(header::IF_MATCH) {
+        Some(v) => match v.to_str().ok().and_then(parse_etag_header) {
+            Some(etag) => etag,
+            None => return SessionError::PreconditionRequired.into_response(),
+        },
+        None => return SessionError::PreconditionRequired.into_response(),
+    };
+
+    let infos = match wm.enumerate_sessions() {
+        Ok(v) => v,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    let mut guard = state.workspace_manifest.write().await;
+    if let Err(e) = reconcile_manifest_in_place(wm, &mut guard, &infos) {
+        return e.into_response();
+    }
+    let current_etag = match wm.manifest_etag_hex(&guard) {
+        Ok(etag) => etag,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    if if_match != current_etag {
+        let mut resp = (
+            StatusCode::PRECONDITION_FAILED,
+            Json(json!({
+                "error": "manifest_stale",
+                "message": "workspace manifest If-Match mismatch",
+            })),
+        )
+            .into_response();
+        let current_quoted = format!("\"{current_etag}\"");
+        if let Ok(val) = HeaderValue::from_str(&current_quoted) {
+            resp.headers_mut().insert(header::ETAG, val);
+        }
+        return resp;
+    }
+
+    if let Err(e) = wm.validate_manifest(&body, &infos) {
+        return SessionError::Workspace(e).into_response();
+    }
+    let mut next = body;
+    if let Err(e) = wm.reconcile_manifest(&mut next, &infos) {
+        return SessionError::Workspace(e).into_response();
+    }
+    let next_etag = match wm.write_manifest(&next) {
+        Ok(etag) => etag,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    *guard = next;
+    let mut resp = Json(ManifestPutResponse {
+        manifest_etag: next_etag.clone(),
+    })
+    .into_response();
+    let next_quoted = format!("\"{next_etag}\"");
+    if let Ok(val) = HeaderValue::from_str(&next_quoted) {
+        resp.headers_mut().insert(header::ETAG, val);
     }
     resp
 }
@@ -625,6 +785,9 @@ pub async fn attach_confirm_handler(
     // 호출 / 미래 wire 변경) 에서도 정합 보장.
     state.attach_index.apply_full_session(&name, &uuids);
 
+    // ADR-0046 D2 — every fresh spawn inherits the session's effective
+    // Workspace(B) as its cwd.
+    let cwd = session_effective_workspace(&state, wm, &name).await;
     let mut spawned: Vec<String> = Vec::new();
     let mut already_present: Vec<String> = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
@@ -633,7 +796,10 @@ pub async fn attach_confirm_handler(
             already_present.push(uuid);
             continue;
         }
-        match state.spawn_terminal_with_uuid(uuid.clone()).await {
+        match state
+            .spawn_terminal_with_uuid(uuid.clone(), Some(cwd.clone()))
+            .await
+        {
             Ok(_) => spawned.push(uuid),
             Err(e) => {
                 failed.push(json!({
@@ -719,8 +885,14 @@ pub async fn create_terminal_handler(
         Err(e) => return e.into_response(),
     };
 
+    // ADR-0046 D2 — the new terminal spawns in the session's effective
+    // Workspace(B).
+    let cwd = session_effective_workspace(&state, wm, &name).await;
     let uuid = crate::terminal_map::fresh_terminal_uuid();
-    let pane = match state.spawn_terminal_with_uuid(uuid.clone()).await {
+    let pane = match state
+        .spawn_terminal_with_uuid(uuid.clone(), Some(cwd))
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(
@@ -1006,6 +1178,38 @@ fn lock_conflict_response(
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionBody {
     pub name: String,
+    /// Session Workspace(B) root — the project directory inside the Server
+    /// Workspace(A). **Mandatory** (ADR-0045 D4 / ADR-0046 D5): New Session is
+    /// project-first. Deserialized as optional so an *absent* field yields a
+    /// clean `400 invalid_workspace` (reason `required`) rather than axum's 422;
+    /// the handler rejects `None`. Validated A-internal + denylist + dir +
+    /// exists. No uniqueness check (N:1 — sessions may share one dir).
+    #[serde(default)]
+    pub workspace_root: Option<String>,
+}
+
+/// Body of `PUT /api/sessions/{name}/workspace` — re-point a session's
+/// Workspace(B) root (ADR-0046 D8). Separate route from rename (`PATCH /{name}`).
+#[derive(Debug, Deserialize)]
+pub struct ChangeWorkspaceBody {
+    pub workspace_root: String,
+}
+
+/// Body of `PATCH /api/sessions/{name}` — rename (ADR-0044 D-B5 / ADR-0019
+/// D10.2). The path segment carries the *current* name; `name` is the target.
+#[derive(Debug, Deserialize)]
+pub struct RenameSessionBody {
+    pub name: String,
+}
+
+/// Body of `POST /api/sessions/{name}/duplicate` (ADR-0044 D-B6). `new_name`
+/// is the copy's name; `folder_id` is the manifest folder to land it in
+/// (`None` / absent = root).
+#[derive(Debug, Deserialize)]
+pub struct DuplicateSessionBody {
+    pub new_name: String,
+    #[serde(default)]
+    pub folder_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1016,6 +1220,42 @@ pub struct ImportSessionBody {
     /// return 400 `schema_invalid` with the precise field code from
     /// `ValidationError::code()`.
     pub layout: Layout,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionsListResponse {
+    pub folders: Vec<WorkspaceFolder>,
+    pub sessions: Vec<SessionListEntry>,
+    pub manifest_etag: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionListEntry {
+    pub name: String,
+    pub active: bool,
+    pub folder_id: Option<String>,
+    pub order: i64,
+    pub tags: Vec<String>,
+    pub favorite: bool,
+    pub item_count: u32,
+    pub terminal_count: u32,
+    pub modified_at: u64,
+    /// Effective Workspace(B) absolute path (ADR-0046 D1) — resolved from the
+    /// record's `workspace_root` via the fallback chain, so it is always a
+    /// concrete dir for the FE picker / Session List row to display.
+    pub workspace_root: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceManifestResponse {
+    #[serde(flatten)]
+    manifest: WorkspaceManifest,
+    manifest_etag: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestPutResponse {
+    manifest_etag: String,
 }
 
 /// `POST /api/sessions/import { name, layout }` — Slice D-4 (G28
@@ -1095,6 +1335,9 @@ pub async fn import_handler(
     state
         .attach_index
         .apply_full_session(&body.name, &imported_uuids);
+    if let Err(e) = append_manifest_session(&state, wm, &body.name).await {
+        return e.into_response();
+    }
     (
         StatusCode::CREATED,
         Json(json!({ "name": body.name, "created_at": created_at })),
@@ -1254,7 +1497,12 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     (year, m, d, hour, minute, second)
 }
 
-/// `POST /api/sessions { name }` — create an empty v2 record.
+/// `POST /api/sessions { name, workspace_root }` — create an empty v2 record
+/// bound to a project Workspace(B). Both fields are mandatory (ADR-0046 D5).
+/// `workspace_root` is validated A-internal + denylist + dir + exists; **no
+/// uniqueness check** (N:1, ADR-0045 D4). Outcomes: `201 { name }` /
+/// `400 invalid_session_name` / `400 invalid_workspace` (+ reason) /
+/// `409 session_already_exists` / `503`.
 pub async fn create_handler(
     State(state): State<crate::AppState>,
     Json(body): Json<CreateSessionBody>,
@@ -1265,6 +1513,28 @@ pub async fn create_handler(
     if let Err(e) = validate_session_name(&body.name) {
         return SessionError::Workspace(e).into_response();
     }
+    // workspace_root is mandatory (ADR-0046 D5). Absent → 400 invalid_workspace
+    // (reason `required`); present → validate A-internal + denylist + dir +
+    // exists and store the canonical absolute path.
+    let Some(workspace_raw) = body.workspace_root.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_workspace",
+                "reason": "required",
+                "message": "workspace_root is required",
+            })),
+        )
+            .into_response();
+    };
+    let workspace_root = match fs_guard::validate_workspace_root(
+        workspace_raw,
+        &state.server_workspace,
+        &state.fs_denylist,
+    ) {
+        Ok(p) => p,
+        Err(e) => return invalid_workspace_response(e),
+    };
     let path = match wm.session_path(&body.name) {
         Ok(p) => p,
         Err(e) => return SessionError::Workspace(e).into_response(),
@@ -1272,7 +1542,8 @@ pub async fn create_handler(
     if path.exists() {
         return SessionError::AlreadyExists(body.name).into_response();
     }
-    let layout = Layout::empty();
+    let mut layout = Layout::empty();
+    layout.workspace_root = Some(workspace_root.to_string_lossy().into_owned());
     let bytes = canonical_bytes(&layout);
     if let Err(e) = atomic_write_session(&path, &bytes) {
         return SessionError::Workspace(e).into_response();
@@ -1282,6 +1553,9 @@ pub async fn create_handler(
     {
         let mut write = state.session_cache.entries.write().await;
         write.insert(body.name.clone(), Arc::new(RwLock::new(cached)));
+    }
+    if let Err(e) = append_manifest_session(&state, wm, &body.name).await {
+        return e.into_response();
     }
     let resp = (StatusCode::CREATED, Json(json!({ "name": body.name })));
     resp.into_response()
@@ -1308,6 +1582,13 @@ pub async fn delete_handler(
             // contribution from the attach_index so its UUIDs no longer
             // surface as "attached" on `GET /api/terminals`.
             state.attach_index.forget_session(&name);
+            {
+                let mut counts = state.session_counts.lock().await;
+                counts.remove(&name);
+            }
+            if let Err(e) = remove_manifest_session(&state, wm, &name).await {
+                return e.into_response();
+            }
             (StatusCode::NO_CONTENT, ()).into_response()
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1315,6 +1596,279 @@ pub async fn delete_handler(
         }
         Err(e) => SessionError::Io(e).into_response(),
     }
+}
+
+/// `PATCH /api/sessions/{name} { name: <new> }` — rename a session record
+/// (ADR-0044 D-B5 / ADR-0019 D10.2). The path segment is the *current* name;
+/// the body's `name` is the target.
+///
+/// Atomic-ish ordering (file rename is the point of no return): validate →
+/// existence/conflict → reject if attached on this server (`409
+/// session_active`, S7 — current-session rename is out of MVP scope) → file
+/// rename → rekey `SessionCache` / manifest / counts cache / `attach_index`.
+///
+/// Outcomes: `200 { name }` / `400 invalid_session_name` / `404 not_found` /
+/// `409 name_conflict` / `409 session_active` / `503`.
+pub async fn rename_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<RenameSessionBody>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    let new_name = body.name;
+    if let Err(e) = validate_session_name(&name) {
+        return SessionError::Workspace(e).into_response();
+    }
+    if let Err(e) = validate_session_name(&new_name) {
+        return SessionError::Workspace(e).into_response();
+    }
+    let old_path = match wm.session_path(&name) {
+        Ok(p) => p,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    let new_path = match wm.session_path(&new_name) {
+        Ok(p) => p,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    if !old_path.exists() {
+        return SessionError::NotFound(name).into_response();
+    }
+    if new_path.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "name_conflict", "name": new_name })),
+        )
+            .into_response();
+    }
+
+    // S7: refuse to rename a session that is currently attached on this
+    // server — the lock / hub / sessionStorage rekey transaction is a follow-up
+    // slice (plan-0020 P2). The two lock maps are kept consistent, so the
+    // by-name `session_locks` map is the authoritative "is it in use here".
+    if state.session_locks.lock().await.contains_key(&name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "session_active", "name": name })),
+        )
+            .into_response();
+    }
+
+    // Capture the terminal UUIDs *before* the rename so the attach_index can be
+    // re-keyed (rename keeps the layout — and therefore the UUIDs — intact).
+    let terminal_uuids = match state.session_cache.get_or_load(wm, &name).await {
+        Ok(arc) => crate::attach_index::terminal_uuids_in(&arc.read().await.layout),
+        Err(SessionError::NotFound(_)) => return SessionError::NotFound(name).into_response(),
+        Err(e) => return e.into_response(),
+    };
+
+    // Point of no return — atomic file rename within the workspace dir.
+    if let Err(e) = std::fs::rename(&old_path, &new_path) {
+        return SessionError::Io(e).into_response();
+    }
+
+    // Rekey in-memory state. The old cache entry now points at a moved file;
+    // evict it so the new name lazily loads the (identical) record on demand.
+    state.session_cache.evict(&name).await;
+    {
+        let mut counts = state.session_counts.lock().await;
+        counts.remove(&name);
+    }
+    state.attach_index.forget_session(&name);
+    state
+        .attach_index
+        .apply_full_session(&new_name, &terminal_uuids);
+    if let Err(e) = rename_manifest_session(&state, wm, &name, &new_name).await {
+        return e.into_response();
+    }
+
+    (StatusCode::OK, Json(json!({ "name": new_name }))).into_response()
+}
+
+/// `POST /api/sessions/{name}/duplicate { new_name, folder_id? }` — independent
+/// copy of a session (ADR-0044 D-B6 / S2). Terminal item ids are re-issued as
+/// fresh UUIDs (= backend Terminal ids, ADR-0018 D2 — global namespace) so the
+/// copy attaches to brand-new Terminals; non-terminal item ids (session-scoped)
+/// are preserved. `path` connected endpoints that pointed at a terminal are
+/// remapped to the re-issued id. Terminals are *not* spawned here — attach's
+/// match-or-spawn handles that (every UUID is fresh).
+///
+/// Outcomes: `201 { name }` / `400 invalid_session_name` / `404 not_found` /
+/// `409 name_conflict` / `503`.
+pub async fn duplicate_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<DuplicateSessionBody>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    let DuplicateSessionBody {
+        new_name,
+        folder_id,
+    } = body;
+    if let Err(e) = validate_session_name(&name) {
+        return SessionError::Workspace(e).into_response();
+    }
+    if let Err(e) = validate_session_name(&new_name) {
+        return SessionError::Workspace(e).into_response();
+    }
+    let new_path = match wm.session_path(&new_name) {
+        Ok(p) => p,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    if new_path.exists() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "name_conflict", "name": new_name })),
+        )
+            .into_response();
+    }
+
+    // Clone the *persisted* source layout, then re-issue terminal ids.
+    let mut layout = match state.session_cache.get_or_load(wm, &name).await {
+        Ok(arc) => arc.read().await.layout.clone(),
+        Err(SessionError::NotFound(_)) => return SessionError::NotFound(name).into_response(),
+        Err(e) => return e.into_response(),
+    };
+    reissue_terminal_ids(&mut layout);
+
+    let bytes = canonical_bytes(&layout);
+    if let Err(e) = atomic_write_session(&new_path, &bytes) {
+        return SessionError::Workspace(e).into_response();
+    }
+
+    // Seed the cache + attach_index with the copy's fresh terminal UUIDs.
+    let new_uuids = crate::attach_index::terminal_uuids_in(&layout);
+    {
+        let mut write = state.session_cache.entries.write().await;
+        write.insert(
+            new_name.clone(),
+            Arc::new(RwLock::new(SessionLayout::new(layout))),
+        );
+    }
+    state.attach_index.apply_full_session(&new_name, &new_uuids);
+    if let Err(e) = append_manifest_session_in_folder(&state, wm, &new_name, folder_id).await {
+        return e.into_response();
+    }
+
+    (StatusCode::CREATED, Json(json!({ "name": new_name }))).into_response()
+}
+
+/// Re-issue every terminal item's id (= backend Terminal UUID, ADR-0018 D2)
+/// as a fresh UUID and remap any `path` connected endpoint that pointed at a
+/// re-issued terminal. Non-terminal item ids are session-scoped and stay
+/// unchanged (no collision across session files). Used by [`duplicate_handler`].
+fn reissue_terminal_ids(layout: &mut Layout) {
+    use crate::schema::{Item, PathEndpoint};
+    let mut remap: HashMap<String, String> = HashMap::new();
+    for item in &mut layout.items {
+        if let Item::Terminal { common } = item {
+            let fresh = crate::terminal_map::fresh_terminal_uuid();
+            remap.insert(common.id.clone(), fresh.clone());
+            common.id = fresh;
+        }
+    }
+    if remap.is_empty() {
+        return;
+    }
+    for item in &mut layout.items {
+        if let Item::Path { from, to, .. } = item {
+            for endpoint in [from, to] {
+                if let PathEndpoint::Connected { item_id, .. } = endpoint {
+                    if let Some(fresh) = remap.get(item_id) {
+                        *item_id = fresh.clone();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `PUT /api/sessions/{name}/workspace { workspace_root }` — re-point a
+/// session's Workspace(B) root (ADR-0046 D8). Separate from rename
+/// (`PATCH /{name}`). The new root is validated A-internal + denylist + dir +
+/// exists; **no uniqueness check** (N:1 — ADR-0045 D4). Active sessions are
+/// allowed: already-running terminals keep their inherited cwd (process
+/// inherent), only *new* terminals pick up the new root. The change is
+/// persisted into `Layout.workspace_root`.
+///
+/// Outcomes: `200 { name, workspace_root }` / `400 invalid_session_name` /
+/// `400 invalid_workspace` (+ reason) / `404 session_not_found` / `503`.
+pub async fn change_workspace_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<ChangeWorkspaceBody>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    if let Err(e) = validate_session_name(&name) {
+        return SessionError::Workspace(e).into_response();
+    }
+    let path = match wm.session_path(&name) {
+        Ok(p) => p,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    if !path.exists() {
+        return SessionError::NotFound(name).into_response();
+    }
+    let new_root = match fs_guard::validate_workspace_root(
+        &body.workspace_root,
+        &state.server_workspace,
+        &state.fs_denylist,
+    ) {
+        Ok(p) => p,
+        Err(e) => return invalid_workspace_response(e),
+    };
+
+    // Mutate + persist under the per-session write lock (disk-first, mirrors
+    // `layout_put_handler`). No If-Match — this is a targeted field set, not a
+    // full-layout CAS.
+    let arc = match state.session_cache.get_or_load(wm, &name).await {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let mut snap = arc.write().await;
+    let mut layout = snap.layout.clone();
+    layout.workspace_root = Some(new_root.to_string_lossy().into_owned());
+    let bytes = canonical_bytes(&layout);
+    let new_snap = SessionLayout::new_with_bytes(layout, &bytes);
+    let write_path = path.clone();
+    let write_bytes = bytes;
+    let write_result =
+        tokio::task::spawn_blocking(move || atomic_write_session(&write_path, &write_bytes)).await;
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return SessionError::Workspace(e).into_response(),
+        Err(join_err) => {
+            tracing::error!(
+                error = %join_err,
+                "change_workspace: atomic_write_session spawn_blocking panicked"
+            );
+            return SessionError::Workspace(WorkspaceError::Io(std::io::Error::other(
+                "change_workspace write task panicked",
+            )))
+            .into_response();
+        }
+    }
+    *snap = new_snap;
+    drop(snap);
+    // Drop the counts cache entry so the next `GET /api/sessions` re-resolves
+    // the effective workspace from the freshly-written record.
+    {
+        let mut counts = state.session_counts.lock().await;
+        counts.remove(&name);
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "name": name,
+            "workspace_root": new_root.to_string_lossy().into_owned(),
+        })),
+    )
+        .into_response()
 }
 
 /// Query parameters for [`delete_item_handler`].
@@ -1745,12 +2299,183 @@ fn diff_terminal_uuids(old: &[String], new: &[String]) -> (Vec<String>, Vec<Stri
 //  Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+async fn manifest_snapshot(
+    state: &crate::AppState,
+    wm: &WorkspaceManager,
+) -> Result<(Vec<SessionInfo>, WorkspaceManifest, String), SessionError> {
+    let infos = wm.enumerate_sessions()?;
+    let mut guard = state.workspace_manifest.write().await;
+    reconcile_manifest_in_place(wm, &mut guard, &infos)?;
+    let etag = wm.manifest_etag_hex(&guard)?;
+    Ok((infos, guard.clone(), etag))
+}
+
+fn reconcile_manifest_in_place(
+    wm: &WorkspaceManager,
+    manifest: &mut WorkspaceManifest,
+    infos: &[SessionInfo],
+) -> Result<(), SessionError> {
+    if wm.reconcile_manifest(manifest, infos)? {
+        wm.write_manifest(manifest)?;
+    }
+    Ok(())
+}
+
+async fn append_manifest_session(
+    state: &crate::AppState,
+    wm: &WorkspaceManager,
+    name: &str,
+) -> Result<(), SessionError> {
+    let infos = wm.enumerate_sessions()?;
+    let mut guard = state.workspace_manifest.write().await;
+    let next_order = guard
+        .sessions
+        .values()
+        .map(|org| org.order)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    guard
+        .sessions
+        .entry(name.to_string())
+        .or_insert(SessionOrg {
+            order: next_order,
+            ..SessionOrg::default()
+        });
+    reconcile_manifest_in_place(wm, &mut guard, &infos)
+}
+
+async fn remove_manifest_session(
+    state: &crate::AppState,
+    wm: &WorkspaceManager,
+    name: &str,
+) -> Result<(), SessionError> {
+    let infos = wm.enumerate_sessions()?;
+    let mut guard = state.workspace_manifest.write().await;
+    guard.sessions.remove(name);
+    reconcile_manifest_in_place(wm, &mut guard, &infos)
+}
+
+/// Move a session's manifest entry `old` → `new` (Stage 3 rename). The
+/// `SessionOrg` (folder/order/tags/favorite) is carried verbatim. Persists
+/// unconditionally because the rekey carries organisation state that
+/// `reconcile`'s self-heal would otherwise lose on the next boot.
+async fn rename_manifest_session(
+    state: &crate::AppState,
+    wm: &WorkspaceManager,
+    old: &str,
+    new: &str,
+) -> Result<(), SessionError> {
+    let infos = wm.enumerate_sessions()?;
+    let mut guard = state.workspace_manifest.write().await;
+    if let Some(org) = guard.sessions.remove(old) {
+        guard.sessions.insert(new.to_string(), org);
+    }
+    // Drop any stale `old` entry / repair dangling refs against the
+    // post-rename file set, then persist unconditionally.
+    wm.reconcile_manifest(&mut guard, &infos)?;
+    wm.write_manifest(&guard)?;
+    Ok(())
+}
+
+/// Append a freshly-created session (Stage 3 duplicate) into the manifest at
+/// the given `folder_id` (`None` = root) with an appended `order`. Dangling
+/// `folder_id` is reparented to root by `reconcile`. Persists unconditionally
+/// so the chosen folder survives a restart.
+async fn append_manifest_session_in_folder(
+    state: &crate::AppState,
+    wm: &WorkspaceManager,
+    name: &str,
+    folder_id: Option<String>,
+) -> Result<(), SessionError> {
+    let infos = wm.enumerate_sessions()?;
+    let mut guard = state.workspace_manifest.write().await;
+    let next_order = guard
+        .sessions
+        .values()
+        .map(|org| org.order)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    guard.sessions.insert(
+        name.to_string(),
+        SessionOrg {
+            folder_id,
+            order: next_order,
+            ..SessionOrg::default()
+        },
+    );
+    wm.reconcile_manifest(&mut guard, &infos)?;
+    wm.write_manifest(&guard)?;
+    Ok(())
+}
+
+async fn session_counts(
+    state: &crate::AppState,
+    wm: &WorkspaceManager,
+    name: &str,
+) -> Result<crate::SessionCountsCacheEntry, SessionError> {
+    let path = wm.session_path(name)?;
+    let meta = std::fs::metadata(&path)?;
+    let modified_at = meta.modified()?;
+    {
+        let cache = state.session_counts.lock().await;
+        if let Some(entry) = cache.get(name) {
+            if entry.modified_at == modified_at {
+                return Ok(entry.clone());
+            }
+        }
+    }
+
+    let bytes = std::fs::read(&path)?;
+    let layout: Layout = serde_json::from_slice(&bytes)
+        .map_err(|e| SessionError::Corrupt(format!("{}: {e}", path.display())))?;
+    let item_count = u32::try_from(layout.items.len()).unwrap_or(u32::MAX);
+    let terminal_count = u32::try_from(
+        layout
+            .items
+            .iter()
+            .filter(|item| matches!(item, crate::schema::Item::Terminal { .. }))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    let entry = crate::SessionCountsCacheEntry {
+        item_count,
+        terminal_count,
+        modified_at,
+        workspace_root: layout.workspace_root.clone(),
+    };
+    let mut cache = state.session_counts.lock().await;
+    cache.insert(name.to_string(), entry.clone());
+    Ok(entry)
+}
+
+fn system_time_unix(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn service_unavailable(code: &'static str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "error": code,
             "message": "the workspace subsystem is not enabled for this Server",
+        })),
+    )
+        .into_response()
+}
+
+/// `400 invalid_workspace` with the machine-readable `reason` (ADR-0046 D5/D8).
+/// Shared by `create_handler` and `change_workspace_handler`.
+fn invalid_workspace_response(e: fs_guard::WorkspaceRootError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "invalid_workspace",
+            "reason": e.reason(),
+            "message": e.to_string(),
         })),
     )
         .into_response()
@@ -1847,6 +2572,76 @@ mod tests {
         assert_eq!(snap.layout.schema_version, 2);
     }
 
+    #[test]
+    fn reissue_terminal_ids_reassigns_terminals_and_remaps_paths() {
+        // Layout: one terminal (id "term-old"), one path connected from that
+        // terminal to a free point. The path item itself is non-terminal.
+        let raw = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [
+                { "type": "terminal", "id": "term-old", "parent_id": null,
+                  "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0, "z": 0,
+                  "visibility": "visible", "locked": false },
+                { "type": "path", "id": "path-1", "parent_id": null,
+                  "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0, "z": 1,
+                  "visibility": "visible", "locked": false,
+                  "from": { "kind": "connected", "item_id": "term-old", "anchor": "E",
+                            "fallback_point": { "x": 0.0, "y": 0.0 } },
+                  "to": { "kind": "free", "point": { "x": 50.0, "y": 50.0 } },
+                  "routing": "straight", "head_from": "none", "head_to": "arrow",
+                  "stroke": "#0d99ff", "stroke_width": 2 }
+            ],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        let mut layout: Layout = serde_json::from_value(raw).unwrap();
+        reissue_terminal_ids(&mut layout);
+
+        // Terminal id is re-issued (global namespace, ADR-0018 D2).
+        let new_terminal_id = match &layout.items[0] {
+            crate::schema::Item::Terminal { common } => common.id.clone(),
+            other => panic!("expected terminal, got {other:?}"),
+        };
+        assert_ne!(new_terminal_id, "term-old", "terminal id must change");
+        assert_eq!(new_terminal_id.len(), 36, "fresh id is a UUID v4");
+
+        // The path item id (session-scoped) is preserved; its connected
+        // endpoint targeting the terminal is remapped to the new id.
+        match &layout.items[1] {
+            crate::schema::Item::Path { common, from, .. } => {
+                assert_eq!(common.id, "path-1", "non-terminal id preserved");
+                match from {
+                    crate::schema::PathEndpoint::Connected { item_id, .. } => {
+                        assert_eq!(*item_id, new_terminal_id, "path endpoint remapped");
+                    }
+                    other => panic!("expected connected, got {other:?}"),
+                }
+            }
+            other => panic!("expected path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reissue_terminal_ids_noop_without_terminals() {
+        let raw = json!({
+            "schema_version": 2, "groups": [],
+            "items": [
+                { "type": "path", "id": "p", "parent_id": null,
+                  "x": 0.0, "y": 0.0, "w": 0.0, "h": 0.0, "z": 0,
+                  "visibility": "visible", "locked": false,
+                  "from": { "kind": "free", "point": { "x": 0.0, "y": 0.0 } },
+                  "to": { "kind": "free", "point": { "x": 1.0, "y": 1.0 } },
+                  "routing": "straight", "head_from": "none", "head_to": "none",
+                  "stroke": "#000000", "stroke_width": 1 }
+            ],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        let mut layout: Layout = serde_json::from_value(raw).unwrap();
+        let before = layout.clone();
+        reissue_terminal_ids(&mut layout);
+        assert_eq!(layout, before, "no terminals → layout unchanged");
+    }
+
     #[tokio::test]
     async fn get_or_load_returns_not_found_for_missing() {
         let (_dir, wm, cache) = fresh();
@@ -1883,6 +2678,7 @@ mod tests {
                 y: 0.0,
                 zoom: 1.0,
             },
+            workspace_root: None,
         };
         let bytes = canonical_bytes(&layout);
         let via_new = SessionLayout::new(layout.clone());

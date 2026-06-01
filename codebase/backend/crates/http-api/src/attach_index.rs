@@ -420,6 +420,7 @@ mod tests {
                 y: 0.0,
                 zoom: 1.0,
             },
+            workspace_root: None,
         };
         std::fs::write(
             dir.path().join("alpha.json"),

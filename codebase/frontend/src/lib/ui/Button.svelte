@@ -54,13 +54,15 @@
 
 <style>
   .btn {
+    box-sizing: border-box;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: var(--space-16);
+    gap: var(--space-6);
     border-radius: var(--radius-md);
     font-family: inherit;
     font-weight: var(--weight-medium);
+    line-height: var(--leading-normal);
     cursor: pointer;
     transition:
       background var(--motion-fast) var(--motion-easing),
@@ -70,6 +72,10 @@
     user-select: none;
   }
 
+  .btn :global(svg) {
+    flex: 0 0 auto;
+  }
+
   .btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
@@ -77,12 +83,14 @@
 
   .btn-sm {
     height: 24px;
+    min-width: 44px;
     padding: 0 var(--space-8);
     font-size: var(--text-sm);
   }
 
   .btn-md {
     height: 32px;
+    min-width: 64px;
     padding: 0 var(--space-12);
     font-size: var(--text-base);
   }

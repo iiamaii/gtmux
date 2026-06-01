@@ -20,6 +20,7 @@
   import { debugCount } from '$lib/common/debugCounts';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { toolStore } from '$lib/stores/toolStore.svelte';
+  import { chromeStore } from '$lib/stores/chrome.svelte';
   import { attachConfirm, UnauthorizedError } from '$lib/http/sessions';
   import { killTerminal } from '$lib/http/terminals';
   import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
@@ -842,6 +843,7 @@
         const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
         const nodeId = nodeEl?.dataset.id ?? nodeIdAtPoint(e.clientX, e.clientY);
         if (nodeId !== null) {
+          returnToLayerTabForCanvasSelection();
           const hitTarget = groupIdFromOverlayNode(nodeId) ?? canvasTargetFor(nodeId);
           if (!targetIsInsideDrill(hitTarget)) sessionStore.clearDrill();
           sessionStore.toggleM(hitTarget);
@@ -864,6 +866,7 @@
       const nodeEl = target?.closest('.svelte-flow__node') as HTMLElement | null;
       const nodeId = nodeEl?.dataset.id ?? null;
       if (nodeId !== null) {
+        returnToLayerTabForCanvasSelection();
         const overlayGroupId = groupIdFromOverlayNode(nodeId);
         const hitTarget = overlayGroupId ?? canvasTargetFor(nodeId);
         if (!targetIsInsideDrill(hitTarget)) sessionStore.clearDrill();
@@ -2074,6 +2077,12 @@
     sessionStore.clearM();
   }
 
+  function returnToLayerTabForCanvasSelection(): void {
+    if (chromeStore.state.leftPanelTab === 'files') {
+      chromeStore.setLeftPanelTab('layers');
+    }
+  }
+
   function isSelectedByGroup(itemId: string): boolean {
     const item = sessionStore.items.get(itemId);
     let parentId = item?.parent_id ?? null;
@@ -2119,6 +2128,7 @@
 
   function onnodeclick({ node, event }: { node: Node; event: MouseEvent | TouchEvent }) {
     if (isSelectMode) {
+      returnToLayerTabForCanvasSelection();
       const id = node.id;
       const overlayGroupId = groupIdFromOverlayNode(id);
       const target = overlayGroupId ?? canvasTargetFor(id);

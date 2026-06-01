@@ -304,7 +304,10 @@ pub async fn respawn_handler(
     // (dangling) just gets a fresh spawn; the kill_and_unregister is a no-op
     // in that case.
     crate::sessions::kill_and_unregister_terminal(&state, &id).await;
-    match state.spawn_terminal_with_uuid(id.clone()).await {
+    // ADR-0046 D2 — respawn in the effective Workspace(B) of a session that
+    // references this terminal (best-effort; falls back to the pty default).
+    let cwd = crate::sessions::terminal_respawn_cwd(&state, &id).await;
+    match state.spawn_terminal_with_uuid(id.clone(), cwd).await {
         Ok(_) => (StatusCode::OK, Json(json!({ "id": id, "reused": false }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

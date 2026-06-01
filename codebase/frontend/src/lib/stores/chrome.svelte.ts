@@ -3,15 +3,17 @@
 //
 // Two floating panels — both follow the same shape (header tabs +
 // PanelFoldButton + collapsed rail with per-tab icons):
-//   - LeftPanel — Layers + Terminals (left edge)
-//   - RightPanel — Inspect (right edge, single tab for now; ref leaves
-//     room for Design / Prototype / Inspect — currently we only need
-//     Inspect, but the tab chrome stays for future growth).
+//   - LeftPanel — Layers + Terminals + Files (left edge)
+//   - RightPanel — Inspect + Preview (right edge).
 // State persists in localStorage so the preference survives reload.
 // Web-only state, no backend round-trip.
 
-export type LeftPanelTab = 'layers' | 'terminals';
-export type RightPanelTab = 'inspect';
+import { filePreviewStore } from '$lib/stores/filePreview.svelte';
+import { pathEditStore } from '$lib/stores/pathEditStore.svelte';
+import { sessionStore } from '$lib/stores/sessionStore.svelte';
+
+export type LeftPanelTab = 'layers' | 'terminals' | 'files';
+export type RightPanelTab = 'inspect' | 'preview';
 
 export type ChromeState = {
   sidebarCollapsed: boolean;
@@ -23,7 +25,7 @@ export type ChromeState = {
 };
 
 const STORAGE_KEY = 'gtmux-chrome';
-const LEFT_PANEL_MIN_WIDTH = 220;
+const LEFT_PANEL_MIN_WIDTH = 230;
 const LEFT_PANEL_MAX_WIDTH = 520;
 const RIGHT_PANEL_MIN_WIDTH = 240;
 const RIGHT_PANEL_MAX_WIDTH = 560;
@@ -31,7 +33,7 @@ const RIGHT_PANEL_MAX_WIDTH = 560;
 const DEFAULT: ChromeState = {
   sidebarCollapsed: false,
   leftPanelTab: 'layers',
-  leftPanelWidth: 248,
+  leftPanelWidth: 268,
   paneInfoCollapsed: false,
   rightPanelTab: 'inspect',
   rightPanelWidth: 268,
@@ -48,7 +50,13 @@ class ChromeStore {
   /** Switch the active tab in the left panel. Always expands the panel
    *  too (matches the "rail icon click → expand + select" UX). */
   setLeftPanelTab(tab: LeftPanelTab): void {
-    this.state = { ...this.state, leftPanelTab: tab, sidebarCollapsed: false };
+    if (tab !== this.state.leftPanelTab) clearSelectionsForTabTransition('left', tab);
+    this.state = {
+      ...this.state,
+      leftPanelTab: tab,
+      rightPanelTab: rightPanelTabForLeft(tab),
+      sidebarCollapsed: false,
+    };
     this.persist();
   }
 
@@ -57,11 +65,20 @@ class ChromeStore {
     this.persist();
   }
 
-  /** Switch the active tab in the right panel. Always expands the panel
-   *  too (matches the LeftPanel rail UX). Currently a single tab, but
-   *  the chrome stays symmetric so adding tabs later is purely additive. */
+  /** Switch the active tab in the right panel and sync the left panel domain:
+   *  Preview owns Files; Inspect owns Layers/Terminals. */
   setRightPanelTab(tab: RightPanelTab): void {
-    this.state = { ...this.state, rightPanelTab: tab, paneInfoCollapsed: false };
+    const leftPanelTab = leftPanelTabForRight(tab, this.state.leftPanelTab);
+    if (tab !== this.state.rightPanelTab || leftPanelTab !== this.state.leftPanelTab) {
+      clearSelectionsForTabTransition('right', tab);
+    }
+    this.state = {
+      ...this.state,
+      leftPanelTab,
+      rightPanelTab: tab,
+      sidebarCollapsed: false,
+      paneInfoCollapsed: false,
+    };
     this.persist();
   }
 
@@ -83,7 +100,13 @@ class ChromeStore {
 
   /** Force a specific state — used by tests / scripted demos. */
   set(next: Partial<ChromeState>): void {
-    this.state = normalizeState({ ...this.state, ...next });
+    const normalized = normalizeState({ ...this.state, ...next });
+    if (normalized.leftPanelTab !== this.state.leftPanelTab) {
+      clearSelectionsForTabTransition('left', normalized.leftPanelTab);
+    } else if (normalized.rightPanelTab !== this.state.rightPanelTab) {
+      clearSelectionsForTabTransition('right', normalized.rightPanelTab);
+    }
+    this.state = normalized;
     this.persist();
   }
 
@@ -113,12 +136,15 @@ function resolveInitial(): ChromeState {
           ? obj.sidebarCollapsed
           : DEFAULT.sidebarCollapsed,
       leftPanelTab:
-        leftTab === 'layers' || leftTab === 'terminals' ? leftTab : DEFAULT.leftPanelTab,
+        leftTab === 'layers' || leftTab === 'terminals' || leftTab === 'files'
+          ? leftTab
+          : DEFAULT.leftPanelTab,
       paneInfoCollapsed:
         typeof obj.paneInfoCollapsed === 'boolean'
           ? obj.paneInfoCollapsed
           : DEFAULT.paneInfoCollapsed,
-      rightPanelTab: rightTab === 'inspect' ? rightTab : DEFAULT.rightPanelTab,
+      rightPanelTab:
+        rightTab === 'inspect' || rightTab === 'preview' ? rightTab : DEFAULT.rightPanelTab,
       leftPanelWidth:
         typeof obj.leftPanelWidth === 'number'
           ? obj.leftPanelWidth
@@ -138,8 +164,35 @@ function normalizeState(state: ChromeState): ChromeState {
   return {
     ...state,
     leftPanelWidth: clamp(state.leftPanelWidth, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
+    rightPanelTab: rightPanelTabForLeft(state.leftPanelTab),
     rightPanelWidth: clamp(state.rightPanelWidth, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
   };
+}
+
+function rightPanelTabForLeft(tab: LeftPanelTab): RightPanelTab {
+  return tab === 'files' ? 'preview' : 'inspect';
+}
+
+function leftPanelTabForRight(tab: RightPanelTab, current: LeftPanelTab): LeftPanelTab {
+  if (tab === 'preview') return 'files';
+  return current === 'files' ? 'layers' : current;
+}
+
+function clearSelectionsForTabTransition(side: 'left', tab: LeftPanelTab): void;
+function clearSelectionsForTabTransition(side: 'right', tab: RightPanelTab): void;
+function clearSelectionsForTabTransition(side: 'left' | 'right', tab: LeftPanelTab | RightPanelTab): void {
+  clearCanvasSelectionState();
+  if (side === 'left' || tab === 'inspect') clearFilePreviewSelectionState();
+}
+
+function clearCanvasSelectionState(): void {
+  pathEditStore.end();
+  sessionStore.clearDrill();
+  sessionStore.clearM();
+}
+
+function clearFilePreviewSelectionState(): void {
+  filePreviewStore.clear();
 }
 
 function clamp(value: number, min: number, max: number): number {

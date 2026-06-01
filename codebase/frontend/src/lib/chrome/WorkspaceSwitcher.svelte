@@ -37,6 +37,7 @@
   } from '$lib/http/sessions';
   import { reconnectGate } from '$lib/stores/reconnectGate.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { workspaceManifest } from '$lib/stores/workspaceManifest.svelte';
   import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { settingsStore } from '$lib/stores/settings.svelte';
@@ -52,6 +53,7 @@
   let existingNames = $state<readonly string[]>([]);
   let pendingAttachPreviousSession: string | null = null;
   let pendingAttachHasTentativeLock = false;
+  let createFolderId = $state<string | null>(null);
 
   $effect(() => {
     if (
@@ -78,6 +80,16 @@
   function redirectToAuth(): void {
     workspaceSwitcher.close();
     window.location.href = '/auth';
+  }
+
+  function goCreateRoot(): void {
+    createFolderId = null;
+    workspaceSwitcher.goCreate();
+  }
+
+  function goCreateInFolder(folderId: string | null): void {
+    createFolderId = folderId;
+    workspaceSwitcher.goCreate();
   }
 
   /** WS conn id stub — Stage 3 BE-NEW-4 의 WS routing 정합 전까지 placeholder. */
@@ -274,11 +286,23 @@
     workspaceSwitcher.goList();
   }
 
-  function onSessionCreated(session: SessionInfo): void {
+  async function onSessionCreated(session: SessionInfo): Promise<void> {
     toastStore.show({
       message: `Created session "${session.name}".`,
       tone: 'success',
     });
+    if (createFolderId !== null) {
+      try {
+        await workspaceManifest.moveSessionToFolder(session.name, createFolderId);
+      } catch (err) {
+        toastStore.show({
+          message: `Created session, but folder move failed: ${err instanceof Error ? err.message : String(err)}`,
+          tone: 'warning',
+          durationMs: 8_000,
+        });
+      }
+    }
+    createFolderId = null;
     void tryAttach(session.name);
   }
 
@@ -295,7 +319,7 @@
 
 <AuthDialog
   open={workspaceSwitcher.stage === 'choice'}
-  onCreate={() => workspaceSwitcher.goCreate()}
+  onCreate={goCreateRoot}
   onSelect={() => workspaceSwitcher.goList()}
   onClose={() => workspaceSwitcher.close()}
   dismissable={sessionStore.active !== null}
@@ -312,6 +336,7 @@
   open={workspaceSwitcher.stage === 'list'}
   onClose={() => workspaceSwitcher.closeList()}
   onSelect={onSessionPicked}
+  onCreateInFolder={goCreateInFolder}
   onUnauthorized={redirectToAuth}
 />
 

@@ -77,6 +77,8 @@ mod tests {
             cloud: None,
             frontend_dist: None,
             workspace_path: None,
+            server_workspace: None,
+            default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
         };
@@ -115,6 +117,7 @@ mod tests {
                 y: 0.0,
                 zoom: 1.0,
             },
+            workspace_root: None,
         };
         let bytes = serde_json::to_vec(&layout).unwrap();
         std::fs::write(dir.join(format!("{name}.json")), bytes).unwrap();
