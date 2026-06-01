@@ -8,6 +8,8 @@
 // State persists in localStorage so the preference survives reload.
 // Web-only state, no backend round-trip.
 
+import { filePreviewStore } from '$lib/stores/filePreview.svelte';
+import { pathEditStore } from '$lib/stores/pathEditStore.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
 export type LeftPanelTab = 'layers' | 'terminals' | 'files';
@@ -48,10 +50,7 @@ class ChromeStore {
   /** Switch the active tab in the left panel. Always expands the panel
    *  too (matches the "rail icon click → expand + select" UX). */
   setLeftPanelTab(tab: LeftPanelTab): void {
-    if (tab === 'files') {
-      sessionStore.clearM();
-      sessionStore.clearDrill();
-    }
+    if (tab !== this.state.leftPanelTab) clearSelectionsForTabTransition('left', tab);
     this.state = {
       ...this.state,
       leftPanelTab: tab,
@@ -70,9 +69,8 @@ class ChromeStore {
    *  Preview owns Files; Inspect owns Layers/Terminals. */
   setRightPanelTab(tab: RightPanelTab): void {
     const leftPanelTab = leftPanelTabForRight(tab, this.state.leftPanelTab);
-    if (leftPanelTab === 'files' && this.state.leftPanelTab !== 'files') {
-      sessionStore.clearM();
-      sessionStore.clearDrill();
+    if (tab !== this.state.rightPanelTab || leftPanelTab !== this.state.leftPanelTab) {
+      clearSelectionsForTabTransition('right', tab);
     }
     this.state = {
       ...this.state,
@@ -102,7 +100,13 @@ class ChromeStore {
 
   /** Force a specific state — used by tests / scripted demos. */
   set(next: Partial<ChromeState>): void {
-    this.state = normalizeState({ ...this.state, ...next });
+    const normalized = normalizeState({ ...this.state, ...next });
+    if (normalized.leftPanelTab !== this.state.leftPanelTab) {
+      clearSelectionsForTabTransition('left', normalized.leftPanelTab);
+    } else if (normalized.rightPanelTab !== this.state.rightPanelTab) {
+      clearSelectionsForTabTransition('right', normalized.rightPanelTab);
+    }
+    this.state = normalized;
     this.persist();
   }
 
@@ -172,6 +176,23 @@ function rightPanelTabForLeft(tab: LeftPanelTab): RightPanelTab {
 function leftPanelTabForRight(tab: RightPanelTab, current: LeftPanelTab): LeftPanelTab {
   if (tab === 'preview') return 'files';
   return current === 'files' ? 'layers' : current;
+}
+
+function clearSelectionsForTabTransition(side: 'left', tab: LeftPanelTab): void;
+function clearSelectionsForTabTransition(side: 'right', tab: RightPanelTab): void;
+function clearSelectionsForTabTransition(side: 'left' | 'right', tab: LeftPanelTab | RightPanelTab): void {
+  clearCanvasSelectionState();
+  if (side === 'left' || tab === 'inspect') clearFilePreviewSelectionState();
+}
+
+function clearCanvasSelectionState(): void {
+  pathEditStore.end();
+  sessionStore.clearDrill();
+  sessionStore.clearM();
+}
+
+function clearFilePreviewSelectionState(): void {
+  filePreviewStore.clear();
 }
 
 function clamp(value: number, min: number, max: number): number {

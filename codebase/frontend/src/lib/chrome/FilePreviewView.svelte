@@ -215,10 +215,9 @@
         <span class="desc">Loading preview...</span>
       </div>
     {:else if errorMessage !== null}
-      <div class="empty-state danger" role="alert">
-        <span class="disc" aria-hidden="true">!</span>
-        <span class="lead">Can't preview this type</span>
-        <span class="desc">{errorMessage}</span>
+      <div class="empty" role="alert">
+        <p>Can't preview this type</p>
+        <p class="hint">{errorMessage}</p>
       </div>
     {:else if kind === 'image' && assetUrl.length > 0}
       <div class="image-wrap">
@@ -245,10 +244,9 @@
         {/each}
       </div>
     {:else}
-      <div class="empty-state">
-        <span class="disc" aria-hidden="true">?</span>
-        <span class="lead">Can't preview this type</span>
-        <span class="desc">Download or open it from the project workspace.</span>
+      <div class="empty">
+        <p>Can't preview this type</p>
+        <p class="hint">Download or open it from the project workspace.</p>
       </div>
     {/if}
   {/if}
@@ -398,28 +396,6 @@
     padding: var(--space-24) var(--space-16);
     text-align: center;
     color: var(--color-fg-muted);
-  }
-
-  .empty-state.danger .disc {
-    color: var(--color-danger);
-    background: color-mix(in srgb, var(--color-danger) 14%, transparent);
-  }
-
-  .disc {
-    width: 36px;
-    height: 36px;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    background: var(--color-glass-1);
-    color: var(--color-fg-muted);
-    font-family: var(--font-mono);
-  }
-
-  .lead {
-    color: var(--color-fg);
-    font-size: var(--text-md);
-    font-weight: var(--weight-semibold);
   }
 
   .desc {

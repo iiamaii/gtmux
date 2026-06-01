@@ -23,6 +23,7 @@
     WorkspaceUpdateUnavailableError,
   } from '$lib/http/sessions';
   import FileExplorer from '$lib/chrome/FileExplorer.svelte';
+  import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
 
   type Row = {
     path: string;
@@ -32,6 +33,9 @@
     loading: boolean;
   };
   type FileIconKind = 'directory' | 'image' | 'document' | 'code' | 'text' | 'archive' | 'file';
+
+  const FILE_TREE_EXPANSION_STORAGE_KEY = 'gtmux:file-tree-expanded:v1';
+  const MAX_FILE_TREE_EXPANSIONS = 200;
 
   let rootPath = $state('');
   let rootError = $state<string | null>(null);
@@ -110,10 +114,12 @@
     const key = `${activeName ?? ''}:${targetRoot}`;
     if (activeName === null || key === loadedKey) return;
     loadedKey = key;
+    filePreviewStore.clear();
     void loadRoot(targetRoot);
   });
 
   async function loadRoot(dir: string): Promise<void> {
+    const sessionName = activeName;
     rootLoading = true;
     rootError = null;
     childrenByDir = new Map();
@@ -122,7 +128,9 @@
     try {
       const res = await listDir(dir);
       rootPath = res.dir;
+      expandedDirs = readRestoredExpandedDirs(sessionName, res.dir);
       childrenByDir = new Map([[res.dir, res.entries]]);
+      void hydrateExpandedDirs(expandedDirs, res.dir);
     } catch (err) {
       if (err instanceof UnauthorizedError) {
         window.location.href = '/auth';
@@ -132,6 +140,17 @@
       rootError = fsErrorMessage(err);
     } finally {
       rootLoading = false;
+    }
+  }
+
+  async function hydrateExpandedDirs(restored: ReadonlySet<string>, root: string): Promise<void> {
+    const dirs = [...restored]
+      .filter((path) => path !== root && isPathWithinRoot(path, root))
+      .sort((a, b) => a.split('/').length - b.split('/').length)
+      .slice(0, MAX_FILE_TREE_EXPANSIONS);
+    for (const path of dirs) {
+      if (!expandedDirs.has(path) || childrenByDir.has(path)) continue;
+      await loadDir(path);
     }
   }
 
@@ -193,10 +212,12 @@
     if (next.has(path)) {
       next.delete(path);
       expandedDirs = next;
+      persistExpandedDirs();
       return;
     }
     next.add(path);
     expandedDirs = next;
+    persistExpandedDirs();
     if (!childrenByDir.has(path)) void loadDir(path);
   }
 
@@ -214,6 +235,7 @@
     if (name === null) return;
     changeOpen = false;
     try {
+      filePreviewStore.clear();
       await changeWorkspace(name, path);
       await workspaceManifest.load();
       await loadRoot(path);
@@ -233,6 +255,33 @@
           : String(err);
       toastStore.show({ message, tone: 'error', durationMs: 6_000 });
     }
+  }
+
+  function fileTreeStateKey(sessionName: string | null, root: string): string | null {
+    return sessionName === null || root.length === 0 ? null : `${sessionName}:${root}`;
+  }
+
+  function readRestoredExpandedDirs(sessionName: string | null, root: string): Set<string> {
+    const restored = readExpandedTreeState(
+      FILE_TREE_EXPANSION_STORAGE_KEY,
+      fileTreeStateKey(sessionName, root),
+    );
+    return new Set([...restored].filter((path) => isPathWithinRoot(path, root)));
+  }
+
+  function persistExpandedDirs(): void {
+    writeExpandedTreeState(
+      FILE_TREE_EXPANSION_STORAGE_KEY,
+      fileTreeStateKey(activeName, rootPath),
+      expandedDirs,
+      MAX_FILE_TREE_EXPANSIONS,
+    );
+  }
+
+  function isPathWithinRoot(path: string, root: string): boolean {
+    if (root.length === 0) return false;
+    const prefix = root.endsWith('/') ? root : `${root}/`;
+    return path === root || path.startsWith(prefix);
   }
 </script>
 
