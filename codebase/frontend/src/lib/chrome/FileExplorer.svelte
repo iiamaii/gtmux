@@ -333,6 +333,15 @@
   size="wide"
   flushBody
 >
+  {#snippet subtitle()}
+    <span class="fx-selected-path" title={pickTarget ?? ''}>
+      {#if pickTarget !== null}
+        Selected · <b>{pickTarget}</b>
+      {:else}
+        {mode === 'dir' ? 'Select current or child directory.' : 'Select a file.'}
+      {/if}
+    </span>
+  {/snippet}
   {#snippet body()}
     <div class="fx-bar">
       <button
@@ -518,13 +527,6 @@
     </div>
 
     <div class="fx-foot">
-      <span class="selected" title={pickTarget ?? ''}>
-      {#if pickTarget !== null}
-        Selected · <b>{pickTarget}</b>
-      {:else}
-        {mode === 'dir' ? 'Select current or child directory.' : 'Select a file.'}
-      {/if}
-      </span>
       <Button variant="ghost" onclick={onCancel} disabled={mutating}>Cancel</Button>
       <Button variant="primary" onclick={onPickClick} disabled={!canPick}>
         {mode === 'dir' ? 'Select this folder' : 'Open file'}
@@ -790,8 +792,7 @@
     color: var(--color-accent);
   }
 
-  .name,
-  .selected {
+  .name {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -869,30 +870,33 @@
     color: var(--color-fg-muted);
   }
 
-  /* Flush-body modal footer follows Modal.svelte spacing/button contract while
-     keeping the selected path as the left-side status slot. */
+  .fx-selected-path {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--color-fg-muted);
+    font-size: var(--text-base);
+    letter-spacing: 0;
+  }
+
+  .fx-selected-path b {
+    color: var(--color-fg);
+    font-family: var(--font-mono);
+    font-weight: var(--weight-medium);
+  }
+
+  /* Flush-body modal footer follows Modal.svelte spacing/button contract. */
   .fx-foot {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
+    justify-content: flex-end;
     gap: var(--space-8);
     padding: var(--space-12) var(--space-24) var(--space-16);
     border-top: 1px solid var(--color-border);
     background: color-mix(in srgb, var(--color-surface-2) 60%, transparent);
-  }
-
-  .selected {
-    flex: 1 1 auto;
-    margin-right: auto;
-    font-size: var(--text-base);
-    color: var(--color-fg-muted);
-    letter-spacing: 0;
-  }
-
-  .selected b {
-    color: var(--color-fg);
-    font-family: var(--font-mono);
-    font-weight: var(--weight-medium);
   }
 
   .confirm-copy {

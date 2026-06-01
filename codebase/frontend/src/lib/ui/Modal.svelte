@@ -18,6 +18,7 @@
    *       </div>
    *     {/snippet}
    *     {#snippet footer()}
+   *       <span class="modal-footer-status">Optional status text</span>
    *       <Button variant="ghost" onclick={cancel}>Cancel</Button>
    *       <Button variant="danger" onclick={confirm}>OK</Button>
    *     {/snippet}
@@ -44,6 +45,8 @@
     size?: 'sm' | 'md' | 'wide';
     /** Let complex modal bodies own their own padding/header/footer bands. */
     flushBody?: boolean;
+    /** Optional line under the title for contextual, potentially long text. */
+    subtitle?: Snippet;
     body: Snippet;
     footer?: Snippet;
   }
@@ -56,6 +59,7 @@
     dismissOnEsc = true,
     size = 'md',
     flushBody = false,
+    subtitle,
     body,
     footer,
   }: Props = $props();
@@ -148,6 +152,11 @@
       {#if title}
         <header class="modal-header">
           <h2 id={titleId} class="modal-title">{title}</h2>
+          {#if subtitle}
+            <div class="modal-subtitle">
+              {@render subtitle()}
+            </div>
+          {/if}
         </header>
       {/if}
       <div class="modal-body" class:modal-body-flush={flushBody}>
@@ -206,6 +215,8 @@
 
   .modal-header {
     padding: var(--space-16) var(--space-24) var(--space-8);
+    display: grid;
+    gap: var(--space-6);
   }
 
   .modal-title {
@@ -213,6 +224,13 @@
     font-size: var(--text-lg);
     font-weight: var(--weight-semibold);
     line-height: var(--leading-tight);
+  }
+
+  .modal-subtitle {
+    min-width: 0;
+    color: var(--color-fg-muted);
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
   }
 
   .modal-body {
@@ -237,6 +255,20 @@
     padding: var(--space-12) var(--space-24) var(--space-16);
     border-top: 1px solid var(--color-border);
     background: color-mix(in srgb, var(--color-surface-2) 60%, transparent);
+  }
+
+  .modal-footer > :global(.modal-footer-status),
+  .modal-footer > :global(.footer-reason) {
+    flex: 1 1 0;
+    min-width: 0;
+    margin-right: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .modal-footer > :global(button) {
+    flex: 0 0 auto;
   }
 
   :global(.modal-stack) {

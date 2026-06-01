@@ -206,7 +206,7 @@
     </div>
   {/snippet}
   {#snippet footer()}
-    <span class="footer-reason" class:hidden={disabledReason === null}>
+    <span class="footer-reason modal-footer-status" class:hidden={disabledReason === null}>
       <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
         <circle cx="8" cy="8" r="6"/>
         <path d="M8 5v3.5M8 11h.01"/>
@@ -340,8 +340,10 @@
 
   .footer-reason {
     min-width: 0;
-    margin-right: auto;
     color: var(--color-fg-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .footer-reason.hidden {
