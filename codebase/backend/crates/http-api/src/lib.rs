@@ -830,6 +830,16 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
                 .layer(DefaultBodyLimit::max(asset_body_limit)),
         )
         .route(
+            // ADR-0047 D9 — rename a file/directory within its parent (guarded).
+            "/api/fs/rename",
+            axum::routing::post(fs_list::fs_rename_handler),
+        )
+        .route(
+            // ADR-0047 D9 — remove a file / empty directory (no recursive wipe).
+            "/api/fs/remove",
+            axum::routing::post(fs_list::fs_remove_handler),
+        )
+        .route(
             "/api/shutdown",
             axum::routing::post(shutdown::shutdown_handler),
         )
@@ -6631,6 +6641,256 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "dir_not_allowed");
         assert!(!inside_store.exists());
+    }
+
+    // ── ADR-0047 D9 — POST /api/fs/rename + /api/fs/remove ─────────────────
+
+    #[tokio::test]
+    async fn fs_rename_file_and_directory_success() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let a_root = dir.path().canonicalize().unwrap();
+
+        // File rename → 200 { path, name, kind: file }; old gone, content kept.
+        let old = dir.path().join("old.md");
+        std::fs::write(&old, b"hello").unwrap();
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rename",
+            Some(json!({ "path": old.to_string_lossy(), "new_name": "new.md" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["name"], "new.md");
+        assert_eq!(body["kind"], "file");
+        assert_eq!(body["path"], a_root.join("new.md").to_string_lossy().as_ref());
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(a_root.join("new.md")).unwrap(), b"hello");
+
+        // Directory rename → 200 kind: directory; child preserved under new path.
+        let d = dir.path().join("d");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("c.txt"), b"c").unwrap();
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rename",
+            Some(json!({ "path": d.to_string_lossy(), "new_name": "d2" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["kind"], "directory");
+        assert!(!d.exists());
+        assert_eq!(std::fs::read(a_root.join("d2").join("c.txt")).unwrap(), b"c");
+    }
+
+    #[tokio::test]
+    async fn fs_rename_collision_returns_409() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        std::fs::write(dir.path().join("a.md"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.md"), b"b").unwrap();
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rename",
+            Some(json!({ "path": dir.path().join("a.md").to_string_lossy(), "new_name": "b.md" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "already_exists");
+        // Both originals untouched.
+        assert_eq!(std::fs::read(dir.path().join("a.md")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dir.path().join("b.md")).unwrap(), b"b");
+    }
+
+    #[tokio::test]
+    async fn fs_rename_invalid_new_name_400() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let src = dir.path().join("x.md");
+        std::fs::write(&src, b"x").unwrap();
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\u{0}b"] {
+            let (status, body) = authed_json(
+                &app,
+                &token,
+                Method::POST,
+                "/api/fs/rename",
+                Some(json!({ "path": src.to_string_lossy(), "new_name": bad })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "new_name {bad:?}");
+            assert_eq!(body["error"], "invalid_name", "new_name {bad:?}");
+        }
+        // Source untouched.
+        assert!(src.exists());
+    }
+
+    #[tokio::test]
+    async fn fs_rename_guard_rejects_outside_store_and_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+
+        // Outside A.
+        let out = outside.path().join("o.md");
+        std::fs::write(&out, b"o").unwrap();
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rename",
+            Some(json!({ "path": out.to_string_lossy(), "new_name": "z.md" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "dir_not_allowed");
+
+        // Inside the Store (denylist).
+        let in_store = store_dir.join("s.md");
+        std::fs::write(&in_store, b"s").unwrap();
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rename",
+            Some(json!({ "path": in_store.to_string_lossy(), "new_name": "z.md" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // The A root itself.
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rename",
+            Some(json!({ "path": dir.path().to_string_lossy(), "new_name": "z" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Missing source → 404.
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rename",
+            Some(json!({ "path": dir.path().join("nope.md").to_string_lossy(), "new_name": "z.md" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn fs_remove_file_and_empty_dir_then_non_empty_409() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+
+        // Remove a file → 204.
+        let f = dir.path().join("f.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/remove",
+            Some(json!({ "path": f.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!f.exists());
+
+        // Remove an empty directory → 204.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/remove",
+            Some(json!({ "path": empty.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!empty.exists());
+
+        // Non-empty directory → 409 dir_not_empty (no recursive wipe).
+        let full = dir.path().join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("child"), b"c").unwrap();
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/remove",
+            Some(json!({ "path": full.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "dir_not_empty");
+        assert!(full.join("child").exists());
+
+        // Missing → 404; inside Store → 403; A root → 403.
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/remove",
+            Some(json!({ "path": dir.path().join("ghost").to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let in_store = store_dir.join("s.txt");
+        std::fs::write(&in_store, b"s").unwrap();
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/remove",
+            Some(json!({ "path": in_store.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(in_store.exists(), "denylisted file must not be removed");
+
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/remove",
+            Some(json!({ "path": dir.path().to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn fs_rename_remove_require_auth_401() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, _token, _store) = make_app_with_workspace(&dir);
+        for uri in ["/api/fs/rename", "/api/fs/remove"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri(uri)
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"path":"/x","new_name":"y"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
     }
 
     #[tokio::test]

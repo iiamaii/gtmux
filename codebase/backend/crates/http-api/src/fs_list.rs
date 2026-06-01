@@ -71,6 +71,15 @@ pub struct FsMutateBody {
     pub path: String,
 }
 
+/// `POST /api/fs/rename` body (ADR-0047 D9). `path` is the absolute source
+/// (file or directory) inside A; `new_name` is a *single* path component the
+/// entry is renamed to within the same parent (no cross-directory move).
+#[derive(Debug, Deserialize)]
+pub struct FsRenameBody {
+    pub path: String,
+    pub new_name: String,
+}
+
 /// `GET /api/fs/list?dir=<percent-encoded>` — ADR-0035 D3 / ADR-0046 D3.
 pub async fn fs_list_handler(
     State(state): State<AppState>,
@@ -284,6 +293,140 @@ pub async fn fs_rmdir_handler(
         }
         Err(_) => internal_500("rmdir_failed"),
     }
+}
+
+/// `POST /api/fs/rename { path, new_name }` — ADR-0047 D9. Rename a file or
+/// directory to `new_name` **within its same parent** (no cross-directory
+/// move). The source must pass the A-scope + denylist guard and must not be
+/// the A root; `new_name` must be a single, clean path component; the target
+/// must not already exist (no silent overwrite). 200 `{ path, name, kind }` /
+/// 400 invalid_path|invalid_name / 403 dir_not_allowed / 404 not_found /
+/// 409 already_exists / 500 rename_failed.
+pub async fn fs_rename_handler(
+    State(state): State<AppState>,
+    Json(body): Json<FsRenameBody>,
+) -> Response {
+    let server_workspace = state.server_workspace.as_path();
+
+    let candidate = PathBuf::from(&body.path);
+    if !candidate.is_absolute() || body.path.contains('\0') {
+        return error(StatusCode::BAD_REQUEST, "invalid_path");
+    }
+    if !is_clean_component(&body.new_name) {
+        return error(StatusCode::BAD_REQUEST, "invalid_name");
+    }
+
+    // Source must exist + be inside A + outside the denylist.
+    let source = match candidate.canonicalize() {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        }
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_path"),
+    };
+    if !fs_guard::is_path_allowed(&source, server_workspace, &state.fs_denylist) {
+        return error(StatusCode::FORBIDDEN, "dir_not_allowed");
+    }
+    // Refuse to rename the A root itself — root re-point is `PUT /workspace`.
+    if source == server_workspace {
+        return error(StatusCode::FORBIDDEN, "dir_not_allowed");
+    }
+    let Some(parent) = source.parent() else {
+        return error(StatusCode::FORBIDDEN, "dir_not_allowed");
+    };
+    let target = parent.join(&body.new_name);
+    // Defense-in-depth: the new path must still clear the guard (e.g. blocks a
+    // rename to the Store dir's name). `parent` is canonical, so this lexical
+    // membership check is sound. The target itself may not exist yet, so we
+    // never canonicalize it.
+    if !fs_guard::is_path_allowed(&target, server_workspace, &state.fs_denylist) {
+        return error(StatusCode::FORBIDDEN, "dir_not_allowed");
+    }
+    if target.exists() {
+        return error(StatusCode::CONFLICT, "already_exists");
+    }
+    let kind = if source.is_dir() { "directory" } else { "file" };
+    match std::fs::rename(&source, &target) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "path": target.to_string_lossy(),
+                "name": body.new_name,
+                "kind": kind,
+            })),
+        )
+            .into_response(),
+        Err(_) => internal_500("rename_failed"),
+    }
+}
+
+/// `POST /api/fs/remove { path }` — ADR-0047 D9. **Permanently** remove a file
+/// (unlink) or an **empty** directory inside A. A non-empty directory is
+/// refused (409) — recursive delete is intentionally not provided so a single
+/// action can never wipe a populated tree (the destructive confirm is a FE
+/// product dialog; the BE just enforces the bounded operation). 204 /
+/// 400 invalid_path / 403 dir_not_allowed / 404 not_found / 409 dir_not_empty /
+/// 500 remove_failed.
+pub async fn fs_remove_handler(
+    State(state): State<AppState>,
+    Json(body): Json<FsMutateBody>,
+) -> Response {
+    let server_workspace = state.server_workspace.as_path();
+    let candidate = PathBuf::from(&body.path);
+    if !candidate.is_absolute() || body.path.contains('\0') {
+        return error(StatusCode::BAD_REQUEST, "invalid_path");
+    }
+    let canonical = match candidate.canonicalize() {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error(StatusCode::NOT_FOUND, "not_found");
+        }
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_path"),
+    };
+    if !fs_guard::is_path_allowed(&canonical, server_workspace, &state.fs_denylist) {
+        return error(StatusCode::FORBIDDEN, "dir_not_allowed");
+    }
+    // Refuse to remove the A root itself.
+    if canonical == server_workspace {
+        return error(StatusCode::FORBIDDEN, "dir_not_allowed");
+    }
+
+    if canonical.is_dir() {
+        // Empty-directory remove only; map ENOTEMPTY → 409 (no recursive wipe).
+        match std::fs::remove_dir(&canonical) {
+            Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                error(StatusCode::NOT_FOUND, "not_found")
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    || e.raw_os_error() == Some(libc_enotempty()) =>
+            {
+                error(StatusCode::CONFLICT, "dir_not_empty")
+            }
+            Err(_) => internal_500("remove_failed"),
+        }
+    } else {
+        match std::fs::remove_file(&canonical) {
+            Ok(()) => (StatusCode::NO_CONTENT, ()).into_response(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                error(StatusCode::NOT_FOUND, "not_found")
+            }
+            Err(_) => internal_500("remove_failed"),
+        }
+    }
+}
+
+/// Whether `name` is a safe **single** path component for a rename target:
+/// non-empty, not `.` / `..`, and free of path separators (`/`, `\`) and NUL
+/// (ADR-0047 D9). Rejecting (not stripping) keeps rename strictly in-place.
+fn is_clean_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
 }
 
 /// ENOTEMPTY raw errno (39 on Linux, 66 on macOS/BSD). Used as a portable
