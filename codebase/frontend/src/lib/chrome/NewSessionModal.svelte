@@ -19,7 +19,6 @@
 
   import Modal from '$lib/ui/Modal.svelte';
   import Button from '$lib/ui/Button.svelte';
-  import Input from '$lib/ui/Input.svelte';
   import FileExplorer from './FileExplorer.svelte';
   import { createSession, SESSION_NAME_REGEX } from '$lib/http/sessions';
   import type { SessionInfo } from '$lib/types/sessions';
@@ -39,6 +38,7 @@
   let explorerOpen = $state(false);
   let submitting = $state(false);
   let errorMessage = $state<string | null>(null);
+  let nameSuggested = $state(false);
 
   /** 실시간 validation — 빈 / pattern / duplicate. */
   let validationError = $derived.by((): string | null => {
@@ -55,6 +55,13 @@
   let canSubmit = $derived(
     !submitting && name.length > 0 && workspaceRoot.trim().length > 0 && validationError === null,
   );
+  let disabledReason = $derived.by((): string | null => {
+    if (submitting) return 'Creating session.';
+    if (workspaceRoot.trim().length === 0) return 'Pick a workspace directory.';
+    if (name.trim().length === 0) return 'Name the session.';
+    if (validationError !== null) return validationError;
+    return null;
+  });
 
   // Modal close 시 form reset
   $effect(() => {
@@ -64,6 +71,7 @@
       explorerOpen = false;
       errorMessage = null;
       submitting = false;
+      nameSuggested = false;
     }
   });
 
@@ -87,7 +95,18 @@
     explorerOpen = false;
     if (name.trim().length === 0) {
       name = suggestNameFromWorkspace(path);
+      nameSuggested = true;
     }
+  }
+
+  function onNameInput(): void {
+    nameSuggested = false;
+    errorMessage = null;
+  }
+
+  function onWorkspaceInput(): void {
+    nameSuggested = false;
+    errorMessage = null;
   }
 
   async function submit(): Promise<void> {
@@ -119,32 +138,84 @@
   dismissOnBackdrop={false}
 >
   {#snippet body()}
-    <p class="lead">
-      Pick a project directory and a short session name.
-    </p>
-    <Input
-      bind:value={name}
-      label="Session name"
-      placeholder="project-session"
-      autofocus
-      error={validationError ?? errorMessage}
-      {onkeydown}
-    />
-    <div class="workspace-field">
-      <Input
-        bind:value={workspaceRoot}
-        label="Workspace root"
-        placeholder="/path/to/project"
-        error={workspaceRoot.length === 0 ? null : null}
-        {onkeydown}
-      />
-      <Button onclick={() => (explorerOpen = true)} disabled={submitting}>Browse</Button>
+    <div class="form-stack">
+      <label class="field">
+        <span class="field-label">Workspace root <span class="required">*</span></span>
+        <span class="path-row">
+          <input
+            class="text-input mono"
+            bind:value={workspaceRoot}
+            placeholder="Pick a project directory..."
+            disabled={submitting}
+            autocomplete="off"
+            oninput={onWorkspaceInput}
+            {onkeydown}
+          />
+          <Button onclick={() => (explorerOpen = true)} disabled={submitting}>
+            <span class="btn-icon" aria-hidden="true">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.2 1.5h5.2A1.5 1.5 0 0 1 14 6v5.5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z"/>
+              </svg>
+            </span>
+            Browse
+          </Button>
+        </span>
+        <span class="field-hint">
+          Files, Preview, upload and download are scoped to this directory.
+        </span>
+      </label>
+
+      <label class="field" class:has-error={validationError !== null}>
+        <span class="field-label">Session name <span class="required">*</span></span>
+        <input
+          class="text-input"
+          bind:value={name}
+          placeholder="project-session"
+          disabled={submitting}
+          autocomplete="off"
+          oninput={onNameInput}
+          {onkeydown}
+        />
+        {#if nameSuggested}
+          <span class="suggested">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+              <path d="M8 2v12M2 8h12"/>
+            </svg>
+            suggested from folder - edit freely
+          </span>
+        {:else if validationError !== null}
+          <span class="field-error" role="alert">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+              <circle cx="8" cy="8" r="6"/>
+              <path d="M8 5v3.5M8 11h.01"/>
+            </svg>
+            {validationError}
+          </span>
+        {/if}
+      </label>
+
+      {#if errorMessage !== null}
+        <p class="field-error form-error" role="alert">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <circle cx="8" cy="8" r="6"/>
+            <path d="M8 5v3.5M8 11h.01"/>
+          </svg>
+          {errorMessage}
+        </p>
+      {/if}
     </div>
   {/snippet}
   {#snippet footer()}
+    <span class="footer-reason" class:hidden={disabledReason === null}>
+      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+        <circle cx="8" cy="8" r="6"/>
+        <path d="M8 5v3.5M8 11h.01"/>
+      </svg>
+      {disabledReason ?? 'Ready'}
+    </span>
     <Button variant="ghost" onclick={onClose} disabled={submitting}>Cancel</Button>
     <Button variant="primary" onclick={submit} disabled={!canSubmit}>
-      {submitting ? 'Creating…' : 'Create'}
+      {submitting ? 'Creating...' : 'Create session'}
     </Button>
   {/snippet}
 </Modal>
@@ -159,18 +230,118 @@
 />
 
 <style>
-  .lead {
-    margin: 0 0 var(--space-12);
-    font-size: var(--text-md);
-    color: var(--color-fg-muted);
-    line-height: var(--leading-normal);
+  .form-stack {
+    display: grid;
+    gap: var(--space-16);
   }
 
-  .workspace-field {
+  .field {
+    display: grid;
+    gap: var(--space-6);
+    min-width: 0;
+  }
+
+  .field-label {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-4);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--color-fg-muted);
+  }
+
+  .required {
+    color: var(--color-accent);
+  }
+
+  .path-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: var(--space-8);
-    align-items: end;
-    margin-top: var(--space-12);
+    align-items: center;
+    min-width: 0;
+  }
+
+  .text-input {
+    width: 100%;
+    min-width: 0;
+    height: 30px;
+    padding: 0 var(--space-10);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface-2);
+    color: var(--color-fg);
+    font: inherit;
+    font-size: var(--text-lg);
+    letter-spacing: -0.1px;
+  }
+
+  .text-input:focus {
+    outline: none;
+    border-color: var(--color-accent);
+    background: var(--color-surface);
+  }
+
+  .field.has-error .text-input {
+    border-color: var(--color-danger);
+  }
+
+  .mono {
+    font-family: var(--font-mono);
+    font-size: var(--text-md);
+  }
+
+  .field-hint,
+  .suggested,
+  .field-error,
+  .footer-reason {
+    font-size: var(--text-sm);
+    letter-spacing: -0.1px;
+  }
+
+  .field-hint {
+    color: var(--color-fg-muted);
+  }
+
+  .suggested,
+  .field-error,
+  .footer-reason {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-4);
+  }
+
+  .suggested {
+    color: var(--color-accent);
+    font-family: var(--font-mono);
+  }
+
+  .field-error {
+    margin: 0;
+    color: var(--color-danger);
+  }
+
+  .form-error {
+    padding: var(--space-8) var(--space-10);
+    border: 1px solid color-mix(in srgb, var(--color-danger) 34%, transparent);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--color-danger) 10%, transparent);
+  }
+
+  .footer-reason {
+    min-width: 0;
+    margin-right: auto;
+    color: var(--color-fg-muted);
+  }
+
+  .footer-reason.hidden {
+    visibility: hidden;
+  }
+
+  .btn-icon {
+    display: inline-flex;
+    align-items: center;
   }
 </style>

@@ -466,7 +466,66 @@
     const path = s.workspace_root.trim();
     return path.length > 0 ? path : 'Workspace unavailable';
   }
+
+  function compactWorkspacePath(s: EnrichedSession): string {
+    const path = workspacePath(s);
+    const parts = path.split('/').filter(Boolean);
+    if (parts.length === 0) return path;
+    if (parts.length <= 2) return parts.join('/');
+    return `.../${parts.slice(-2).join('/')}`;
+  }
+
+  function folderChipLabel(s: EnrichedSession): string {
+    const path = workspaceManifest.folderPath(s.folder_id);
+    return path.length > 0 ? path : 'Root';
+  }
 </script>
+
+{#snippet sessionFolderIcon()}
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <rect x="2.5" y="3" width="11" height="10" rx="1.5"/>
+    <path d="M2.5 6h11"/>
+  </svg>
+{/snippet}
+
+{#snippet workspaceIcon()}
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.2 1.5h5.2A1.5 1.5 0 0 1 14 6v5.5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z"/>
+  </svg>
+{/snippet}
+
+{#snippet moreIcon()}
+  <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" stroke="none" aria-hidden="true">
+    <circle cx="8" cy="3.5" r="1.1"/>
+    <circle cx="8" cy="8" r="1.1"/>
+    <circle cx="8" cy="12.5" r="1.1"/>
+  </svg>
+{/snippet}
+
+{#snippet editIcon()}
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M11 2.5l2.5 2.5M3 13l.6-2.4L10.5 3.7l2.5 2.5-6.9 6.9z"/>
+  </svg>
+{/snippet}
+
+{#snippet duplicateIcon()}
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <rect x="5" y="5" width="8" height="9" rx="1.2"/>
+    <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
+  </svg>
+{/snippet}
+
+{#snippet plusIcon()}
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+    <path d="M8 3v10M3 8h10"/>
+  </svg>
+{/snippet}
+
+{#snippet trashIcon()}
+  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M3 4.5h10M6 4.5V3h4v1.5M5 4.5l.6 8.5h4.8L11 4.5"/>
+  </svg>
+{/snippet}
 
 <Modal
   {open}
@@ -506,14 +565,14 @@
             <li class="folder-row" style={`padding-left: ${row.depth * 18}px`}>
               <button type="button" class="folder-main" onclick={() => void toggleFolder(row.folder)}>
                 <span class="glyph" aria-hidden="true">{row.folder.collapsed ? '›' : '⌄'}</span>
-                <span class="glyph" aria-hidden="true">□</span>
+                <span class="glyph folder-glyph" aria-hidden="true">{@render sessionFolderIcon()}</span>
                 <span class="folder-name">{row.folder.name}</span>
                 <span class="count">{row.childCount}</span>
               </button>
               <Dropdown>
                 {#snippet trigger({ toggle })}
                   <IconButton aria-label="Folder actions" title="Folder actions" size="sm" onclick={toggle}>
-                    <span class="glyph" aria-hidden="true">...</span>
+                    {@render moreIcon()}
                   </IconButton>
                 {/snippet}
                 {#snippet menu({ close })}
@@ -524,7 +583,7 @@
                       close();
                     }}
                   >
-                    <span class="glyph" aria-hidden="true">+</span>
+                    <span class="glyph" aria-hidden="true">{@render plusIcon()}</span>
                     <span>New session here</span>
                   </button>
                   <button
@@ -535,7 +594,7 @@
                       close();
                     }}
                   >
-                    <span class="glyph" aria-hidden="true">×</span>
+                    <span class="glyph" aria-hidden="true">{@render trashIcon()}</span>
                     <span>Delete folder</span>
                   </button>
                 {/snippet}
@@ -552,12 +611,18 @@
                 onclick={() => onSelect(row.session.name)}
               >
                 <span class="session-main">
-                  <span class="session-name">
-                    {row.session.name}
+                  <span class="session-title">
+                    <span class="session-name">{row.session.name}</span>
                   </span>
-                  <span class="session-workspace" title={workspacePath(row.session)}>
-                    <span class="workspace-label">Workspace</span>
-                    <span class="workspace-path mono">{workspacePath(row.session)}</span>
+                  <span class="session-chips">
+                    <span class="chip folder-chip" title={folderChipLabel(row.session)}>
+                      <span class="chip-icon">{@render sessionFolderIcon()}</span>
+                      <span class="chip-text">{folderChipLabel(row.session)}</span>
+                    </span>
+                    <span class="chip workspace-chip" title={workspacePath(row.session)}>
+                      <span class="chip-icon">{@render workspaceIcon()}</span>
+                      <span class="chip-text">{compactWorkspacePath(row.session)}</span>
+                    </span>
                   </span>
                   <span class="session-meta">{sessionMeta(row.session)}</span>
                 </span>
@@ -568,7 +633,7 @@
               <Dropdown>
                 {#snippet trigger({ toggle })}
                   <IconButton aria-label="Session actions" title="Session actions" size="sm" onclick={toggle}>
-                    <span class="glyph" aria-hidden="true">...</span>
+                    {@render moreIcon()}
                   </IconButton>
                 {/snippet}
                 {#snippet menu({ close })}
@@ -580,7 +645,7 @@
                       close();
                     }}
                   >
-                    <span class="glyph" aria-hidden="true">✎</span>
+                    <span class="glyph" aria-hidden="true">{@render editIcon()}</span>
                     <span>Rename</span>
                   </button>
                   <button
@@ -591,7 +656,7 @@
                       close();
                     }}
                   >
-                    <span class="glyph" aria-hidden="true">⧉</span>
+                    <span class="glyph" aria-hidden="true">{@render duplicateIcon()}</span>
                     <span>Duplicate</span>
                   </button>
                   <button
@@ -601,7 +666,7 @@
                       close();
                     }}
                   >
-                    <span class="glyph" aria-hidden="true">□</span>
+                    <span class="glyph" aria-hidden="true">{@render workspaceIcon()}</span>
                     <span>Change workspace</span>
                   </button>
                   <button
@@ -613,7 +678,7 @@
                       close();
                     }}
                   >
-                    <span class="glyph" aria-hidden="true">×</span>
+                    <span class="glyph" aria-hidden="true">{@render trashIcon()}</span>
                     <span>Remove</span>
                   </button>
                 {/snippet}
@@ -867,9 +932,17 @@
   .folder-row,
   .session-row-wrap {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
     gap: var(--space-4);
     align-items: center;
+  }
+
+  .folder-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .session-row-wrap {
+    grid-template-columns: minmax(0, 1fr) auto;
+    overflow: visible;
   }
 
   .folder-main,
@@ -924,43 +997,68 @@
   .session-main {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: var(--space-4);
     min-width: 0;
     flex: 1;
   }
 
-  .session-name {
+  .session-title {
     display: flex;
     align-items: center;
     gap: var(--space-6);
+    min-width: 0;
+  }
+
+  .session-name {
     font-size: var(--text-md);
     font-weight: var(--weight-medium);
   }
 
-  .session-workspace {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
+  .session-chips {
+    display: flex;
     align-items: center;
-    gap: var(--space-6);
+    gap: var(--space-8);
     min-width: 0;
-    color: var(--color-fg-muted);
-    font-size: var(--text-sm);
+    overflow: hidden;
   }
 
-  .workspace-label {
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-4);
+    height: 18px;
+    max-width: 100%;
+    min-width: 0;
+    padding: 0 var(--space-6);
+    border-radius: var(--radius-sm);
     font-family: var(--font-mono);
-    color: var(--color-fg-subtle);
-    text-transform: uppercase;
     font-size: 10px;
-    letter-spacing: 0.4px;
+    letter-spacing: -0.1px;
+    white-space: nowrap;
   }
 
-  .workspace-path {
+  .chip-icon {
+    display: grid;
+    place-items: center;
+    flex: 0 0 auto;
+  }
+
+  .chip-text {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    white-space: nowrap;
+  }
+
+  .folder-chip {
+    background: var(--color-surface-2);
+    border: 1px solid var(--color-border);
     color: var(--color-fg-muted);
+  }
+
+  .workspace-chip {
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-accent) 30%, transparent);
+    color: var(--color-accent);
   }
 
   .session-meta {
@@ -983,5 +1081,9 @@
     min-width: 14px;
     font-size: var(--text-base);
     line-height: 1;
+  }
+
+  .folder-glyph {
+    color: var(--color-fg-muted);
   }
 </style>

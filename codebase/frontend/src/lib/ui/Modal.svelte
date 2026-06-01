@@ -35,6 +35,10 @@
     dismissOnBackdrop?: boolean;
     /** Whether the Esc key should close. Default true. */
     dismissOnEsc?: boolean;
+    /** Width preset for the dialog shell. */
+    size?: 'sm' | 'md' | 'wide';
+    /** Let complex modal bodies own their own padding/header/footer bands. */
+    flushBody?: boolean;
     body: Snippet;
     footer?: Snippet;
   }
@@ -45,6 +49,8 @@
     title,
     dismissOnBackdrop = true,
     dismissOnEsc = true,
+    size = 'md',
+    flushBody = false,
     body,
     footer,
   }: Props = $props();
@@ -132,14 +138,14 @@
       role="dialog"
       aria-modal="true"
       aria-labelledby={title ? titleId : undefined}
-      class="modal-dialog"
+      class="modal-dialog modal-dialog-{size}"
     >
       {#if title}
         <header class="modal-header">
           <h2 id={titleId} class="modal-title">{title}</h2>
         </header>
       {/if}
-      <div class="modal-body">
+      <div class="modal-body" class:modal-body-flush={flushBody}>
         {@render body()}
       </div>
       {#if footer}
@@ -168,7 +174,6 @@
 
   .modal-dialog {
     width: 100%;
-    max-width: 480px;
     background: var(--color-surface);
     color: var(--color-fg);
     border: 1px solid var(--color-border-strong);
@@ -176,6 +181,18 @@
     box-shadow: var(--shadow-lg);
     overflow: hidden;
     animation: dialog-in var(--motion-slow) var(--motion-easing);
+  }
+
+  .modal-dialog-sm {
+    max-width: 360px;
+  }
+
+  .modal-dialog-md {
+    max-width: 480px;
+  }
+
+  .modal-dialog-wide {
+    max-width: 560px;
   }
 
   .modal-header {
@@ -193,6 +210,10 @@
     padding: var(--space-12) var(--space-24);
     font-size: var(--text-base);
     color: var(--color-fg-muted);
+  }
+
+  .modal-body-flush {
+    padding: 0;
   }
 
   .modal-footer {

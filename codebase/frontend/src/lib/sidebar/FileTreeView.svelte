@@ -61,6 +61,18 @@
     return path || 'Server workspace';
   }
 
+  function basename(path: string): string {
+    const leaf = path.split('/').filter(Boolean).pop();
+    return leaf ?? displayPath(path);
+  }
+
+  function compactPath(path: string): string {
+    const display = displayPath(path);
+    const parts = display.split('/').filter(Boolean);
+    if (parts.length <= 2) return display;
+    return `.../${parts.slice(-2).join('/')}`;
+  }
+
   function extension(path: string): string {
     const name = path.split('/').filter(Boolean).pop()?.toLowerCase() ?? path.toLowerCase();
     const dot = name.lastIndexOf('.');
@@ -121,6 +133,11 @@
     } finally {
       rootLoading = false;
     }
+  }
+
+  async function refreshRoot(): Promise<void> {
+    if (activeName === null) return;
+    await loadRoot(rootPath || targetRoot);
   }
 
   async function loadDir(path: string): Promise<void> {
@@ -270,30 +287,90 @@
 
 <div class="file-tree">
   <header class="files-head">
+    <span class="workspace-icon" aria-hidden="true">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.2 1.5h5.2A1.5 1.5 0 0 1 14 6v5.5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z"/>
+      </svg>
+    </span>
     <div class="workspace-meta">
-      <span class="eyebrow">Workspace</span>
+      <span class="workspace-base" title={displayPath(rootPath || targetRoot)}>
+        {basename(rootPath || targetRoot)}
+      </span>
       <span class="workspace-path mono" title={displayPath(rootPath || targetRoot)}>
-        {displayPath(rootPath || targetRoot)}
+        {compactPath(rootPath || targetRoot)}
       </span>
     </div>
-    <button
-      type="button"
-      class="change-btn"
-      disabled={activeName === null}
-      onclick={() => (changeOpen = true)}
-    >
-      Change
-    </button>
+    <div class="head-actions">
+      <button
+        type="button"
+        class="icon-btn"
+        disabled={activeName === null || rootLoading}
+        title="Refresh files"
+        aria-label="Refresh files"
+        onclick={() => void refreshRoot()}
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+          <path d="M13 8a5 5 0 1 1-1.5-3.5M13 3v2.5h-2.5"/>
+        </svg>
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        disabled
+        title="Upload requires backend support"
+        aria-label="Upload here"
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+          <path d="M8 11V3M5 6l3-3 3 3M3 13h10"/>
+        </svg>
+      </button>
+      <button
+        type="button"
+        class="icon-btn"
+        disabled={activeName === null}
+        title="Change workspace"
+        aria-label="Change workspace"
+        onclick={() => (changeOpen = true)}
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M6 11H4.5a3.5 3.5 0 0 1 0-7H6"/>
+          <path d="M10 4h1.5a3.5 3.5 0 0 1 0 7H10"/>
+          <path d="M5.5 7.5h5"/>
+        </svg>
+      </button>
+    </div>
   </header>
 
   {#if activeName === null}
-    <p class="state">Connect a session to browse files.</p>
+    <div class="panel-state muted">
+      <span class="state-disc" aria-hidden="true">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.2 1.5h5.2A1.5 1.5 0 0 1 14 6v5.5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z"/>
+        </svg>
+      </span>
+      <span class="state-lead">No active session</span>
+      <span class="state-desc">Open or create a session to browse its workspace.</span>
+    </div>
   {:else if rootLoading}
-    <p class="state">Loading files…</p>
+    <div class="shimmer-stack" aria-label="Loading files">
+      <span></span><span></span><span></span>
+    </div>
   {:else if rootError !== null}
-    <p class="state error">{rootError}</p>
+    <div class="panel-state danger" role="alert">
+      <span class="state-disc" aria-hidden="true">!</span>
+      <span class="state-lead">Unable to read workspace</span>
+      <span class="state-desc">{rootError}</span>
+    </div>
   {:else if rows.length === 0}
-    <p class="state">Empty workspace.</p>
+    <div class="panel-state muted">
+      <span class="state-disc" aria-hidden="true">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.2 1.5h5.2A1.5 1.5 0 0 1 14 6v5.5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z"/>
+        </svg>
+      </span>
+      <span class="state-lead">Empty workspace</span>
+      <span class="state-desc">This folder has no visible files.</span>
+    </div>
   {:else}
     <ul class="tree" role="tree" aria-label="Workspace file tree">
       {#each rows as row (row.path)}
@@ -305,10 +382,12 @@
           aria-selected={selected}
           aria-expanded={row.entry.kind === 'directory' ? row.expanded : undefined}
         >
-          <div
-            class="row-inner"
-            style:padding-left={`${row.depth * 16 + 4}px`}
-          >
+            <div
+              class="row-inner"
+              style:padding-left={row.entry.kind === 'directory'
+                ? `${row.depth * 16 + 4}px`
+                : `${row.depth * 16 + 20}px`}
+            >
             <span
               class="caret"
               class:caret-disabled={row.entry.kind !== 'directory'}
@@ -320,7 +399,11 @@
               onkeydown={() => {}}
             >
               {#if row.entry.kind === 'directory'}
-                {row.loading ? '…' : row.expanded ? '▾' : '▸'}
+                {#if row.loading}
+                  <span class="tiny-spin" aria-hidden="true"></span>
+                {:else}
+                  {row.expanded ? '▾' : '▸'}
+                {/if}
               {/if}
             </span>
             <button
@@ -364,11 +447,21 @@
 
   .files-head {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: var(--space-8);
-    padding: var(--space-10) var(--space-10) var(--space-8);
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: var(--space-6);
+    align-items: center;
+    padding: var(--space-8) var(--space-10);
     border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface-2);
     flex: 0 0 auto;
+  }
+
+  .workspace-icon {
+    width: 16px;
+    height: 16px;
+    display: grid;
+    place-items: center;
+    color: var(--color-accent);
   }
 
   .workspace-meta {
@@ -378,16 +471,18 @@
     gap: 2px;
   }
 
-  .eyebrow {
-    font-family: var(--font-mono);
-    font-size: 10px;
-    text-transform: uppercase;
-    color: var(--color-fg-subtle);
-    letter-spacing: 0.6px;
-  }
-
   .mono {
     font-family: var(--font-mono);
+  }
+
+  .workspace-base {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--color-fg);
+    font-size: var(--text-md);
+    font-weight: var(--weight-semibold);
+    letter-spacing: -0.1px;
   }
 
   .workspace-path {
@@ -396,22 +491,38 @@
     white-space: nowrap;
     color: var(--color-fg-muted);
     font-size: var(--text-sm);
+    direction: rtl;
+    text-align: left;
   }
 
-  .change-btn {
-    align-self: end;
+  .head-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+  }
+
+  .icon-btn {
+    width: 24px;
     height: 24px;
-    padding: 0 var(--space-8);
-    border: 1px solid var(--color-border-strong);
+    display: inline-grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
-    background: var(--color-surface-2);
-    color: var(--color-fg);
-    font: inherit;
-    font-size: var(--text-sm);
+    background: transparent;
+    color: var(--color-fg-muted);
     cursor: pointer;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
   }
 
-  .change-btn:disabled {
+  .icon-btn:hover:not(:disabled) {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
+  }
+
+  .icon-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
   }
@@ -478,10 +589,11 @@
     width: 16px;
     flex: 0 0 16px;
     display: inline-block;
-    text-align: left;
+    text-align: center;
     color: var(--color-fg-muted);
     cursor: pointer;
     user-select: none;
+    transition: transform var(--motion-fast) var(--motion-easing);
   }
 
   .caret-disabled {
@@ -517,15 +629,47 @@
     color: var(--color-accent);
   }
 
-  .state {
-    margin: 0;
-    padding: var(--space-16) var(--space-12);
-    color: var(--color-fg-muted);
+  .panel-state {
+    flex: 1 1 auto;
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: var(--space-8);
+    padding: var(--space-24) var(--space-12);
     text-align: center;
-    font-size: var(--text-md);
+    color: var(--color-fg-muted);
   }
 
-  .state.error,
+  .state-disc {
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: var(--color-glass-1);
+    color: var(--color-fg-muted);
+    font-family: var(--font-mono);
+  }
+
+  .panel-state.danger .state-disc {
+    color: var(--color-danger);
+    background: color-mix(in srgb, var(--color-danger) 14%, transparent);
+  }
+
+  .state-lead {
+    color: var(--color-fg);
+    font-size: var(--text-md);
+    font-weight: var(--weight-semibold);
+  }
+
+  .state-desc {
+    max-width: 190px;
+    color: var(--color-fg-muted);
+    font-size: var(--text-sm);
+    letter-spacing: -0.1px;
+    line-height: var(--leading-normal);
+  }
+
   .row-error {
     color: var(--color-danger);
   }
@@ -533,5 +677,45 @@
   .row-error {
     margin: 2px 0 4px 28px;
     font-size: var(--text-sm);
+  }
+
+  .shimmer-stack {
+    padding: var(--space-12);
+    display: grid;
+    gap: var(--space-8);
+  }
+
+  .shimmer-stack span {
+    height: 20px;
+    border-radius: var(--radius-sm);
+    background: linear-gradient(
+      90deg,
+      var(--color-surface-2),
+      var(--color-glass-1),
+      var(--color-surface-2)
+    );
+    background-size: 180% 100%;
+    animation: shimmer 1.1s linear infinite;
+  }
+
+  .tiny-spin {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 1.5px solid var(--color-border-strong);
+    border-top-color: var(--color-accent);
+    animation: spin 900ms linear infinite;
+  }
+
+  @keyframes shimmer {
+    to {
+      background-position: -180% 0;
+    }
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>
