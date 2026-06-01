@@ -78,6 +78,15 @@ pub struct Layout {
     /// Canvas viewport state (pan + zoom).
     #[serde(default)]
     pub viewport: Viewport,
+    /// Session Workspace(B) absolute path — that project's working directory
+    /// inside the Server Workspace(A). ADR-0045 D4 / ADR-0046 D1 (amends
+    /// ADR-0018 D3). `None` on legacy/edge records; the effective workspace is
+    /// then resolved via the fallback chain
+    /// `workspace_root ?? config.default_session_workspace ?? $HOME`. New
+    /// sessions always set it (ADR-0046 D5). v2 stays additive — a missing
+    /// field round-trips to `None`.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
 }
 
 impl Layout {
@@ -88,6 +97,7 @@ impl Layout {
             groups: Vec::new(),
             items: Vec::new(),
             viewport: Viewport::default(),
+            workspace_root: None,
         }
     }
 }
@@ -1102,7 +1112,11 @@ pub fn degrade_dangling_path_endpoints(layout: &mut Layout) {
     // snippets, …), so skip the O(N) id-set build + clone entirely when there
     // is nothing to degrade. Saves N String clones + a HashSet on every PUT
     // for the common path-less case.
-    if !layout.items.iter().any(|it| matches!(it, Item::Path { .. })) {
+    if !layout
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Path { .. }))
+    {
         return;
     }
     let live_ids: std::collections::HashSet<String> = layout
@@ -1154,7 +1168,11 @@ fn degrade_endpoint(ep: &mut PathEndpoint, live_ids: &std::collections::HashSet<
 pub fn recompute_path_bboxes(layout: &mut Layout) {
     // Fast path: no `path` items → nothing to recompute. Skips the O(N)
     // geometry-index build + id clones that Pass 2 would never consume.
-    if !layout.items.iter().any(|it| matches!(it, Item::Path { .. })) {
+    if !layout
+        .items
+        .iter()
+        .any(|it| matches!(it, Item::Path { .. }))
+    {
         return;
     }
     // Pass 1 — snapshot every non-path item's geometry by id.
@@ -1371,6 +1389,7 @@ mod tests {
                 common: item_common(UUID_A),
             }],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         let s = serde_json::to_string(&l).unwrap();
         let parsed: Layout = serde_json::from_str(&s).unwrap();
@@ -1429,6 +1448,7 @@ mod tests {
                 y: 20.0,
                 zoom: 1.5,
             },
+            workspace_root: None,
         };
         let s = serde_json::to_string(&l).unwrap();
         let parsed: Layout = serde_json::from_str(&s).unwrap();
@@ -1851,6 +1871,7 @@ mod tests {
                 path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W),
             ],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         assert_eq!(validate(&l), Ok(()));
         let v = serde_json::to_value(&l).unwrap();
@@ -1871,6 +1892,7 @@ mod tests {
                 path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W),
             ],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         assert_eq!(validate(&l), Err(ValidationError::PathEndpointMissing));
     }
@@ -1898,6 +1920,7 @@ mod tests {
                 path_between(UUID_C, UUID_A, line_id, Anchor::E, Anchor::W),
             ],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         assert_eq!(validate(&l), Err(ValidationError::PathInvalidEndpoint));
     }
@@ -1914,6 +1937,7 @@ mod tests {
                 path_between(UUID_C, UUID_A, UUID_A, Anchor::N, Anchor::S),
             ],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         assert_eq!(validate(&l), Err(ValidationError::PathSelfLoop));
     }
@@ -1938,6 +1962,7 @@ mod tests {
                 p,
             ],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         assert_eq!(
             validate(&l),
@@ -1970,6 +1995,7 @@ mod tests {
                 p,
             ],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         assert_eq!(
             validate(&l),
@@ -1994,6 +2020,7 @@ mod tests {
                 path_between(UUID_C, UUID_A, UUID_B, Anchor::E, Anchor::W),
             ],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         recompute_path_bboxes(&mut l);
         let path = l
@@ -2050,6 +2077,7 @@ mod tests {
                 p,
             ],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         recompute_path_bboxes(&mut l);
         let Item::Path { from, .. } = l.items.last().unwrap() else {
@@ -2087,6 +2115,7 @@ mod tests {
             groups: vec![],
             items: vec![rect_at(UUID_A, 0.0, 0.0, 100.0, 50.0), p],
             viewport: Viewport::default(),
+            workspace_root: None,
         };
         degrade_dangling_path_endpoints(&mut l);
         let Item::Path { from, to, .. } = l

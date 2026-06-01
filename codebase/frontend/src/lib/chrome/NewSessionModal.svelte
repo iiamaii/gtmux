@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * NewSessionModal — 이름 입력 + Create.
+   * NewSessionModal — project-first session creation.
    *
    * 정본:
    * - ADR-0019 D8 (session name validation `^[A-Za-z0-9_-]{1,64}$`)
@@ -20,6 +20,7 @@
   import Modal from '$lib/ui/Modal.svelte';
   import Button from '$lib/ui/Button.svelte';
   import Input from '$lib/ui/Input.svelte';
+  import FileExplorer from './FileExplorer.svelte';
   import { createSession, SESSION_NAME_REGEX } from '$lib/http/sessions';
   import type { SessionInfo } from '$lib/types/sessions';
 
@@ -34,6 +35,8 @@
   const { open, existingNames = [], onClose, onCreated }: Props = $props();
 
   let name = $state('');
+  let workspaceRoot = $state('');
+  let explorerOpen = $state(false);
   let submitting = $state(false);
   let errorMessage = $state<string | null>(null);
 
@@ -50,24 +53,49 @@
   });
 
   let canSubmit = $derived(
-    !submitting && name.length > 0 && validationError === null,
+    !submitting && name.length > 0 && workspaceRoot.trim().length > 0 && validationError === null,
   );
 
   // Modal close 시 form reset
   $effect(() => {
     if (!open) {
       name = '';
+      workspaceRoot = '';
+      explorerOpen = false;
       errorMessage = null;
       submitting = false;
     }
   });
+
+  function suggestNameFromWorkspace(path: string): string {
+    const raw = path.split('/').filter(Boolean).pop() ?? 'session';
+    const base = raw
+      .replace(/[^A-Za-z0-9_-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 64) || 'session';
+    if (!existingNames.includes(base)) return base;
+    for (let i = 2; i < 1000; i += 1) {
+      const suffix = `-${i}`;
+      const candidate = `${base.slice(0, 64 - suffix.length)}${suffix}`;
+      if (!existingNames.includes(candidate)) return candidate;
+    }
+    return base;
+  }
+
+  function onWorkspacePicked(path: string): void {
+    workspaceRoot = path;
+    explorerOpen = false;
+    if (name.trim().length === 0) {
+      name = suggestNameFromWorkspace(path);
+    }
+  }
 
   async function submit(): Promise<void> {
     if (!canSubmit) return;
     submitting = true;
     errorMessage = null;
     try {
-      const res = await createSession({ name });
+      const res = await createSession({ name, workspace_root: workspaceRoot.trim() });
       onCreated(res.session);
     } catch (err) {
       errorMessage = err instanceof Error ? err.message : String(err);
@@ -92,16 +120,26 @@
 >
   {#snippet body()}
     <p class="lead">
-      Pick a short name. Letters, digits, <code>_</code>, <code>-</code> only.
+      Pick a project directory and a short session name.
     </p>
     <Input
       bind:value={name}
       label="Session name"
-      placeholder="my-workspace"
+      placeholder="project-session"
       autofocus
       error={validationError ?? errorMessage}
       {onkeydown}
     />
+    <div class="workspace-field">
+      <Input
+        bind:value={workspaceRoot}
+        label="Workspace root"
+        placeholder="/path/to/project"
+        error={workspaceRoot.length === 0 ? null : null}
+        {onkeydown}
+      />
+      <Button onclick={() => (explorerOpen = true)} disabled={submitting}>Browse</Button>
+    </div>
   {/snippet}
   {#snippet footer()}
     <Button variant="ghost" onclick={onClose} disabled={submitting}>Cancel</Button>
@@ -111,6 +149,15 @@
   {/snippet}
 </Modal>
 
+<FileExplorer
+  open={explorerOpen}
+  mode="dir"
+  title="Choose workspace root"
+  initialDir={workspaceRoot}
+  onCancel={() => (explorerOpen = false)}
+  onPick={onWorkspacePicked}
+/>
+
 <style>
   .lead {
     margin: 0 0 var(--space-12);
@@ -119,12 +166,11 @@
     line-height: var(--leading-normal);
   }
 
-  .lead code {
-    font-family: var(--font-mono);
-    font-size: var(--text-base);
-    padding: 1px 5px;
-    border-radius: 3px;
-    background: var(--color-surface-2);
-    color: var(--color-fg);
+  .workspace-field {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--space-8);
+    align-items: end;
+    margin-top: var(--space-12);
   }
 </style>

@@ -258,18 +258,17 @@ pub async fn upload_from_path_handler(
         }
     };
 
-    let workspace_canonical = match wm.path().canonicalize() {
-        Ok(path) => path,
-        Err(e) => {
-            warn!(error = %e, "assets: workspace canonicalize failed");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "workspace_canonicalize_failed" })),
-            )
-                .into_response();
-        }
-    };
-    if !canonical.starts_with(&workspace_canonical) {
+    // ADR-0046 D3/§보안 — the unified file explorer materializes image/document
+    // selections through this endpoint, so the source must be clamped to the
+    // **Server Workspace(A)** sandbox + M2 denylist (the same single guard as
+    // the picker / mkdir / rmdir / workspace_root), NOT to the Store(C). The
+    // previous `starts_with(wm.path())` rooted this at the Store and 403'd every
+    // real project file (the same bug ADR-0046 D3 fixed for `fs_list`).
+    if !crate::fs_guard::is_path_allowed(
+        &canonical,
+        state.server_workspace.as_path(),
+        &state.fs_denylist,
+    ) {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({ "error": "source_not_allowed" })),
@@ -415,8 +414,7 @@ pub async fn serve_handler(
     // Read the (immutable, content-addressed) asset off the blocking pool so a
     // large image read doesn't stall a tokio worker thread.
     let read_path = path.clone();
-    let read_result =
-        tokio::task::spawn_blocking(move || std::fs::read(&read_path)).await;
+    let read_result = tokio::task::spawn_blocking(move || std::fs::read(&read_path)).await;
     let bytes = match read_result {
         Ok(Ok(b)) => b,
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {

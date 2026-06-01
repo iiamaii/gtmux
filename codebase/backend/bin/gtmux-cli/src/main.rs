@@ -86,13 +86,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Start a gtmux Server (spawns dedicated tmux daemon per ADR-0009).
+    /// Start a gtmux Server Instance.
     Start {
-        /// Session name; binds 1:1:1 to Server : tmux session : port.
-        #[arg(long)]
-        session: String,
+        /// Server Instance name. `--session` is a deprecated alias.
+        #[arg(long = "name", visible_alias = "session")]
+        name: String,
         /// HTTP/WS listen port. When omitted the value is taken from the
-        /// per-session config file (D21 c6 port lookup). When provided here
+        /// per-instance config file (D21 c6 port lookup). When provided here
         /// the CLI flag wins — ADR-0007 D2 immutable bind still holds because
         /// the override happens *before* the first listener call.
         #[arg(long)]
@@ -101,22 +101,25 @@ enum Cmd {
         /// + env-only — useful for first-run / smoke contexts.
         #[arg(long = "config", value_name = "PATH")]
         config_path: Option<PathBuf>,
-        /// Workspace storage directory (ADR-0019 D2 / D11, boot-immutable).
-        /// Overrides the TOML `workspace_path` field. When neither is set the
-        /// default is `${XDG_DATA_HOME:-~/.local/share}/gtmux/workspace/`.
+        /// Server Workspace(A) root — the fs sandbox this instance can
+        /// browse / spawn / open inside (ADR-0045 D3, boot-immutable).
+        /// Overrides the TOML `server_workspace` field; defaults to `$HOME`.
+        /// NOTE: under ADR-0045 this flag no longer designates the Store(C)
+        /// (gtmux's internal session storage) — the Store is now instance-
+        /// derived (`…/gtmux/store/<instance>/`, config `workspace_path` to
+        /// override). Must already exist (boot fails otherwise).
         #[arg(long = "workspace", value_name = "PATH")]
         workspace_path: Option<PathBuf>,
     },
-    /// Stop a running gtmux Server (소켓·daemon은 그대로 둔다).
+    /// Stop a running gtmux Server Instance.
     ///
-    /// Reads the pidfile at `${XDG_STATE_HOME}/gtmux/<session>.pid`, sends
+    /// Reads the pidfile at `${XDG_STATE_HOME}/gtmux/<name>.pid`, sends
     /// SIGTERM, and waits up to 5 s for the process to exit. ADR-0009 D5
-    /// is preserved: the tmux daemon (and therefore session / pane state)
-    /// survives this call so a subsequent `gtmux start --session <name>`
-    /// can re-attach via `new-session -A` (D21 c2).
+    /// is preserved for the state-file identity: state files survive so a
+    /// subsequent `gtmux start --name <name>` can reuse the same instance.
     Stop {
-        #[arg(long)]
-        session: String,
+        #[arg(long = "name", visible_alias = "session")]
+        name: String,
         /// On SIGTERM grace timeout, escalate to SIGKILL instead of
         /// returning exit 6. Use sparingly — SIGKILL gives the server no
         /// chance to flush layout state or close WS connections cleanly.
@@ -125,40 +128,49 @@ enum Cmd {
     },
     /// Teardown: ADR-0009 §D6 5-step cleanup (socket·token·layout·pid·config).
     Teardown {
-        /// Session name (positional or `--session`). Required.
-        #[arg(long)]
-        session: String,
+        /// Server Instance name. `--session` is a deprecated alias.
+        #[arg(long = "name", visible_alias = "session")]
+        name: String,
         /// Skip the live-daemon refusal — issue `kill-server` outright and
         /// reap the socket after a short settling delay. The user-visible
         /// confirmation prompt that normally precedes this flag lives in
         /// the CLI's TTY branch (Use --force on non-interactive callers).
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// Preserve the per-session state files (token / layout / pid).
+        /// Preserve the per-instance state files (token / layout / pid).
         /// Useful when capturing post-mortem evidence; the operator can
         /// remove these by hand afterwards.
         #[arg(long = "keep-state", default_value_t = false)]
         keep_state: bool,
-        /// Preserve `${XDG_CONFIG_HOME}/gtmux/<session>.config.toml` so the
-        /// Server can be brought back up with the same identity (D21 c8).
+        /// Preserve `${XDG_CONFIG_HOME}/gtmux/<name>.config.toml` so the
+        /// Server Instance can be brought back up with the same identity.
         #[arg(long = "keep-config", default_value_t = false)]
         keep_config: bool,
     },
-    /// Rotate the session token (cloud 모드 전용; local은 매 start 재발급).
+    /// Rotate the instance token (cloud 모드 전용; local은 매 start 재발급).
     RotateToken {
-        #[arg(long)]
-        session: String,
+        #[arg(long = "name", visible_alias = "session")]
+        name: String,
     },
     /// Status: running Servers + bound ports + daemon health summary.
     ///
-    /// With `--session`, prints a single-row table. Without it, enumerates
+    /// With `--name`, prints a single-row table. Without it, enumerates
     /// every `${XDG_STATE_HOME}/gtmux/*.token` and probes the matching
-    /// daemon via `tmux ... has-session`.
+    /// Server Instance.
     Status {
-        /// Restrict the report to one session. When omitted every session
-        /// with a token file is listed.
-        #[arg(long)]
-        session: Option<String>,
+        /// Restrict the report to one Server Instance. `--session` is a
+        /// deprecated alias.
+        #[arg(long = "name", visible_alias = "session")]
+        name: Option<String>,
+    },
+    /// Read / export / import session records of an instance's workspace
+    /// (ADR-0044 D-C2). Offline-tolerant — operates directly on the workspace
+    /// dir, so the server need not be running. Mutation (create/delete/rename/
+    /// move) is intentionally excluded: those go through the HTTP API so they
+    /// serialise on the live server's manifest lock + attach lock.
+    Session {
+        #[command(subcommand)]
+        command: SessionCmd,
     },
     /// Set or replace the password used by ADR-0020 password-mode auth.
     /// Prompts twice on the TTY (or reads from stdin in non-interactive
@@ -171,11 +183,57 @@ enum Cmd {
     ResetPassword,
 }
 
+/// `gtmux session <ls|export|import>` — offline session-record tooling
+/// (ADR-0044 D-C2). `--name <instance>` selects which instance's workspace to
+/// read; `--workspace <path>` overrides the resolved dir (use it when the
+/// instance's config pins a non-default `workspace_path`).
+#[derive(Debug, Subcommand)]
+enum SessionCmd {
+    /// List session records as a folder tree (organisation from the manifest).
+    Ls {
+        #[arg(long = "name", visible_alias = "instance")]
+        name: String,
+        #[arg(long = "workspace", value_name = "PATH")]
+        workspace_path: Option<PathBuf>,
+    },
+    /// Export one session as an ADR-0029 envelope (layout-only) to a file
+    /// (`-o`) or stdout.
+    Export {
+        #[arg(long = "name", visible_alias = "instance")]
+        name: String,
+        /// Session record name to export.
+        session: String,
+        /// Output file. Omit to write the envelope to stdout.
+        #[arg(short = 'o', long = "out", value_name = "FILE")]
+        out: Option<PathBuf>,
+        #[arg(long = "workspace", value_name = "PATH")]
+        workspace_path: Option<PathBuf>,
+    },
+    /// Import a session envelope (or raw v2 layout) file as a new record.
+    /// The manifest absorbs it at the next server `GET /api/sessions`
+    /// (self-heal → root append), so no manifest mutation happens here.
+    Import {
+        #[arg(long = "name", visible_alias = "instance")]
+        name: String,
+        /// Path to the envelope/layout JSON file.
+        file: PathBuf,
+        /// Name for the imported record. Defaults to the envelope's
+        /// `session_name`, then the file stem.
+        #[arg(long = "name-as", value_name = "NEW")]
+        name_as: Option<String>,
+        #[arg(long = "workspace", value_name = "PATH")]
+        workspace_path: Option<PathBuf>,
+    },
+}
+
 fn main() -> ExitCode {
     // We hand-roll the runtime so `main` can convert anyhow errors into the
     // grill-D20 exit-code matrix without losing context (clap's anyhow path
     // collapses everything to exit 1).
     let cli = Cli::parse();
+    if deprecated_session_alias_used() {
+        eprintln!("gtmux: --session is deprecated; use --name.");
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -189,12 +247,12 @@ fn main() -> ExitCode {
 
     match cli.command {
         Cmd::Start {
-            session,
+            name,
             port,
             config_path,
             workspace_path,
         } => match rt.block_on(start(StartArgs {
-            session,
+            instance: name,
             port,
             config_path,
             workspace_override: workspace_path,
@@ -202,23 +260,29 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => report_start_error(e),
         },
-        Cmd::Stop { session, force } => rt.block_on(stop(&session, force)),
+        Cmd::Stop { name, force } => rt.block_on(stop(&name, force)),
         Cmd::Teardown {
-            session,
+            name,
             force,
             keep_state,
             keep_config,
         } => rt.block_on(teardown_cmd(TeardownArgs {
-            session,
+            instance: name,
             force,
             keep_state,
             keep_config,
         })),
-        Cmd::RotateToken { session } => rotate_token_cmd(&session),
-        Cmd::Status { session } => rt.block_on(status_cmd(session.as_deref())),
+        Cmd::RotateToken { name } => rotate_token_cmd(&name),
+        Cmd::Status { name } => rt.block_on(status_cmd(name.as_deref())),
+        Cmd::Session { command } => session_cmd(command),
         Cmd::SetPassword => set_password_cmd(),
         Cmd::ResetPassword => reset_password_cmd(),
     }
+}
+
+fn deprecated_session_alias_used() -> bool {
+    std::env::args_os()
+        .any(|arg| arg == "--session" || arg.to_string_lossy().starts_with("--session="))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -226,11 +290,12 @@ fn main() -> ExitCode {
 // ────────────────────────────────────────────────────────────────────────────
 
 struct StartArgs {
-    session: String,
+    instance: String,
     port: Option<u16>,
     config_path: Option<PathBuf>,
-    /// `--workspace <path>` override (ADR-0019 D2 / D11). Beats the TOML
-    /// `workspace_path` field; both unset → XDG_DATA_HOME default.
+    /// `--workspace <path>` override (ADR-0045 D3). Now designates the Server
+    /// Workspace(A), the fs sandbox root — beats config `server_workspace`;
+    /// both unset → `$HOME`. (No longer the Store/`workspace_path` override.)
     workspace_override: Option<PathBuf>,
 }
 
@@ -263,20 +328,20 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         return Err(StartError::NestedTmux(val).into());
     }
 
-    // 2) config — figment chain. CLI `--session` and `--port` are passed in as
+    // 2) config — figment chain. CLI `--name` and `--port` are passed in as
     //    figment overrides so they win against TOML / env *before* validation
     //    runs. Mutating `config.server.port` after load is the old path; it
     //    fails when the TOML omits `[server].port` because the sentinel 0 dies
     //    in `validate()` before the CLI ever gets a chance to speak. `bind`
     //    is intentionally not overridable here (security mode D22 flips on it).
     let default_config_path = if args.config_path.is_none() {
-        match config_path_for(&args.session) {
+        match config_path_for(&args.instance) {
             Ok(path) if path.exists() => Some(path),
             Ok(_) => None,
             Err(e) => {
                 warn!(
                     error = %e,
-                    session = %args.session,
+                    instance = %args.instance,
                     "default config path resolution failed; continuing with CLI/env/default config"
                 );
                 None
@@ -290,31 +355,30 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         .as_deref()
         .or(default_config_path.as_deref());
     let config =
-        load_config(config_path, &args.session, args.port).context("loading gtmux config")?;
+        load_config(config_path, &args.instance, args.port).context("loading gtmux config")?;
 
-    // 2a) pidfile liveness — refuse duplicate server bind on the same session
-    //     before we go anywhere near tmux. ADR-0007 D2's 1:1:1 invariant
-    //     forbids two Servers per session; the pidfile is the cheap canonical
+    // 2a) pidfile liveness — refuse duplicate server bind on the same instance
+    //     before we go anywhere near bind/listen. The pidfile is the cheap canonical
     //     check. Stale pidfiles (server crashed) downgrade to a warning and
     //     are overwritten in step 10a.
     match check_pidfile_liveness(&config.server.session) {
         Ok(PidLiveness::Alive(pid)) => {
             return Err(StartError::AlreadyRunning {
-                session: config.server.session.clone(),
+                instance: config.server.session.clone(),
                 pid,
             }
             .into());
         }
         Ok(PidLiveness::Stale(pid)) => {
             warn!(
-                session = %config.server.session,
+                instance = %config.server.session,
                 stale_pid = pid,
                 "stale gtmux pidfile detected; previous server appears to have crashed — overwriting on bind"
             );
         }
         Ok(PidLiveness::Malformed) => {
             warn!(
-                session = %config.server.session,
+                instance = %config.server.session,
                 "malformed gtmux pidfile detected; overwriting on bind"
             );
         }
@@ -336,7 +400,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     init_tracing(&config);
 
     info!(
-        session = %config.server.session,
+        instance = %config.server.session,
         port = config.server.port,
         bind = %config.server.bind,
         mode = ?mode,
@@ -344,7 +408,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     );
 
     // 4a) Boot-time orphan reap (ADR-0014 D11) — scan all live processes
-    //     for `GTMUX_SESSION=<our-session>` from a *previous* gtmux Server
+    //     for `GTMUX_SERVER_INSTANCE=<our-instance>` or legacy
+    //     `GTMUX_SESSION=<our-instance>` from a *previous* gtmux Server
     //     run (`GTMUX_SERVER_PID != our pid`). Common on graceful boot
     //     this returns 0 candidates in milliseconds. After a crash
     //     (SIGKILL / OOM / panic) it cleans up the orphaned shells.
@@ -352,7 +417,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     if !audit.candidates.is_empty() {
         info!(
             reaped = audit.candidates.len(),
-            "process_audit: cleaned up {} orphan(s) from previous session",
+            "process_audit: cleaned up {} orphan(s) from previous instance",
             audit.candidates.len()
         );
     }
@@ -362,7 +427,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //    instant + infallible, and the per-pane reader / writer / wait
     //    threads come into existence lazily on the first `spawn()` call.
     //    `with_session(...)` tags every spawned child with
-    //    `GTMUX_SESSION=<session>` + `GTMUX_SERVER_PID=<pid>` so the
+    //    `GTMUX_SERVER_INSTANCE=<instance>` + legacy `GTMUX_SESSION=<instance>`
+    //    + `GTMUX_SERVER_PID=<pid>` so the
     //    boot-time orphan scanner (ADR-0014 D11) can identify strays
     //    from a previous crashed Server.
     let backend = PtyBackend::with_session(Some(config.server.session.clone()));
@@ -389,15 +455,20 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         },
     };
 
-    // 6b) workspace — ADR-0019 D2 / D11 boot-immutable bind. Precedence:
-    //     CLI `--workspace` > TOML `workspace_path` > XDG_DATA_HOME default.
+    // 6b) Store(C) — ADR-0045 D5 boot-immutable bind. The Store is now
+    //     instance-derived: `${XDG_DATA_HOME}/gtmux/store/<instance>/` with
+    //     legacy back-compat (0044 `workspaces/<instance>` / pre-0044 shared
+    //     `workspace/`). config `workspace_path` still overrides it; the CLI
+    //     `--workspace` no longer feeds the Store (it designates A — see 6d).
     //     The boot-time v1→v2 migration scans the resolved dir for legacy
     //     records (ADR-0018 D5 / ADR-0006 D15) and rewrites them in place.
     let workspace = gtmux_http_api::WorkspaceManager::resolve(
-        args.workspace_override.clone(),
+        None,
         config.workspace_path.clone(),
+        &config.server.session,
     )
-    .context("resolving workspace directory")?;
+    .context("resolving Store directory")?;
+    let workspace_uses_legacy_default = workspace.is_legacy_shared();
     let migration = workspace
         .boot_migration_v1_to_v2()
         .context("workspace boot migration v1→v2")?;
@@ -405,10 +476,24 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         info!(
             migrated = migration.migrated,
             quarantined = migration.quarantined,
-            workspace = %workspace.path().display(),
-            "workspace: boot migration complete"
+            store = %workspace.path().display(),
+            "store: boot migration complete"
         );
     }
+
+    // 6d) Server Workspace(A) — ADR-0045 D3 fs sandbox root. Precedence:
+    //     CLI `--workspace` > config `server_workspace` > `$HOME`. Must already
+    //     exist as a directory — A is a pre-existing fs region, never created
+    //     by gtmux (there is no sandbox to enforce otherwise → hard boot error).
+    let server_workspace = gtmux_http_api::resolve_server_workspace(
+        args.workspace_override.clone(),
+        config.server_workspace.clone(),
+    )
+    .context("resolving Server Workspace (A) root")?;
+    info!(
+        server_workspace = %server_workspace.display(),
+        "server workspace (A) bound"
+    );
 
     // 6c) password hash — ADR-0020 D5. Loaded eagerly when `auth.mode =
     //     "password"` so a missing file fails fast at boot rather than at
@@ -454,7 +539,14 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     hub.set_disconnect_sink(disconnect_tx);
     hub.set_heartbeat_sink(heartbeat_tx);
 
-    let app_state = build_app_state(&config, &token, hub.clone(), workspace, password_hash);
+    let app_state = build_app_state(
+        &config,
+        &token,
+        hub.clone(),
+        workspace.clone(),
+        server_workspace.clone(),
+        password_hash,
+    );
 
     // Stage 5 D10 α: register the cookie validator so the WS handshake
     // accepts cookie auth as an alternative to the subprotocol bearer
@@ -560,7 +652,15 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     // 11) banner — D21 c1 + ADR-0003 D3. We emit the cleartext token URL
     //    exactly once; subsequent traffic must use Authorization: Bearer
     //    or the WebSocket subprotocol.
-    print_banner(&config, mode, &token, listener.local_addr().ok());
+    print_banner(
+        &config,
+        mode,
+        &token,
+        listener.local_addr().ok(),
+        &workspace,
+        &server_workspace,
+        workspace_uses_legacy_default,
+    );
 
     // 12) shutdown — install both SIGINT (Ctrl-C) and SIGTERM listeners.
     //    The graceful shutdown future ends when *either* fires; axum then
@@ -604,6 +704,7 @@ fn build_app_state(
     token: &TokenString,
     hub: Hub,
     workspace: gtmux_http_api::WorkspaceManager,
+    server_workspace: PathBuf,
     password_hash: Option<String>,
 ) -> gtmux_http_api::AppState {
     // AppState wires three side-channels into the HTTP router:
@@ -622,7 +723,8 @@ fn build_app_state(
         token.clone(),
         hub,
         workspace,
-    );
+    )
+    .with_server_workspace(server_workspace);
     if let Some(h) = password_hash {
         app_state = app_state.with_password_hash(h);
     }
@@ -660,7 +762,15 @@ fn build_router(
 /// First-run banner. ADR-0003 D3 + D21 c1. The token is emitted cleartext on
 /// stdout *exactly once* — the user is expected to follow the URL, receive an
 /// HttpOnly cookie, and bookmark the path-only URL thereafter.
-fn print_banner(config: &Config, mode: Mode, token: &TokenString, bound: Option<SocketAddr>) {
+fn print_banner(
+    config: &Config,
+    mode: Mode,
+    token: &TokenString,
+    bound: Option<SocketAddr>,
+    workspace: &gtmux_http_api::WorkspaceManager,
+    server_workspace: &std::path::Path,
+    workspace_uses_legacy_default: bool,
+) {
     let displayed_addr = bound
         .map(|a| a.to_string())
         .unwrap_or_else(|| format!("{}:{}", config.server.bind, config.server.port));
@@ -673,7 +783,7 @@ fn print_banner(config: &Config, mode: Mode, token: &TokenString, bound: Option<
     let pid_self = std::process::id();
 
     println!();
-    println!("gtmux {} ready", config.server.session);
+    println!("gtmux {} ready (instance)", config.server.session);
     println!(
         "  Mode:         {}",
         match mode {
@@ -687,6 +797,13 @@ fn print_banner(config: &Config, mode: Mode, token: &TokenString, bound: Option<
         url_host, token.0
     );
     println!("  Token path:   {} (0600)", token_path);
+    println!("  Workspace(A): {}", server_workspace.display());
+    println!("  Store(C):     {}", workspace.path().display());
+    if workspace_uses_legacy_default {
+        println!(
+            "  Store note:   using legacy Store location; set config `workspace_path` to silence (new default: …/gtmux/store/<instance>/)."
+        );
+    }
     println!(
         "  Backend:      PtyBackend (ADR-0013, supervisor pid={})",
         pid_self
@@ -696,17 +813,17 @@ fn print_banner(config: &Config, mode: Mode, token: &TokenString, bound: Option<
     println!();
 }
 
-fn print_farewell(session: &str) {
+fn print_farewell(instance: &str) {
     println!();
     println!(
-        "gtmux {session} stopped. All child shells reaped. \
-         Run 'gtmux teardown --session {session}' to clean state files."
+        "gtmux {instance} stopped. All child shells reaped. \
+         Run 'gtmux teardown --name {instance}' to clean state files."
     );
 }
 
-/// `${XDG_STATE_HOME:-~/.local/state}/gtmux/<session>.token`, expanded for
+/// `${XDG_STATE_HOME:-~/.local/state}/gtmux/<name>.token`, expanded for
 /// display only — we never round-trip the result back into `auth`.
-fn humanise_token_path(session: &str) -> String {
+fn humanise_token_path(instance: &str) -> String {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
         .filter(|s| !s.is_empty())
@@ -716,7 +833,7 @@ fn humanise_token_path(session: &str) -> String {
                 .map(|h| format!("{h}/.local/state"))
         })
         .unwrap_or_else(|| "$XDG_STATE_HOME".to_string());
-    format!("{base}/gtmux/{session}.token")
+    format!("{base}/gtmux/{instance}.token")
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -829,7 +946,7 @@ impl std::error::Error for BindError {}
 #[derive(Debug)]
 enum StartError {
     AlreadyRunning {
-        session: String,
+        instance: String,
         pid: libc::pid_t,
     },
     /// ADR-0014 D10 amend (2026-05-14) — `TMUX` env detected, refuse to start
@@ -842,10 +959,10 @@ enum StartError {
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartError::AlreadyRunning { session, pid } => write!(
+            StartError::AlreadyRunning { instance, pid } => write!(
                 f,
-                "gtmux server already running for session '{session}' (pid {pid}). \
-                 Use `gtmux stop --session {session}` first, or pick another --session."
+                "gtmux server already running for instance '{instance}' (pid {pid}). \
+                 Use `gtmux stop --name {instance}` first, or pick another --name."
             ),
             StartError::NestedTmux(val) => write!(
                 f,
@@ -910,7 +1027,7 @@ fn report_start_error(err: anyhow::Error) -> ExitCode {
 // ────────────────────────────────────────────────────────────────────────────
 
 struct TeardownArgs {
-    session: String,
+    instance: String,
     force: bool,
     keep_state: bool,
     keep_config: bool,
@@ -935,8 +1052,8 @@ async fn teardown_cmd(args: TeardownArgs) -> ExitCode {
     // `force = false` we surface the confirmation prompt before SIGTERM
     // touches the process.
     if !opts.force {
-        if let Ok(PidLiveness::Alive(pid)) = check_pidfile_liveness(&args.session) {
-            if !confirm_teardown(&args.session, pid) {
+        if let Ok(PidLiveness::Alive(pid)) = check_pidfile_liveness(&args.instance) {
+            if !confirm_teardown(&args.instance, pid) {
                 return ExitCode::from(EXIT_FAILURE);
             }
         }
@@ -945,7 +1062,7 @@ async fn teardown_cmd(args: TeardownArgs) -> ExitCode {
         // nothing is at risk of being killed.
     }
 
-    let report = match state_files::teardown(&args.session, opts.clone()).await {
+    let report = match state_files::teardown(&args.instance, opts.clone()).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("gtmux teardown: {e}");
@@ -953,7 +1070,7 @@ async fn teardown_cmd(args: TeardownArgs) -> ExitCode {
         }
     };
 
-    print_teardown_report(&args.session, &report, opts.remove_config);
+    print_teardown_report(&args.instance, &report, opts.remove_config);
 
     let unlink_warnings: Vec<&str> = report
         .removed
@@ -970,7 +1087,7 @@ async fn teardown_cmd(args: TeardownArgs) -> ExitCode {
 /// Stdin-driven confirmation prompt. Returns `true` when the user typed
 /// `yes` (case-insensitive). Non-TTY callers see an instruction line and
 /// a `false` return.
-fn confirm_teardown(session: &str, pid: libc::pid_t) -> bool {
+fn confirm_teardown(instance: &str, pid: libc::pid_t) -> bool {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         eprintln!(
             "gtmux teardown: refusing to proceed without confirmation \
@@ -979,7 +1096,7 @@ fn confirm_teardown(session: &str, pid: libc::pid_t) -> bool {
         return false;
     }
     eprintln!(
-        "gtmux teardown will SIGTERM the gtmux Server for session '{session}'\n  \
+        "gtmux teardown will SIGTERM the gtmux Server Instance '{instance}'\n  \
          pid: {pid}\nContinue? Type 'yes' to confirm: "
     );
     let mut line = String::new();
@@ -995,7 +1112,7 @@ fn confirm_teardown(session: &str, pid: libc::pid_t) -> bool {
     ok
 }
 
-fn print_teardown_report(session: &str, report: &TeardownReport, requested_remove_config: bool) {
+fn print_teardown_report(instance: &str, report: &TeardownReport, requested_remove_config: bool) {
     let stop_line = match &report.stop {
         Some(StopOutcome::NoPidfile(_)) => "no pidfile (server was not running)".to_string(),
         Some(StopOutcome::MalformedPidfile(_)) => "malformed pidfile (cleaned)".to_string(),
@@ -1013,7 +1130,7 @@ fn print_teardown_report(session: &str, report: &TeardownReport, requested_remov
     };
 
     println!();
-    println!("gtmux teardown {session} complete.");
+    println!("gtmux teardown {instance} complete.");
     println!("  Server:              {stop_line}");
     if report.removed.is_empty() {
         println!("  Files removed:       (no state-file unlink attempted)");
@@ -1044,7 +1161,7 @@ fn print_teardown_report(session: &str, report: &TeardownReport, requested_remov
 // `gtmux stop`  (P0-CLI-2 — Sprint 4-D LIFE-3 real wiring)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Stop a running gtmux Server gracefully via the pidfile.
+/// Stop a running gtmux Server Instance gracefully via the pidfile.
 ///
 /// Exit-code matrix:
 ///   * `Stopped` / `Killed` / `AlreadyDead` → 0 (success — the operator's
@@ -1055,14 +1172,14 @@ fn print_teardown_report(session: &str, report: &TeardownReport, requested_remov
 ///   * `MalformedPidfile` → 1.
 ///   * `TimedOut` → 6 (lifecycle / tmux-domain failure code in the
 ///     grill-D20 matrix; the server didn't honour SIGTERM within 5 s).
-async fn stop(session: &str, force: bool) -> ExitCode {
+async fn stop(instance: &str, force: bool) -> ExitCode {
     use std::time::Duration;
 
     // We compute the pidfile path up-front so the friendly error message
     // for `NoPidfile` can mention the exact path operators should look
     // at. Resolution failures here (XDG_STATE_HOME empty, HOME unset)
     // surface as exit 1 with a targeted message.
-    let path = match pidfile_path_for(session) {
+    let path = match pidfile_path_for(instance) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("gtmux stop: cannot resolve pidfile path: {e}");
@@ -1070,11 +1187,11 @@ async fn stop(session: &str, force: bool) -> ExitCode {
         }
     };
 
-    let outcome = match stop_server(session, Duration::from_secs(5), force).await {
+    let outcome = match stop_server(instance, Duration::from_secs(5), force).await {
         Ok(o) => o,
         Err(e) => {
             eprintln!(
-                "gtmux stop: failed to signal server for session '{session}' \
+                "gtmux stop: failed to signal server for instance '{instance}' \
                  (pidfile {}): {e}",
                 path.display()
             );
@@ -1085,9 +1202,9 @@ async fn stop(session: &str, force: bool) -> ExitCode {
     match outcome {
         StopOutcome::NoPidfile(path) => {
             eprintln!(
-                "gtmux stop: no running gtmux server for session '{session}' \
+                "gtmux stop: no running gtmux server for instance '{instance}' \
                  (pidfile {} not found).\n\
-                 If you intended to remove tmux state, use `gtmux teardown --session {session}`.",
+                 If you intended to remove gtmux state, use `gtmux teardown --name {instance}`.",
                 path.display()
             );
             ExitCode::from(EXIT_FAILURE)
@@ -1133,13 +1250,13 @@ async fn stop(session: &str, force: bool) -> ExitCode {
 // `gtmux rotate-token`  (P0-CLI-4)
 // ────────────────────────────────────────────────────────────────────────────
 
-fn rotate_token_cmd(session: &str) -> ExitCode {
-    let fresh = match rotate_token(session) {
+fn rotate_token_cmd(instance: &str) -> ExitCode {
+    let fresh = match rotate_token(instance) {
         Ok(t) => t,
         Err(AuthError::NotFound(p)) => {
             eprintln!(
-                "gtmux rotate-token: no token file for session '{session}' at {}.\n\
-                 Has `gtmux start --session {session}` ever run on this host?",
+                "gtmux rotate-token: no token file for instance '{instance}' at {}.\n\
+                 Has `gtmux start --name {instance}` ever run on this host?",
                 p.display()
             );
             return ExitCode::from(EXIT_SESSION_MISSING);
@@ -1168,16 +1285,14 @@ fn rotate_token_cmd(session: &str) -> ExitCode {
     // rotation message is much friendlier with a clickable URL. When the
     // file is missing (first-run after manual file ops, or a non-default
     // config path) we print a generic note instead.
-    let url_line = match infer_open_url(session, &fresh) {
+    let url_line = match infer_open_url(instance, &fresh) {
         Some(url) => format!("  Open URL:     {url}"),
-        None => {
-            "  Open URL:     (run `gtmux status --session <name>` for the bound port)".to_string()
-        }
+        None => "  Open URL:     (run `gtmux status --name <name>` for the bound port)".to_string(),
     };
-    let token_path = humanise_token_path(session);
+    let token_path = humanise_token_path(instance);
 
     println!();
-    println!("gtmux {} token rotated.", session);
+    println!("gtmux {} token rotated.", instance);
     println!("  New token:    {}", fresh.0);
     println!("{}", url_line);
     println!("  Token path:   {} (0600)", token_path);
@@ -1291,12 +1406,12 @@ fn reset_password_cmd() -> ExitCode {
     }
 }
 
-/// Best-effort: peek into `${XDG_CONFIG_HOME}/gtmux/<session>.config.toml`
+/// Best-effort: peek into `${XDG_CONFIG_HOME}/gtmux/<name>.config.toml`
 /// for the bound host + port and build a clickable URL. We don't go through
 /// the full figment chain because rotate-token is offline-tolerant — env
 /// overrides and CLI flags don't apply here.
-fn infer_open_url(session: &str, token: &TokenString) -> Option<String> {
-    let cfg_path = config_dir_for_humanise()?.join(format!("{session}.config.toml"));
+fn infer_open_url(instance: &str, token: &TokenString) -> Option<String> {
+    let cfg_path = config_dir_for_humanise()?.join(format!("{instance}.config.toml"));
     let raw = std::fs::read_to_string(&cfg_path).ok()?;
     // Cheap regex-free parse: walk lines, capture `bind = "..."` and
     // `port = NNNN`. Anything else is ignored.
@@ -1352,7 +1467,7 @@ async fn status_cmd(filter: Option<&str>) -> ExitCode {
         }
     };
 
-    let sessions = match enumerate_sessions(&state_dir, filter) {
+    let instances = match enumerate_instances(&state_dir, filter) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("gtmux status: {e}");
@@ -1360,15 +1475,15 @@ async fn status_cmd(filter: Option<&str>) -> ExitCode {
         }
     };
 
-    if sessions.is_empty() {
+    if instances.is_empty() {
         if let Some(name) = filter {
             println!(
-                "gtmux status: no session '{name}' under {}",
+                "gtmux status: no instance '{name}' under {}",
                 state_dir.display()
             );
         } else {
             println!(
-                "gtmux status: no gtmux sessions found under {} \
+                "gtmux status: no gtmux instances found under {} \
                  (no .token files).",
                 state_dir.display()
             );
@@ -1381,13 +1496,13 @@ async fn status_cmd(filter: Option<&str>) -> ExitCode {
     // session names; full paths abbreviated on a single line).
     println!(
         "{:<14}{:<28}{:<32}{:<12}{:<10}",
-        "SESSION", "SERVER", "PIDFILE", "TOKEN", "CONFIG"
+        "INSTANCE", "SERVER", "PIDFILE", "TOKEN", "CONFIG"
     );
-    for s in sessions {
-        let row = describe_session(&s).await;
+    for s in instances {
+        let row = describe_instance(&s).await;
         println!(
             "{:<14}{:<28}{:<32}{:<12}{:<10}",
-            truncate(&row.session, 14),
+            truncate(&row.instance, 14),
             truncate(&row.server, 28),
             truncate(&row.pidfile, 32),
             row.token,
@@ -1413,7 +1528,7 @@ fn status_state_dir() -> Option<PathBuf> {
     )
 }
 
-fn enumerate_sessions(
+fn enumerate_instances(
     state_dir: &std::path::Path,
     filter: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
@@ -1430,50 +1545,50 @@ fn enumerate_sessions(
             continue;
         };
         // We only care about `.token` files — the canonical existence
-        // marker for "this session has ever been started".
-        let Some(session_name) = name_str.strip_suffix(".token") else {
+        // marker for "this instance has ever been started".
+        let Some(instance_name) = name_str.strip_suffix(".token") else {
             continue;
         };
         if let Some(f) = filter {
-            if session_name != f {
+            if instance_name != f {
                 continue;
             }
         }
-        out.push(session_name.to_string());
+        out.push(instance_name.to_string());
     }
     out.sort();
     Ok(out)
 }
 
 struct StatusRow {
-    session: String,
+    instance: String,
     server: String,
     pidfile: String,
     token: String,
     config: String,
 }
 
-async fn describe_session(session: &str) -> StatusRow {
+async fn describe_instance(instance: &str) -> StatusRow {
     // Server liveness — pidfile probe (replaces the pre-Stage-B
     // `tmux has-session` socket probe).
-    let (server, pidfile_display) = match check_pidfile_liveness(session) {
+    let (server, pidfile_display) = match check_pidfile_liveness(instance) {
         Ok(PidLiveness::Alive(pid)) => (
             format!("running (pid {pid})"),
-            match pidfile_path_for(session) {
+            match pidfile_path_for(instance) {
                 Ok(p) => p.display().to_string(),
                 Err(_) => "(unresolved)".to_string(),
             },
         ),
         Ok(PidLiveness::Stale(pid)) => (
             format!("stale pidfile (pid {pid}, not alive)"),
-            match pidfile_path_for(session) {
+            match pidfile_path_for(instance) {
                 Ok(p) => p.display().to_string(),
                 Err(_) => "(unresolved)".to_string(),
             },
         ),
         Ok(PidLiveness::Malformed) => (
             "malformed pidfile".to_string(),
-            match pidfile_path_for(session) {
+            match pidfile_path_for(instance) {
                 Ok(p) => p.display().to_string(),
                 Err(_) => "(unresolved)".to_string(),
             },
@@ -1482,20 +1597,21 @@ async fn describe_session(session: &str) -> StatusRow {
         Err(e) => (format!("probe error: {e}"), "(error)".to_string()),
     };
 
-    let token = match check_token_perm(session) {
+    let token = match check_token_perm(instance) {
         TokenStatus::Ok => "ok".to_string(),
         TokenStatus::BadPerm => "bad-perm".to_string(),
         TokenStatus::Missing => "missing".to_string(),
     };
 
-    let config = match config_dir_for_humanise().map(|d| d.join(format!("{session}.config.toml"))) {
+    let config = match config_dir_for_humanise().map(|d| d.join(format!("{instance}.config.toml")))
+    {
         Some(p) if p.exists() => "ok".to_string(),
         Some(_) => "missing".to_string(),
         None => "unknown".to_string(),
     };
 
     StatusRow {
-        session: session.to_string(),
+        instance: instance.to_string(),
         server,
         pidfile: pidfile_display,
         token,
@@ -1509,11 +1625,11 @@ enum TokenStatus {
     Missing,
 }
 
-fn check_token_perm(session: &str) -> TokenStatus {
+fn check_token_perm(instance: &str) -> TokenStatus {
     let Some(state_dir) = status_state_dir() else {
         return TokenStatus::Missing;
     };
-    let token_path = state_dir.join(format!("{session}.token"));
+    let token_path = state_dir.join(format!("{instance}.token"));
     let Ok(meta) = std::fs::metadata(&token_path) else {
         return TokenStatus::Missing;
     };
@@ -1539,6 +1655,363 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// `gtmux session <ls|export|import>` — offline session tooling (ADR-0044 D-C2)
+// ────────────────────────────────────────────────────────────────────────────
+
+fn session_cmd(command: SessionCmd) -> ExitCode {
+    match command {
+        SessionCmd::Ls {
+            name,
+            workspace_path,
+        } => session_ls(&name, workspace_path),
+        SessionCmd::Export {
+            name,
+            session,
+            out,
+            workspace_path,
+        } => session_export(&name, &session, out, workspace_path),
+        SessionCmd::Import {
+            name,
+            file,
+            name_as,
+            workspace_path,
+        } => session_import(&name, &file, name_as, workspace_path),
+    }
+}
+
+/// Resolve an instance's workspace dir for offline tooling. Honors an explicit
+/// `--workspace`; otherwise the instance-isolated default (+ legacy
+/// back-compat, ADR-0044 D-A3). The instance's config `workspace_path` is *not*
+/// consulted here — pass `--workspace` when it pins a custom path.
+fn resolve_offline_workspace(
+    instance: &str,
+    workspace_override: Option<PathBuf>,
+) -> anyhow::Result<gtmux_http_api::WorkspaceManager> {
+    gtmux_http_api::WorkspaceManager::resolve(workspace_override, None, instance)
+        .map_err(|e| anyhow!("resolving workspace for instance {instance:?}: {e}"))
+}
+
+fn session_ls(instance: &str, workspace_override: Option<PathBuf>) -> ExitCode {
+    let wm = match resolve_offline_workspace(instance, workspace_override) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("gtmux session ls: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let infos = match wm.enumerate_sessions() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("gtmux session ls: enumerating sessions: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let mut manifest = wm.read_manifest().unwrap_or_default();
+    // Best-effort in-memory self-heal so file-only sessions show at root.
+    // No persist — `ls` is a read.
+    let _ = wm.reconcile_manifest(&mut manifest, &infos);
+    print_session_tree(instance, wm.path(), &manifest, &infos);
+    ExitCode::SUCCESS
+}
+
+/// Recursively print folders (indented) under `parent`, sorted by `order`.
+fn print_folder_subtree(
+    parent: Option<&str>,
+    depth: usize,
+    folders: &[gtmux_http_api::WorkspaceFolder],
+) {
+    let mut children: Vec<&gtmux_http_api::WorkspaceFolder> = folders
+        .iter()
+        .filter(|f| f.parent_id.as_deref() == parent)
+        .collect();
+    children.sort_by_key(|f| f.order);
+    for f in children {
+        println!("{}📁 {}", "  ".repeat(depth + 1), f.name);
+        print_folder_subtree(Some(&f.id), depth + 1, folders);
+    }
+}
+
+fn print_session_tree(
+    instance: &str,
+    ws_path: &std::path::Path,
+    manifest: &gtmux_http_api::WorkspaceManifest,
+    infos: &[gtmux_http_api::SessionInfo],
+) {
+    println!("gtmux sessions — instance '{instance}'");
+    println!("  workspace: {}", ws_path.display());
+    println!();
+    if infos.is_empty() {
+        println!("  (no sessions)");
+        return;
+    }
+    if !manifest.folders.is_empty() {
+        println!("Folders:");
+        print_folder_subtree(None, 0, &manifest.folders);
+        println!();
+    }
+    let folder_name: std::collections::HashMap<&str, &str> = manifest
+        .folders
+        .iter()
+        .map(|f| (f.id.as_str(), f.name.as_str()))
+        .collect();
+    println!("Sessions:");
+    for info in infos {
+        let org = manifest
+            .sessions
+            .get(&info.name)
+            .cloned()
+            .unwrap_or_default();
+        let folder = match org.folder_id.as_deref() {
+            Some(id) => folder_name.get(id).copied().unwrap_or("?"),
+            None => "(root)",
+        };
+        let star = if org.favorite { " ★" } else { "" };
+        let tags = if org.tags.is_empty() {
+            String::new()
+        } else {
+            format!("  tags: {}", org.tags.join(","))
+        };
+        println!(
+            "  {:<24} [{}]{}{}",
+            truncate(&info.name, 24),
+            folder,
+            star,
+            tags
+        );
+    }
+}
+
+fn session_export(
+    instance: &str,
+    session: &str,
+    out: Option<PathBuf>,
+    workspace_override: Option<PathBuf>,
+) -> ExitCode {
+    let wm = match resolve_offline_workspace(instance, workspace_override) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("gtmux session export: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let path = match wm.session_path(session) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gtmux session export: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("gtmux session export: no session '{session}' in instance '{instance}'");
+            return ExitCode::from(EXIT_SESSION_MISSING);
+        }
+        Err(e) => {
+            eprintln!("gtmux session export: reading {}: {e}", path.display());
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let layout: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "gtmux session export: {} is not valid JSON: {e}",
+                path.display()
+            );
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    // ADR-0029 envelope (layout-only), matching the server's export shape.
+    let envelope = serde_json::json!({
+        "kind": "gtmux.session.export",
+        "export_version": 1,
+        "exported_at": rfc3339_utc_now(),
+        "session_name": session,
+        "layout": layout,
+        "metadata": { "app": "gtmux", "app_version": null },
+    });
+    let text = serde_json::to_vec_pretty(&envelope).unwrap_or_default();
+    match out {
+        Some(file) => {
+            if let Err(e) = std::fs::write(&file, &text) {
+                eprintln!("gtmux session export: writing {}: {e}", file.display());
+                return ExitCode::from(EXIT_FAILURE);
+            }
+            println!(
+                "gtmux session export: wrote '{session}' → {}",
+                file.display()
+            );
+        }
+        None => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(&text);
+            let _ = stdout.write_all(b"\n");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn session_import(
+    instance: &str,
+    file: &std::path::Path,
+    name_as: Option<String>,
+    workspace_override: Option<PathBuf>,
+) -> ExitCode {
+    let wm = match resolve_offline_workspace(instance, workspace_override) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("gtmux session import: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let bytes = match std::fs::read(file) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("gtmux session import: reading {}: {e}", file.display());
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "gtmux session import: {} is not valid JSON: {e}",
+                file.display()
+            );
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    // Accept either an ADR-0029 export envelope or a raw v2 layout.
+    let is_envelope = value.get("kind").and_then(|k| k.as_str()) == Some("gtmux.session.export");
+    let (layout_value, envelope_name) = if is_envelope {
+        match value.get("layout") {
+            Some(l) => (
+                l.clone(),
+                value
+                    .get("session_name")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string),
+            ),
+            None => {
+                eprintln!("gtmux session import: export envelope has no 'layout' field");
+                return ExitCode::from(EXIT_FAILURE);
+            }
+        }
+    } else {
+        (value, None)
+    };
+
+    let name = name_as
+        .or(envelope_name)
+        .or_else(|| {
+            file.file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    if let Err(e) = gtmux_http_api::validate_session_name(&name) {
+        eprintln!(
+            "gtmux session import: invalid session name {name:?}: {e}. Pass --name-as <NEW>."
+        );
+        return ExitCode::from(EXIT_FAILURE);
+    }
+
+    // Validate against the real v2 schema before writing — a corrupt import
+    // should fail here, not at the server's next attach.
+    let layout: gtmux_http_api::Layout = match serde_json::from_value(layout_value) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("gtmux session import: layout is not a valid v2 record: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    if let Err(e) = gtmux_http_api::validate_layout_v2(&layout) {
+        eprintln!("gtmux session import: layout failed schema validation: {e}");
+        return ExitCode::from(EXIT_FAILURE);
+    }
+
+    let path = match wm.session_path(&name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("gtmux session import: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    if path.exists() {
+        eprintln!(
+            "gtmux session import: session '{name}' already exists in instance '{instance}'. \
+             Pass --name-as <NEW>."
+        );
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    let out_bytes = match serde_json::to_vec(&layout) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("gtmux session import: serialising layout: {e}");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    if let Err(e) = write_session_file_0600(&path, &out_bytes) {
+        eprintln!("gtmux session import: writing {}: {e}", path.display());
+        return ExitCode::from(EXIT_FAILURE);
+    }
+    println!(
+        "gtmux session import: imported '{name}' into instance '{instance}'. \
+         It will appear at the workspace root on the next server session list."
+    );
+    ExitCode::SUCCESS
+}
+
+/// Atomic-ish write of a new session file (temp + rename) at mode 0600. Used by
+/// the offline `gtmux session import` path — a fresh session name, so no live
+/// server is writing the same file.
+fn write_session_file_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp = dir.join(format!(".gtmux-import-{}.tmp", std::process::id()));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Minimal RFC3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) for the export
+/// envelope's `exported_at`. Self-contained civil-from-days (Howard Hinnant)
+/// so the CLI needs no date crate; the value is informational (import ignores
+/// it).
+fn rfc3339_utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // civil_from_days
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Self-tests — argument parsing only. End-to-end (spawn → bind → curl) lives
 // in the C4 smoke harness (`codebase/smoke/01_engine_connect.sh`).
 // ────────────────────────────────────────────────────────────────────────────
@@ -1556,15 +2029,15 @@ mod tests {
 
     #[test]
     fn start_parses_minimum_args() {
-        let cli = Cli::parse_from(["gtmux", "start", "--session", "alpha"]);
+        let cli = Cli::parse_from(["gtmux", "start", "--name", "alpha"]);
         match cli.command {
             Cmd::Start {
-                session,
+                name,
                 port,
                 config_path,
                 workspace_path,
             } => {
-                assert_eq!(session, "alpha");
+                assert_eq!(name, "alpha");
                 assert!(port.is_none());
                 assert!(config_path.is_none());
                 assert!(workspace_path.is_none());
@@ -1578,7 +2051,7 @@ mod tests {
         let cli = Cli::parse_from([
             "gtmux",
             "start",
-            "--session",
+            "--name",
             "beta",
             "--port",
             "9999",
@@ -1589,12 +2062,12 @@ mod tests {
         ]);
         match cli.command {
             Cmd::Start {
-                session,
+                name,
                 port,
                 config_path,
                 workspace_path,
             } => {
-                assert_eq!(session, "beta");
+                assert_eq!(name, "beta");
                 assert_eq!(port, Some(9999));
                 assert_eq!(
                     config_path.as_deref(),
@@ -1605,6 +2078,15 @@ mod tests {
                     Some(std::path::Path::new("/tmp/ws"))
                 );
             }
+            other => panic!("expected Start, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_accepts_deprecated_session_alias() {
+        let cli = Cli::parse_from(["gtmux", "start", "--session", "alpha"]);
+        match cli.command {
+            Cmd::Start { name, .. } => assert_eq!(name, "alpha"),
             other => panic!("expected Start, got {other:?}"),
         }
     }
@@ -1630,7 +2112,7 @@ mod tests {
         let cli = Cli::parse_from([
             "gtmux",
             "teardown",
-            "--session",
+            "--name",
             "smoke",
             "--force",
             "--keep-state",
@@ -1638,12 +2120,12 @@ mod tests {
         ]);
         match cli.command {
             Cmd::Teardown {
-                session,
+                name,
                 force,
                 keep_state,
                 keep_config,
             } => {
-                assert_eq!(session, "smoke");
+                assert_eq!(name, "smoke");
                 assert!(force);
                 assert!(keep_state);
                 assert!(keep_config);
@@ -1654,7 +2136,7 @@ mod tests {
 
     #[test]
     fn teardown_defaults_to_no_force() {
-        let cli = Cli::parse_from(["gtmux", "teardown", "--session", "x"]);
+        let cli = Cli::parse_from(["gtmux", "teardown", "--name", "x"]);
         match cli.command {
             Cmd::Teardown {
                 force,
@@ -1674,31 +2156,102 @@ mod tests {
     fn status_accepts_optional_session() {
         let cli = Cli::parse_from(["gtmux", "status"]);
         match cli.command {
-            Cmd::Status { session } => assert!(session.is_none()),
+            Cmd::Status { name } => assert!(name.is_none()),
             other => panic!("expected Status, got {other:?}"),
         }
-        let cli = Cli::parse_from(["gtmux", "status", "--session", "smoke"]);
+        let cli = Cli::parse_from(["gtmux", "status", "--name", "smoke"]);
         match cli.command {
-            Cmd::Status { session } => assert_eq!(session.as_deref(), Some("smoke")),
+            Cmd::Status { name } => assert_eq!(name.as_deref(), Some("smoke")),
             other => panic!("expected Status, got {other:?}"),
         }
     }
 
     #[test]
     fn rotate_token_requires_session() {
-        let cli = Cli::parse_from(["gtmux", "rotate-token", "--session", "smoke"]);
+        let cli = Cli::parse_from(["gtmux", "rotate-token", "--name", "smoke"]);
         match cli.command {
-            Cmd::RotateToken { session } => assert_eq!(session, "smoke"),
+            Cmd::RotateToken { name } => assert_eq!(name, "smoke"),
             other => panic!("expected RotateToken, got {other:?}"),
         }
     }
 
     #[test]
-    fn stop_parses() {
-        let cli = Cli::parse_from(["gtmux", "stop", "--session", "smoke"]);
+    fn session_subcommands_parse() {
+        // ls
+        let cli = Cli::parse_from(["gtmux", "session", "ls", "--name", "demo"]);
         match cli.command {
-            Cmd::Stop { session, force } => {
-                assert_eq!(session, "smoke");
+            Cmd::Session {
+                command: SessionCmd::Ls { name, .. },
+            } => assert_eq!(name, "demo"),
+            other => panic!("expected Session::Ls, got {other:?}"),
+        }
+        // `--instance` alias for `--name`.
+        let cli = Cli::parse_from(["gtmux", "session", "ls", "--instance", "demo"]);
+        assert!(matches!(
+            cli.command,
+            Cmd::Session {
+                command: SessionCmd::Ls { .. }
+            }
+        ));
+        // export with positional session + `-o`.
+        let cli = Cli::parse_from([
+            "gtmux",
+            "session",
+            "export",
+            "--name",
+            "demo",
+            "build",
+            "-o",
+            "/tmp/x.json",
+        ]);
+        match cli.command {
+            Cmd::Session {
+                command:
+                    SessionCmd::Export {
+                        name, session, out, ..
+                    },
+            } => {
+                assert_eq!(name, "demo");
+                assert_eq!(session, "build");
+                assert_eq!(out.as_deref(), Some(std::path::Path::new("/tmp/x.json")));
+            }
+            other => panic!("expected Session::Export, got {other:?}"),
+        }
+        // import with `--name-as`.
+        let cli = Cli::parse_from([
+            "gtmux",
+            "session",
+            "import",
+            "--name",
+            "demo",
+            "/tmp/x.json",
+            "--name-as",
+            "copy",
+        ]);
+        match cli.command {
+            Cmd::Session {
+                command:
+                    SessionCmd::Import {
+                        name,
+                        file,
+                        name_as,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "demo");
+                assert_eq!(file, std::path::Path::new("/tmp/x.json"));
+                assert_eq!(name_as.as_deref(), Some("copy"));
+            }
+            other => panic!("expected Session::Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_parses() {
+        let cli = Cli::parse_from(["gtmux", "stop", "--name", "smoke"]);
+        match cli.command {
+            Cmd::Stop { name, force } => {
+                assert_eq!(name, "smoke");
                 assert!(!force, "force defaults to false");
             }
             other => panic!("expected Stop, got {other:?}"),
@@ -1707,10 +2260,10 @@ mod tests {
 
     #[test]
     fn stop_parses_force_flag() {
-        let cli = Cli::parse_from(["gtmux", "stop", "--session", "smoke", "--force"]);
+        let cli = Cli::parse_from(["gtmux", "stop", "--name", "smoke", "--force"]);
         match cli.command {
-            Cmd::Stop { session, force } => {
-                assert_eq!(session, "smoke");
+            Cmd::Stop { name, force } => {
+                assert_eq!(name, "smoke");
                 assert!(force, "--force must propagate");
             }
             other => panic!("expected Stop, got {other:?}"),
@@ -1844,7 +2397,7 @@ mod tests {
                 // Round-trip the user-visible error message so the
                 // friendly text doesn't drift silently.
                 let err = StartError::AlreadyRunning {
-                    session: session.to_string(),
+                    instance: session.to_string(),
                     pid,
                 };
                 let msg = err.to_string();

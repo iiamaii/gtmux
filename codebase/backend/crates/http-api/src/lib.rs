@@ -48,6 +48,7 @@ mod attach_index;
 mod auth;
 mod file_open;
 mod file_stat;
+mod fs_guard;
 mod fs_list;
 pub mod schema;
 mod session_lock;
@@ -68,6 +69,10 @@ pub use file_open::{
     default_allowlist_path, default_audit_dir, Allowlist, AllowlistEntry, AllowlistMatch, AuditLog,
     FileOpenContext,
 };
+pub use fs_guard::{
+    build_denylist, effective_workspace, resolve_server_workspace, validate_workspace_root,
+    ServerWorkspaceError, WorkspaceRootError,
+};
 pub use schema::{
     degrade_dangling_path_endpoints, detect_shape, migrate_v1_to_v2, recompute_path_bboxes,
     validate as validate_layout_v2, Anchor, Group, Head, Item, ItemCommon, Layout, PathEndpoint,
@@ -80,7 +85,8 @@ pub use settings::{default_behavior_settings, BehaviorSettings};
 pub use terminal_map::{fresh_terminal_uuid, MapError as TerminalMapError, TerminalMap};
 pub use terminals::{TerminalInfo, TerminalMetadata, TerminalMetadataStore};
 pub use workspace::{
-    validate_session_name, BootMigrationReport, SessionInfo, WorkspaceError, WorkspaceManager,
+    validate_session_name, BootMigrationReport, SessionCountsCacheEntry, SessionInfo, SessionOrg,
+    WorkspaceError, WorkspaceFolder, WorkspaceManager, WorkspaceManifest,
 };
 
 use std::path::Path;
@@ -127,10 +133,31 @@ pub struct AppState {
     /// the dispatcher's `LAYOUT_CHANGED` path. `None` in unit-tests that
     /// exercise the HTTP surface in isolation.
     pub hub: Option<gtmux_ws_server::Hub>,
-    /// Per-Server workspace handle — the multi-session storage root (ADR-0019
-    /// D1/D2). When `Some`, the `/api/sessions[/<name>[/layout]]` routes are
-    /// wired and accept requests; when `None` those routes return 503.
+    /// Per-Server Store(C) handle — the gtmux-internal multi-session storage
+    /// root (ADR-0045 D5; the type is still named `WorkspaceManager` pending
+    /// the gradual `StoreManager` rename). When `Some`, the
+    /// `/api/sessions[/<name>[/layout]]` routes are wired and accept requests;
+    /// when `None` those routes return 503.
     pub workspace: Option<Arc<WorkspaceManager>>,
+    /// Server Workspace(A) root — the canonical fs sandbox boundary every
+    /// user-steerable filesystem access is clamped to (ADR-0045 D3 / D6).
+    /// Resolved once at boot (`--workspace` > config > `$HOME`); tests default
+    /// it to the current dir. The `fs_list` / `mkdir` / `rmdir` /
+    /// `workspace_root` / terminal-cwd paths all check membership against this.
+    pub server_workspace: Arc<std::path::PathBuf>,
+    /// M2 denylist (ADR-0045 D6): canonical `{ Store dir, gtmux config dir,
+    /// gtmux state dir }`. A path inside A but also inside any denylist entry
+    /// is rejected — this is what stops the user from pointing a terminal /
+    /// mkdir / rmdir / workspace_root at gtmux's own control-plane storage.
+    pub fs_denylist: Arc<Vec<std::path::PathBuf>>,
+    /// Workspace organization manifest loaded from
+    /// `<workspace>/.gtmux-workspace.json`. Mutations hold the write lock
+    /// through disk persistence so manifest writers serialize in-process.
+    pub workspace_manifest: Arc<RwLock<WorkspaceManifest>>,
+    /// Lazy per-session counts cache for `GET /api/sessions`. Keyed by
+    /// session name and invalidated by comparing the session file mtime.
+    pub session_counts:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, SessionCountsCacheEntry>>>,
     /// In-memory cache of loaded session layouts. Always present so handler
     /// code can borrow it without an `Option` gate; lookups in it are no-ops
     /// when `workspace` is `None`.
@@ -236,6 +263,19 @@ impl AppState {
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
             hub: None,
             workspace: None,
+            // Default A = `$HOME` (or `/` if unset) so `AppState::new`-only
+            // test paths have a sane sandbox root; production / workspace
+            // tests override via `with_server_workspace`. Denylist starts
+            // empty and is populated by `with_workspace` (it needs the Store
+            // dir). No IO/canonicalize here — boot wiring does the real resolve.
+            server_workspace: Arc::new(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from("/")),
+            ),
+            fs_denylist: Arc::new(Vec::new()),
+            workspace_manifest: Arc::new(RwLock::new(WorkspaceManifest::default())),
+            session_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_cache: Arc::new(SessionCache::new()),
             behavior_settings: default_behavior_settings(),
             file_open: FileOpenContext::production(),
@@ -360,6 +400,7 @@ impl AppState {
     pub async fn spawn_terminal_with_uuid(
         &self,
         uuid: String,
+        cwd: Option<std::path::PathBuf>,
     ) -> Result<gtmux_pty_backend::PaneId, SpawnTerminalError> {
         if let Some(existing) = self.terminal_map.lookup_pane(&uuid).await {
             return Ok(existing);
@@ -368,9 +409,13 @@ impl AppState {
             .hub
             .as_ref()
             .ok_or(SpawnTerminalError::HubUnavailable)?;
-        let pane = hub
-            .backend()
-            .spawn(gtmux_pty_backend::SpawnSpec::default_shell())?;
+        // ADR-0046 D2 — default cwd = the session's effective workspace(B).
+        // `None` keeps the pty-backend default ($HOME → process cwd); a
+        // per-terminal template cwd override would win here in the future.
+        let pane = hub.backend().spawn(gtmux_pty_backend::SpawnSpec {
+            cwd,
+            ..gtmux_pty_backend::SpawnSpec::default_shell()
+        })?;
         match self.terminal_map.register(uuid.clone(), pane).await {
             Ok(()) => {
                 self.terminal_meta.record_spawn(&uuid).await;
@@ -427,6 +472,20 @@ impl AppState {
     ///    already recognises Stale at runtime, so a failed sweep does not
     ///    affect functionality.
     pub fn with_workspace(mut self, workspace: WorkspaceManager) -> Self {
+        // Load the org manifest into the single in-memory authority (grilling
+        // G1). We *replace* the Arc rather than `blocking_write()` into it:
+        // this builder runs both at sync boot *and* from inside `#[tokio::test]`
+        // async contexts, and `blocking_write()` panics on a runtime thread.
+        // The Arc is not yet shared at this point (AppState hasn't been cloned
+        // into any handler), so a swap is sound and lock-free.
+        let manifest = workspace.read_manifest().unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "workspace_manifest: boot load failed; starting with empty manifest"
+            );
+            WorkspaceManifest::default()
+        });
+        self.workspace_manifest = Arc::new(RwLock::new(manifest));
         let wm = Arc::new(workspace);
         if let Err(e) = self.attach_index.rebuild_from_disk(&wm) {
             tracing::warn!(
@@ -435,7 +494,26 @@ impl AppState {
             );
         }
         crate::session_lock::scan_and_cleanup_stale_locks(&wm);
+        // ADR-0045 D6 — derive the M2 denylist from the Store dir now that it
+        // is known: { Store, gtmux config dir, gtmux state dir }. The Server
+        // Workspace(A) root is set separately via `with_server_workspace`.
+        self.fs_denylist = Arc::new(fs_guard::build_denylist(wm.path()));
         self.workspace = Some(wm);
+        self
+    }
+
+    /// Pin the Server Workspace(A) root — the canonical fs sandbox boundary
+    /// (ADR-0045 D3). Boot wiring (`gtmux start`) resolves it via
+    /// [`resolve_server_workspace`](crate::resolve_server_workspace) and passes
+    /// the canonical path here. Composes with [`with_workspace`](Self::with_workspace)
+    /// (order-independent — A and the denylist are set on separate fields).
+    pub fn with_server_workspace(mut self, root: std::path::PathBuf) -> Self {
+        // Store the canonical form so the guard's `starts_with` lines up with
+        // canonicalized candidate paths (symlinked TMPDIR on macOS, etc.).
+        // Boot passes an already-canonical path; the fallback keeps a raw
+        // value usable if canonicalize fails (non-existent → caught earlier).
+        let canonical = root.canonicalize().unwrap_or(root);
+        self.server_workspace = Arc::new(canonical);
         self
     }
 
@@ -455,9 +533,7 @@ impl AppState {
         hub: gtmux_ws_server::Hub,
         workspace: WorkspaceManager,
     ) -> Self {
-        let mut me = Self::with_hub(config, token, hub);
-        me.workspace = Some(Arc::new(workspace));
-        me
+        Self::with_hub(config, token, hub).with_workspace(workspace)
     }
 }
 
@@ -617,14 +693,30 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
                 // documents) sit between the two ceilings.
                 .layer(DefaultBodyLimit::max(sessions::SESSION_PUT_MAX_BYTES)),
         )
+        .route(
+            "/api/workspace/manifest",
+            get(sessions::manifest_get_handler).put(sessions::manifest_put_handler),
+        )
         .route("/api/sessions/{name}/export", get(sessions::export_handler))
         .route(
+            // ADR-0044 D-B6: independent copy with fresh terminal UUIDs.
+            "/api/sessions/{name}/duplicate",
+            axum::routing::post(sessions::duplicate_handler),
+        )
+        .route(
+            // PATCH = rename (ADR-0044 D-B5 / ADR-0019 D10.2).
             "/api/sessions/{name}",
-            axum::routing::delete(sessions::delete_handler),
+            axum::routing::patch(sessions::rename_handler).delete(sessions::delete_handler),
         )
         .route(
             "/api/sessions/{name}/layout",
             get(sessions::layout_get_handler).put(sessions::layout_put_handler),
+        )
+        .route(
+            // ADR-0046 D8 — change a session's Workspace(B) root (N:1, no
+            // uniqueness). Kept separate from PATCH /{name} (= rename).
+            "/api/sessions/{name}/workspace",
+            axum::routing::put(sessions::change_workspace_handler),
         )
         .route(
             "/api/sessions/{name}/attach",
@@ -708,11 +800,20 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             get(file_stat::file_stat_handler),
         )
         .route(
-            // ADR-0035 — file system picker. MVP scope = workspace dir only
-            // (implicit allow). External roots land in Stage 3 with the
-            // `[picker.roots]` toml schema mutation.
+            // ADR-0035 / ADR-0046 D3 — file system picker, rooted at the
+            // Server Workspace(A) with the M2 denylist guard.
             "/api/fs/list",
             get(fs_list::fs_list_handler),
+        )
+        .route(
+            // ADR-0046 D3 — create a directory inside A (denylist-guarded).
+            "/api/fs/mkdir",
+            axum::routing::post(fs_list::fs_mkdir_handler),
+        )
+        .route(
+            // ADR-0046 D3 — remove an *empty* directory inside A (guarded).
+            "/api/fs/rmdir",
+            axum::routing::post(fs_list::fs_rmdir_handler),
         )
         .route(
             "/api/shutdown",
@@ -1025,6 +1126,8 @@ mod tests {
             cloud: None,
             frontend_dist: None,
             workspace_path: None,
+            server_workspace: None,
+            default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
         }
@@ -1629,16 +1732,16 @@ mod tests {
 
     // ── Multi-session HTTP surface (Stage 1, ADR-0019 + ADR-0018) ──
 
+    /// Server Workspace(A) = the tempdir root; Store(C) = a nested `store/`
+    /// subdir (mirrors the production A ⊋ Store nesting so the denylist guard
+    /// behaves the same). Create-session tests pass `dir.path()` (the A root)
+    /// as `workspace_root`. The returned `PathBuf` is the *Store* dir — tests
+    /// that seed `<name>.json` records write there as before.
     fn make_app_with_workspace(
         dir: &tempfile::TempDir,
     ) -> (Router, TokenString, std::path::PathBuf) {
-        let token = issue_token().expect("token");
-        let cfg = test_config();
-        let workspace_dir = dir.path().to_path_buf();
-        let wm = WorkspaceManager::from_path(workspace_dir.clone()).expect("workspace");
-        let state = AppState::new(cfg, token.clone()).with_workspace(wm);
-        let app = router_with_state(state);
-        (app, token, workspace_dir)
+        let (app, token, store_dir, _state) = make_app_with_workspace_and_state(dir);
+        (app, token, store_dir)
     }
 
     /// Variant of [`make_app_with_workspace`] that *also* returns the
@@ -1649,11 +1752,14 @@ mod tests {
     ) -> (Router, TokenString, std::path::PathBuf, AppState) {
         let token = issue_token().expect("token");
         let cfg = test_config();
-        let workspace_dir = dir.path().to_path_buf();
-        let wm = WorkspaceManager::from_path(workspace_dir.clone()).expect("workspace");
-        let state = AppState::new(cfg, token.clone()).with_workspace(wm);
+        let server_workspace = dir.path().to_path_buf();
+        let store_dir = server_workspace.join("store");
+        let wm = WorkspaceManager::from_path(store_dir.clone()).expect("workspace");
+        let state = AppState::new(cfg, token.clone())
+            .with_server_workspace(server_workspace)
+            .with_workspace(wm);
         let app = router_with_state(state.clone());
-        (app, token, workspace_dir, state)
+        (app, token, store_dir, state)
     }
 
     #[tokio::test]
@@ -1674,7 +1780,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body, json!([]));
+        assert_eq!(body["folders"], json!([]));
+        assert_eq!(body["sessions"], json!([]));
+        assert!(body["manifest_etag"].as_str().is_some());
     }
 
     /// 0074 Phase 1: `GET /api/sessions` emits the boot's `server_id`
@@ -1717,7 +1825,10 @@ mod tests {
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
 
         // POST /api/sessions { name: "demo" } → 201
-        let create_body = serde_json::to_vec(&json!({ "name": "demo" })).unwrap();
+        let create_body = serde_json::to_vec(
+            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap() }),
+        )
+        .unwrap();
         let resp = app
             .clone()
             .oneshot(
@@ -1751,7 +1862,13 @@ mod tests {
             .unwrap();
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body, json!([{ "name": "demo", "active": false }]));
+        assert_eq!(body["folders"], json!([]));
+        assert_eq!(body["sessions"][0]["name"], json!("demo"));
+        assert_eq!(body["sessions"][0]["active"], json!(false));
+        assert_eq!(body["sessions"][0]["folder_id"], Value::Null);
+        assert_eq!(body["sessions"][0]["item_count"], json!(0));
+        assert_eq!(body["sessions"][0]["terminal_count"], json!(0));
+        assert!(body["manifest_etag"].as_str().is_some());
 
         // GET /api/sessions/demo/layout returns an empty v2 layout.
         let resp = app
@@ -1778,10 +1895,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_manifest_put_enriches_sessions_and_rejects_stale_etag() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "demo", dir.path()).await;
+
+        let list = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(list.into_body(), 64 * 1024).await.unwrap();
+        let before: Value = serde_json::from_slice(&bytes).unwrap();
+        let initial_etag = before["manifest_etag"].as_str().unwrap().to_string();
+        let folder_id = "11111111-1111-4111-8111-111111111111";
+        let manifest = json!({
+            "manifest_version": 1,
+            "folders": [{
+                "id": folder_id,
+                "name": "P0",
+                "parent_id": null,
+                "order": 0,
+                "collapsed": false
+            }],
+            "sessions": {
+                "demo": {
+                    "folder_id": folder_id,
+                    "order": 3,
+                    "tags": ["p0"],
+                    "favorite": true
+                }
+            }
+        });
+
+        let put = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri("/api/workspace/manifest")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::IF_MATCH, format!("\"{initial_etag}\""))
+                    .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        let bytes = to_bytes(put.into_body(), 64 * 1024).await.unwrap();
+        let put_body: Value = serde_json::from_slice(&bytes).unwrap();
+        let next_etag = put_body["manifest_etag"].as_str().unwrap().to_string();
+        assert_ne!(next_etag, initial_etag);
+
+        let stale = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PUT)
+                    .uri("/api/workspace/manifest")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::IF_MATCH, format!("\"{initial_etag}\""))
+                    .body(Body::from(serde_json::to_vec(&manifest).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+
+        let list = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(list.into_body(), 64 * 1024).await.unwrap();
+        let after: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(after["folders"][0]["name"], json!("P0"));
+        assert_eq!(after["sessions"][0]["folder_id"], json!(folder_id));
+        assert_eq!(after["sessions"][0]["tags"], json!(["p0"]));
+        assert_eq!(after["sessions"][0]["favorite"], json!(true));
+    }
+
+    #[tokio::test]
     async fn sessions_create_rejects_duplicate() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        let body = || serde_json::to_vec(&json!({ "name": "twin" })).unwrap();
+        let body = || {
+            serde_json::to_vec(
+                &json!({ "name": "twin", "workspace_root": dir.path().to_str().unwrap() }),
+            )
+            .unwrap()
+        };
         let make_req = || {
             HttpRequest::builder()
                 .method(Method::POST)
@@ -1868,7 +2089,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _wd) = make_app_with_workspace(&dir);
         // Seed by creating the same name first.
-        let create_body = serde_json::to_vec(&json!({ "name": "dup" })).unwrap();
+        let create_body = serde_json::to_vec(
+            &json!({ "name": "dup", "workspace_root": dir.path().to_str().unwrap() }),
+        )
+        .unwrap();
         let r1 = app
             .clone()
             .oneshot(
@@ -2069,7 +2293,8 @@ mod tests {
             .await
             .unwrap();
         let bytes = to_bytes(list.into_body(), 8 * 1024).await.unwrap();
-        let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = body["sessions"].as_array().unwrap();
         assert!(rows.iter().any(|r| r["name"] == "ledger"));
     }
 
@@ -2081,7 +2306,7 @@ mod tests {
     async fn export_returns_envelope_for_existing_session() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "alpha").await;
+        create_session(&app, &token, "alpha", dir.path()).await;
 
         let res = app
             .oneshot(
@@ -2165,7 +2390,7 @@ mod tests {
     async fn export_401_without_auth() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "alpha").await;
+        create_session(&app, &token, "alpha", dir.path()).await;
         let res = app
             .oneshot(
                 HttpRequest::builder()
@@ -2214,7 +2439,7 @@ mod tests {
     async fn export_import_round_trip_equal_layout() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "src").await;
+        create_session(&app, &token, "src", dir.path()).await;
 
         // 1. Export.
         let exp_res = app
@@ -2280,7 +2505,10 @@ mod tests {
     async fn sessions_layout_put_etag_cas() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        let create_body = serde_json::to_vec(&json!({ "name": "demo" })).unwrap();
+        let create_body = serde_json::to_vec(
+            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap() }),
+        )
+        .unwrap();
         app.clone()
             .oneshot(
                 HttpRequest::builder()
@@ -2376,7 +2604,10 @@ mod tests {
         use ring::digest::{digest, SHA256};
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
-        let create_body = serde_json::to_vec(&json!({ "name": "be4" })).unwrap();
+        let create_body = serde_json::to_vec(
+            &json!({ "name": "be4", "workspace_root": dir.path().to_str().unwrap() }),
+        )
+        .unwrap();
         app.clone()
             .oneshot(
                 HttpRequest::builder()
@@ -2542,8 +2773,16 @@ mod tests {
             .to_string()
     }
 
-    async fn attach_idx_create_session(app: &Router, token: &TokenString, name: &str) {
-        let create_body = serde_json::to_vec(&json!({ "name": name })).unwrap();
+    async fn attach_idx_create_session(
+        app: &Router,
+        token: &TokenString,
+        name: &str,
+        workspace_root: &std::path::Path,
+    ) {
+        let create_body = serde_json::to_vec(
+            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap() }),
+        )
+        .unwrap();
         let resp = app
             .clone()
             .oneshot(
@@ -2590,7 +2829,7 @@ mod tests {
     async fn attach_index_layout_put_adds_uuid_to_session() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
-        attach_idx_create_session(&app, &token, "alpha").await;
+        attach_idx_create_session(&app, &token, "alpha", dir.path()).await;
         put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
         let refs = state.attach_index.read_all_attach_refs();
         assert_eq!(refs.get(UUID_A).unwrap(), &vec!["alpha".to_string()]);
@@ -2620,7 +2859,7 @@ mod tests {
         let app = router_with_state(state);
         let mut attach_replay_rx = hub.subscribe_attach_replay();
 
-        attach_idx_create_session(&app, &token, "alpha").await;
+        attach_idx_create_session(&app, &token, "alpha", dir.path()).await;
         // First PUT establishes UUID_A in the layout (added=[UUID_A]).
         let etag = put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
         // Drain any event that the *first* PUT might have produced (no
@@ -2682,7 +2921,7 @@ mod tests {
     async fn attach_index_layout_put_remove_terminal_drops_entry() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
-        attach_idx_create_session(&app, &token, "alpha").await;
+        attach_idx_create_session(&app, &token, "alpha", dir.path()).await;
         let etag = put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
         // Now PUT an empty-items layout — should drop UUID_A's entry. The
         // `x-gtmux-webpage-id: alpha` header matches the attach owner_key
@@ -2721,7 +2960,7 @@ mod tests {
     async fn attach_index_delete_item_removes_terminal_uuid() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
-        attach_idx_create_session(&app, &token, "alpha").await;
+        attach_idx_create_session(&app, &token, "alpha", dir.path()).await;
         put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
         // DELETE the item. `x-gtmux-webpage-id: alpha` so the ADR-0019 D5.6
         // owner-attach guard sees the same owner_key the attach handler
@@ -2800,8 +3039,8 @@ mod tests {
     async fn attach_index_session_delete_clears_session_from_entries() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _, state) = make_app_with_workspace_and_state(&dir);
-        attach_idx_create_session(&app, &token, "alpha").await;
-        attach_idx_create_session(&app, &token, "beta").await;
+        attach_idx_create_session(&app, &token, "alpha", dir.path()).await;
+        attach_idx_create_session(&app, &token, "beta", dir.path()).await;
         put_layout_with_terminal(&app, &token, "alpha", UUID_A).await;
         put_layout_with_terminal(&app, &token, "beta", UUID_A).await; // mirror
                                                                       // Sanity: both sessions reference UUID_A.
@@ -2840,7 +3079,10 @@ mod tests {
     async fn sessions_delete_removes_file_and_cache() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
-        let create_body = serde_json::to_vec(&json!({ "name": "doomed" })).unwrap();
+        let create_body = serde_json::to_vec(
+            &json!({ "name": "doomed", "workspace_root": dir.path().to_str().unwrap() }),
+        )
+        .unwrap();
         app.clone()
             .oneshot(
                 HttpRequest::builder()
@@ -3479,12 +3721,18 @@ mod tests {
     ) -> (AppState, TokenString, std::path::PathBuf) {
         let token = issue_token().expect("token");
         let cfg = test_config();
-        let workspace_dir = dir.path().to_path_buf();
-        let wm = WorkspaceManager::from_path(workspace_dir.clone()).expect("workspace");
+        // A = tempdir root; Store(C) = nested `store/` (mirrors production
+        // nesting + the denylist). Returns the Store dir (callers seed records
+        // there); `create_session` passes `dir.path()` (the A root) as a valid
+        // workspace_root.
+        let server_workspace = dir.path().to_path_buf();
+        let store_dir = server_workspace.join("store");
+        let wm = WorkspaceManager::from_path(store_dir.clone()).expect("workspace");
         let backend = gtmux_pty_backend::PtyBackend::new();
         let hub = gtmux_ws_server::Hub::new(backend);
-        let state = AppState::with_hub_and_workspace(cfg, token.clone(), hub, wm);
-        (state, token, workspace_dir)
+        let state = AppState::with_hub_and_workspace(cfg, token.clone(), hub, wm)
+            .with_server_workspace(server_workspace);
+        (state, token, store_dir)
     }
 
     fn make_layout_with_one_terminal(uuid: &str) -> Value {
@@ -3689,8 +3937,16 @@ mod tests {
 
     // ── Stage 3: cross-server session attach lock (ADR-0019 D3/D6) ──
 
-    async fn create_session(app: &Router, token: &TokenString, name: &str) {
-        let body = serde_json::to_vec(&json!({ "name": name })).unwrap();
+    async fn create_session(
+        app: &Router,
+        token: &TokenString,
+        name: &str,
+        workspace_root: &std::path::Path,
+    ) {
+        let body = serde_json::to_vec(
+            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap() }),
+        )
+        .unwrap();
         let resp = app
             .clone()
             .oneshot(
@@ -3723,6 +3979,188 @@ mod tests {
             .await
             .unwrap();
         resp.status()
+    }
+
+    // ── Stage 3 (ADR-0044 D-B5/B6) — rename + duplicate helpers/tests ──
+
+    async fn rename_session(
+        app: &Router,
+        token: &TokenString,
+        name: &str,
+        new_name: &str,
+    ) -> (StatusCode, Value) {
+        let body = serde_json::to_vec(&json!({ "name": new_name })).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/sessions/{name}"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 8 * 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, v)
+    }
+
+    async fn import_session_with_layout(
+        app: &Router,
+        token: &TokenString,
+        name: &str,
+        layout: Value,
+    ) {
+        let body = serde_json::to_vec(&json!({ "name": name, "layout": layout })).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/import")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED, "import must succeed");
+    }
+
+    async fn get_layout(app: &Router, token: &TokenString, name: &str) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/sessions/{name}/layout"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rename_session_available_moves_record_and_manifest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "old", dir.path()).await;
+
+        let (status, body) = rename_session(&app, &token, "old", "new").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["name"], "new");
+
+        // Old name is gone, new name is present in the enriched list.
+        let listing = list_as_webpage(&app, &token, "page").await;
+        let names: Vec<String> = listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"new".to_string()), "new present");
+        assert!(!names.contains(&"old".to_string()), "old gone");
+    }
+
+    #[tokio::test]
+    async fn rename_session_conflict_returns_409() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "old", dir.path()).await;
+        create_session(&app, &token, "taken", dir.path()).await;
+        let (status, body) = rename_session(&app, &token, "old", "taken").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "name_conflict");
+    }
+
+    #[tokio::test]
+    async fn rename_session_invalid_name_returns_400() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "old", dir.path()).await;
+        let (status, _) = rename_session(&app, &token, "old", "bad name!").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rename_session_active_returns_409_session_active() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        create_session(&app, &token, "old", dir.path()).await;
+        assert_eq!(
+            attach_as_webpage(&app, &token, "old", "page-a").await,
+            StatusCode::OK
+        );
+        let (status, body) = rename_session(&app, &token, "old", "new").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "session_active");
+    }
+
+    #[tokio::test]
+    async fn duplicate_session_reissues_terminal_ids_and_appends_manifest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let original_terminal_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let layout = json!({
+            "schema_version": 2, "groups": [],
+            "items": [{
+                "type": "terminal", "id": original_terminal_id, "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 100.0, "h": 100.0, "z": 0,
+                "visibility": "visible", "locked": false
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        import_session_with_layout(&app, &token, "src", layout).await;
+
+        let body = serde_json::to_vec(&json!({ "new_name": "copy", "folder_id": null })).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/src/duplicate")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The copy exists with a *fresh* terminal id (independent copy, S2).
+        let copy_layout = get_layout(&app, &token, "copy").await;
+        let copy_terminal_id = copy_layout["items"][0]["id"].as_str().unwrap();
+        assert_ne!(
+            copy_terminal_id, original_terminal_id,
+            "duplicate must re-issue the terminal id"
+        );
+
+        // The original is untouched, and both appear in the manifest list.
+        let src_layout = get_layout(&app, &token, "src").await;
+        assert_eq!(src_layout["items"][0]["id"], original_terminal_id);
+        let listing = list_as_webpage(&app, &token, "page").await;
+        let names: Vec<String> = listing["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"src".to_string()));
+        assert!(names.contains(&"copy".to_string()));
     }
 
     async fn attach_as_webpage(
@@ -3820,7 +4258,7 @@ mod tests {
     async fn attach_then_detach_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "alpha").await;
+        create_session(&app, &token, "alpha", dir.path()).await;
         assert_eq!(attach(&app, &token, "alpha").await, StatusCode::OK);
         assert_eq!(detach(&app, &token, "alpha").await, StatusCode::OK);
         // Second detach is still 200 (idempotent).
@@ -3831,7 +4269,7 @@ mod tests {
     async fn same_cookie_different_webpage_cannot_attach_same_session() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "alpha").await;
+        create_session(&app, &token, "alpha", dir.path()).await;
 
         assert_eq!(
             attach_as_webpage(&app, &token, "alpha", "page-a").await,
@@ -3853,7 +4291,7 @@ mod tests {
     async fn detach_is_webpage_scoped() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "alpha").await;
+        create_session(&app, &token, "alpha", dir.path()).await;
 
         assert_eq!(
             attach_as_webpage(&app, &token, "alpha", "page-a").await,
@@ -3882,8 +4320,8 @@ mod tests {
     async fn session_list_disables_any_open_webpage_session() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "alpha").await;
-        create_session(&app, &token, "beta").await;
+        create_session(&app, &token, "alpha", dir.path()).await;
+        create_session(&app, &token, "beta", dir.path()).await;
 
         assert_eq!(
             attach_as_webpage(&app, &token, "alpha", "page-a").await,
@@ -3892,7 +4330,8 @@ mod tests {
 
         let as_owner = list_as_webpage(&app, &token, "page-a").await;
         let alpha_for_owner = as_owner
-            .as_array()
+            .get("sessions")
+            .and_then(Value::as_array)
             .unwrap()
             .iter()
             .find(|row| row["name"] == "alpha")
@@ -3905,7 +4344,8 @@ mod tests {
 
         let as_other = list_as_webpage(&app, &token, "page-b").await;
         let alpha_for_other = as_other
-            .as_array()
+            .get("sessions")
+            .and_then(Value::as_array)
             .unwrap()
             .iter()
             .find(|row| row["name"] == "alpha")
@@ -3948,7 +4388,7 @@ mod tests {
     async fn leave_releases_lock_for_owner() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "alpha").await;
+        create_session(&app, &token, "alpha", dir.path()).await;
 
         assert_eq!(
             attach_as_webpage(&app, &token, "alpha", "page-a").await,
@@ -3958,7 +4398,8 @@ mod tests {
         // any open Webpage sees the row as in-use).
         let before = list_as_webpage(&app, &token, "page-a").await;
         let alpha_before = before
-            .as_array()
+            .get("sessions")
+            .and_then(Value::as_array)
             .unwrap()
             .iter()
             .find(|row| row["name"] == "alpha")
@@ -3972,7 +4413,8 @@ mod tests {
 
         let after = list_as_webpage(&app, &token, "page-b").await;
         let alpha_after = after
-            .as_array()
+            .get("sessions")
+            .and_then(Value::as_array)
             .unwrap()
             .iter()
             .find(|row| row["name"] == "alpha")
@@ -4027,8 +4469,8 @@ mod tests {
     async fn leave_releases_only_matching_owner() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "alpha").await;
-        create_session(&app, &token, "beta").await;
+        create_session(&app, &token, "alpha", dir.path()).await;
+        create_session(&app, &token, "beta", dir.path()).await;
 
         // Two Webpages on the *same* (bearer-only) auth context, distinct
         // tab identities — each takes its own session.
@@ -4049,13 +4491,15 @@ mod tests {
 
         let listing = list_as_webpage(&app, &token, "page-3").await;
         let alpha = listing
-            .as_array()
+            .get("sessions")
+            .and_then(Value::as_array)
             .unwrap()
             .iter()
             .find(|row| row["name"] == "alpha")
             .unwrap();
         let beta = listing
-            .as_array()
+            .get("sessions")
+            .and_then(Value::as_array)
             .unwrap()
             .iter()
             .find(|row| row["name"] == "beta")
@@ -4076,7 +4520,7 @@ mod tests {
     async fn attach_active_flag_appears_in_list() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "beta").await;
+        create_session(&app, &token, "beta", dir.path()).await;
 
         // Before attach: active = false
         let list_before = app
@@ -4093,7 +4537,8 @@ mod tests {
             .unwrap();
         let body = to_bytes(list_before.into_body(), 64 * 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v, json!([{ "name": "beta", "active": false }]));
+        assert_eq!(v["sessions"][0]["name"], json!("beta"));
+        assert_eq!(v["sessions"][0]["active"], json!(false));
 
         // Attach.
         assert_eq!(attach(&app, &token, "beta").await, StatusCode::OK);
@@ -4113,7 +4558,8 @@ mod tests {
             .unwrap();
         let body = to_bytes(list_after.into_body(), 64 * 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v, json!([{ "name": "beta", "active": true }]));
+        assert_eq!(v["sessions"][0]["name"], json!("beta"));
+        assert_eq!(v["sessions"][0]["active"], json!(true));
 
         // Cleanup so the TempDir Drop doesn't trip the held flock cleanup.
         assert_eq!(detach(&app, &token, "beta").await, StatusCode::OK);
@@ -4127,7 +4573,7 @@ mod tests {
     async fn attach_idempotent_for_same_cookie_same_session() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "gamma").await;
+        create_session(&app, &token, "gamma", dir.path()).await;
         let cookie_value = "same-cookie-aaa";
         let make_req = || {
             HttpRequest::builder()
@@ -4184,7 +4630,7 @@ mod tests {
     async fn attach_409_when_held_by_different_cookie() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "gamma").await;
+        create_session(&app, &token, "gamma", dir.path()).await;
         let cookie_a = "cookie-aaa";
         let cookie_b = "cookie-bbb";
         let post = |cookie: &str| {
@@ -4230,7 +4676,7 @@ mod tests {
         // DELETE.
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "auto-rel").await;
+        create_session(&app, &token, "auto-rel", dir.path()).await;
 
         // Attach with a known cookie so we can drive release-by-cookie.
         let cookie_value = "test-cookie-XYZ";
@@ -4386,7 +4832,7 @@ mod tests {
         // an attach through the handler — handler must report 409.
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
-        create_session(&app, &token, "delta").await;
+        create_session(&app, &token, "delta", dir.path()).await;
 
         let locks_dir = workspace_dir.join(".locks");
         let other_server_id: Arc<str> = crate::session_lock::fresh_server_id().into();
@@ -4435,7 +4881,7 @@ mod tests {
         let hub = state.hub.as_ref().expect("hub wired").clone();
         let app = router_with_state(state);
         let cookie = "p2-cookie";
-        create_session(&app, &token, "p2demo").await;
+        create_session(&app, &token, "p2demo", dir.path()).await;
 
         // Take the attach so the create_terminal handler sees the cookie
         // as the lock holder.
@@ -4508,7 +4954,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (state, token, _) = make_state_with_workspace_and_hub(&dir);
         let app = router_with_state(state);
-        create_session(&app, &token, "p2na").await;
+        create_session(&app, &token, "p2na", dir.path()).await;
 
         // Skip attach — POST /terminals must 403 not_attached.
         let resp = app
@@ -4621,7 +5067,7 @@ mod tests {
         let uuid = "11111111-2222-4333-8444-66666666666e";
         let mut rx = hub.subscribe_terminal_spawned();
         let pane = state
-            .spawn_terminal_with_uuid(uuid.to_string())
+            .spawn_terminal_with_uuid(uuid.to_string(), None)
             .await
             .expect("spawn");
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
@@ -4643,7 +5089,7 @@ mod tests {
         let uuid = "11111111-2222-4333-8444-66666666666f";
         let mut rx = hub.subscribe_terminal_spawned();
         let _first = state
-            .spawn_terminal_with_uuid(uuid.to_string())
+            .spawn_terminal_with_uuid(uuid.to_string(), None)
             .await
             .expect("spawn 1");
         let _drain = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
@@ -4652,7 +5098,7 @@ mod tests {
             .expect("recv");
         // Re-spawn the same UUID — fast-path lookup, no fresh broadcast.
         let _second = state
-            .spawn_terminal_with_uuid(uuid.to_string())
+            .spawn_terminal_with_uuid(uuid.to_string(), None)
             .await
             .expect("spawn 2");
         let racy = tokio::time::timeout(std::time::Duration::from_millis(80), rx.recv()).await;
@@ -5116,7 +5562,8 @@ mod tests {
             .await
             .unwrap();
         let body = axum::body::to_bytes(list.into_body(), 4096).await.unwrap();
-        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rows = body["sessions"].as_array().unwrap();
         let one = rows.iter().find(|r| r["name"] == "one").expect("one row");
         let two = rows.iter().find(|r| r["name"] == "two").expect("two row");
         assert_eq!(
@@ -5323,9 +5770,11 @@ mod tests {
     #[tokio::test]
     async fn assets_from_path_image_roundtrip() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (app, token, workspace_dir) = make_app_with_workspace(&dir);
+        let (app, token, _store) = make_app_with_workspace(&dir);
         let png = fixture_png_1x1();
-        let source = workspace_dir.join("picked.png");
+        // A picked file lives inside the Server Workspace(A) (= dir.path()),
+        // not the Store. ADR-0046 D3/§보안 — from-path is A-scoped + denylist.
+        let source = dir.path().join("picked.png");
         std::fs::write(&source, &png).unwrap();
 
         let resp = app
@@ -5365,6 +5814,24 @@ mod tests {
         let outside = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
         let source = outside.path().join("picked.png");
+        std::fs::write(&source, fixture_png_1x1()).unwrap();
+
+        let resp = app
+            .oneshot(upload_from_path_request(&token, &source, "image"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// ADR-0046 D3/§보안 regression — a source *inside the Store* (on the M2
+    /// denylist) must be rejected even though it is inside A. This locks in the
+    /// fix for the Store-rooted from-path bug (the explorer materialize path
+    /// must not let the user import gtmux's own control-plane files).
+    #[tokio::test]
+    async fn assets_from_path_rejects_inside_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+        let source = store_dir.join("picked.png");
         std::fs::write(&source, fixture_png_1x1()).unwrap();
 
         let resp = app
@@ -5624,7 +6091,7 @@ mod tests {
     async fn batch5_layout_put_rect_full_payload_round_trip() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        attach_idx_create_session(&app, &token, "fig1").await;
+        attach_idx_create_session(&app, &token, "fig1", dir.path()).await;
         let etag = batch5_fetch_etag(&app, &token, "fig1").await;
 
         let layout = json!({
@@ -5670,7 +6137,7 @@ mod tests {
     async fn batch5_layout_put_legacy_rect_get_defaults() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        attach_idx_create_session(&app, &token, "fig2").await;
+        attach_idx_create_session(&app, &token, "fig2", dir.path()).await;
         let etag = batch5_fetch_etag(&app, &token, "fig2").await;
 
         let legacy_layout = json!({
@@ -5714,7 +6181,7 @@ mod tests {
     async fn batch5_layout_put_stroke_width_overflow_returns_400() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        attach_idx_create_session(&app, &token, "fig3").await;
+        attach_idx_create_session(&app, &token, "fig3", dir.path()).await;
         let etag = batch5_fetch_etag(&app, &token, "fig3").await;
 
         let bad_layout = json!({
@@ -5744,7 +6211,7 @@ mod tests {
     async fn batch5_layout_put_text_font_size_overflow_returns_400() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        attach_idx_create_session(&app, &token, "txt1").await;
+        attach_idx_create_session(&app, &token, "txt1", dir.path()).await;
         let etag = batch5_fetch_etag(&app, &token, "txt1").await;
 
         let bad_layout = json!({
@@ -5775,7 +6242,7 @@ mod tests {
     async fn batch5_layout_put_text_full_style_round_trip() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
-        attach_idx_create_session(&app, &token, "txt2").await;
+        attach_idx_create_session(&app, &token, "txt2", dir.path()).await;
         let etag = batch5_fetch_etag(&app, &token, "txt2").await;
 
         let layout = json!({
@@ -5811,5 +6278,354 @@ mod tests {
         assert_eq!(text["underline"], true);
         assert_eq!(text["strikethrough"], false);
         assert_eq!(text["font_size"], 18);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    //  ADR-0045 / ADR-0046 — Server Workspace(A) sandbox + Workspace(B)
+    //  (fs picker re-root + denylist + mkdir/rmdir, session workspace_root,
+    //  change-workspace, duplicate copy). Gate coverage for plan-0020 A-2/B-1/B-5.
+    // ──────────────────────────────────────────────────────────────────────
+
+    async fn authed_json(
+        app: &Router,
+        token: &TokenString,
+        method: Method,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, TEST_HOST)
+            .header(header::ORIGIN, TEST_ORIGIN)
+            .header(header::AUTHORIZATION, bearer(token));
+        let req = match body {
+            Some(v) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                builder
+                    .body(Body::from(serde_json::to_vec(&v).unwrap()))
+                    .unwrap()
+            }
+            None => builder.body(Body::empty()).unwrap(),
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 256 * 1024).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn fs_list_roots_at_server_workspace_and_denies_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+        let a_root = dir.path().canonicalize().unwrap();
+
+        // Default open (dir="") = Server Workspace(A) root, not the Store.
+        let (status, body) =
+            authed_json(&app, &token, Method::GET, "/api/fs/list?dir=", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["dir"], a_root.to_string_lossy().as_ref());
+        // The A root has no parent exposed to the picker.
+        assert_eq!(body["parent"], Value::Null);
+
+        // The Store dir is inside A but on the denylist → 403.
+        let store_uri = format!("/api/fs/list?dir={}", store_dir.to_string_lossy());
+        let (status, body) = authed_json(&app, &token, Method::GET, &store_uri, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "dir_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn fs_mkdir_then_rmdir_roundtrip_and_non_empty_409() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let proj = dir.path().join("proj");
+
+        // mkdir → 201.
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/mkdir",
+            Some(json!({ "path": proj.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(proj.is_dir());
+
+        // mkdir again → 409 already_exists.
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/mkdir",
+            Some(json!({ "path": proj.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "already_exists");
+
+        // rmdir non-empty → 409 dir_not_empty.
+        std::fs::write(proj.join("file.txt"), b"x").unwrap();
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rmdir",
+            Some(json!({ "path": proj.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "dir_not_empty");
+
+        // After emptying, rmdir → 204.
+        std::fs::remove_file(proj.join("file.txt")).unwrap();
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/rmdir",
+            Some(json!({ "path": proj.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!proj.exists());
+    }
+
+    #[tokio::test]
+    async fn fs_mkdir_denies_inside_store() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+        let inside_store = store_dir.join("evil");
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/mkdir",
+            Some(json!({ "path": inside_store.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "dir_not_allowed");
+        assert!(!inside_store.exists());
+    }
+
+    #[tokio::test]
+    async fn create_requires_workspace_root_400() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        // Valid name, but no workspace_root → 400 invalid_workspace (required).
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({ "name": "needs-ws" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_workspace");
+        assert_eq!(body["reason"], "required");
+    }
+
+    #[tokio::test]
+    async fn create_rejects_workspace_root_outside_a() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({ "name": "escape", "workspace_root": "/etc" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_workspace");
+        assert_eq!(body["reason"], "outside_server_workspace");
+    }
+
+    #[tokio::test]
+    async fn create_persists_workspace_root_and_two_sessions_share_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let proj = dir.path().join("shared");
+        std::fs::create_dir_all(&proj).unwrap();
+        let proj_canonical = proj.canonicalize().unwrap();
+
+        for name in ["one", "two"] {
+            let (status, _) = authed_json(
+                &app,
+                &token,
+                Method::POST,
+                "/api/sessions",
+                Some(json!({ "name": name, "workspace_root": proj.to_string_lossy() })),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "N:1 — both sessions may share one workspace"
+            );
+        }
+
+        // The persisted record carries the canonical workspace_root.
+        let (status, layout) =
+            authed_json(&app, &token, Method::GET, "/api/sessions/one/layout", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            layout["workspace_root"],
+            proj_canonical.to_string_lossy().as_ref()
+        );
+
+        // The enriched list reports the effective workspace for both.
+        let (status, list) = authed_json(&app, &token, Method::GET, "/api/sessions", None).await;
+        assert_eq!(status, StatusCode::OK);
+        for s in list["sessions"].as_array().unwrap() {
+            assert_eq!(
+                s["workspace_root"],
+                proj_canonical.to_string_lossy().as_ref()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_record_without_workspace_root_lists_safe_effective_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+        let a_root = dir.path().canonicalize().unwrap();
+        // Seed a legacy v2 record on disk with no workspace_root field.
+        let legacy = json!({
+            "schema_version": 2, "groups": [], "items": [],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        std::fs::write(
+            store_dir.join("legacy.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let (status, list) = authed_json(&app, &token, Method::GET, "/api/sessions", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "legacy")
+            .expect("legacy session listed");
+        // No config default_session_workspace: chain tries $HOME, but test
+        // $HOME is outside this temp A, so the closed fallback is A-root.
+        assert_eq!(entry["workspace_root"], a_root.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn change_workspace_updates_record() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let proj1 = dir.path().join("p1");
+        let proj2 = dir.path().join("p2");
+        std::fs::create_dir_all(&proj1).unwrap();
+        std::fs::create_dir_all(&proj2).unwrap();
+        let proj2_canonical = proj2.canonicalize().unwrap();
+
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({ "name": "movable", "workspace_root": proj1.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Re-point to proj2.
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::PUT,
+            "/api/sessions/movable/workspace",
+            Some(json!({ "workspace_root": proj2.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["workspace_root"],
+            proj2_canonical.to_string_lossy().as_ref()
+        );
+
+        // Persisted layout reflects the new root.
+        let (status, layout) = authed_json(
+            &app,
+            &token,
+            Method::GET,
+            "/api/sessions/movable/layout",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            layout["workspace_root"],
+            proj2_canonical.to_string_lossy().as_ref()
+        );
+
+        // 404 for an unknown session; 400 for an out-of-A target.
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::PUT,
+            "/api/sessions/ghost/workspace",
+            Some(json!({ "workspace_root": proj2.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::PUT,
+            "/api/sessions/movable/workspace",
+            Some(json!({ "workspace_root": "/etc" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_workspace");
+    }
+
+    #[tokio::test]
+    async fn duplicate_copies_workspace_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let proj = dir.path().join("dup-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let proj_canonical = proj.canonicalize().unwrap();
+
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({ "name": "orig", "workspace_root": proj.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions/orig/duplicate",
+            Some(json!({ "new_name": "copy" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // The copy carries the same workspace_root (N:1 — shared project dir).
+        let (status, layout) =
+            authed_json(&app, &token, Method::GET, "/api/sessions/copy/layout", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            layout["workspace_root"],
+            proj_canonical.to_string_lossy().as_ref()
+        );
     }
 }

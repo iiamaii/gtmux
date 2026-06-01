@@ -15,31 +15,65 @@ import type { CanvasLayout } from './canvas';
 /* GET /api/sessions — list                                                   */
 /* ────────────────────────────────────────────────────────────────────────── */
 
+export interface Folder {
+  id: string;
+  parent_id: string | null;
+  name: string;
+  order: number;
+  color?: string | null;
+  collapsed: boolean;
+}
+
+export interface SessionOrg {
+  folder_id: string | null;
+  order: number;
+  tags: string[];
+  favorite: boolean;
+}
+
 /**
  * 한 session 의 list-level metadata. 실제 layout 은 attach 후 별 GET.
  * `active = true` 이면 *다른 webpage* 가 attach 중 — 본 webpage 는 attach 불가.
  */
-export interface SessionInfo {
+export interface EnrichedSession extends SessionOrg {
   /** 사용자 부여 이름. ADR-0019 정규식 `^[A-Za-z0-9_-]{1,64}$`. */
   name: string;
-  /**
-   * ISO 8601 timestamp — 마지막 attach 종료 시각. fresh session 은 created_at.
-   * 현재 BE list endpoint 는 아직 이 값을 내려주지 않으므로 optional.
-   */
-  last_used_at?: string;
+  /** Effective project workspace root. Empty string means legacy BE/default root. */
+  workspace_root: string;
   /** 다른 webpage 가 현재 attach 상태인가. SessionListModal 의 "in use" 섹션 결정. */
   active: boolean;
+  /** Item count (panel + non-terminal) 의 hint — list row 의 subtitle. */
+  item_count: number;
+  /** Terminal item count. */
+  terminal_count: number;
+  /** Unix seconds from the session file mtime. */
+  modified_at: number;
+  /**
+   * ISO 8601 timestamp — legacy optional display hook. BE Stage 2 uses
+   * `modified_at`; this stays optional for older call sites/tests.
+   */
+  last_used_at?: string;
   /**
    * `active = true` 인 경우 attach 중인 server pid. local-only display
    * (e.g. `in use by server-pid 12345`). cross-server lock 의 detection.
    */
   active_server_pid?: number;
-  /** Item count (panel + non-terminal) 의 hint — list row 의 subtitle. optional. */
-  item_count?: number;
 }
 
-export interface SessionListResponse {
-  sessions: SessionInfo[];
+export type SessionInfo = EnrichedSession;
+
+export interface WorkspaceListResponse {
+  folders: Folder[];
+  sessions: EnrichedSession[];
+  manifest_etag: string;
+}
+
+export type SessionListResponse = WorkspaceListResponse;
+
+export interface ManifestPutBody {
+  manifest_version: 1;
+  folders: Folder[];
+  sessions: Record<string, SessionOrg>;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -48,10 +82,20 @@ export interface SessionListResponse {
 
 export interface CreateSessionRequest {
   name: string;
+  workspace_root: string;
 }
 
 export interface CreateSessionResponse {
   session: SessionInfo;
+}
+
+export interface DuplicateSessionRequest {
+  new_name: string;
+  folder_id?: string | null;
+}
+
+export interface DuplicateSessionResponse {
+  name: string;
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */

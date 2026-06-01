@@ -3,10 +3,7 @@
    * RightPanel — unified floating panel on the right edge.
    *
    * Symmetric counterpart of `LeftPanel.svelte` (ADR-0017 §D2 amend ③).
-   * Currently a single tab (`Inspect` — Item Info), but the chrome
-   * matches LeftPanel exactly so additional tabs (ref `Design /
-   * Prototype / Inspect`) can be added without re-shaping the
-   * container.
+   * Hosts Inspect and Preview tabs while matching LeftPanel chrome.
    *
    * Collapsed state:
    *   - chromeStore.state.paneInfoCollapsed === true
@@ -19,6 +16,7 @@
   import { chromeStore, type RightPanelTab } from '$lib/stores/chrome.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import ItemInfoView from './ItemInfoView.svelte';
+  import FilePreviewView from './FilePreviewView.svelte';
   import PanelFoldButton from './PanelFoldButton.svelte';
 
   const collapsed = $derived(chromeStore.state.paneInfoCollapsed);
@@ -97,6 +95,20 @@
         <line x1="12" y1="7.5" x2="12" y2="7.6"/>
       </svg>
     </button>
+    <button
+      type="button"
+      class="rail-btn"
+      class:active={activeTab === 'preview'}
+      title={noActiveSession ? 'Connect a session to preview files' : 'Preview'}
+      aria-label="Open Preview tab"
+      disabled={noActiveSession}
+      onclick={() => expandAndSelect('preview')}
+    >
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h8L20 10.5v8A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-13z"/>
+        <path d="M13 4v7h7"/>
+      </svg>
+    </button>
   </aside>
 {:else}
   <aside
@@ -125,6 +137,16 @@
           title={noActiveSession ? 'Connect a session to inspect items' : ''}
           onclick={() => selectTab('inspect')}
         >Inspect</button>
+        <button
+          type="button"
+          role="tab"
+          class="panel-tab"
+          class:active={activeTab === 'preview'}
+          aria-selected={activeTab === 'preview'}
+          disabled={noActiveSession}
+          title={noActiveSession ? 'Connect a session to preview files' : ''}
+          onclick={() => selectTab('preview')}
+        >Preview</button>
       </div>
       <span class="head-spacer"></span>
       <PanelFoldButton
@@ -137,6 +159,8 @@
     <div class="right-panel-body" class:no-session={noActiveSession} inert={noActiveSession}>
       {#if activeTab === 'inspect'}
         <ItemInfoView />
+      {:else}
+        <FilePreviewView />
       {/if}
     </div>
   </aside>

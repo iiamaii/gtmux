@@ -646,6 +646,7 @@ dependencies = [
  "gtmux-ws-server",
  "libc",
  "rpassword",
+ "serde_json",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",

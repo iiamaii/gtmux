@@ -454,10 +454,11 @@ struct PtyBackendInner {
     /// [`BackendNotify`] values; the ws-server router serialises them
     /// to `0x07` envelopes.
     notify_tx: broadcast::Sender<BackendNotify>,
-    /// Session marker injected into every child shell's environment
-    /// (ADR-0014 D11). `GTMUX_SESSION=<this>` is the boot-time scanner's
-    /// signal that a stray process belongs to our gtmux. `None` in
-    /// unit tests where the marker is irrelevant.
+    /// Server-instance marker injected into every child shell's environment
+    /// (ADR-0014 D11, ADR-0044 D-A4). Emitted as `GTMUX_SERVER_INSTANCE=<this>`
+    /// (plus the legacy `GTMUX_SESSION=<this>` during the transition release) —
+    /// the boot-time scanner's signal that a stray process belongs to our
+    /// gtmux. `None` in unit tests where the marker is irrelevant.
     session_marker: Option<String>,
 }
 
@@ -484,12 +485,12 @@ impl PtyBackend {
         Self::with_session(None)
     }
 
-    /// Construct an empty backend tagged with a *session marker* —
-    /// every child shell spawned via `spawn()` will have
-    /// `GTMUX_SESSION=<marker>` + `GTMUX_SERVER_PID=<pid>` injected
-    /// (ADR-0014 D11). The boot-time orphan scanner uses these
-    /// markers to identify stray processes from a crashed prior
-    /// Server instance.
+    /// Construct an empty backend tagged with a *server-instance marker* —
+    /// every child shell spawned via `spawn()` has `GTMUX_SERVER_INSTANCE`
+    /// (plus the legacy `GTMUX_SESSION`) and `GTMUX_SERVER_PID` injected into
+    /// its environment (ADR-0014 D11, ADR-0044 D-A4). The boot-time orphan
+    /// scanner uses these markers to identify stray processes from a crashed
+    /// prior Server instance.
     pub fn with_session(session_marker: Option<String>) -> Self {
         let (notify_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
@@ -779,8 +780,13 @@ fn spawn_inner(
     // stray children from a previous crashed Server. Injected before
     // user-supplied env so the user can intentionally override (though
     // doing so weakens the cleanup guarantee).
-    if let Some(session) = inner.session_marker.as_deref() {
-        cmd.env("GTMUX_SESSION", session);
+    //
+    // ADR-0044 D-A4: the canonical tag is now `GTMUX_SERVER_INSTANCE`;
+    // the legacy `GTMUX_SESSION` is dual-emitted for one transition
+    // release so an orphan scanner from either build recognises the child.
+    if let Some(instance) = inner.session_marker.as_deref() {
+        cmd.env("GTMUX_SERVER_INSTANCE", instance);
+        cmd.env("GTMUX_SESSION", instance);
     }
     cmd.env("GTMUX_SERVER_PID", std::process::id().to_string());
 

@@ -3,15 +3,13 @@
 //
 // Two floating panels — both follow the same shape (header tabs +
 // PanelFoldButton + collapsed rail with per-tab icons):
-//   - LeftPanel — Layers + Terminals (left edge)
-//   - RightPanel — Inspect (right edge, single tab for now; ref leaves
-//     room for Design / Prototype / Inspect — currently we only need
-//     Inspect, but the tab chrome stays for future growth).
+//   - LeftPanel — Layers + Terminals + Files (left edge)
+//   - RightPanel — Inspect + Preview (right edge).
 // State persists in localStorage so the preference survives reload.
 // Web-only state, no backend round-trip.
 
-export type LeftPanelTab = 'layers' | 'terminals';
-export type RightPanelTab = 'inspect';
+export type LeftPanelTab = 'layers' | 'terminals' | 'files';
+export type RightPanelTab = 'inspect' | 'preview';
 
 export type ChromeState = {
   sidebarCollapsed: boolean;
@@ -23,7 +21,7 @@ export type ChromeState = {
 };
 
 const STORAGE_KEY = 'gtmux-chrome';
-const LEFT_PANEL_MIN_WIDTH = 220;
+const LEFT_PANEL_MIN_WIDTH = 268;
 const LEFT_PANEL_MAX_WIDTH = 520;
 const RIGHT_PANEL_MIN_WIDTH = 240;
 const RIGHT_PANEL_MAX_WIDTH = 560;
@@ -31,7 +29,7 @@ const RIGHT_PANEL_MAX_WIDTH = 560;
 const DEFAULT: ChromeState = {
   sidebarCollapsed: false,
   leftPanelTab: 'layers',
-  leftPanelWidth: 248,
+  leftPanelWidth: 268,
   paneInfoCollapsed: false,
   rightPanelTab: 'inspect',
   rightPanelWidth: 268,
@@ -113,12 +111,15 @@ function resolveInitial(): ChromeState {
           ? obj.sidebarCollapsed
           : DEFAULT.sidebarCollapsed,
       leftPanelTab:
-        leftTab === 'layers' || leftTab === 'terminals' ? leftTab : DEFAULT.leftPanelTab,
+        leftTab === 'layers' || leftTab === 'terminals' || leftTab === 'files'
+          ? leftTab
+          : DEFAULT.leftPanelTab,
       paneInfoCollapsed:
         typeof obj.paneInfoCollapsed === 'boolean'
           ? obj.paneInfoCollapsed
           : DEFAULT.paneInfoCollapsed,
-      rightPanelTab: rightTab === 'inspect' ? rightTab : DEFAULT.rightPanelTab,
+      rightPanelTab:
+        rightTab === 'inspect' || rightTab === 'preview' ? rightTab : DEFAULT.rightPanelTab,
       leftPanelWidth:
         typeof obj.leftPanelWidth === 'number'
           ? obj.leftPanelWidth
