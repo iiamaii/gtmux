@@ -120,12 +120,16 @@ export interface AttachConfirmSummary {
 export interface AttachConfirmRequired {
   kind: 'confirm_required';
   summary: AttachConfirmSummary;
+  /** Effective project workspace root returned by attach when available. */
+  workspace_root?: string;
 }
 
 /** Attach 성공 — layout 전체 페이로드. */
 export interface AttachOk {
   kind: 'ok';
   layout: CanvasLayout;
+  /** Effective project workspace root returned by layout/attach when available. */
+  workspace_root?: string;
   /** Layout file 의 raw etag (hex) — 후속 PUT 의 If-Match 입력. */
   etag: string;
   /** BE 4-C 의 matched UUID list — 정합 검증 / debug. */

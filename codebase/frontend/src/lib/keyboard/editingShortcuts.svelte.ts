@@ -18,12 +18,14 @@
 //   offset.
 
 import type { CanvasItem } from '$lib/types/canvas';
+import { chromeStore } from '$lib/stores/chrome.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { pasteItems, materializeSelection } from '$lib/canvas/clipboardOps.svelte';
 import { nudgeBuffer } from './nudgeBuffer.svelte';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
 function selectAllVisible(): boolean {
+  if (chromeStore.state.leftPanelTab === 'files') return false;
   return sessionStore.selectAllVisibleAtDrillScope();
 }
 

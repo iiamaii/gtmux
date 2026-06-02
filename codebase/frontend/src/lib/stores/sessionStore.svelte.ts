@@ -23,7 +23,14 @@
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 import { debugCount } from '$lib/common/debugCounts';
-import { attachConfirm, deleteItem, EtagMismatchError, mutateLayout, UnauthorizedError } from '$lib/http/sessions';
+import {
+  attachConfirm,
+  deleteItem,
+  EtagMismatchError,
+  mutateLayout,
+  parseLayoutBody,
+  UnauthorizedError,
+} from '$lib/http/sessions';
 import { killTerminal } from '$lib/http/terminals';
 import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
 import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
@@ -54,6 +61,8 @@ import { degradeDeletedEndpoint, updatePathBBoxCache } from '$lib/canvas/pathGeo
 export interface ActiveSession {
   /** Session name (user-facing identifier, ADR-0019). */
   name: string;
+  /** Effective Project Workspace(B), if the server/list response exposed it. */
+  effectiveWorkspaceRoot?: string;
 }
 
 /**
@@ -73,7 +82,7 @@ export interface ActiveSession {
  */
 export type ReattachResult =
   | { kind: 'success' }
-  | { kind: 'confirm_required'; summary: AttachConfirmSummary }
+  | { kind: 'confirm_required'; summary: AttachConfirmSummary; workspace_root?: string }
   | { kind: 'in_use'; holderPid?: number }
   | { kind: 'not_found' }
   | { kind: 'unauthorized' }
@@ -128,9 +137,19 @@ function normalizePathItems(layout: CanvasLayout): CanvasLayout {
   return { ...layout, items };
 }
 
+function layoutWorkspaceRoot(layout: CanvasLayout): string | undefined {
+  return typeof layout.workspace_root === 'string' && layout.workspace_root.length > 0
+    ? layout.workspace_root
+    : undefined;
+}
+
 class SessionStore {
   /** 현 webpage 가 attach 한 session. null = pre-attach / post-detach. */
   active = $state<ActiveSession | null>(null);
+
+  get effectiveWorkspaceRoot(): string {
+    return this.active?.effectiveWorkspaceRoot ?? '';
+  }
 
   /** `items[]` 의 in-memory representation — id 키 SvelteMap. */
   items = $state(new SvelteMap<string, CanvasItem>());
@@ -264,6 +283,10 @@ class SessionStore {
    */
   loadLayout(layout: CanvasLayout): void {
     debugCount('sessionStore.loadLayout');
+    const workspaceRoot = layoutWorkspaceRoot(layout);
+    if (workspaceRoot !== undefined) {
+      this.setActiveWorkspaceRoot(workspaceRoot);
+    }
     // plan-0012 §6 / ADR-0024 신 D3' — boot 시점 consecutive z normalize.
     // 옛 layout (gap 있는 z) 가 fresh attach / LAYOUT_CHANGED 으로 들어와도 store
     // entry 시점에 *FE 측 invariant* 정합. Idempotent — 이미 정합인 layout 은
@@ -308,7 +331,8 @@ class SessionStore {
         },
       );
       if (!res.ok) return false;
-      const layout = (await res.json()) as CanvasLayout;
+      const { layout, workspace_root } = parseLayoutBody(await res.json());
+      if (workspace_root !== undefined) this.setActiveWorkspaceRoot(workspace_root);
       this.loadLayout(layout);
       return true;
     } catch {
@@ -338,6 +362,11 @@ class SessionStore {
     this.suppressedTextEditDblClick = null;
     // ADR-0028 D4 — per-session history. 이전 session 의 stack 은 drop.
     historyStore.setActive(session.name);
+  }
+
+  setActiveWorkspaceRoot(root: string): void {
+    if (this.active === null) return;
+    this.active = { ...this.active, effectiveWorkspaceRoot: root };
   }
 
   /**
@@ -1025,11 +1054,12 @@ class SessionStore {
     // 면 confirm_required 반환 (WorkspaceSwitcher.tryAttach 와 정합). caller 가
     // AttachConfirmModal 노출 책임. 서버 재기동 후 panel 만 남기고 respawn 누락
     // 회귀 (2026-05-17) 직접 차단.
-    let attachBody: { matched?: string[]; unmatched?: string[] } = {};
+    let attachBody: { matched?: string[]; unmatched?: string[]; workspace_root?: string } = {};
     try {
       attachBody = (await attachRes.json()) as {
         matched?: string[];
         unmatched?: string[];
+        workspace_root?: string;
       };
     } catch {
       /* body 형식 변화 무관 — 아래 layout fetch 가 진실 */
@@ -1039,6 +1069,7 @@ class SessionStore {
     if (unmatched.length > 0) {
       return {
         kind: 'confirm_required',
+        workspace_root: attachBody.workspace_root,
         summary: {
           spawn_count: unmatched.length,
           unmatched_item_ids: unmatched,
@@ -1073,8 +1104,9 @@ class SessionStore {
       };
     }
     try {
-      const layout = (await layoutRes.json()) as CanvasLayout;
-      this.setActiveSession({ name });
+      const { layout, workspace_root } = parseLayoutBody(await layoutRes.json());
+      const effectiveWorkspaceRoot = workspace_root ?? attachBody.workspace_root;
+      this.setActiveSession({ name, effectiveWorkspaceRoot });
       this.loadLayout(layout);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1171,8 +1203,10 @@ class SessionStore {
    * store mutation 이 snapshot 을 mutate 하지 않도록 안전.
    */
   layoutSnapshot(): CanvasLayout {
+    const workspaceRoot = this.effectiveWorkspaceRoot;
     return {
       schema_version: 2,
+      ...(workspaceRoot.length > 0 ? { workspace_root: workspaceRoot } : {}),
       groups: Array.from(this.groups.values()).map((g) => ({ ...g })),
       items: Array.from(this.items.values()).map((it) => ({ ...it })),
       viewport: { ...this.viewport },

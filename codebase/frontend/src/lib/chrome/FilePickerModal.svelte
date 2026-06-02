@@ -16,6 +16,8 @@
     onUnauthorized?: () => void;
     initialDir?: string;
     accept?: { extensions: string[]; description: string } | null;
+    rootKind?: 'server' | 'workspace';
+    rootPath?: string;
   }
 
   const {
@@ -25,6 +27,8 @@
     onUnauthorized,
     initialDir = '',
     accept = null,
+    rootKind = 'server',
+    rootPath = '',
   }: Props = $props();
 </script>
 
@@ -34,6 +38,8 @@
   title={accept === null ? 'Pick a file' : `Pick ${accept.description}`}
   filter={accept?.extensions ?? []}
   filterDescription={accept?.description ?? 'files'}
+  {rootKind}
+  {rootPath}
   {initialDir}
   onCancel={onCancel}
   onPick={onSelect}

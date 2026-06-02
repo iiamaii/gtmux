@@ -14,6 +14,10 @@
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
   import { documentViewModeStore } from '$lib/stores/documentViewMode.svelte';
+  import { fsFileUrl } from '$lib/http/fs';
+  import { basename, resolveWorkspacePath } from '$lib/files/workspaceAssets';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
   import PanelDanglingOverlay from '$lib/canvas/PanelDanglingOverlay.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
@@ -37,11 +41,15 @@
   const terminalPaneId = $derived(itemId !== null ? terminalPool.paneIdFor(itemId) : undefined);
 
   const noteAccent = $derived(item?.type === 'note' ? item.color : null);
+  const documentFileName = $derived.by(() => {
+    if (item?.type !== 'document') return '';
+    return item.file_name ?? (item.path !== undefined ? basename(item.path) : 'document');
+  });
 
   const headerLabel = $derived.by(() => {
     if (item === null) return '—';
     if (item.type === 'note') return item.title.length > 0 ? item.title : 'Untitled';
-    if (item.type === 'document') return item.file_name.length > 0 ? item.file_name : 'document';
+    if (item.type === 'document') return documentFileName.length > 0 ? documentFileName : 'document';
     const pool = itemId !== null ? terminalPool.byId(itemId) : null;
     const poolLabel = pool?.label?.trim();
     if (poolLabel !== undefined && poolLabel.length > 0) return poolLabel;
@@ -60,17 +68,40 @@
   let documentAssetLoading = $state(false);
   let documentAssetError = $state<string | null>(null);
 
+  const documentHasWorkspacePath = $derived(
+    item?.type === 'document' && (item.path ?? '').length > 0,
+  );
+  const documentHasLegacyAsset = $derived(
+    item?.type === 'document' && (item.asset_id ?? '').length > 0,
+  );
+  const documentIsInline = $derived(
+    item?.type === 'document' && !documentHasWorkspacePath && !documentHasLegacyAsset,
+  );
+  const documentWorkspaceAbsolute = $derived(
+    item?.type === 'document' && item.path !== undefined
+      ? resolveWorkspacePath(sessionStore.effectiveWorkspaceRoot, item.path)
+      : null,
+  );
+  const documentCopyPath = $derived(documentHasWorkspacePath ? documentWorkspaceAbsolute : null);
+  const documentRemoteSrc = $derived(
+    documentWorkspaceAbsolute !== null
+      ? fsFileUrl(documentWorkspaceAbsolute)
+      : item?.type === 'document' && documentHasLegacyAsset
+        ? `/api/assets/${item.asset_id}`
+        : '',
+  );
+
   /** ADR-0018 D10 amend ③/④ (2026-05-21) — DocumentNode 와 동일 helper 사용
    *  으로 normal / maximize 양쪽 rendering 동기화. 옛 parseDocumentText 의
    *  paragraph slice 폐기. */
   const documentText = $derived.by(() => {
     if (item?.type !== 'document') return '';
-    return item.asset_id ? (documentAssetText ?? '') : (item.content ?? '');
+    return documentIsInline ? (item.content ?? '') : (documentAssetText ?? '');
   });
   const documentFileTypeLabel = $derived.by(() => {
     if (item?.type !== 'document') return '';
-    if (!item.asset_id) return 'markdown';
-    const name = item.file_name.toLowerCase();
+    if (documentIsInline) return 'markdown';
+    const name = documentFileName.toLowerCase();
     const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
     if (ext === 'md' || ext === 'markdown') return 'markdown';
     if (ext === 'html' || ext === 'htm') return 'html';
@@ -97,31 +128,33 @@
 
   const documentRenderedHtmlSrcdoc = $derived(buildRenderedHtmlSrcdoc(documentText));
   const canPreviewDocumentAsset = $derived.by(() => {
-    if (item?.type !== 'document' || !item.asset_id) return false;
+    if (item?.type !== 'document' || documentIsInline) return false;
     const mime = (item.mime ?? '').toLowerCase();
-    return mime.startsWith('text/') || mime === 'application/json';
+    return (
+      mime.startsWith('text/') ||
+      mime === 'application/json' ||
+      ['markdown', 'html', 'text', 'json', 'css', 'javascript', 'typescript'].includes(documentFileTypeLabel)
+    );
   });
   /** ADR-0018 D10 amend ⑦ — PDF asset 은 browser-native PDF viewer iframe. */
   const isDocumentPdf = $derived(
     item?.type === 'document'
     && documentFileTypeLabel === 'pdf'
-    && (item.asset_id ?? '').length > 0,
+    && documentRemoteSrc.length > 0,
   );
-  const documentPdfSrc = $derived(
-    isDocumentPdf && item?.type === 'document' ? `/api/assets/${item.asset_id}` : '',
-  );
+  const documentPdfSrc = $derived(isDocumentPdf ? documentRemoteSrc : '');
 
   // svelte-flow 의 selection 변경이 item prop 의 reactive proxy 를 새 ref 로
   // 갱신할 때 effect 의 dependency 가 invalidate → fetch 재시작 blink 회피.
   // 정본 = DocumentNode 의 같은 패턴.
   const documentFetchId = $derived.by((): string => {
-    if (item?.type !== 'document' || !item.asset_id || !canPreviewDocumentAsset) return '';
-    return item.asset_id;
+    if (item?.type !== 'document' || documentIsInline || !canPreviewDocumentAsset) return '';
+    return documentRemoteSrc;
   });
 
   $effect(() => {
-    const assetId = documentFetchId;
-    if (assetId.length === 0) {
+    const src = documentFetchId;
+    if (src.length === 0) {
       documentAssetText = null;
       documentAssetLoading = false;
       documentAssetError = null;
@@ -135,12 +168,12 @@
 
     async function loadDocumentAsset(): Promise<void> {
       try {
-        const res = await fetch(`/api/assets/${assetId}`, {
+        const res = await fetch(src, {
           method: 'GET',
           credentials: 'include',
           headers: { Accept: 'text/plain,application/json,*/*' },
         });
-        if (!res.ok) throw new Error(`GET /api/assets/${assetId} returned ${res.status}`);
+        if (!res.ok) throw new Error(`GET document source returned ${res.status}`);
         const text = await res.text();
         if (!cancelled) documentAssetText = text;
       } catch (err) {
@@ -231,6 +264,17 @@
     if (e.key === 'Escape' && !titleEditing && !bodyEditing) {
       sessionStore.unmaximize();
     }
+  }
+
+  async function copyDocumentPath(e: MouseEvent): Promise<void> {
+    e.stopPropagation();
+    const path = documentCopyPath;
+    if (path === null) return;
+    const result = await copyTextToSystemClipboard(path);
+    toastStore.show({
+      message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
   }
 
   async function commitNoteField(field: 'title' | 'body', next: string): Promise<void> {
@@ -368,6 +412,20 @@
               {/if}
             </button>
           {/if}
+          {#if isDocument && documentCopyPath !== null}
+            <button
+              type="button"
+              class="max-btn"
+              aria-label="Copy path"
+              title="Copy path"
+              onclick={(e) => void copyDocumentPath(e)}
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="5" y="5" width="8" height="9" rx="1.2"/>
+                <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
+              </svg>
+            </button>
+          {/if}
           <button
             type="button"
             class="max-btn"
@@ -438,28 +496,28 @@
               <iframe
                 class="document-pdf"
                 src={documentPdfSrc}
-                title={item.file_name}
+                title={documentFileName}
                 referrerpolicy="no-referrer"
                 loading="lazy"
               ></iframe>
-            {:else if item.asset_id && documentAssetLoading}
+            {:else if !documentIsInline && documentAssetLoading}
               <div class="document-empty">Loading preview…</div>
-            {:else if item.asset_id && !canPreviewDocumentAsset}
+            {:else if !documentIsInline && !canPreviewDocumentAsset}
               <div class="document-asset-summary">
                 <div class="document-eyebrow">Document file</div>
-                <h1>{item.file_name}</h1>
+                <h1>{documentFileName}</h1>
                 <p>Preview is not available for this document type.</p>
               </div>
-            {:else if item.asset_id && documentAssetError !== null}
+            {:else if !documentIsInline && documentAssetError !== null}
               <div class="document-asset-summary">
                 <div class="document-eyebrow">Document file</div>
-                <h1>{item.file_name}</h1>
+                <h1>{documentFileName}</h1>
                 <p>{documentAssetError}</p>
               </div>
             {:else if documentText.length === 0}
               <div class="document-empty">Empty document</div>
             {:else}
-              <div class="document-eyebrow">{item.asset_id ? 'Document file' : 'Inline document'}</div>
+              <div class="document-eyebrow">{documentIsInline ? 'Inline document' : 'Document file'}</div>
               <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — DocumentNode 와 동일
                    markdown/html/source rendering. -->
               {#if documentViewMode === 'source'}
@@ -469,7 +527,7 @@
                 <iframe
                   class="document-html-frame"
                   sandbox={RENDERED_HTML_IFRAME_SANDBOX}
-                  title={item.file_name}
+                  title={documentFileName}
                   referrerpolicy="no-referrer"
                   loading="lazy"
                   srcdoc={documentRenderedHtmlSrcdoc}

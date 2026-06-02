@@ -53,6 +53,7 @@
   let existingNames = $state<readonly string[]>([]);
   let pendingAttachPreviousSession: string | null = null;
   let pendingAttachHasTentativeLock = false;
+  let pendingAttachWorkspaceRoot: string | null = null;
   let createFolderId = $state<string | null>(null);
 
   $effect(() => {
@@ -116,7 +117,7 @@
     window.location.reload();
   }
 
-  async function tryAttach(name: string): Promise<void> {
+  async function tryAttach(name: string, effectiveWorkspaceRoot?: string): Promise<void> {
     const previousSession = sessionStore.active?.name ?? null;
     let res: AttachResponse;
     try {
@@ -142,11 +143,15 @@
     }
 
     if (res.kind === 'ok') {
-      sessionStore.setActiveSession({ name });
+      sessionStore.setActiveSession({
+        name,
+        effectiveWorkspaceRoot: res.workspace_root ?? effectiveWorkspaceRoot,
+      });
       sessionStore.loadLayout(res.layout);
       reconnectGate.markSuccess();
       pendingAttachPreviousSession = null;
       pendingAttachHasTentativeLock = false;
+      pendingAttachWorkspaceRoot = null;
       toastStore.show({
         message: `Attached to session "${name}".`,
         tone: 'success',
@@ -164,6 +169,7 @@
       // 다시 attach 해 "switch 취소 = 이전 workspace 유지" 의미를 복원한다.
       pendingAttachPreviousSession = previousSession;
       pendingAttachHasTentativeLock = true;
+      pendingAttachWorkspaceRoot = res.workspace_root ?? effectiveWorkspaceRoot ?? null;
       workspaceSwitcher.goAttachConfirm(name, res.summary);
       return;
     }
@@ -204,15 +210,18 @@
         });
       }
       // Layout fetch — confirm 후엔 모두 match-able 상태.
-      const { layout } = await getLayout(name);
+      const { layout, workspace_root } = await getLayout(name);
+      const effectiveWorkspaceRoot =
+        workspace_root ?? pendingAttachWorkspaceRoot ?? sessionStore.active?.effectiveWorkspaceRoot;
       // 0077 follow-up — reset 전에 capture (maybeReloadOnSwitch 의 입력).
       const previousForReload = pendingAttachPreviousSession;
-      sessionStore.setActiveSession({ name });
+      sessionStore.setActiveSession({ name, effectiveWorkspaceRoot });
       sessionStore.loadLayout(layout);
       reconnectGate.markSuccess();
       void terminalPool.refresh();
       pendingAttachPreviousSession = null;
       pendingAttachHasTentativeLock = false;
+      pendingAttachWorkspaceRoot = null;
       workspaceSwitcher.close();
       maybeReloadOnSwitch(previousForReload, name);
     } catch (err) {
@@ -230,7 +239,7 @@
   async function restorePreviousSession(name: string): Promise<void> {
     const res = await attachSession(name, { ws_conn_id: makeWsConnId() });
     if (res.kind === 'ok') {
-      sessionStore.setActiveSession({ name });
+      sessionStore.setActiveSession({ name, effectiveWorkspaceRoot: res.workspace_root });
       sessionStore.loadLayout(res.layout);
       reconnectGate.markSuccess();
       void terminalPool.refresh();
@@ -259,6 +268,7 @@
 
     pendingAttachPreviousSession = null;
     pendingAttachHasTentativeLock = false;
+    pendingAttachWorkspaceRoot = null;
 
     try {
       if (shouldReleasePending) {
@@ -303,11 +313,11 @@
       }
     }
     createFolderId = null;
-    void tryAttach(session.name);
+    void tryAttach(session.name, session.workspace_root);
   }
 
-  function onSessionPicked(name: string): void {
-    void tryAttach(name);
+  function onSessionPicked(session: SessionInfo): void {
+    void tryAttach(session.name, session.workspace_root);
   }
 
   function onConfirmAttach(): void {

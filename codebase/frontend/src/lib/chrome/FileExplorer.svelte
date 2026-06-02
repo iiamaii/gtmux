@@ -15,14 +15,21 @@
     DirNotEmptyError,
     DirNotFoundError,
     FsApiUnavailableError,
+    FsNameConflictError,
+    FsPayloadTooLargeError,
+    FsUnsupportedMimeError,
     listDir,
     mkdirFs,
     rmdirFs,
+    uploadFs,
     type FsEntry,
   } from '$lib/http/fs';
   import { UnauthorizedError } from '$lib/http/sessions';
+  import { isPathWithinRoot } from '$lib/files/workspaceAssets';
+  import { pickLocalFiles } from '$lib/files/localFilePicker';
 
   type Mode = 'dir' | 'file';
+  type RootKind = 'server' | 'workspace';
 
   interface Props {
     open: boolean;
@@ -34,6 +41,8 @@
     initialDir?: string;
     filter?: string[];
     filterDescription?: string;
+    rootKind?: RootKind;
+    rootPath?: string;
   }
 
   const {
@@ -46,6 +55,8 @@
     initialDir = '',
     filter = [],
     filterDescription = 'files',
+    rootKind = 'server',
+    rootPath = '',
   }: Props = $props();
 
   let currentDir = $state<string>('');
@@ -65,6 +76,7 @@
 
   const normalizedFilter = $derived(filter.map((ext) => ext.toLowerCase()));
   const modalTitle = $derived(title ?? (mode === 'dir' ? 'Choose workspace root' : 'Pick a file'));
+  const boundaryRoot = $derived(rootKind === 'workspace' ? rootPath || initialDir : '');
 
   function joinPath(dir: string, name: string): string {
     if (dir.length === 0 || dir.endsWith('/')) return `${dir}${name}`;
@@ -111,13 +123,18 @@
   const breadcrumbSegments = $derived.by(() => buildBreadcrumbSegments(currentDir));
 
   async function navigate(dir: string): Promise<void> {
+    const nextDir = rootKind === 'workspace' && boundaryRoot.length > 0
+      ? (isPathWithinRoot(dir, boundaryRoot) ? dir : boundaryRoot)
+      : dir;
     loading = true;
     errorMessage = null;
     selectedName = null;
     try {
-      const res = await listDir(dir, { showHidden });
+      const res = await listDir(nextDir, { showHidden });
       currentDir = res.dir;
-      parentDir = res.parent;
+      parentDir = rootKind === 'workspace' && boundaryRoot.length > 0
+        ? (res.parent !== null && isPathWithinRoot(res.parent, boundaryRoot) ? res.parent : null)
+        : res.parent;
       entries = res.entries;
       total = res.total;
       truncated = res.truncated;
@@ -236,6 +253,38 @@
     }
   }
 
+  async function uploadHere(): Promise<void> {
+    const files = await pickLocalFiles({ multiple: true });
+    if (files.length === 0) return;
+    mutating = true;
+    errorMessage = null;
+    try {
+      await uploadFs(currentDir, files, 'reject');
+      await navigate(currentDir);
+    } catch (err) {
+      if (err instanceof FsNameConflictError) {
+        try {
+          if (window.confirm('A file with that name exists. Upload with a renamed filename?')) {
+            await uploadFs(currentDir, files, 'rename');
+            await navigate(currentDir);
+            return;
+          }
+          if (window.confirm('Overwrite the existing file?')) {
+            await uploadFs(currentDir, files, 'overwrite');
+            await navigate(currentDir);
+            return;
+          }
+        } catch (retryErr) {
+          errorMessage = mutationErrorMessage(retryErr, 'Upload failed');
+          return;
+        }
+      }
+      errorMessage = mutationErrorMessage(err, 'Upload failed');
+    } finally {
+      mutating = false;
+    }
+  }
+
   function requestRemoveSelectedDirectory(): void {
     if (selectedAbsolute === null || selectedEntry?.kind !== 'directory') return;
     pendingRemoveDir = selectedAbsolute;
@@ -265,6 +314,9 @@
     if (err instanceof DirNotAllowedError) return `${prefix}: directory is outside the server workspace.`;
     if (err instanceof DirAlreadyExistsError) return `${prefix}: directory already exists.`;
     if (err instanceof DirNotEmptyError) return `${prefix}: directory is not empty.`;
+    if (err instanceof FsNameConflictError) return `${prefix}: file already exists.`;
+    if (err instanceof FsPayloadTooLargeError) return `${prefix}: file is too large.`;
+    if (err instanceof FsUnsupportedMimeError) return `${prefix}: file type is not supported.`;
     if (err instanceof UnauthorizedError) {
       onUnauthorized?.();
       return `${prefix}: unauthorized.`;
@@ -391,9 +443,10 @@
         <button
           type="button"
           class="icon-btn"
-          title="Upload here is not available yet"
+          title="Upload here"
           aria-label="Upload here"
-          disabled
+          disabled={mutating || currentDir.length === 0}
+          onclick={() => void uploadHere()}
         >
           <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
             <path d="M8 11V3M5 6l3-3 3 3M3 13h10"/>

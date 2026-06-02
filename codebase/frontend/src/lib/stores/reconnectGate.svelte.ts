@@ -165,7 +165,7 @@ class ReconnectGate {
         // 의 tryAttach 와 동일하게 AttachConfirmModal 진입 (2026-05-17 회귀 fix).
         // sessionStore.active 를 set 해야 AttachConfirmModal 의 confirm 후 layout
         // load 가 정상 — WorkspaceSwitcher.tryAttach 의 confirm_required 분기 정합.
-        sessionStore.setActiveSession({ name });
+        sessionStore.setActiveSession({ name, effectiveWorkspaceRoot: result.workspace_root });
         this.markIdle();
         workspaceSwitcher.goAttachConfirm(name, result.summary);
         return;

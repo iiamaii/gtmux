@@ -13,8 +13,15 @@
 
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
-  import { pickLocalFile } from '$lib/files/localFilePicker';
-  import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
+  import { filePicker } from '$lib/stores/filePicker.svelte';
+  import { fsFileUrl } from '$lib/http/fs';
+  import {
+    IMAGE_EXTENSIONS,
+    basename,
+    guessMimeFromPath,
+    resolveWorkspacePath,
+    workspaceRelativePath,
+  } from '$lib/files/workspaceAssets';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, ImageItem } from '$lib/types/canvas';
   import CanvasCloseButton from './CanvasCloseButton.svelte';
@@ -32,6 +39,7 @@
     visibility: boolean;
     locked: boolean;
     label?: string;
+    path?: string;
     asset_id?: string;
     mime?: string;
     original_w?: number;
@@ -63,7 +71,18 @@
   const isVisible = $derived(data.visibility !== false);
   const isLocked = $derived(data.locked === true);
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
-  const hasAsset = $derived((data.asset_id ?? '').length > 0);
+  const workspaceRoot = $derived(sessionStore.effectiveWorkspaceRoot);
+  const resolvedWorkspacePath = $derived(
+    data.path !== undefined ? resolveWorkspacePath(workspaceRoot, data.path) : null,
+  );
+  const imageSrc = $derived(
+    resolvedWorkspacePath !== null
+      ? fsFileUrl(resolvedWorkspacePath)
+      : (data.asset_id ?? '').length > 0
+        ? `/api/assets/${data.asset_id}`
+        : '',
+  );
+  const hasAsset = $derived(imageSrc.length > 0);
   const imageLabel = $derived(data.label ?? 'image');
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
@@ -127,27 +146,46 @@
     );
   }
 
-  const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/svg+xml';
+  const IMAGE_ACCEPT = IMAGE_EXTENSIONS.join(',');
 
-  async function onLoadImageClick(e: MouseEvent): Promise<void> {
+  function initialImageDir(): string {
+    if (resolvedWorkspacePath === null) return workspaceRoot;
+    const slash = resolvedWorkspacePath.lastIndexOf('/');
+    return slash <= 0 ? workspaceRoot : resolvedWorkspacePath.slice(0, slash);
+  }
+
+  function onLoadImageClick(e: MouseEvent): void {
     e.stopPropagation();
     if (isLocked) return;
-    const file = await pickLocalFile({ accept: IMAGE_ACCEPT });
-    if (file === null) return;
-    try {
-      const uploaded = await uploadAsset(file, 'image');
-      await sessionStore.applyMutation(
+    if (workspaceRoot.length === 0) {
+      toastStore.show({
+        message: 'Workspace root is not available yet.',
+        tone: 'error',
+      });
+      return;
+    }
+    filePicker.openFor(initialImageDir(), (absolutePath) => {
+      const nextPath = workspaceRelativePath(workspaceRoot, absolutePath);
+      if (nextPath === null) {
+        toastStore.show({
+          message: 'Image files must be inside the active project workspace.',
+          tone: 'error',
+        });
+        return;
+      }
+      void sessionStore.applyMutation(
         (cur) => ({
           ...cur,
           items: cur.items.map((it: CanvasItem) =>
             it.id === data.id && it.type === 'image'
               ? ({
                   ...it,
-                  label: uploaded.file_name,
-                  asset_id: uploaded.asset_id,
-                  mime: uploaded.mime,
-                  original_w: uploaded.original_w,
-                  original_h: uploaded.original_h,
+                  label: basename(absolutePath),
+                  path: nextPath,
+                  asset_id: undefined,
+                  mime: guessMimeFromPath(absolutePath),
+                  original_w: undefined,
+                  original_h: undefined,
                 } as ImageItem)
               : it,
           ),
@@ -157,15 +195,11 @@
           failMessage: 'Image file change failed',
         },
       );
-    } catch (err) {
-      toastStore.show({
-        message: err instanceof AssetUploadUnavailableError
-          ? 'Asset upload API is not available yet. Backend work is required before image upload can complete.'
-          : `Image upload failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-        durationMs: 6_000,
-      });
-    }
+    }, {
+      accept: { extensions: [...IMAGE_EXTENSIONS], description: 'image files' },
+      rootKind: 'workspace',
+      rootPath: workspaceRoot,
+    });
   }
 </script>
 
@@ -180,7 +214,7 @@
     style="width: 100%; height: 100%;"
     role="img"
     aria-label={hasAsset ? 'Image' : 'Image (pending — BE asset endpoint required)'}
-    onclick={!hasAsset ? (e) => void onLoadImageClick(e) : undefined}
+    onclick={!hasAsset ? onLoadImageClick : undefined}
   >
     <NodeResizer
       nodeId={data.id}
@@ -200,7 +234,7 @@
         class="image-change"
         title={hasAsset ? 'Change image' : 'Load image'}
         aria-label={hasAsset ? 'Change image' : 'Load image'}
-        onclick={(e) => void onLoadImageClick(e)}
+        onclick={onLoadImageClick}
       >
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
           <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
@@ -212,7 +246,7 @@
     <div class="image-clip" class:is-empty={!hasAsset}>
       {#if hasAsset}
         <img
-          src={`/api/assets/${data.asset_id}`}
+          src={imageSrc}
           alt=""
           class="image-asset"
           draggable="false"

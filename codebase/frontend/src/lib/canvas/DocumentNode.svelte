@@ -26,8 +26,18 @@
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
-  import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
-  import { pickLocalFile } from '$lib/files/localFilePicker';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
+  import { filePicker } from '$lib/stores/filePicker.svelte';
+  import { fsFileUrl } from '$lib/http/fs';
+  import { UnauthorizedError } from '$lib/http/sessions';
+  import {
+    DOCUMENT_EXTENSIONS,
+    basename,
+    fileStem as workspaceFileStem,
+    guessMimeFromPath,
+    resolveWorkspacePath,
+    workspaceRelativePath,
+  } from '$lib/files/workspaceAssets';
   import {
     renderMarkdown,
     renderHtml,
@@ -56,8 +66,9 @@
     locked: boolean;
     minimized?: boolean;
     label?: string;
+    path?: string;
     asset_id?: string;
-    file_name: string;
+    file_name?: string;
     content?: string;
     mime?: string;
     size_bytes?: number;
@@ -96,11 +107,29 @@
   const isMultiM = $derived(isInM && sessionStore.M.size > 1);
   const isSingleM = $derived(isInM && sessionStore.M.size <= 1);
   const isMaximized = $derived(sessionStore.maximizedItemId === data.id);
-  /** Asset-based vs inline-stored 모드 구분 (ADR-0018 D4 amend ②). */
-  const isInline = $derived((data.asset_id ?? '').length === 0);
+  /** ADR-0047 — path-based workspace file, legacy asset, or inline-stored. */
+  const hasWorkspacePath = $derived((data.path ?? '').length > 0);
+  const hasLegacyAsset = $derived((data.asset_id ?? '').length > 0);
+  const isInline = $derived(!hasWorkspacePath && !hasLegacyAsset);
+  const workspaceRoot = $derived(sessionStore.effectiveWorkspaceRoot);
+  const resolvedWorkspacePath = $derived(
+    data.path !== undefined ? resolveWorkspacePath(workspaceRoot, data.path) : null,
+  );
+  const remoteDocumentSrc = $derived(
+    resolvedWorkspacePath !== null
+      ? fsFileUrl(resolvedWorkspacePath)
+      : hasLegacyAsset
+        ? `/api/assets/${data.asset_id}`
+        : '',
+  );
+  const documentCopyPath = $derived(hasWorkspacePath ? resolvedWorkspacePath : null);
   let assetPreviewText = $state<string | null>(null);
   let assetPreviewLoading = $state(false);
   let assetPreviewError = $state<string | null>(null);
+
+  const displayFileName = $derived(
+    data.file_name ?? (data.path !== undefined ? basename(data.path) : 'document'),
+  );
 
   /** size_bytes 의 사람용 표기 (KB). */
   const sizeLabel = $derived.by((): string => {
@@ -110,7 +139,7 @@
   });
   const fileTypeLabel = $derived.by((): string => {
     if (isInline) return 'markdown';
-    const name = data.file_name.toLowerCase();
+    const name = displayFileName.toLowerCase();
     const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
     switch (ext) {
       case 'md':
@@ -167,7 +196,7 @@
   const assetHtml = $derived(renderContent(assetPreviewText ?? ''));
   const isEmpty = $derived(isInline && (data.content ?? '').trim().length === 0);
   const fileStem = $derived.by((): string => {
-    const base = data.file_name.trim().split('/').pop() ?? data.file_name.trim();
+    const base = displayFileName.trim().split('/').pop() ?? displayFileName.trim();
     const dot = base.lastIndexOf('.');
     if (dot <= 0) return base;
     return base.slice(0, dot);
@@ -176,7 +205,11 @@
   const canPreviewAssetText = $derived.by(() => {
     if (isInline) return false;
     const mime = (data.mime ?? '').toLowerCase();
-    return mime.startsWith('text/') || mime === 'application/json';
+    return (
+      mime.startsWith('text/') ||
+      mime === 'application/json' ||
+      ['markdown', 'html', 'text', 'json', 'css', 'javascript', 'typescript'].includes(fileTypeLabel)
+    );
   });
   /** ADR-0018 D10 amend ⑦ — PDF asset 은 browser-native PDF viewer 로 iframe
    *  렌더. ADR-0037 의 sandbox-격리 HTML rendered 와 다른 mental model:
@@ -186,11 +219,9 @@
   const isPdfAsset = $derived(
     !isInline
     && fileTypeLabel === 'pdf'
-    && (data.asset_id ?? '').length > 0,
+    && remoteDocumentSrc.length > 0,
   );
-  const pdfAssetSrc = $derived(
-    isPdfAsset ? `/api/assets/${data.asset_id}` : '',
-  );
+  const pdfAssetSrc = $derived(isPdfAsset ? remoteDocumentSrc : '');
 
   // svelte-flow 가 selection 변경 시 data prop 의 reactive proxy 를 새 ref 로
   // 갱신 → effect 의 dependency 가 invalidate → fetch 재시작 → "Loading
@@ -198,13 +229,13 @@
   // svelte 의 derived 가 subscriber notify skip → effect re-fire 안 함.
   const assetFetchId = $derived.by((): string => {
     if (isInline || !canPreviewAssetText) return '';
-    return data.asset_id ?? '';
+    return remoteDocumentSrc;
   });
   const assetFetchAccept = $derived(data.mime ?? 'text/plain');
 
   $effect(() => {
-    const id = assetFetchId;
-    if (id.length === 0) {
+    const src = assetFetchId;
+    if (src.length === 0) {
       assetPreviewText = null;
       assetPreviewLoading = false;
       assetPreviewError = null;
@@ -216,17 +247,22 @@
     assetPreviewError = null;
     assetPreviewLoading = true;
 
-    async function loadPreview(): Promise<void> {
+  async function loadPreview(): Promise<void> {
       try {
-        const res = await fetch(`/api/assets/${id}`, {
+        const res = await fetch(src, {
           method: 'GET',
           credentials: 'include',
           headers: { Accept: assetFetchAccept },
         });
-        if (!res.ok) throw new Error(`GET /api/assets/${id} returned ${res.status}`);
+        if (res.status === 401) throw new UnauthorizedError();
+        if (!res.ok) throw new Error(`GET document source returned ${res.status}`);
         const text = await res.text();
         if (!cancelled) assetPreviewText = text;
       } catch (err) {
+        if (err instanceof UnauthorizedError) {
+          window.location.href = '/auth';
+          return;
+        }
         if (!cancelled) assetPreviewError = err instanceof Error ? err.message : String(err);
       } finally {
         if (!cancelled) assetPreviewLoading = false;
@@ -255,6 +291,17 @@
     labelEditing = true;
   }
 
+  async function onCopyPathClick(e: MouseEvent): Promise<void> {
+    e.stopPropagation();
+    const path = documentCopyPath;
+    if (path === null) return;
+    const result = await copyTextToSystemClipboard(path);
+    toastStore.show({
+      message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
+  }
+
   function onNameDblClick(e: MouseEvent): void {
     if (isLocked || !isInline) return;
     e.stopPropagation();
@@ -269,7 +316,7 @@
 
   async function commitName(next: string): Promise<void> {
     const trimmed = next.trim();
-    if (trimmed === data.file_name || trimmed.length === 0) {
+    if (trimmed === displayFileName || trimmed.length === 0) {
       nameEditing = false;
       return;
     }
@@ -463,27 +510,45 @@
     await sessionStore.applyDeletion([data.id], { killTerminal: false });
   }
 
-  const DOCUMENT_ACCEPT = '.md,.txt,.json,.html,.css,.js,.ts,.tsx,.jsx,.pdf,text/*,application/json,application/pdf';
+  function initialDocumentDir(): string {
+    if (resolvedWorkspacePath === null) return workspaceRoot;
+    const slash = resolvedWorkspacePath.lastIndexOf('/');
+    return slash <= 0 ? workspaceRoot : resolvedWorkspacePath.slice(0, slash);
+  }
 
-  async function onLoadFileClick(e: MouseEvent): Promise<void> {
+  function onLoadFileClick(e: MouseEvent): void {
     e.stopPropagation();
     if (isLocked) return;
-    const file = await pickLocalFile({ accept: DOCUMENT_ACCEPT });
-    if (file === null) return;
-    try {
-      const uploaded = await uploadAsset(file, 'document');
-      await sessionStore.applyMutation(
+    if (workspaceRoot.length === 0) {
+      toastStore.show({
+        message: 'Workspace root is not available yet.',
+        tone: 'error',
+      });
+      return;
+    }
+    filePicker.openFor(initialDocumentDir(), (absolutePath) => {
+      const nextPath = workspaceRelativePath(workspaceRoot, absolutePath);
+      if (nextPath === null) {
+        toastStore.show({
+          message: 'Document files must be inside the active project workspace.',
+          tone: 'error',
+        });
+        return;
+      }
+      const nextFileName = basename(absolutePath);
+      void sessionStore.applyMutation(
         (cur) => ({
           ...cur,
           items: cur.items.map((it: CanvasItem) =>
             it.id === data.id && it.type === 'document'
               ? ({
                   ...it,
-                  asset_id: uploaded.asset_id,
-                  label: uploaded.file_name.replace(/\.[^/.]+$/, ''),
-                  file_name: uploaded.file_name,
-                  mime: uploaded.mime,
-                  size_bytes: uploaded.size_bytes,
+                  path: nextPath,
+                  asset_id: undefined,
+                  label: workspaceFileStem(nextFileName),
+                  file_name: nextFileName,
+                  mime: guessMimeFromPath(absolutePath),
+                  size_bytes: undefined,
                   content: undefined,
                 } as DocumentItem)
               : it,
@@ -494,15 +559,11 @@
           failMessage: 'Document file change failed',
         },
       );
-    } catch (err) {
-      toastStore.show({
-        message: err instanceof AssetUploadUnavailableError
-          ? 'Asset upload API is not available yet. Backend work is required before document upload can complete.'
-          : `Document upload failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-        durationMs: 6_000,
-      });
-    }
+    }, {
+      accept: { extensions: [...DOCUMENT_EXTENSIONS], description: 'document files' },
+      rootKind: 'workspace',
+      rootPath: workspaceRoot,
+    });
   }
 
   function onRootClick(e: MouseEvent): void {
@@ -645,9 +706,9 @@
           role="presentation"
         >{documentTitle}</span>
       {/if}
-      {#if !isLocked}
+      {#if !isLocked || documentCopyPath !== null}
         <div class="doc-actions">
-          {#if canToggleView}
+          {#if !isLocked && canToggleView}
             <!-- ADR-0037 amend — markdown/html use one 2-mode rendered↔source
                  transition. The icon hints the next mode. -->
             <button
@@ -677,6 +738,22 @@
               {/if}
             </button>
           {/if}
+          {#if documentCopyPath !== null}
+            <button
+              type="button"
+              class="doc-btn nodrag"
+              title="Copy path"
+              aria-label="Copy path"
+              onclick={(e) => void onCopyPathClick(e)}
+              onmousedown={(e: MouseEvent) => e.stopPropagation()}
+            >
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="5" y="5" width="8" height="9" rx="1.2"/>
+                <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
+              </svg>
+            </button>
+          {/if}
+          {#if !isLocked}
           <button
             type="button"
             class="doc-btn nodrag"
@@ -735,6 +812,7 @@
               <path d="M3 3l6 6M9 3l-6 6"/>
             </svg>
           </button>
+          {/if}
         </div>
       {/if}
     </header>
@@ -779,7 +857,7 @@
             class="doc-html-frame"
             class:drag-isolated={dragging}
             sandbox={RENDERED_HTML_IFRAME_SANDBOX}
-            title={data.file_name}
+            title={displayFileName}
             referrerpolicy="no-referrer"
             loading="lazy"
             srcdoc={renderedHtmlSrcdoc}
@@ -798,7 +876,7 @@
           class="doc-pdf"
           class:drag-isolated={dragging}
           src={pdfAssetSrc}
-          title={data.file_name}
+          title={displayFileName}
           referrerpolicy="no-referrer"
           loading="lazy"
         ></iframe>
@@ -815,7 +893,7 @@
               class="doc-html-frame"
               class:drag-isolated={dragging}
               sandbox={RENDERED_HTML_IFRAME_SANDBOX}
-              title={data.file_name}
+              title={displayFileName}
               referrerpolicy="no-referrer"
               loading="lazy"
               srcdoc={renderedHtmlSrcdocAsset}
@@ -830,7 +908,7 @@
               <path d="M14 3.5v3h3"/>
               <path d="M10 11h4M10 14h5M10 17h3"/>
             </svg>
-            <h2>{data.file_name}</h2>
+            <h2>{displayFileName}</h2>
             <p>{assetPreviewError ?? 'Preview is not available for this document type.'}</p>
           </div>
         {/if}
@@ -843,7 +921,7 @@
       <span>Page 1</span>
       {#if nameEditing}
         <InlineEditField
-          value={data.file_name}
+          value={displayFileName}
           editing={true}
           plain={true}
           placeholder="filename.md"
@@ -854,10 +932,10 @@
       {:else}
         <span
           class="filename"
-          title={isInline ? `${data.file_name} — double-click to rename` : data.file_name}
+          title={isInline ? `${displayFileName} — double-click to rename` : displayFileName}
           ondblclick={onNameDblClick}
           role="presentation"
-        >{data.file_name}</span>
+        >{displayFileName}</span>
       {/if}
       {#if (data.size_bytes ?? 0) > 0}
         <span class="doc-size" title={sizeLabel}>{sizeLabel}</span>

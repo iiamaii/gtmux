@@ -1,5 +1,6 @@
 export interface LocalFilePickOptions {
   accept?: string;
+  multiple?: boolean;
 }
 
 /**
@@ -15,12 +16,17 @@ export interface LocalFilePickOptions {
 let pendingPicker = false;
 
 export function pickLocalFile(options: LocalFilePickOptions = {}): Promise<File | null> {
-  if (pendingPicker) return Promise.resolve(null);
+  return pickLocalFiles(options).then((files) => files[0] ?? null);
+}
+
+export function pickLocalFiles(options: LocalFilePickOptions = {}): Promise<File[]> {
+  if (pendingPicker) return Promise.resolve([]);
   pendingPicker = true;
   return new Promise((resolve) => {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = options.accept ?? '';
+    input.multiple = options.multiple === true;
     input.style.position = 'fixed';
     input.style.left = '-9999px';
     input.style.top = '-9999px';
@@ -32,19 +38,19 @@ export function pickLocalFile(options: LocalFilePickOptions = {}): Promise<File 
       window.removeEventListener('focus', onFocus);
       pendingPicker = false;
     };
-    const settle = (file: File | null) => {
+    const settle = (files: File[]) => {
       if (settled) return;
       settled = true;
       cleanup();
-      resolve(file);
+      resolve(files);
     };
     const onFocus = () => {
       window.setTimeout(() => {
-        if (input.files === null || input.files.length === 0) settle(null);
+        if (input.files === null || input.files.length === 0) settle([]);
       }, 1000);
     };
 
-    input.onchange = () => settle(input.files?.[0] ?? null);
+    input.onchange = () => settle(Array.from(input.files ?? []));
     window.addEventListener('focus', onFocus);
     document.body.append(input);
     input.click();
