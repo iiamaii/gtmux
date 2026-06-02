@@ -116,6 +116,25 @@ export function fileTypeLabelForPath(path: string, mime?: string | null): string
   return meta.fileTypeLabel;
 }
 
+/**
+ * Resolve the Shiki language for a document's `source` view. Shared by
+ * `DocumentNode` and `MaximizedItemModal` so the two source surfaces stay in
+ * sync (single source — ADR-0037 D7 / ADR-0018 D10 amend ④ drift guard).
+ *
+ * - inline documents default to markdown (html when the label says so).
+ * - workspace-file documents resolve from the path's extension; when that is
+ *   plain `text`, fall back to the human file-type label for html/markdown/json.
+ */
+export function sourceLangForDocument(fileName: string, label: string, inline: boolean): string {
+  if (inline) return label === 'html' ? 'html' : 'markdown';
+  const mapped = shikiLangForPath(fileName);
+  if (mapped !== 'text') return mapped;
+  if (label === 'html') return 'html';
+  if (label === 'markdown') return 'markdown';
+  if (label === 'json') return 'json';
+  return mapped;
+}
+
 export function guessMimeFromPath(path: string): string {
   switch (extension(path)) {
     case '.png':

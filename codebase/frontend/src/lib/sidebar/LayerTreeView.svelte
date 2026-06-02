@@ -22,6 +22,7 @@
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { patchTerminalLabel } from '$lib/http/terminals';
+  import PanelEmptyState from '$lib/chrome/PanelEmptyState.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, CanvasItemType, CanvasLayout } from '$lib/types/canvas';
   import { groupHover } from '$lib/stores/groupHover.svelte';
@@ -1012,12 +1013,20 @@
   </span>
 {/snippet}
 
-<div class="layer-tree-view" aria-label="Layer tree">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="layer-tree-view" aria-label="Layer tree" onclick={onLayerTreeBackgroundClick} onkeydown={() => {}}>
   <!-- ADR-0024 의 2026-05-22 ② amend (Tree=Z) — Z tab UI 제거. Tree 가 단일 view.
        z-index 값 표시는 Inspector 로 단일화. -->
-  <ul class="tree" role="tree" onclick={onLayerTreeBackgroundClick} onkeydown={() => {}}>
-    {#each tree as node, nodeIdx (node.kind + ':' + node.id)}
-      {#if node.kind === 'group'}
+  {#if tree.length === 0}
+    <PanelEmptyState
+      icon="layers"
+      lead="No canvas items"
+      description="Add items from the toolbar to build the layer tree."
+    />
+  {:else}
+    <ul class="tree" role="tree" aria-label="Canvas layer tree">
+      {#each tree as node (node.kind + ':' + node.id)}
+        {#if node.kind === 'group'}
         {@const g = node.group}
         {@const selected = sessionStore.M.has(node.id)}
         {@const isOpen = expanded.has(node.id)}
@@ -1156,7 +1165,7 @@
             {@render groupIcons()}
           </div>
         </li>
-      {:else}
+        {:else}
         {@const p = node.panel}
         {@const selected = sessionStore.M.has(node.id)}
         {@const dead = isPanelDead(p)}
@@ -1277,11 +1286,10 @@
             {@render panelIcons()}
           </div>
         </li>
-      {/if}
-    {:else}
-      <li class="empty">No panels yet.</li>
-    {/each}
-  </ul>
+        {/if}
+      {/each}
+    </ul>
+  {/if}
 </div>
 
 <style>
@@ -1577,12 +1585,6 @@
     height: 4px;
     border-radius: 50%;
     background: var(--color-fg-muted);
-  }
-
-  .empty {
-    padding: var(--space-8) var(--space-12);
-    color: var(--color-fg-subtle);
-    font-style: italic;
   }
 
   /* Tree/Z toggle CSS 제거됨 — ADR-0024 의 2026-05-22 ② amend (Tree=Z). */

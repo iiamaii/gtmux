@@ -39,7 +39,7 @@
     guessMimeFromPath,
     previewMetaForPath,
     resolveWorkspacePath,
-    shikiLangForPath,
+    sourceLangForDocument,
     workspaceRelativePath,
   } from '$lib/files/workspaceAssets';
   import {
@@ -544,16 +544,6 @@
 
   function onBodyWheel(e: WheelEvent): void {
     e.stopPropagation();
-  }
-
-  function sourceLangForDocument(fileName: string, label: string, inline: boolean): string {
-    if (inline) return label === 'html' ? 'html' : 'markdown';
-    const mapped = shikiLangForPath(fileName);
-    if (mapped !== 'text') return mapped;
-    if (label === 'html') return 'html';
-    if (label === 'markdown') return 'markdown';
-    if (label === 'json') return 'json';
-    return mapped;
   }
 
   function interceptRenderedLinks(node: HTMLElement): { destroy: () => void } {

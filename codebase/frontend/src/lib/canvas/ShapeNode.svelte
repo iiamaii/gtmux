@@ -414,6 +414,13 @@
     cursor: default;
   }
 
+  /* Match Image/Text nodes: keep every NodeResizer control above the SVG
+     hit-target layer. Fill-off shapes add a transparent stroke hit band near
+     the bbox, so edge resize lines need an explicit stacking layer too. */
+  :global(.shape-node .svelte-flow__resize-control) {
+    z-index: 10 !important;
+  }
+
   .shape-text {
     box-sizing: border-box;
     position: absolute;

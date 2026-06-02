@@ -20,7 +20,7 @@
     fileTypeLabelForPath,
     previewMetaForPath,
     resolveWorkspacePath,
-    shikiLangForPath,
+    sourceLangForDocument,
   } from '$lib/files/workspaceAssets';
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -255,16 +255,6 @@
     return {
       destroy: () => node.removeEventListener('click', onClick),
     };
-  }
-
-  function sourceLangForDocument(fileName: string, label: string, inline: boolean): string {
-    if (inline) return label === 'html' ? 'html' : 'markdown';
-    const mapped = shikiLangForPath(fileName);
-    if (mapped !== 'text') return mapped;
-    if (label === 'html') return 'html';
-    if (label === 'markdown') return 'markdown';
-    if (label === 'json') return 'json';
-    return mapped;
   }
 
   function blockBackdropEvent(e: Event): void {
