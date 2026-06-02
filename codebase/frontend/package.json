@@ -31,6 +31,7 @@
     "dompurify": "^3.4.5",
     "lucide-svelte": "^1.0.1",
     "marked": "^18.0.4",
-    "openapi-fetch": "^0.17.0"
+    "openapi-fetch": "^0.17.0",
+    "shiki": "^4.1.0"
   }
 }

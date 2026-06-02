@@ -15,9 +15,16 @@
   import { muxStore } from '$lib/stores/mux.svelte';
   import { documentViewModeStore } from '$lib/stores/documentViewMode.svelte';
   import { fsFileUrl } from '$lib/http/fs';
-  import { basename, resolveWorkspacePath } from '$lib/files/workspaceAssets';
+  import {
+    basename,
+    fileTypeLabelForPath,
+    previewMetaForPath,
+    resolveWorkspacePath,
+    shikiLangForPath,
+  } from '$lib/files/workspaceAssets';
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import CodeViewer from '$lib/canvas/CodeViewer.svelte';
   import PanelDanglingOverlay from '$lib/canvas/PanelDanglingOverlay.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
@@ -101,15 +108,11 @@
   const documentFileTypeLabel = $derived.by(() => {
     if (item?.type !== 'document') return '';
     if (documentIsInline) return 'markdown';
-    const name = documentFileName.toLowerCase();
-    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
-    if (ext === 'md' || ext === 'markdown') return 'markdown';
-    if (ext === 'html' || ext === 'htm') return 'html';
-    const mime = (item.mime ?? '').toLowerCase();
-    if (mime.startsWith('text/markdown')) return 'markdown';
-    if (mime.startsWith('text/html')) return 'html';
-    return ext;
+    return fileTypeLabelForPath(documentFileName, item.mime);
   });
+  const documentSourceLang = $derived(
+    sourceLangForDocument(documentFileName, documentFileTypeLabel, documentIsInline),
+  );
   /** ADR-0018 D10 amend ⑥ — viewMode persist via documentViewModeStore.
    *  DocumentNode (normal) 와 같은 itemId 구독 → normal↔maximize 전환 시
    *  reset 없음. */
@@ -133,7 +136,8 @@
     return (
       mime.startsWith('text/') ||
       mime === 'application/json' ||
-      ['markdown', 'html', 'text', 'json', 'css', 'javascript', 'typescript'].includes(documentFileTypeLabel)
+      previewMetaForPath(documentFileName).kind === 'text' ||
+      ['markdown', 'html'].includes(documentFileTypeLabel)
     );
   });
   /** ADR-0018 D10 amend ⑦ — PDF asset 은 browser-native PDF viewer iframe. */
@@ -251,6 +255,16 @@
     return {
       destroy: () => node.removeEventListener('click', onClick),
     };
+  }
+
+  function sourceLangForDocument(fileName: string, label: string, inline: boolean): string {
+    if (inline) return label === 'html' ? 'html' : 'markdown';
+    const mapped = shikiLangForPath(fileName);
+    if (mapped !== 'text') return mapped;
+    if (label === 'html') return 'html';
+    if (label === 'markdown') return 'markdown';
+    if (label === 'json') return 'json';
+    return mapped;
   }
 
   function blockBackdropEvent(e: Event): void {
@@ -521,7 +535,9 @@
               <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — DocumentNode 와 동일
                    markdown/html/source rendering. -->
               {#if documentViewMode === 'source'}
-                <pre class="document-source">{documentText}</pre>
+                <div class="document-source-view">
+                  <CodeViewer text={documentText} lang={documentSourceLang} filename={documentFileName} />
+                </div>
               {:else if documentFileTypeLabel === 'html'}
                 <!-- svelte-ignore a11y_missing_attribute -->
                 <iframe
@@ -826,14 +842,23 @@
   }
   .document-md :global(img) { max-width: 100%; height: auto; }
 
-  .document-source {
-    margin: 0; padding: 0;
-    font-family: var(--font-mono);
-    font-size: 13px;
-    line-height: 1.6;
-    color: var(--color-fg-muted);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
+  .document-source-view {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
+    --code-viewer-font-size: 13px;
+    --code-viewer-line-height: 1.6;
+    --code-viewer-gutter-width: 42px;
+    --code-viewer-padding: 12px 0;
+  }
+  .document-body-host:has(.document-source-view) {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .document-body-host:has(.document-source-view) .document-eyebrow {
+    display: none;
   }
 
   /* ADR-0037 amend — rendered HTML is isolated in a sandboxed iframe. */
