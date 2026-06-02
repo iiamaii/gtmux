@@ -30,12 +30,16 @@
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import { fsFileUrl } from '$lib/http/fs';
   import { UnauthorizedError } from '$lib/http/sessions';
+  import CodeViewer from './CodeViewer.svelte';
   import {
     DOCUMENT_EXTENSIONS,
     basename,
+    fileTypeLabelForPath,
     fileStem as workspaceFileStem,
     guessMimeFromPath,
+    previewMetaForPath,
     resolveWorkspacePath,
+    shikiLangForPath,
     workspaceRelativePath,
   } from '$lib/files/workspaceAssets';
   import {
@@ -139,42 +143,9 @@
   });
   const fileTypeLabel = $derived.by((): string => {
     if (isInline) return 'markdown';
-    const name = displayFileName.toLowerCase();
-    const ext = name.includes('.') ? name.slice(name.lastIndexOf('.') + 1) : '';
-    switch (ext) {
-      case 'md':
-      case 'markdown':
-        return 'markdown';
-      case 'html':
-      case 'htm':
-        return 'html';
-      case 'txt':
-      case 'text':
-      case 'log':
-        return 'text';
-      case 'json':
-        return 'json';
-      case 'pdf':
-        return 'pdf';
-      case 'css':
-        return 'css';
-      case 'js':
-      case 'jsx':
-        return 'javascript';
-      case 'ts':
-      case 'tsx':
-        return 'typescript';
-      default: {
-        const mime = (data.mime ?? '').toLowerCase();
-        if (mime === 'application/json') return 'json';
-        if (mime === 'application/pdf') return 'pdf';
-        if (mime.startsWith('text/html')) return 'html';
-        if (mime.startsWith('text/markdown')) return 'markdown';
-        if (mime.startsWith('text/')) return 'text';
-        return 'document';
-      }
-    }
+    return fileTypeLabelForPath(displayFileName, data.mime);
   });
+  const sourceLang = $derived(sourceLangForDocument(displayFileName, fileTypeLabel, isInline));
 
   /** ADR-0018 D10 amend ③/④/⑤/⑥ + ADR-0037 — markdown/html viewer + 2-mode
    *  toggle. helper + viewMode store 가 외부화 — DocumentNode (normal) 와
@@ -208,7 +179,8 @@
     return (
       mime.startsWith('text/') ||
       mime === 'application/json' ||
-      ['markdown', 'html', 'text', 'json', 'css', 'javascript', 'typescript'].includes(fileTypeLabel)
+      previewMetaForPath(displayFileName).kind === 'text' ||
+      ['markdown', 'html'].includes(fileTypeLabel)
     );
   });
   /** ADR-0018 D10 amend ⑦ — PDF asset 은 browser-native PDF viewer 로 iframe
@@ -574,6 +546,16 @@
     e.stopPropagation();
   }
 
+  function sourceLangForDocument(fileName: string, label: string, inline: boolean): string {
+    if (inline) return label === 'html' ? 'html' : 'markdown';
+    const mapped = shikiLangForPath(fileName);
+    if (mapped !== 'text') return mapped;
+    if (label === 'html') return 'html';
+    if (label === 'markdown') return 'markdown';
+    if (label === 'json') return 'json';
+    return mapped;
+  }
+
   function interceptRenderedLinks(node: HTMLElement): { destroy: () => void } {
     function onClick(e: MouseEvent): void {
       const target = e.target;
@@ -850,7 +832,9 @@
         <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — markdown/html rendered
              or source. HTML rendered is sandboxed iframe. -->
         {#if viewMode === 'source'}
-          <pre class="doc-source">{data.content ?? ''}</pre>
+          <div class="doc-source-view">
+            <CodeViewer text={data.content ?? ''} lang={sourceLang} filename={displayFileName} />
+          </div>
         {:else if fileTypeLabel === 'html'}
           <!-- svelte-ignore a11y_missing_attribute -->
           <iframe
@@ -886,7 +870,9 @@
           <p>Loading preview…</p>
         {:else if assetPreviewText !== null && (assetPreviewText.trim().length > 0)}
           {#if viewMode === 'source'}
-            <pre class="doc-source">{assetPreviewText}</pre>
+            <div class="doc-source-view">
+              <CodeViewer text={assetPreviewText} lang={sourceLang} filename={displayFileName} />
+            </div>
           {:else if fileTypeLabel === 'html'}
             <!-- svelte-ignore a11y_missing_attribute -->
             <iframe
@@ -1203,16 +1189,24 @@
     pointer-events: none;
   }
 
-  /* ADR-0018 D10 amend ④ — source view (raw markdown / html source code). */
-  .doc-source {
-    margin: 0;
+  /* ADR-0037 D7 — source view uses shared CodeViewer. */
+  .doc-source-view {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
+    --code-viewer-font-size: 11.5px;
+    --code-viewer-line-height: 1.55;
+    --code-viewer-gutter-width: 34px;
+    --code-viewer-padding: 10px 0;
+  }
+  .doc-body:has(.doc-source-view) {
     padding: 0;
-    font-family: var(--font-mono);
-    font-size: 11.5px;
-    line-height: 1.55;
-    color: var(--color-fg-muted);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .doc-body:has(.doc-source-view) .eyebrow {
+    display: none;
   }
 
   /* plan 0011 follow-up (2026-05-21) — marked output container styling.

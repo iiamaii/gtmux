@@ -9,6 +9,9 @@
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { escRouter } from '$lib/common/escRouter.svelte';
+  import CodeViewer from '$lib/canvas/CodeViewer.svelte';
+  import { basename, extension, previewMetaForPath, type WorkspacePreviewKind } from '$lib/files/workspaceAssets';
+  import { formatPathWithLocation, selectionToRange } from '$lib/files/sourceLocation';
   import {
     buildRenderedHtmlSrcdoc,
     renderMarkdown,
@@ -16,7 +19,7 @@
   } from '$lib/canvas/documentRender';
   import type { FilePreviewSelection } from '$lib/stores/filePreview.svelte';
 
-  type PreviewKind = 'empty' | 'directory' | 'image' | 'pdf' | 'markdown' | 'html' | 'text' | 'unsupported';
+  type PreviewKind = WorkspacePreviewKind | 'directory' | 'unsupported';
 
   const SUMMARY_ROW_LIMIT = 12;
 
@@ -30,23 +33,33 @@
     hiddenCount: number;
   }
 
+  interface PreviewContentMenu {
+    x: number;
+    y: number;
+    copyText: string;
+    pathWithLocation: string;
+  }
+
   let loading = $state(false);
   let errorMessage = $state<string | null>(null);
   let textContent = $state<string | null>(null);
   let loadedPath = $state<string | null>(null);
   let previewMaximized = $state(false);
+  let contentMenu = $state<PreviewContentMenu | null>(null);
+  let contentMenuEl: HTMLDivElement | undefined = $state();
 
   const selection = $derived(filePreviewStore.selection);
   const selectedEntries = $derived(filePreviewStore.selectedEntries);
   const selectedCount = $derived(selectedEntries.length);
   const isMultiSelection = $derived(selectedCount > 1);
+  const previewMeta = $derived(previewMetaForPath(selection?.path ?? ''));
   const kind = $derived(
-    selection?.entry.kind === 'directory' ? 'directory' : classify(selection?.path ?? ''),
+    selection?.entry.kind === 'directory' ? 'directory' : previewMeta.kind,
   );
   const previewUrl = $derived(selection === null ? '' : fsFileUrl(selection.path));
   const renderedMarkdown = $derived(renderMarkdown(textContent ?? ''));
   const renderedHtml = $derived(buildRenderedHtmlSrcdoc(textContent ?? ''));
-  const textLines = $derived((textContent ?? '').split('\n'));
+  const codeLang = $derived(previewMeta.shikiLang);
   const multiSummary = $derived.by((): MultiSelectionSummary => {
     let fileCount = 0;
     let folderCount = 0;
@@ -74,32 +87,10 @@
     };
   });
 
-  function basename(path: string): string {
-    return path.split('/').filter(Boolean).pop() ?? path;
-  }
-
-  function extension(path: string): string {
-    const name = basename(path).toLowerCase();
-    const dot = name.lastIndexOf('.');
-    return dot < 0 ? '' : name.slice(dot + 1);
-  }
-
-  function classify(path: string): PreviewKind {
-    if (path.length === 0) return 'empty';
-    const ext = extension(path);
-    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(ext)) return 'image';
-    if (ext === 'pdf') return 'pdf';
-    if (['md', 'markdown'].includes(ext)) return 'markdown';
-    if (['html', 'htm'].includes(ext)) return 'html';
-    if (['txt', 'log', 'json', 'ts', 'tsx', 'js', 'jsx', 'css', 'rs', 'svelte', 'toml', 'yaml', 'yml'].includes(ext)) {
-      return 'text';
-    }
-    return 'unsupported';
-  }
-
   $effect(() => {
     const current = selection;
     if (isMultiSelection) {
+      closeContentMenu();
       loadedPath = null;
       textContent = null;
       errorMessage = null;
@@ -107,6 +98,7 @@
       return;
     }
     if (current === null) {
+      closeContentMenu();
       loadedPath = null;
       textContent = null;
       errorMessage = null;
@@ -133,14 +125,7 @@
   async function loadPreview(path: string): Promise<void> {
     textContent = null;
     errorMessage = null;
-    const nextKind = classify(path);
-    if (nextKind === 'directory' || nextKind === 'unsupported') {
-      loading = false;
-      errorMessage = nextKind === 'directory'
-        ? null
-        : 'Preview is not available for this file type.';
-      return;
-    }
+    const nextKind = previewMetaForPath(path).kind;
     if (nextKind === 'image' || nextKind === 'pdf') {
       loading = false;
       return;
@@ -179,18 +164,13 @@
   }
 
   function extLabel(path: string): string {
-    const ext = extension(path);
-    if (ext.length === 0) return 'file';
-    return ext.slice(0, 4);
+    const ext = extension(path).slice(1);
+    if (ext.length > 0) return ext.slice(0, 4);
+    return previewMetaForPath(path).fileTypeLabel.slice(0, 4) || 'file';
   }
 
   function extClass(path: string): string {
-    const ext = extension(path);
-    if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'avif'].includes(ext)) return 'img';
-    if (ext === 'pdf') return 'pdf';
-    if (['md', 'markdown'].includes(ext)) return 'md';
-    if (['ts', 'tsx', 'js', 'jsx', 'svelte', 'rs', 'css', 'html', 'json', 'toml', 'yaml', 'yml'].includes(ext)) return 'code';
-    return 'file';
+    return previewMetaForPath(path).chipClass;
   }
 
   function compactPath(path: string): string {
@@ -220,6 +200,82 @@
     });
   }
 
+  function closeContentMenu(): void {
+    contentMenu = null;
+  }
+
+  function openContentMenu(e: MouseEvent, current: FilePreviewSelection): void {
+    e.preventDefault();
+    e.stopPropagation();
+    const root = e.currentTarget as HTMLElement;
+    const selectedText = selectedTextWithin(root);
+    const sourceRange = kind === 'text'
+      ? selectionToRange(root, window.getSelection())
+      : null;
+    contentMenu = {
+      x: e.clientX,
+      y: e.clientY,
+      copyText: selectedText,
+      pathWithLocation: formatPathWithLocation(current.path, sourceRange),
+    };
+    queueMicrotask(clampContentMenu);
+  }
+
+  function selectedTextWithin(root: HTMLElement): string {
+    const sel = window.getSelection();
+    if (sel === null || sel.rangeCount === 0 || sel.isCollapsed) return '';
+    const range = sel.getRangeAt(0);
+    const node = range.commonAncestorContainer;
+    if (node !== root && !root.contains(node)) return '';
+    return sel.toString();
+  }
+
+  function clampContentMenu(): void {
+    if (contentMenu === null || contentMenuEl === undefined) return;
+    const rect = contentMenuEl.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let nx = contentMenu.x;
+    let ny = contentMenu.y;
+    if (nx + rect.width > vw) nx = Math.max(0, vw - rect.width - 4);
+    if (ny + rect.height > vh) ny = Math.max(0, vh - rect.height - 4);
+    if (nx !== contentMenu.x || ny !== contentMenu.y) {
+      contentMenu = { ...contentMenu, x: nx, y: ny };
+    }
+  }
+
+  function onWindowPointerDown(e: PointerEvent): void {
+    if (contentMenu === null || contentMenuEl === undefined) return;
+    if (contentMenuEl.contains(e.target as Node)) return;
+    closeContentMenu();
+  }
+
+  function onWindowKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Escape') closeContentMenu();
+  }
+
+  async function copySelectedText(): Promise<void> {
+    const menu = contentMenu;
+    if (menu === null || menu.copyText.length === 0) return;
+    closeContentMenu();
+    const result = await copyTextToSystemClipboard(menu.copyText);
+    toastStore.show({
+      message: result.ok ? 'Copied selection.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
+  }
+
+  async function copyContentPath(): Promise<void> {
+    const menu = contentMenu;
+    if (menu === null) return;
+    closeContentMenu();
+    const result = await copyTextToSystemClipboard(menu.pathWithLocation);
+    toastStore.show({
+      message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
+  }
+
   function openPreviewMaximize(e: MouseEvent): void {
     e.stopPropagation();
     e.preventDefault();
@@ -240,52 +296,60 @@
   }
 </script>
 
+<svelte:window
+  onpointerdowncapture={onWindowPointerDown}
+  onkeydown={onWindowKeydown}
+  onresize={closeContentMenu}
+  onblur={closeContentMenu}
+/>
+
 {#snippet previewSurface(current: FilePreviewSelection)}
-  {#if loading}
-    <div class="empty-state">
-      <span class="spin" aria-hidden="true"></span>
-      <span class="desc">Loading preview...</span>
-    </div>
-  {:else if kind === 'directory'}
-    <div class="empty">
-      <p>Folder selected</p>
-      <p class="hint">Use Files actions to upload here, rename, remove, or insert it as a file path.</p>
-    </div>
-  {:else if errorMessage !== null}
-    <div class="empty" role="alert">
-      <p>Can't preview this type</p>
-      <p class="hint">{errorMessage}</p>
-    </div>
-  {:else if kind === 'image' && previewUrl.length > 0}
-    <div class="image-wrap">
-      <img src={previewUrl} alt={basename(current.path)} />
-    </div>
-  {:else if kind === 'pdf' && previewUrl.length > 0}
-    <iframe class="pdf-frame" src={previewUrl} title={basename(current.path)}></iframe>
-  {:else if kind === 'markdown'}
-    <article class="text-preview rendered">{@html renderedMarkdown}</article>
-  {:else if kind === 'html'}
-    <iframe
-      class="html-frame"
-      title={basename(current.path)}
-      sandbox={RENDERED_HTML_IFRAME_SANDBOX}
-      srcdoc={renderedHtml}
-    ></iframe>
-  {:else if kind === 'text'}
-    <div class="code-preview">
-      {#each textLines as line, index (index)}
-        <div class="code-line">
-          <span class="gutter">{index + 1}</span>
-          <code>{line}</code>
-        </div>
-      {/each}
-    </div>
-  {:else}
-    <div class="empty">
-      <p>Can't preview this type</p>
-      <p class="hint">Download or open it from the project workspace.</p>
-    </div>
-  {/if}
+  <div
+    class="preview-surface"
+    role="region"
+    aria-label="Preview content"
+    oncontextmenu={(e: MouseEvent) => openContentMenu(e, current)}
+    onscroll={closeContentMenu}
+  >
+    {#if loading}
+      <div class="empty-state">
+        <span class="spin" aria-hidden="true"></span>
+        <span class="desc">Loading preview...</span>
+      </div>
+    {:else if kind === 'directory'}
+      <div class="empty">
+        <p>Folder selected</p>
+        <p class="hint">Use Files actions to upload here, rename, remove, or insert it as a file path.</p>
+      </div>
+    {:else if errorMessage !== null}
+      <div class="empty" role="alert">
+        <p>Can't preview this type</p>
+        <p class="hint">{errorMessage}</p>
+      </div>
+    {:else if kind === 'image' && previewUrl.length > 0}
+      <div class="image-wrap">
+        <img src={previewUrl} alt={basename(current.path)} />
+      </div>
+    {:else if kind === 'pdf' && previewUrl.length > 0}
+      <iframe class="pdf-frame" src={previewUrl} title={basename(current.path)}></iframe>
+    {:else if kind === 'markdown'}
+      <article class="text-preview rendered">{@html renderedMarkdown}</article>
+    {:else if kind === 'html'}
+      <iframe
+        class="html-frame"
+        title={basename(current.path)}
+        sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+        srcdoc={renderedHtml}
+      ></iframe>
+    {:else if kind === 'text'}
+      <CodeViewer text={textContent ?? ''} lang={codeLang} filename={basename(current.path)} />
+    {:else}
+      <div class="empty">
+        <p>Can't preview this type</p>
+        <p class="hint">Download or open it from the project workspace.</p>
+      </div>
+    {/if}
+  </div>
 {/snippet}
 
 {#snippet multiSelectionSurface(summary: MultiSelectionSummary)}
@@ -426,6 +490,29 @@
     {@render previewSurface(selection)}
   {/if}
 </div>
+
+{#if contentMenu !== null}
+  <div
+    bind:this={contentMenuEl}
+    class="preview-content-menu"
+    style:left={`${contentMenu.x}px`}
+    style:top={`${contentMenu.y}px`}
+    role="menu"
+    tabindex="-1"
+    oncontextmenu={(e: MouseEvent) => e.preventDefault()}
+    onkeydown={(e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeContentMenu();
+    }}
+  >
+    <button
+      type="button"
+      role="menuitem"
+      disabled={contentMenu.copyText.length === 0}
+      onclick={() => void copySelectedText()}
+    >Copy</button>
+    <button type="button" role="menuitem" onclick={() => void copyContentPath()}>Copy path</button>
+  </div>
+{/if}
 
 {#if previewMaximized && (selection !== null || isMultiSelection)}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -675,6 +762,16 @@
     animation: spin 900ms linear infinite;
   }
 
+  .preview-surface {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    --code-viewer-font-size: 10.5px;
+    --code-viewer-line-height: 1.6;
+    --code-viewer-gutter-width: 28px;
+  }
+
   .image-wrap {
     flex: 1 1 auto;
     min-height: 0;
@@ -716,32 +813,6 @@
     line-height: 1.45;
     white-space: pre-wrap;
     word-break: break-word;
-  }
-
-  .code-preview {
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow: auto;
-    padding: var(--space-8) 0;
-    color: var(--color-fg);
-    background: var(--color-surface);
-    font-family: var(--font-mono);
-    font-size: 10.5px;
-    line-height: 1.6;
-  }
-
-  .code-line {
-    display: grid;
-    grid-template-columns: 28px max-content;
-    gap: var(--space-8);
-    min-width: max-content;
-    padding-right: var(--space-12);
-  }
-
-  .gutter {
-    color: var(--color-fg-subtle);
-    text-align: right;
-    user-select: none;
   }
 
   .text-preview.rendered {
@@ -922,6 +993,40 @@
     color: var(--color-fg-subtle);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
+  }
+
+  .preview-content-menu {
+    position: fixed;
+    z-index: var(--z-context-menu);
+    min-width: 132px;
+    padding: 4px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-surface-2);
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+  }
+
+  .preview-content-menu button {
+    width: 100%;
+    height: 26px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: var(--text-sm);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .preview-content-menu button:hover:not(:disabled) {
+    background: var(--color-glass-1);
+  }
+
+  .preview-content-menu button:disabled {
+    color: var(--color-fg-subtle);
+    cursor: not-allowed;
   }
 
   .preview-max-backdrop {

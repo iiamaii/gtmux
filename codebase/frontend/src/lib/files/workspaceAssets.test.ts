@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   materializationTypeForPath,
   parseWorkspaceFileDragPayload,
+  previewMetaForPath,
   resolveWorkspacePath,
+  shikiLangForPath,
   workspaceRelativePath,
 } from './workspaceAssets';
 
@@ -12,6 +14,32 @@ describe('workspaceAssets', () => {
     expect(materializationTypeForPath('/workspace/image.PNG')).toBe('image');
     expect(materializationTypeForPath('/workspace/report.html')).toBe('document');
     expect(materializationTypeForPath('/workspace/bin/app')).toBe('file_path');
+  });
+
+  it('classifies preview surfaces and shiki languages from one map', () => {
+    expect(previewMetaForPath('/workspace/photo.avif')).toMatchObject({
+      kind: 'image',
+      chipClass: 'img',
+    });
+    expect(previewMetaForPath('/workspace/readme.md')).toMatchObject({
+      kind: 'markdown',
+      shikiLang: 'markdown',
+      fileTypeLabel: 'markdown',
+    });
+    expect(previewMetaForPath('/workspace/src/main.rs')).toMatchObject({
+      kind: 'text',
+      shikiLang: 'rust',
+      chipClass: 'code',
+    });
+    expect(previewMetaForPath('/workspace/Dockerfile')).toMatchObject({
+      kind: 'text',
+      shikiLang: 'dockerfile',
+    });
+    expect(previewMetaForPath('/workspace/bin/tool')).toMatchObject({
+      kind: 'text',
+      shikiLang: 'text',
+    });
+    expect(shikiLangForPath('/workspace/app.py')).toBe('python');
   });
 
   it('creates B-relative paths only for files below the workspace root', () => {
