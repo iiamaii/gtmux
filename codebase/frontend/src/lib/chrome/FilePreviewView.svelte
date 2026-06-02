@@ -10,6 +10,7 @@
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { escRouter } from '$lib/common/escRouter.svelte';
   import CodeViewer from '$lib/canvas/CodeViewer.svelte';
+  import PanelEmptyState from './PanelEmptyState.svelte';
   import { basename, extension, previewMetaForPath, type WorkspacePreviewKind } from '$lib/files/workspaceAssets';
   import { formatPathWithLocation, selectionToRange } from '$lib/files/sourceLocation';
   import {
@@ -317,15 +318,18 @@
         <span class="desc">Loading preview...</span>
       </div>
     {:else if kind === 'directory'}
-      <div class="empty">
-        <p>Folder selected</p>
-        <p class="hint">Use Files actions to upload here, rename, remove, or insert it as a file path.</p>
-      </div>
+      <PanelEmptyState
+        icon="files"
+        lead="Folder selected"
+        description="Use Files actions to upload here, rename, remove, or add it to canvas."
+      />
     {:else if errorMessage !== null}
-      <div class="empty" role="alert">
-        <p>Can't preview this type</p>
-        <p class="hint">{errorMessage}</p>
-      </div>
+      <PanelEmptyState
+        icon="preview"
+        lead="Preview unavailable"
+        description={errorMessage}
+        role="alert"
+      />
     {:else if kind === 'image' && previewUrl.length > 0}
       <div class="image-wrap">
         <img src={previewUrl} alt={basename(current.path)} />
@@ -344,10 +348,11 @@
     {:else if kind === 'text'}
       <CodeViewer text={textContent ?? ''} lang={codeLang} filename={basename(current.path)} />
     {:else}
-      <div class="empty">
-        <p>Can't preview this type</p>
-        <p class="hint">Download or open it from the project workspace.</p>
-      </div>
+      <PanelEmptyState
+        icon="preview"
+        lead="Preview unavailable"
+        description="Download or open it from the project workspace."
+      />
     {/if}
   </div>
 {/snippet}
@@ -432,10 +437,11 @@
     </header>
     {@render multiSelectionSurface(multiSummary)}
   {:else if selection === null}
-    <div class="empty">
-      <p>No selection</p>
-      <p class="hint">Click a file in Files to preview.</p>
-    </div>
+    <PanelEmptyState
+      icon="preview"
+      lead="No file selected"
+      description="Select a file in Files to preview it here."
+    />
   {:else}
     <header class="preview-head">
       <div class="title-row">
@@ -605,21 +611,6 @@
     border-bottom: 1px solid var(--color-border);
     background: var(--color-surface-2);
     flex: 0 0 auto;
-  }
-
-  .empty {
-    padding: calc(var(--space-12) + var(--space-6)) var(--space-12) var(--space-12);
-    color: var(--color-fg-muted);
-  }
-
-  .empty p {
-    margin: 0 0 var(--space-4);
-    font-size: var(--text-md);
-  }
-
-  .empty .hint {
-    font-size: var(--text-base);
-    color: var(--color-fg-subtle);
   }
 
   .title-row {

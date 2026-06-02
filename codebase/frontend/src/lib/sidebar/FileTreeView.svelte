@@ -42,6 +42,7 @@
     WorkspaceUpdateUnavailableError,
   } from '$lib/http/sessions';
   import FileExplorer from '$lib/chrome/FileExplorer.svelte';
+  import PanelEmptyState from '$lib/chrome/PanelEmptyState.svelte';
   import Modal from '$lib/ui/Modal.svelte';
   import Button from '$lib/ui/Button.svelte';
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
@@ -1276,35 +1277,29 @@
   </header>
 
   {#if activeName === null}
-    <div class="panel-state muted">
-      <span class="state-disc" aria-hidden="true">
-        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.2 1.5h5.2A1.5 1.5 0 0 1 14 6v5.5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z"/>
-        </svg>
-      </span>
-      <span class="state-lead">No active session</span>
-      <span class="state-desc">Open or create a session to browse its workspace.</span>
-    </div>
+    <PanelEmptyState
+      icon="files"
+      lead="No active session"
+      description="Open or create a session to browse its workspace."
+    />
   {:else if rootLoading}
     <div class="shimmer-stack" aria-label="Loading files">
       <span></span><span></span><span></span>
     </div>
   {:else if rootError !== null}
-    <div class="panel-state danger" role="alert">
-      <span class="state-disc" aria-hidden="true">!</span>
-      <span class="state-lead">Unable to read workspace</span>
-      <span class="state-desc">{rootError}</span>
-    </div>
+    <PanelEmptyState
+      icon="alert"
+      lead="Unable to read workspace"
+      description={rootError}
+      tone="danger"
+      role="alert"
+    />
   {:else if rows.length === 0}
-    <div class="panel-state muted">
-      <span class="state-disc" aria-hidden="true">
-        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h2.6l1.2 1.5h5.2A1.5 1.5 0 0 1 14 6v5.5A1.5 1.5 0 0 1 12.5 13h-9A1.5 1.5 0 0 1 2 11.5z"/>
-        </svg>
-      </span>
-      <span class="state-lead">Empty workspace</span>
-      <span class="state-desc">This folder has no visible files.</span>
-    </div>
+    <PanelEmptyState
+      icon="files"
+      lead="Empty workspace"
+      description="This folder has no visible files."
+    />
   {:else}
     <ul class="tree" role="tree" aria-label="Workspace file tree">
       {#each rows as row (row.path)}
@@ -1771,7 +1766,7 @@
   }
 
   .file-tree.drop-root .tree,
-  .file-tree.drop-root .panel-state {
+  .file-tree.drop-root :global(.panel-empty) {
     background: color-mix(in srgb, var(--color-accent) 8%, transparent);
     outline: 1px dashed var(--color-accent);
     outline-offset: -1px;
@@ -1878,47 +1873,6 @@
 
   .row.selected .type-icon {
     color: var(--color-accent);
-  }
-
-  .panel-state {
-    flex: 1 1 auto;
-    display: grid;
-    place-items: center;
-    align-content: center;
-    gap: var(--space-8);
-    padding: var(--space-24) var(--space-12);
-    text-align: center;
-    color: var(--color-fg-muted);
-  }
-
-  .state-disc {
-    width: 36px;
-    height: 36px;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    background: var(--color-glass-1);
-    color: var(--color-fg-muted);
-    font-family: var(--font-mono);
-  }
-
-  .panel-state.danger .state-disc {
-    color: var(--color-danger);
-    background: color-mix(in srgb, var(--color-danger) 14%, transparent);
-  }
-
-  .state-lead {
-    color: var(--color-fg);
-    font-size: var(--text-md);
-    font-weight: var(--weight-semibold);
-  }
-
-  .state-desc {
-    max-width: 190px;
-    color: var(--color-fg-muted);
-    font-size: var(--text-sm);
-    letter-spacing: -0.1px;
-    line-height: var(--leading-normal);
   }
 
   .row-error {

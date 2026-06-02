@@ -35,6 +35,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
+  import PanelEmptyState from '$lib/chrome/PanelEmptyState.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { TerminalInfo } from '$lib/types/terminals';
   import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
@@ -287,7 +288,13 @@
     {:else if errorMessage !== null}
       <p class="state error" role="alert">{errorMessage}</p>
     {:else if terminals.length === 0}
-      <p class="state placeholder">No terminals running</p>
+      <PanelEmptyState
+        icon="terminal"
+        lead={allTerminals.length === 0 ? 'No terminals running' : 'No terminals in this scope'}
+        description={allTerminals.length === 0
+          ? 'Create a terminal panel from the toolbar to start one.'
+          : 'Switch to ALL to show terminals attached only to other sessions.'}
+      />
     {:else}
       <ul class="term-list">
         {#each terminals as t (t.id)}
@@ -316,7 +323,7 @@
               <button
                 type="button"
                 class="badge desync"
-                title={`Panel is on this canvas but the workspace pool reports 0 references — likely a sync miss. Click to refresh.`}
+                title="Panel is on this canvas but the workspace pool reports 0 references — likely a sync miss. Click to refresh."
                 onclick={() => void terminalPool.refresh()}
               >
                 (!) desync
@@ -494,6 +501,8 @@
 
   .terminals-body {
     flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
     overflow-y: auto;
     min-height: 0;
   }
@@ -503,11 +512,6 @@
     padding: var(--space-8) var(--space-12);
     color: var(--color-fg-muted);
     font-size: var(--text-base);
-  }
-
-  .state.placeholder {
-    color: var(--color-fg-subtle);
-    font-style: italic;
   }
 
   .state.error {

@@ -57,6 +57,7 @@
   import Toggle from '$lib/ui/Toggle.svelte';
   import Dropdown from '$lib/ui/Dropdown.svelte';
   import DropdownChevron from '$lib/ui/DropdownChevron.svelte';
+  import PanelEmptyState from './PanelEmptyState.svelte';
   import DashSegments from './DashSegments.svelte';
   import HeadIcon from './HeadIcon.svelte';
   import InspectorField from './InspectorField.svelte';
@@ -1870,10 +1871,11 @@
       </section>
 
     {:else if selectedPanel === null}
-      <div class="empty">
-        <p>No selection</p>
-        <p class="hint">Click a panel on the canvas to inspect.</p>
-      </div>
+      <PanelEmptyState
+        icon="inspect"
+        lead="No canvas item selected"
+        description="Select an item on the canvas to inspect its properties."
+      />
     {:else}
       {#if selectionCount > 1}
         <!-- ADR-0027 D2 — multi-select header (count + type homogeneity). -->
@@ -3818,23 +3820,10 @@
 
   .pane-info-body {
     flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
     overflow-y: auto;
     padding: var(--space-6) 0;
-  }
-
-  .empty {
-    padding: var(--space-12);
-    color: var(--color-fg-muted);
-  }
-
-  .empty p {
-    margin: 0 0 var(--space-4);
-    font-size: var(--text-md);
-  }
-
-  .empty .hint {
-    font-size: var(--text-base);
-    color: var(--color-fg-subtle);
   }
 
   /* ADR-0027 D2 — multi-select header. */
