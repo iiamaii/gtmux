@@ -138,14 +138,14 @@ pub async fn fs_file_serve_handler(
 /// ADR-0047 D2 — what to do when an uploaded file's name already exists in the
 /// target directory. Wire values `reject` (default) / `rename` / `overwrite`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConflictMode {
+pub(crate) enum ConflictMode {
     Reject,
     Rename,
     Overwrite,
 }
 
 impl ConflictMode {
-    fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "reject" => Some(Self::Reject),
             "rename" => Some(Self::Rename),
@@ -370,8 +370,10 @@ fn write_uploads(
 
 /// Produce the first non-colliding `name (N).ext` (N starts at 2) for `name`
 /// inside `dir`. Splits on the final extension so `a.tar.gz` → `a.tar (2).gz`
-/// (acceptable for MVP; the common case is a single extension).
-fn next_free_name(dir: &Path, name: &str) -> String {
+/// (acceptable for MVP; the common case is a single extension). A name with no
+/// extension (e.g. a directory `docs`) becomes `docs (2)`. Shared with the
+/// `/api/fs/copy` paste flow (ADR-0047 D10).
+pub(crate) fn next_free_name(dir: &Path, name: &str) -> String {
     let (stem, ext) = match name.rfind('.') {
         // Keep a leading-dot file (e.g. `.env`) intact — no split.
         Some(i) if i > 0 => (&name[..i], &name[i..]),

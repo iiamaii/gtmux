@@ -48,6 +48,7 @@ mod attach_index;
 mod auth;
 mod file_open;
 mod file_stat;
+mod fs_copy;
 mod fs_file;
 mod fs_guard;
 mod fs_list;
@@ -838,6 +839,12 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             // ADR-0047 D9 — remove a file / empty directory (no recursive wipe).
             "/api/fs/remove",
             axum::routing::post(fs_list::fs_remove_handler),
+        )
+        .route(
+            // ADR-0047 D10 — copy file(s)/dir(s) into a workspace dir (recursive,
+            // symlink/escape/cycle fail-closed). Files-tab clipboard paste.
+            "/api/fs/copy",
+            axum::routing::post(fs_copy::fs_copy_handler),
         )
         .route(
             "/api/shutdown",
@@ -6891,6 +6898,267 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
         }
+    }
+
+    // ── ADR-0047 D10 — POST /api/fs/copy ───────────────────────────────────
+
+    #[tokio::test]
+    async fn fs_copy_single_and_multiple_files_preserve_order_and_content() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let a_root = dir.path().canonicalize().unwrap();
+        std::fs::write(a_root.join("a.md"), b"AAA").unwrap();
+        std::fs::write(a_root.join("b.md"), b"BBB").unwrap();
+        let dest = a_root.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({
+                "sources": [
+                    a_root.join("a.md").to_string_lossy(),
+                    a_root.join("b.md").to_string_lossy(),
+                ],
+                "dest_dir": dest.to_string_lossy(),
+                "on_conflict": "rename",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        // Order preserved.
+        assert_eq!(entries[0]["name"], "a.md");
+        assert_eq!(entries[0]["kind"], "file");
+        assert_eq!(entries[1]["name"], "b.md");
+        assert_eq!(
+            entries[0]["path"].as_str().unwrap(),
+            dest.join("a.md").to_string_lossy().as_ref()
+        );
+        assert_eq!(std::fs::read(dest.join("a.md")).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(dest.join("b.md")).unwrap(), b"BBB");
+        // Originals untouched.
+        assert!(a_root.join("a.md").exists());
+    }
+
+    #[tokio::test]
+    async fn fs_copy_directory_recursive() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let a_root = dir.path().canonicalize().unwrap();
+        let src = a_root.join("proj");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("top.txt"), b"t").unwrap();
+        std::fs::create_dir(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub").join("deep.txt"), b"d").unwrap();
+        let dest = a_root.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({
+                "sources": [src.to_string_lossy()],
+                "dest_dir": dest.to_string_lossy(),
+                "on_conflict": "rename",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["entries"][0]["kind"], "directory");
+        assert_eq!(std::fs::read(dest.join("proj").join("top.txt")).unwrap(), b"t");
+        assert_eq!(
+            std::fs::read(dest.join("proj").join("sub").join("deep.txt")).unwrap(),
+            b"d"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_copy_directory_with_symlink_rejected_no_partial() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret"), b"s").unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let a_root = dir.path().canonicalize().unwrap();
+        let src = a_root.join("proj");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("ok.txt"), b"ok").unwrap();
+        symlink(outside.path().join("secret"), src.join("link")).unwrap();
+        let dest = a_root.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({
+                "sources": [src.to_string_lossy()],
+                "dest_dir": dest.to_string_lossy(),
+                "on_conflict": "rename",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "invalid_request");
+        // Partial tree was cleaned up — nothing unsafe left behind.
+        assert!(!dest.join("proj").exists());
+    }
+
+    #[tokio::test]
+    async fn fs_copy_guard_cycle_and_dest_rejections() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+        let a_root = dir.path().canonicalize().unwrap();
+        let dest = a_root.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+
+        // Source outside A → 403.
+        let out = outside.path().join("o.md");
+        std::fs::write(&out, b"o").unwrap();
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({ "sources": [out.to_string_lossy()], "dest_dir": dest.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Source inside the Store (denylist) → 403.
+        let in_store = store_dir.join("s.md");
+        std::fs::write(&in_store, b"s").unwrap();
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({ "sources": [in_store.to_string_lossy()], "dest_dir": dest.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // dest_dir missing → 404.
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({
+                "sources": [a_root.join("dest").to_string_lossy()],
+                "dest_dir": a_root.join("ghost").to_string_lossy(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // A root as source → 403.
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({ "sources": [a_root.to_string_lossy()], "dest_dir": dest.to_string_lossy() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Cycle: copy a directory into its own descendant → 409 copy_cycle.
+        let parent = a_root.join("parent");
+        std::fs::create_dir_all(parent.join("inner")).unwrap();
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({
+                "sources": [parent.to_string_lossy()],
+                "dest_dir": parent.join("inner").to_string_lossy(),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "copy_cycle");
+    }
+
+    #[tokio::test]
+    async fn fs_copy_conflict_modes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+        let a_root = dir.path().canonicalize().unwrap();
+        std::fs::write(a_root.join("a.md"), b"SRC").unwrap();
+        let dest = a_root.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("a.md"), b"OLD").unwrap();
+
+        let src = json!([a_root.join("a.md").to_string_lossy()]);
+
+        // reject → 409 name_conflict.
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({ "sources": src, "dest_dir": dest.to_string_lossy(), "on_conflict": "reject" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "name_conflict");
+        assert_eq!(std::fs::read(dest.join("a.md")).unwrap(), b"OLD");
+
+        // rename → 200, lands at "a (2).md".
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({ "sources": src, "dest_dir": dest.to_string_lossy(), "on_conflict": "rename" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["entries"][0]["name"], "a (2).md");
+        assert_eq!(std::fs::read(dest.join("a (2).md")).unwrap(), b"SRC");
+        assert_eq!(std::fs::read(dest.join("a.md")).unwrap(), b"OLD");
+
+        // overwrite (file) → 200, target replaced.
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/fs/copy",
+            Some(json!({ "sources": src, "dest_dir": dest.to_string_lossy(), "on_conflict": "overwrite" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(std::fs::read(dest.join("a.md")).unwrap(), b"SRC");
+    }
+
+    #[tokio::test]
+    async fn fs_copy_requires_auth_401() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, _token, _store) = make_app_with_workspace(&dir);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/fs/copy")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"sources":["/x"],"dest_dir":"/y"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
