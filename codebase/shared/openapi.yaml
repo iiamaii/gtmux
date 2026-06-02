@@ -443,14 +443,22 @@ components:
       - allOf:
         - $ref: '#/components/schemas/ItemCommon'
         - type: object
-          required:
-          - asset_id
-          - mime
           properties:
             asset_id:
-              type: string
+              type:
+              - string
+              - 'null'
+              description: |-
+                Legacy content-hash asset id (ADR-0033, superseded by ADR-0047).
+                Read-only: existing records keep rendering via
+                `GET /api/assets/{asset_id}`. New items never set this.
             mime:
-              type: string
+              type:
+              - string
+              - 'null'
+              description: |-
+                Optional MIME hint. New `path` items may omit it (the serve
+                endpoint sniffs magic bytes); legacy asset records carry it.
             original_h:
               type:
               - integer
@@ -463,7 +471,23 @@ components:
               - 'null'
               format: int32
               minimum: 0
+            path:
+              type:
+              - string
+              - 'null'
+              description: |-
+                ADR-0047 D1 — workspace(B)-relative path to the source file. The
+                new origin for image items.
         - type: object
+          description: |-
+            ADR-0047 D1 (amends ADR-0018 D4) — image item = **workspace(B) file
+            reference** (`path`) or a **legacy content-hash asset** (`asset_id`,
+            read-only — ADR-0033 superseded). Exactly one of `path` / `asset_id`
+            is set; `validate()` enforces it (`ImageMissingSource` /
+            `ImageBothSources`). New items use `path` (B-relative — see
+            [`is_clean_relative_workspace_path`]); the FE resolves it → absolute
+            against the session's effective `workspace_root` and fetches the bytes
+            via `GET /api/fs/file`. `mime` is optional (sniffed at serve time).
           required:
           - type
           properties:
@@ -471,48 +495,68 @@ components:
               type: string
               enum:
               - image
+        description: |-
+          ADR-0047 D1 (amends ADR-0018 D4) — image item = **workspace(B) file
+          reference** (`path`) or a **legacy content-hash asset** (`asset_id`,
+          read-only — ADR-0033 superseded). Exactly one of `path` / `asset_id`
+          is set; `validate()` enforces it (`ImageMissingSource` /
+          `ImageBothSources`). New items use `path` (B-relative — see
+          [`is_clean_relative_workspace_path`]); the FE resolves it → absolute
+          against the session's effective `workspace_root` and fetches the bytes
+          via `GET /api/fs/file`. `mime` is optional (sniffed at serve time).
       - allOf:
         - $ref: '#/components/schemas/ItemCommon'
         - type: object
-          required:
-          - mime
-          - file_name
-          - size_bytes
           properties:
             asset_id:
               type:
               - string
               - 'null'
-              description: |-
-                (a) asset-based mode: sha256 → `/api/assets/<asset_id>`.
-                (b) inline-stored mode: `None`.
+              description: '(a) legacy asset-based origin: sha256 → `/api/assets/<asset_id>`.'
             content:
               type:
               - string
               - 'null'
               description: |-
                 (b) inline-stored UTF-8 markdown, capped at
-                [`DOCUMENT_INLINE_MAX_BYTES`]. (a) is `None`.
+                [`DOCUMENT_INLINE_MAX_BYTES`].
             file_name:
-              type: string
+              type:
+              - string
+              - 'null'
+              description: Optional display name (derived from `path` basename when absent).
             mime:
-              type: string
+              type:
+              - string
+              - 'null'
+              description: Optional MIME hint (sniffed at serve time for `path` items).
+            path:
+              type:
+              - string
+              - 'null'
+              description: |-
+                (c) workspace-file origin: B-relative path. New documents from the
+                file explorer / Files-tab drag use this.
             size_bytes:
-              type: integer
+              type:
+              - integer
+              - 'null'
               format: int64
               description: |-
-                (a) asset-based: real binary size.
-                (b) inline-stored: `content.len()` bytes.
+                Optional size in bytes — `content.len()` (inline) or the real file
+                size (legacy asset). `path` items may omit it.
               minimum: 0
         - type: object
           description: |-
-            ADR-0018 D10 amend ① — two-mode document item:
-              * (a) asset-based — `asset_id` is `Some(sha256)`, `content` is
-                `None`. The actual bytes live behind `/api/assets/<asset_id>`
-                (Stage 2, ADR-0030 to-be).
-              * (b) inline-stored — `asset_id` is `None`, `content` is
-                `Some(<utf-8 markdown>)` capped at [`DOCUMENT_INLINE_MAX_BYTES`].
-            The two modes are *mutually exclusive*; `validate()` enforces this
+            ADR-0047 D1 (amends ADR-0018 D10) — three-origin document item, exactly
+            one of:
+              * (c) **workspace file** — `path` is `Some(<B-relative>)` (new; the
+                bytes are read live via `GET /api/fs/file`). md/pdf/txt/html.
+              * (b) **inline-stored** — `content` is `Some(<utf-8 markdown>)`
+                capped at [`DOCUMENT_INLINE_MAX_BYTES`] (kept — canvas-authored).
+              * (a) **legacy asset** — `asset_id` is `Some(sha256)` (read-only,
+                ADR-0033 superseded; renders via `/api/assets/<asset_id>`).
+            The three origins are *mutually exclusive*; `validate()` enforces this
             (`DocumentMissingSource` / `DocumentBothSources`).
           required:
           - type
@@ -522,13 +566,15 @@ components:
               enum:
               - document
         description: |-
-          ADR-0018 D10 amend ① — two-mode document item:
-            * (a) asset-based — `asset_id` is `Some(sha256)`, `content` is
-              `None`. The actual bytes live behind `/api/assets/<asset_id>`
-              (Stage 2, ADR-0030 to-be).
-            * (b) inline-stored — `asset_id` is `None`, `content` is
-              `Some(<utf-8 markdown>)` capped at [`DOCUMENT_INLINE_MAX_BYTES`].
-          The two modes are *mutually exclusive*; `validate()` enforces this
+          ADR-0047 D1 (amends ADR-0018 D10) — three-origin document item, exactly
+          one of:
+            * (c) **workspace file** — `path` is `Some(<B-relative>)` (new; the
+              bytes are read live via `GET /api/fs/file`). md/pdf/txt/html.
+            * (b) **inline-stored** — `content` is `Some(<utf-8 markdown>)`
+              capped at [`DOCUMENT_INLINE_MAX_BYTES`] (kept — canvas-authored).
+            * (a) **legacy asset** — `asset_id` is `Some(sha256)` (read-only,
+              ADR-0033 superseded; renders via `/api/assets/<asset_id>`).
+          The three origins are *mutually exclusive*; `validate()` enforces this
           (`DocumentMissingSource` / `DocumentBothSources`).
       - allOf:
         - $ref: '#/components/schemas/ItemCommon'
@@ -733,7 +779,7 @@ components:
             inside the Server Workspace(A). ADR-0045 D4 / ADR-0046 D1 (amends
             ADR-0018 D3). `None` on legacy/edge records; the effective workspace is
             then resolved via the fallback chain
-            `workspace_root ?? config.default_session_workspace ?? A-root`. New
+            `workspace_root ?? config.default_session_workspace ?? $HOME`. New
             sessions always set it (ADR-0046 D5). v2 stays additive — a missing
             field round-trips to `None`.
       additionalProperties: false
