@@ -76,6 +76,43 @@ async function json<T>(res: Response): Promise<T> {
   }
 }
 
+function isCanvasLayout(value: unknown): value is CanvasLayout {
+  const candidate = value as Partial<CanvasLayout> | null;
+  return (
+    candidate !== null &&
+    candidate.schema_version === 2 &&
+    Array.isArray(candidate.items) &&
+    Array.isArray(candidate.groups) &&
+    typeof candidate.viewport === 'object' &&
+    candidate.viewport !== null
+  );
+}
+
+function workspaceRootFromLayout(layout: CanvasLayout): string | undefined {
+  return typeof layout.workspace_root === 'string' && layout.workspace_root.length > 0
+    ? layout.workspace_root
+    : undefined;
+}
+
+export function parseLayoutBody(body: unknown): { layout: CanvasLayout; workspace_root?: string } {
+  if (isCanvasLayout(body)) {
+    return { layout: body, workspace_root: workspaceRootFromLayout(body) };
+  }
+  const envelope = body as { layout?: unknown; workspace_root?: unknown } | null;
+  if (envelope !== null && isCanvasLayout(envelope.layout)) {
+    const workspace_root = typeof envelope.workspace_root === 'string'
+      ? envelope.workspace_root
+      : workspaceRootFromLayout(envelope.layout);
+    return {
+      layout: workspace_root !== undefined
+        ? { ...envelope.layout, workspace_root }
+        : envelope.layout,
+      workspace_root,
+    };
+  }
+  throw new Error('GET layout response missing schema_version 2 layout');
+}
+
 function normalizeSessionInfo(
   raw: Partial<SessionInfo> & { name: string; active?: boolean },
   index: number,
@@ -313,8 +350,14 @@ export async function attachSession(
     matched?: string[];
     unmatched?: string[];
     server_id?: string;
+    workspace_root?: string;
   }>(res).catch(
-    () => ({}) as { matched?: string[]; unmatched?: string[]; server_id?: string },
+    () => ({}) as {
+      matched?: string[];
+      unmatched?: string[];
+      server_id?: string;
+      workspace_root?: string;
+    },
   );
   // 0074 Phase 1 — body 의 server_id 도 detection 채널 (list 호출 전에 attach
   // 가 먼저 일어나는 reconnect 흐름 대비). list 의 response header 와 같은
@@ -331,10 +374,17 @@ export async function attachSession(
         unmatched_item_ids: unmatched,
         matched_item_ids: matched,
       },
+      workspace_root: body.workspace_root,
     };
   }
-  const { layout, etag } = await getLayout(name);
-  return { kind: 'ok', layout, etag, matched };
+  const { layout, etag, workspace_root } = await getLayout(name);
+  return {
+    kind: 'ok',
+    layout,
+    etag,
+    workspace_root: workspace_root ?? body.workspace_root,
+    matched,
+  };
 }
 
 /**
@@ -402,7 +452,7 @@ export async function deleteItem(
  */
 export async function getLayout(
   name: string,
-): Promise<{ layout: CanvasLayout; etag: string }> {
+): Promise<{ layout: CanvasLayout; etag: string; workspace_root?: string }> {
   const res = await fetch(
     `/api/sessions/${encodeURIComponent(name)}/layout`,
     {
@@ -413,9 +463,9 @@ export async function getLayout(
   );
   if (res.status === 401) throw new UnauthorizedError();
   if (!res.ok) throw new Error(`GET layout returned ${res.status}`);
-  const layout = await json<CanvasLayout>(res);
+  const { layout, workspace_root } = parseLayoutBody(await json<unknown>(res));
   const etag = (res.headers.get('ETag') ?? '').replace(/^"|"$/g, '');
-  return { layout, etag };
+  return { layout, etag, workspace_root };
 }
 
 /**

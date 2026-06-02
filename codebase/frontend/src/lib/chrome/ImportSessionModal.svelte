@@ -218,7 +218,10 @@
       const wsConnId = getWebpageId();
       const res = await attachSession(importedName, { ws_conn_id: wsConnId });
       if (res.kind === 'ok') {
-        sessionStore.setActiveSession({ name: importedName });
+        sessionStore.setActiveSession({
+          name: importedName,
+          effectiveWorkspaceRoot: res.workspace_root,
+        });
         sessionStore.loadLayout(res.layout);
         toastStore.show({
           message: `Opened imported session "${importedName}".`,
@@ -229,7 +232,10 @@
       }
       if (res.kind === 'confirm_required') {
         // imported terminal items 가 unmatched → AttachConfirmModal 흐름.
-        sessionStore.setActiveSession({ name: importedName });
+        sessionStore.setActiveSession({
+          name: importedName,
+          effectiveWorkspaceRoot: res.workspace_root,
+        });
         workspaceSwitcher.goAttachConfirm(importedName, res.summary);
         sessionIODialog.close();
         return;

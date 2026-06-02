@@ -23,9 +23,17 @@
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { patchTerminalLabel } from '$lib/http/terminals';
   import { filePicker } from '$lib/stores/filePicker.svelte';
-  import { pickLocalFile } from '$lib/files/localFilePicker';
-  import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
   import { UnauthorizedError } from '$lib/http/sessions';
+  import {
+    DOCUMENT_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    basename,
+    fileStem as workspaceFileStem,
+    guessMimeFromPath,
+    resolveWorkspacePath,
+    workspaceRelativePath,
+  } from '$lib/files/workspaceAssets';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { snippetEditPanel } from '$lib/stores/snippetEditPanel.svelte';
   import {
@@ -492,6 +500,9 @@
   }
   const FONT_FAMILIES: FontFamily[] = ['sans', 'serif', 'mono'];
   let figureTextSettingsOpen = $state(false);
+  const INSPECTOR_DROPDOWN_LABEL_INSET = 66;
+  const INSPECTOR_DROPDOWN_GAP = 2;
+  const INSPECTOR_DROPDOWN_MENU_CLASS = 'inspector-dropdown-menu';
 
   type PathEndpointId = 'from' | 'to';
 
@@ -570,7 +581,7 @@
       return terminalPool.byId(it.id)?.label?.trim() || it.label || '';
     }
     if (it.type === 'note') return it.title;
-    if (it.type === 'document') return it.label?.trim() || fileStem(it.file_name);
+    if (it.type === 'document') return it.label?.trim() || fileStem(it.file_name ?? it.path ?? 'document');
     return it.label ?? '';
   }
   function commonDisplayLabel(): string | 'Mixed' | null {
@@ -759,8 +770,6 @@
   }
 
   const isSelectedTerminal = $derived(sessionItem?.type === 'terminal');
-  const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/svg+xml';
-  const DOCUMENT_ACCEPT = '.md,.txt,.json,.html,.css,.js,.ts,.tsx,.jsx,.pdf,text/*,application/json,application/pdf';
 
   /* ── Common field broadcast (ADR-0027 D1/D3/D6) ──
    * Geometry / label / state 는 한 mutateLayout PUT 으로 selected item 전체에
@@ -1202,17 +1211,33 @@
     });
   }
 
-  function onAssetChangeError(err: unknown, kind: 'image' | 'document'): void {
-    if (err instanceof UnauthorizedError) {
-      window.location.href = '/auth';
-      return;
-    }
+  function workspaceRootOrToast(): string | null {
+    const root = sessionStore.effectiveWorkspaceRoot;
+    if (root.length > 0) return root;
     toastStore.show({
-      message: err instanceof AssetUploadUnavailableError
-        ? 'Asset upload API is not available yet.'
-        : `${kind === 'image' ? 'Image' : 'Document'} change failed: ${err instanceof Error ? err.message : String(err)}`,
+      message: 'Workspace root is not available yet.',
       tone: 'error',
-      durationMs: 6_000,
+    });
+    return null;
+  }
+
+  function itemCopyPath(item: CanvasItem): string | null {
+    if (item.type === 'file_path') {
+      const path = item.path.trim();
+      return path.length > 0 ? path : null;
+    }
+    if ((item.type === 'image' || item.type === 'document') && (item.path ?? '').length > 0) {
+      return resolveWorkspacePath(sessionStore.effectiveWorkspaceRoot, item.path ?? '');
+    }
+    return null;
+  }
+
+  async function copyInspectorPath(path: string | null): Promise<void> {
+    if (path === null) return;
+    const result = await copyTextToSystemClipboard(path);
+    toastStore.show({
+      message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
     });
   }
 
@@ -1237,25 +1262,33 @@
     });
   }
 
-  async function changeImageFromInspector(): Promise<void> {
+  function changeImageFromInspector(): void {
     const item = sessionItem;
     if (item?.type !== 'image' || item.locked) return;
-    const file = await pickLocalFile({ accept: IMAGE_ACCEPT });
-    if (file === null) return;
-    try {
-      const uploaded = await uploadAsset(file, 'image');
-      await sessionStore.optimisticMutation(
+    const workspaceRoot = workspaceRootOrToast();
+    if (workspaceRoot === null) return;
+    filePicker.openFor(workspaceRoot, (absolutePath) => {
+      const nextPath = workspaceRelativePath(workspaceRoot, absolutePath);
+      if (nextPath === null) {
+        toastStore.show({
+          message: 'Image files must be inside the active project workspace.',
+          tone: 'error',
+        });
+        return;
+      }
+      void sessionStore.optimisticMutation(
         (cur) => ({
           ...cur,
           items: cur.items.map((it: CanvasItem) =>
             it.id === item.id && it.type === 'image'
               ? ({
                   ...it,
-                  label: uploaded.file_name,
-                  asset_id: uploaded.asset_id,
-                  mime: uploaded.mime,
-                  original_w: uploaded.original_w,
-                  original_h: uploaded.original_h,
+                  label: basename(absolutePath),
+                  path: nextPath,
+                  asset_id: undefined,
+                  mime: guessMimeFromPath(absolutePath),
+                  original_w: undefined,
+                  original_h: undefined,
                 } as CanvasItem)
               : it,
           ),
@@ -1265,30 +1298,41 @@
           failMessage: 'Image change failed',
         },
       );
-    } catch (err) {
-      onAssetChangeError(err, 'image');
-    }
+    }, {
+      accept: { extensions: [...IMAGE_EXTENSIONS], description: 'image files' },
+      rootKind: 'workspace',
+      rootPath: workspaceRoot,
+    });
   }
 
-  async function changeDocumentFromInspector(): Promise<void> {
+  function changeDocumentFromInspector(): void {
     const item = sessionItem;
     if (item?.type !== 'document' || item.locked) return;
-    const file = await pickLocalFile({ accept: DOCUMENT_ACCEPT });
-    if (file === null) return;
-    try {
-      const uploaded = await uploadAsset(file, 'document');
-      await sessionStore.optimisticMutation(
+    const workspaceRoot = workspaceRootOrToast();
+    if (workspaceRoot === null) return;
+    filePicker.openFor(workspaceRoot, (absolutePath) => {
+      const nextPath = workspaceRelativePath(workspaceRoot, absolutePath);
+      if (nextPath === null) {
+        toastStore.show({
+          message: 'Document files must be inside the active project workspace.',
+          tone: 'error',
+        });
+        return;
+      }
+      const nextFileName = basename(absolutePath);
+      void sessionStore.optimisticMutation(
         (cur) => ({
           ...cur,
           items: cur.items.map((it: CanvasItem) =>
             it.id === item.id && it.type === 'document'
               ? ({
                   ...it,
-                  asset_id: uploaded.asset_id,
-                  label: uploaded.file_name.replace(/\.[^/.]+$/, ''),
-                  file_name: uploaded.file_name,
-                  mime: uploaded.mime,
-                  size_bytes: uploaded.size_bytes,
+                  path: nextPath,
+                  asset_id: undefined,
+                  label: workspaceFileStem(nextFileName),
+                  file_name: nextFileName,
+                  mime: guessMimeFromPath(absolutePath),
+                  size_bytes: undefined,
                   content: undefined,
                 } as CanvasItem)
               : it,
@@ -1299,9 +1343,11 @@
           failMessage: 'Document change failed',
         },
       );
-    } catch (err) {
-      onAssetChangeError(err, 'document');
-    }
+    }, {
+      accept: { extensions: [...DOCUMENT_EXTENSIONS], description: 'document files' },
+      rootKind: 'workspace',
+      rootPath: workspaceRoot,
+    });
   }
 
   /** Multi-select 의 boolean 동질성 — 모두 같으면 그 값, 아니면 null (mixed). */
@@ -1618,6 +1664,50 @@
     );
   }
 </script>
+
+{#snippet horizontalAlignIcon(value: TextAlign)}
+  {#if value === 'left'}
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <line x1="4" y1="6" x2="20" y2="6" />
+      <line x1="4" y1="12" x2="14" y2="12" />
+      <line x1="4" y1="18" x2="18" y2="18" />
+    </svg>
+  {:else if value === 'center'}
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <line x1="4" y1="6" x2="20" y2="6" />
+      <line x1="7" y1="12" x2="17" y2="12" />
+      <line x1="5" y1="18" x2="19" y2="18" />
+    </svg>
+  {:else}
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <line x1="4" y1="6" x2="20" y2="6" />
+      <line x1="10" y1="12" x2="20" y2="12" />
+      <line x1="6" y1="18" x2="20" y2="18" />
+    </svg>
+  {/if}
+{/snippet}
+
+{#snippet verticalAlignIcon(value: TextVerticalAlign)}
+  {#if value === 'top'}
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <line x1="5" y1="5" x2="19" y2="5" />
+      <line x1="8" y1="10" x2="16" y2="10" />
+      <line x1="10" y1="15" x2="14" y2="15" />
+    </svg>
+  {:else if value === 'middle'}
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <line x1="6" y1="7" x2="18" y2="7" />
+      <line x1="4" y1="12" x2="20" y2="12" />
+      <line x1="6" y1="17" x2="18" y2="17" />
+    </svg>
+  {:else}
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+      <line x1="10" y1="9" x2="14" y2="9" />
+      <line x1="8" y1="14" x2="16" y2="14" />
+      <line x1="5" y1="19" x2="19" y2="19" />
+    </svg>
+  {/if}
+{/snippet}
 
 <div class="item-info-view" aria-label="Item info">
   <div class="pane-info-body">
@@ -2124,7 +2214,13 @@
               </div>
               <div class="fig-group-body">
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -2142,7 +2238,7 @@
                       </button>
                     {/snippet}
                     {#snippet menu({ close })}
-                      {#each FONT_FAMILIES as f}
+                      {#each FONT_FAMILIES as f (f)}
                         <button
                           type="button"
                           class="font-option font-preview-{f}"
@@ -2195,18 +2291,18 @@
                 </div>
                 <div class="display-row control-row fig-body-row">
                   <span class="control-label">align</span>
-                  <div class="segmented-control" role="group" aria-label="Horizontal alignment">
-                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'left'} aria-pressed={sharedTextAlign === 'left'} title="Align left" aria-label="Align left" disabled={textStyleLocked} onclick={() => void applyTextAlign('left')}>L</button>
-                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'center'} aria-pressed={sharedTextAlign === 'center'} title="Align center" aria-label="Align center" disabled={textStyleLocked} onclick={() => void applyTextAlign('center')}>C</button>
-                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'right'} aria-pressed={sharedTextAlign === 'right'} title="Align right" aria-label="Align right" disabled={textStyleLocked} onclick={() => void applyTextAlign('right')}>R</button>
+                  <div class="segmented-control icon-segments" role="group" aria-label="Horizontal alignment">
+                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'left'} aria-pressed={sharedTextAlign === 'left'} title="Align left" aria-label="Align left" disabled={textStyleLocked} onclick={() => void applyTextAlign('left')}>{@render horizontalAlignIcon('left')}</button>
+                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'center'} aria-pressed={sharedTextAlign === 'center'} title="Align center" aria-label="Align center" disabled={textStyleLocked} onclick={() => void applyTextAlign('center')}>{@render horizontalAlignIcon('center')}</button>
+                    <button type="button" class="seg-btn" class:active={sharedTextAlign === 'right'} aria-pressed={sharedTextAlign === 'right'} title="Align right" aria-label="Align right" disabled={textStyleLocked} onclick={() => void applyTextAlign('right')}>{@render horizontalAlignIcon('right')}</button>
                   </div>
                 </div>
                 <div class="display-row control-row fig-body-row">
                   <span class="control-label">v-align</span>
-                  <div class="segmented-control" role="group" aria-label="Vertical alignment">
-                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'top'} aria-pressed={sharedTextVerticalAlign === 'top'} title="Align top" aria-label="Align top" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('top')}>T</button>
-                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'middle'} aria-pressed={sharedTextVerticalAlign === 'middle'} title="Align middle" aria-label="Align middle" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('middle')}>M</button>
-                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'bottom'} aria-pressed={sharedTextVerticalAlign === 'bottom'} title="Align bottom" aria-label="Align bottom" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('bottom')}>B</button>
+                  <div class="segmented-control icon-segments" role="group" aria-label="Vertical alignment">
+                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'top'} aria-pressed={sharedTextVerticalAlign === 'top'} title="Align top" aria-label="Align top" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('top')}>{@render verticalAlignIcon('top')}</button>
+                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'middle'} aria-pressed={sharedTextVerticalAlign === 'middle'} title="Align middle" aria-label="Align middle" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('middle')}>{@render verticalAlignIcon('middle')}</button>
+                    <button type="button" class="seg-btn" class:active={sharedTextVerticalAlign === 'bottom'} aria-pressed={sharedTextVerticalAlign === 'bottom'} title="Align bottom" aria-label="Align bottom" disabled={textStyleLocked} onclick={() => void applyTextVerticalAlign('bottom')}>{@render verticalAlignIcon('bottom')}</button>
                   </div>
                 </div>
               </div>
@@ -2325,7 +2421,13 @@
               </div>
               <div class="fig-group-body">
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -2367,7 +2469,13 @@
                   </Dropdown>
                 </div>
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -2547,7 +2655,13 @@
               {#if figureTextSettingsOpen}
                 <div class="fig-group-body">
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -2563,10 +2677,11 @@
                       </button>
                     {/snippet}
                     {#snippet menu({ close })}
-                      {#each FONT_FAMILIES as f}
+                      {#each FONT_FAMILIES as f (f)}
                         <button
                           type="button"
                           class="font-option font-preview-{f}"
+                          class:selected={shapeFamily === f}
                           disabled={shape.locked}
                           onclick={() => {
                             void applyTextFontFamily(f);
@@ -2614,18 +2729,18 @@
                 </div>
                 <div class="display-row control-row fig-body-row">
                   <span class="control-label">align</span>
-                  <div class="segmented-control" role="group" aria-label="Horizontal alignment">
-                    <button type="button" class="seg-btn" class:active={shapeH === 'left'} aria-pressed={shapeH === 'left'} title="Align left" aria-label="Align left" disabled={shape.locked} onclick={() => void applyTextAlign('left')}>L</button>
-                    <button type="button" class="seg-btn" class:active={shapeH === 'center'} aria-pressed={shapeH === 'center'} title="Align center" aria-label="Align center" disabled={shape.locked} onclick={() => void applyTextAlign('center')}>C</button>
-                    <button type="button" class="seg-btn" class:active={shapeH === 'right'} aria-pressed={shapeH === 'right'} title="Align right" aria-label="Align right" disabled={shape.locked} onclick={() => void applyTextAlign('right')}>R</button>
+                  <div class="segmented-control icon-segments" role="group" aria-label="Horizontal alignment">
+                    <button type="button" class="seg-btn" class:active={shapeH === 'left'} aria-pressed={shapeH === 'left'} title="Align left" aria-label="Align left" disabled={shape.locked} onclick={() => void applyTextAlign('left')}>{@render horizontalAlignIcon('left')}</button>
+                    <button type="button" class="seg-btn" class:active={shapeH === 'center'} aria-pressed={shapeH === 'center'} title="Align center" aria-label="Align center" disabled={shape.locked} onclick={() => void applyTextAlign('center')}>{@render horizontalAlignIcon('center')}</button>
+                    <button type="button" class="seg-btn" class:active={shapeH === 'right'} aria-pressed={shapeH === 'right'} title="Align right" aria-label="Align right" disabled={shape.locked} onclick={() => void applyTextAlign('right')}>{@render horizontalAlignIcon('right')}</button>
                   </div>
                 </div>
                 <div class="display-row control-row fig-body-row">
                   <span class="control-label">v-align</span>
-                  <div class="segmented-control" role="group" aria-label="Vertical alignment">
-                    <button type="button" class="seg-btn" class:active={shapeV === 'top'} aria-pressed={shapeV === 'top'} title="Align top" aria-label="Align top" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('top')}>T</button>
-                    <button type="button" class="seg-btn" class:active={shapeV === 'middle'} aria-pressed={shapeV === 'middle'} title="Align middle" aria-label="Align middle" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('middle')}>M</button>
-                    <button type="button" class="seg-btn" class:active={shapeV === 'bottom'} aria-pressed={shapeV === 'bottom'} title="Align bottom" aria-label="Align bottom" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('bottom')}>B</button>
+                  <div class="segmented-control icon-segments" role="group" aria-label="Vertical alignment">
+                    <button type="button" class="seg-btn" class:active={shapeV === 'top'} aria-pressed={shapeV === 'top'} title="Align top" aria-label="Align top" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('top')}>{@render verticalAlignIcon('top')}</button>
+                    <button type="button" class="seg-btn" class:active={shapeV === 'middle'} aria-pressed={shapeV === 'middle'} title="Align middle" aria-label="Align middle" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('middle')}>{@render verticalAlignIcon('middle')}</button>
+                    <button type="button" class="seg-btn" class:active={shapeV === 'bottom'} aria-pressed={shapeV === 'bottom'} title="Align bottom" aria-label="Align bottom" disabled={shape.locked} onclick={() => void applyTextVerticalAlign('bottom')}>{@render verticalAlignIcon('bottom')}</button>
                   </div>
                 </div>
                 </div>
@@ -2669,7 +2784,13 @@
               </div>
               <div class="fig-group-body">
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -2705,7 +2826,13 @@
                   </Dropdown>
                 </div>
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -2769,7 +2896,13 @@
                   </div>
                 </div>
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -2805,7 +2938,13 @@
                   </Dropdown>
                 </div>
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -2886,7 +3025,13 @@
                 {@const fromTarget = connectedEndpointTarget(path.from)}
                 <div class="fig-group-body">
                   <div class="font-dropdown">
-                    <Dropdown placement="bottom-start">
+                    <Dropdown
+                      placement="bottom-start"
+                      menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                      menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                      matchTriggerWidth={true}
+                      menuGap={INSPECTOR_DROPDOWN_GAP}
+                    >
                       {#snippet trigger({ toggle })}
                         <button
                           type="button"
@@ -2967,7 +3112,13 @@
                 {@const toTarget = connectedEndpointTarget(path.to)}
                 <div class="fig-group-body">
                   <div class="font-dropdown">
-                    <Dropdown placement="bottom-start">
+                    <Dropdown
+                      placement="bottom-start"
+                      menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                      menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                      matchTriggerWidth={true}
+                      menuGap={INSPECTOR_DROPDOWN_GAP}
+                    >
                       {#snippet trigger({ toggle })}
                         <button
                           type="button"
@@ -3059,7 +3210,13 @@
               </div>
               <div class="fig-group-body">
                 <div class="font-dropdown">
-                  <Dropdown placement="bottom-start">
+                  <Dropdown
+                    placement="bottom-start"
+                    menuClass={INSPECTOR_DROPDOWN_MENU_CLASS}
+                    menuInsetLeft={INSPECTOR_DROPDOWN_LABEL_INSET}
+                    matchTriggerWidth={true}
+                    menuGap={INSPECTOR_DROPDOWN_GAP}
+                  >
                     {#snippet trigger({ toggle })}
                       <button
                         type="button"
@@ -3075,10 +3232,11 @@
                       </button>
                     {/snippet}
                     {#snippet menu({ close })}
-                      {#each FONT_FAMILIES as f}
+                      {#each FONT_FAMILIES as f (f)}
                         <button
                           type="button"
                           class="font-option font-preview-{f}"
+                          class:selected={family === f}
                           disabled={txt.locked}
                           onclick={() => {
                             void applyTextFontFamily(f);
@@ -3370,10 +3528,25 @@
               />
             </div>
           {:else if sessionItem.type === 'file_path'}
+            {@const copyPath = itemCopyPath(sessionItem)}
             <div class="prop-row full">
               <div class="display-row">
                 <span class="k">path</span>
                 <span class="display-val mono" title={sessionItem.path}>{strOr(sessionItem.path, '—')}</span>
+                {#if copyPath !== null}
+                  <button
+                    type="button"
+                    class="inline-action"
+                    title="Copy path"
+                    aria-label="Copy path"
+                    onclick={() => void copyInspectorPath(copyPath)}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="5" y="5" width="8" height="9" rx="1.2"/>
+                      <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
+                    </svg>
+                  </button>
+                {/if}
                 <button
                   type="button"
                   class="inline-action"
@@ -3391,10 +3564,27 @@
               </div>
             </div>
           {:else if sessionItem.type === 'image'}
+            {@const copyPath = itemCopyPath(sessionItem)}
             <div class="prop-row full">
               <div class="display-row">
                 <span class="k">file</span>
-                <span class="display-val mono" title={sessionItem.label ?? sessionItem.asset_id}>{strOr(sessionItem.label ?? sessionItem.asset_id, '—')}</span>
+                <span class="display-val mono" title={sessionItem.label ?? sessionItem.path ?? sessionItem.asset_id}>
+                  {strOr(sessionItem.label ?? sessionItem.path ?? sessionItem.asset_id, '—')}
+                </span>
+                {#if copyPath !== null}
+                  <button
+                    type="button"
+                    class="inline-action"
+                    title="Copy path"
+                    aria-label="Copy path"
+                    onclick={() => void copyInspectorPath(copyPath)}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="5" y="5" width="8" height="9" rx="1.2"/>
+                      <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
+                    </svg>
+                  </button>
+                {/if}
                 <button
                   type="button"
                   class="inline-action"
@@ -3412,10 +3602,27 @@
               </div>
             </div>
           {:else if sessionItem.type === 'document'}
+            {@const copyPath = itemCopyPath(sessionItem)}
             <div class="prop-row full">
               <div class="display-row">
                 <span class="k">file</span>
-                <span class="display-val mono" title={sessionItem.file_name}>{strOr(sessionItem.file_name, '—')}</span>
+                <span class="display-val mono" title={sessionItem.file_name ?? sessionItem.path}>
+                  {strOr(sessionItem.file_name ?? sessionItem.path, '—')}
+                </span>
+                {#if copyPath !== null}
+                  <button
+                    type="button"
+                    class="inline-action"
+                    title="Copy path"
+                    aria-label="Copy path"
+                    onclick={() => void copyInspectorPath(copyPath)}
+                  >
+                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="5" y="5" width="8" height="9" rx="1.2"/>
+                      <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
+                    </svg>
+                  </button>
+                {/if}
                 <button
                   type="button"
                   class="inline-action"
@@ -3962,7 +4169,6 @@
 
   .font-dropdown {
     --inspector-k-w: 56px;
-    --inspector-dropdown-menu-left: calc(var(--inspector-k-w) + 10px);
     width: 100%;
     min-width: 0;
   }
@@ -3992,38 +4198,34 @@
     border-color: var(--color-accent);
   }
 
-  .font-dropdown :global(.dropdown-menu) {
+  :global(.dropdown-menu.inspector-dropdown-menu[role='menu']) {
     box-sizing: border-box;
-    width: auto;
     min-width: 0;
     max-width: none;
     max-height: min(280px, calc(100vh - 96px));
     overflow-x: hidden;
     overflow-y: auto;
     overscroll-behavior: contain;
-    margin-top: 2px;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
     padding: 2px;
     background: var(--color-bg);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.16);
+    z-index: var(--z-context-menu);
   }
 
-  .font-dropdown :global(.dropdown-menu.dropdown-menu-bottom-start),
-  .font-dropdown :global(.dropdown-menu.dropdown-menu-bottom-end) {
-    left: var(--inspector-dropdown-menu-left);
-    right: 0;
-  }
-
-  .font-dropdown :global(.dropdown-menu button) {
+  :global(.dropdown-menu.inspector-dropdown-menu[role='menu'] button) {
     justify-content: center;
     height: 24px;
     padding: 0 6px;
-    border-radius: 3px;
+    border-radius: 2px;
     font-size: 11px;
   }
 
-  .font-dropdown :global(.dropdown-menu button.selected) {
+  :global(.dropdown-menu.inspector-dropdown-menu[role='menu'] button.selected) {
     background: var(--color-accent);
     color: var(--color-accent-fg);
   }

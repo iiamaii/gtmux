@@ -14,9 +14,14 @@
 
 import type { CanvasItem } from '$lib/types/canvas';
 import { clipboardStore, type ClipboardPayload } from '$lib/stores/clipboardStore.svelte';
+import { chromeStore } from '$lib/stores/chrome.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
 import { pasteItems, materializeSelection } from '$lib/canvas/clipboardOps.svelte';
+import {
+  commitNewItem,
+  createTextItemFromClipboardText,
+} from '$lib/canvas/itemFactory';
 import { effectiveLocked } from '$lib/types/group';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
@@ -35,6 +40,7 @@ function filterMutablePayload(payload: ClipboardPayload): ClipboardPayload {
 }
 
 function doCopy(): boolean {
+  if (chromeStore.state.leftPanelTab === 'files') return false;
   const payload = selectionPayload();
   if (payload.items.length === 0 && payload.groups.length === 0) return false;
   clipboardStore.copy(payload);
@@ -42,6 +48,7 @@ function doCopy(): boolean {
 }
 
 function doCut(): boolean {
+  if (chromeStore.state.leftPanelTab === 'files') return false;
   const payload = filterMutablePayload(selectionPayload());
   if (payload.items.length === 0 && payload.groups.length === 0) return false;
   clipboardStore.cut(payload);
@@ -68,14 +75,103 @@ function doCut(): boolean {
 }
 
 function doPaste(): boolean {
-  if (!clipboardStore.hasItems) return false;
+  if (chromeStore.state.leftPanelTab === 'files') return false;
   if (sessionStore.active === null) return false;
+  if (clipboardStore.kind === 'text') {
+    void pasteTextAt(canvasViewportCenter(), { centerAtAnchor: true });
+    return true;
+  }
+  if (!clipboardStore.hasItems) return false;
   const offset = clipboardStore.consumePasteOffset();
   void pasteItems(clipboardStore.entries, clipboardStore.groups, {
     offset,
     failMessage: 'Paste failed',
   });
   return true;
+}
+
+async function pasteTextAt(
+  anchor: { x: number; y: number },
+  options: { centerAtAnchor: boolean },
+): Promise<boolean> {
+  const offset = clipboardStore.consumeTextPasteOffset();
+  const item = createTextItemFromClipboardText(clipboardStore.text, {
+    x: anchor.x + offset.dx,
+    y: anchor.y + offset.dy,
+  });
+  if (item === null) return false;
+  if (options.centerAtAnchor) {
+    item.x -= item.w / 2;
+    item.y -= item.h / 2;
+  }
+  const committed = await commitNewItem(item);
+  return committed !== null;
+}
+
+function canvasViewportCenter(): { x: number; y: number } {
+  const viewport = sessionStore.viewport;
+  const zoom = viewport.zoom <= 0 ? 1 : viewport.zoom;
+  const canvas = document.querySelector('.canvas-root') as HTMLElement | null;
+  const local = canvas === null
+    ? { x: window.innerWidth / 2, y: window.innerHeight / 2 }
+    : { x: canvas.getBoundingClientRect().width / 2, y: canvas.getBoundingClientRect().height / 2 };
+  return {
+    x: (local.x - viewport.x) / zoom,
+    y: (local.y - viewport.y) / zoom,
+  };
+}
+
+function isEditableFocused(): boolean {
+  if (typeof document === 'undefined') return false;
+  const el = document.activeElement as HTMLElement | null;
+  if (el === null) return false;
+  return isEditableElement(el);
+}
+
+function isXtermFocused(): boolean {
+  if (typeof document === 'undefined') return false;
+  const el = document.activeElement as HTMLElement | null;
+  return el?.classList.contains('xterm-helper-textarea') === true;
+}
+
+function isEditableElement(el: HTMLElement): boolean {
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
+function selectedTextFromEventTarget(target: EventTarget | null): string {
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
+    const start = target.selectionStart ?? 0;
+    const end = target.selectionEnd ?? start;
+    return target.value.slice(start, end);
+  }
+  return document.getSelection()?.toString() ?? '';
+}
+
+function onNativeTextCopyOrCut(event: ClipboardEvent): void {
+  if (
+    event.target instanceof HTMLTextAreaElement &&
+    event.target.readOnly &&
+    event.target.getAttribute('aria-hidden') === 'true'
+  ) {
+    return;
+  }
+  const text = selectedTextFromEventTarget(event.target);
+  if (text.trim().length === 0) return;
+  clipboardStore.copyText(text);
+}
+
+function onNativePaste(event: ClipboardEvent): void {
+  if (chromeStore.state.leftPanelTab === 'files') return;
+  if (isEditableFocused() || isXtermFocused()) return;
+  if (clipboardStore.kind === 'canvas') return;
+  if (sessionStore.active === null) return;
+  const text = event.clipboardData?.getData('text/plain') ?? '';
+  if (text.trim().length === 0) return;
+  clipboardStore.copyText(text);
+  event.preventDefault();
+  event.stopPropagation();
+  void pasteTextAt(canvasViewportCenter(), { centerAtAnchor: true });
 }
 
 export function bindClipboardShortcuts(): () => void {
@@ -112,7 +208,14 @@ export function bindClipboardShortcuts(): () => void {
   register('selection.paste', 'v', 'meta', 'Paste', doPaste);
   register('selection.paste', 'v', 'ctrl', 'Paste (Win/Linux)', doPaste);
 
+  window.addEventListener('copy', onNativeTextCopyOrCut, { capture: true });
+  window.addEventListener('cut', onNativeTextCopyOrCut, { capture: true });
+  window.addEventListener('paste', onNativePaste, { capture: true });
+
   return () => {
     for (const fn of unsubs) fn();
+    window.removeEventListener('copy', onNativeTextCopyOrCut, { capture: true });
+    window.removeEventListener('cut', onNativeTextCopyOrCut, { capture: true });
+    window.removeEventListener('paste', onNativePaste, { capture: true });
   };
 }

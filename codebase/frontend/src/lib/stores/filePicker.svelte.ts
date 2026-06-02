@@ -13,6 +13,8 @@ class FilePickerStore {
   open = $state(false);
   initialDir = $state<string>('');
   accept = $state<{ extensions: string[]; description: string } | null>(null);
+  rootKind = $state<'server' | 'workspace'>('server');
+  rootPath = $state<string>('');
   #onSelect: ((absolutePath: string) => void) | null = null;
 
   /**
@@ -22,10 +24,16 @@ class FilePickerStore {
   openFor(
     initialDir: string,
     onSelect: (absolutePath: string) => void,
-    options?: { accept?: { extensions: string[]; description: string } },
+    options?: {
+      accept?: { extensions: string[]; description: string };
+      rootKind?: 'server' | 'workspace';
+      rootPath?: string;
+    },
   ): void {
     this.initialDir = initialDir;
     this.accept = options?.accept ?? null;
+    this.rootKind = options?.rootKind ?? 'server';
+    this.rootPath = options?.rootPath ?? '';
     this.#onSelect = onSelect;
     this.open = true;
   }
@@ -33,6 +41,8 @@ class FilePickerStore {
   cancel(): void {
     this.open = false;
     this.accept = null;
+    this.rootKind = 'server';
+    this.rootPath = '';
     this.#onSelect = null;
   }
 
@@ -40,6 +50,8 @@ class FilePickerStore {
     const cb = this.#onSelect;
     this.open = false;
     this.accept = null;
+    this.rootKind = 'server';
+    this.rootPath = '';
     this.#onSelect = null;
     if (cb !== null) cb(absolutePath);
   }

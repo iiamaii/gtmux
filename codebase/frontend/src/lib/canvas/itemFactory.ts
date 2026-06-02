@@ -32,11 +32,21 @@ import type {
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { generateUuidV4 } from '$lib/uuid';
 import {
+  basename,
+  fileStem,
+  guessMimeFromPath,
+  materializationTypeForPath,
+  workspaceRelativePath,
+  type WorkspaceEntryKind,
+  type WorkspaceMaterializationType,
+} from '$lib/files/workspaceAssets';
+import {
   autoRoutePath,
   bestAnchorPair,
   computePathBBox,
   type ConnectableItem,
 } from './pathGeometry';
+import { deriveLabel } from './labelDerive';
 import { getPathStyleMemory, type PathStyleMemory } from './pathStyleMemory';
 
 /** 신규 item 의 기본 좌표 + 크기 default. ADR-0018 D7 의 z 정책은 commit 시점에 결정. */
@@ -46,6 +56,12 @@ export const DEFAULT_TERMINAL_SIZE = { w: 480, h: 320 } as const;
 // middle / bottom 차이가 ±12.5px 만큼 가시. 너무 작으면 (예 h<40) 정렬 차이가
 // 거의 안 보여 fit-perception 가짐.
 const DEFAULT_TEXT_SIZE = { w: 160, h: 56 } as const;
+const PASTE_TEXT_MIN_SIZE = { w: 160, h: 56 } as const;
+const PASTE_TEXT_MAX_SIZE = { w: 520, h: 360 } as const;
+const PASTE_TEXT_HORIZONTAL_PAD = 24;
+const PASTE_TEXT_VERTICAL_PAD = 20;
+const PASTE_TEXT_AVG_CHAR_WIDTH_RATIO = 0.58;
+const PASTE_TEXT_LINE_HEIGHT_RATIO = 1.4;
 export const DEFAULT_NOTE_SIZE = { w: 300, h: 96 } as const;
 // 시안 §03 — fp-main(icon 24 + padding 11+10 = 45) + fp-foot(content 14 +
 // padding 6+7 = 27) + border 2 = ~74. NodeResizer minHeight 와 정합 — 셋
@@ -176,6 +192,45 @@ export function createCanvasItem(
   }
 }
 
+export function createTextItemFromClipboardText(
+  text: string,
+  pos: { x: number; y: number },
+): TextItem | null {
+  const normalized = normalizeClipboardText(text);
+  if (normalized.trim().length === 0) return null;
+  const base = createCanvasItem('text', pos) as TextItem;
+  const size = estimateClipboardTextSize(normalized, base.font_size);
+  return {
+    ...base,
+    text: normalized,
+    w: size.w,
+    h: size.h,
+    label: deriveLabel(normalized),
+    label_auto: true,
+  };
+}
+
+function normalizeClipboardText(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function estimateClipboardTextSize(text: string, fontSize: number): { w: number; h: number } {
+  const lines = text.split('\n');
+  const longest = lines.reduce((max, line) => Math.max(max, line.length), 0);
+  const rawW =
+    longest * fontSize * PASTE_TEXT_AVG_CHAR_WIDTH_RATIO + PASTE_TEXT_HORIZONTAL_PAD;
+  const rawH =
+    lines.length * fontSize * PASTE_TEXT_LINE_HEIGHT_RATIO + PASTE_TEXT_VERTICAL_PAD;
+  return {
+    w: clamp(Math.ceil(rawW), PASTE_TEXT_MIN_SIZE.w, PASTE_TEXT_MAX_SIZE.w),
+    h: clamp(Math.ceil(rawH), PASTE_TEXT_MIN_SIZE.h, PASTE_TEXT_MAX_SIZE.h),
+  };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 /**
  * Image item — placeholder spawn (ADR-0018 D4 P2+, asset endpoint 미land).
  *
@@ -231,6 +286,57 @@ export function createDocumentItem(pos: { x: number; y: number }): DocumentItem 
     file_name: 'document',
     size_bytes: new TextEncoder().encode(content).length,
     content,
+  };
+}
+
+export interface WorkspaceFileItemSource {
+  absolutePath: string;
+  workspaceRoot: string;
+  kind?: WorkspaceEntryKind;
+  sizeBytes?: number | null;
+}
+
+export function createCanvasItemFromWorkspaceFile(
+  pos: { x: number; y: number },
+  source: WorkspaceFileItemSource,
+  requestedType: WorkspaceMaterializationType = source.kind === 'directory'
+    ? 'file_path'
+    : materializationTypeForPath(source.absolutePath),
+): ImageItem | DocumentItem | FilePathItem {
+  if (source.kind === 'directory' && requestedType !== 'file_path') {
+    throw new Error('Directories can only be inserted as file paths.');
+  }
+  const relativePath = workspaceRelativePath(source.workspaceRoot, source.absolutePath);
+  if (requestedType === 'file_path') {
+    const item = createCanvasItem('file_path', pos) as FilePathItem;
+    return {
+      ...item,
+      path: source.absolutePath,
+      kind: source.kind ?? 'file',
+    };
+  }
+  if (relativePath === null) {
+    throw new Error('Image/document files must be inside the active project workspace.');
+  }
+  const fileName = basename(source.absolutePath);
+  if (requestedType === 'image') {
+    return {
+      ...createImageItem(pos),
+      label: fileName,
+      path: relativePath,
+      asset_id: undefined,
+      mime: guessMimeFromPath(source.absolutePath),
+    };
+  }
+  return {
+    ...createDocumentItem(pos),
+    label: fileStem(fileName),
+    path: relativePath,
+    asset_id: undefined,
+    file_name: fileName,
+    mime: guessMimeFromPath(source.absolutePath),
+    size_bytes: source.sizeBytes ?? 0,
+    content: undefined,
   };
 }
 
@@ -520,7 +626,7 @@ export async function commitNewItem(item: CanvasItem): Promise<CanvasItem | null
   sessionStore.setM([committed.id]);
   // R7 (batch-5) — text item spawn 직후 auto-edit 진입 signal. TextNode 의
   // mount $effect 가 본 flag 읽고 editing=true 설정 + flag clear.
-  if (committed.type === 'text') {
+  if (committed.type === 'text' && committed.text.length === 0) {
     sessionStore.justSpawnedTextId = committed.id;
   }
   return committed;

@@ -23,7 +23,6 @@
   import { chromeStore } from '$lib/stores/chrome.svelte';
   import { attachConfirm, UnauthorizedError } from '$lib/http/sessions';
   import { killTerminal } from '$lib/http/terminals';
-  import { uploadAsset, AssetUploadUnavailableError } from '$lib/http/assets';
   import type { Anchor, CanvasItem, CanvasLayout, Head, PathEndpoint, PathItem, Point } from '$lib/types/canvas';
   import {
     descendantGroups,
@@ -37,7 +36,12 @@
   import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
   import FilePickerModal from '$lib/chrome/FilePickerModal.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
-  import { pickLocalFile } from '$lib/files/localFilePicker';
+  import {
+    DOCUMENT_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    WORKSPACE_FILE_DRAG_MIME,
+    parseWorkspaceFileDragPayload,
+  } from '$lib/files/workspaceAssets';
   import PanelNode from './PanelNode.svelte';
   import TextNode from './TextNode.svelte';
   import NoteNode from './NoteNode.svelte';
@@ -58,8 +62,7 @@
     createLineItem,
     createPathItem,
     createTerminalItem,
-    createImageItem,
-    createDocumentItem,
+    createCanvasItemFromWorkspaceFile,
     createFreeDrawItem,
     createSnippetsItem,
     lineBoxFromEndpoints,
@@ -1591,10 +1594,10 @@
         payload = '|free_draw';
         break;
       case 'image':
-        payload = `|${item.asset_id}|${item.mime}|${item.original_w ?? ''}|${item.original_h ?? ''}`;
+        payload = `|${item.path ?? ''}|${item.asset_id ?? ''}|${item.mime ?? ''}|${item.original_w ?? ''}|${item.original_h ?? ''}`;
         break;
       case 'document':
-        payload = `|${item.asset_id ?? ''}|${item.mime}|${item.file_name}|${item.size_bytes}|${item.content ?? ''}`;
+        payload = `|${item.path ?? ''}|${item.asset_id ?? ''}|${item.mime ?? ''}|${item.file_name ?? ''}|${item.size_bytes ?? ''}|${item.content ?? ''}`;
         break;
       case 'snippets':
         // ADR-0038 — id + content hash. 옛 length-only sig 는 same-length edit
@@ -2245,22 +2248,15 @@
     });
   }
 
-  function onAssetUploadError(err: unknown): void {
-    if (err instanceof UnauthorizedError) {
-      window.location.href = '/auth';
-      return;
-    }
+  function workspaceRootOrToast(): string | null {
+    const root = sessionStore.effectiveWorkspaceRoot;
+    if (root.length > 0) return root;
     toastStore.show({
-      message: err instanceof AssetUploadUnavailableError
-        ? 'Asset upload API is not available yet. Backend work is required before image/document insertion can complete.'
-        : `Asset upload failed: ${err instanceof Error ? err.message : String(err)}`,
+      message: 'Workspace root is not available yet.',
       tone: 'error',
-      durationMs: 6_000,
     });
+    return null;
   }
-
-  const IMAGE_ACCEPT = 'image/png,image/jpeg,image/gif,image/webp,image/svg+xml';
-  const DOCUMENT_ACCEPT = '.md,.txt,.json,.html,.css,.js,.ts,.tsx,.jsx,.pdf,text/*,application/json,application/pdf';
 
   function onpaneclick({ event }: { event: MouseEvent | TouchEvent }) {
     // Hand tool — exploration only, click no-op (Figma).
@@ -2366,57 +2362,108 @@
       }
       if (tool === 'image') {
         const pos = centered('image');
-        void pickLocalFile({ accept: IMAGE_ACCEPT }).then(async (file) => {
-          if (file === null) return;
+        const workspaceRoot = workspaceRootOrToast();
+        if (workspaceRoot === null) return;
+        filePicker.openFor(workspaceRoot, (absolutePath) => {
           try {
-            const uploaded = await uploadAsset(file, 'image');
-            const item = {
-              ...createImageItem(pos),
-              label: uploaded.file_name,
-              asset_id: uploaded.asset_id,
-              mime: uploaded.mime,
-              original_w: uploaded.original_w,
-              original_h: uploaded.original_h,
-            };
-            await commitNewItem(item);
-            toolStore.consume();
-            // ★ 2026-05-22 사용자 보고 (#upload-canvas-desync) — async
-            // commit-after layout refetch (defensive, silent best-effort).
-            void sessionStore.reloadActiveLayout();
+            const item = createCanvasItemFromWorkspaceFile(
+              pos,
+              { absolutePath, workspaceRoot },
+              'image',
+            );
+            void commitNewItem(item)
+              .then((committed) => {
+                if (committed !== null) {
+                  toolStore.consume();
+                  void sessionStore.reloadActiveLayout();
+                }
+              })
+              .catch(onSpawnError);
           } catch (err) {
-            onAssetUploadError(err);
+            onSpawnError(err);
           }
+        }, {
+          accept: { extensions: [...IMAGE_EXTENSIONS], description: 'image files' },
+          rootKind: 'workspace',
+          rootPath: workspaceRoot,
         });
         return;
       }
       if (tool === 'document') {
         const pos = centered('document');
-        void pickLocalFile({ accept: DOCUMENT_ACCEPT }).then(async (file) => {
-          if (file === null) return;
+        const workspaceRoot = workspaceRootOrToast();
+        if (workspaceRoot === null) return;
+        filePicker.openFor(workspaceRoot, (absolutePath) => {
           try {
-            const uploaded = await uploadAsset(file, 'document');
-            const item = {
-              ...createDocumentItem(pos),
-              asset_id: uploaded.asset_id,
-              label: uploaded.file_name.replace(/\.[^/.]+$/, ''),
-              mime: uploaded.mime,
-              file_name: uploaded.file_name,
-              size_bytes: uploaded.size_bytes,
-              content: undefined,
-            };
-            await commitNewItem(item);
-            toolStore.consume();
-            // ★ 2026-05-22 사용자 보고 (#upload-canvas-desync) — async
-            // commit-after layout refetch (defensive, silent best-effort).
-            void sessionStore.reloadActiveLayout();
+            const item = createCanvasItemFromWorkspaceFile(
+              pos,
+              { absolutePath, workspaceRoot },
+              'document',
+            );
+            void commitNewItem(item)
+              .then((committed) => {
+                if (committed !== null) {
+                  toolStore.consume();
+                  void sessionStore.reloadActiveLayout();
+                }
+              })
+              .catch(onSpawnError);
           } catch (err) {
-            onAssetUploadError(err);
+            onSpawnError(err);
           }
+        }, {
+          accept: { extensions: [...DOCUMENT_EXTENSIONS], description: 'document files' },
+          rootKind: 'workspace',
+          rootPath: workspaceRoot,
         });
         return;
       }
     }
     clearCanvasDrillAndSelection();
+  }
+
+  function onCanvasDragOver(e: DragEvent): void {
+    if (!e.dataTransfer?.types.includes(WORKSPACE_FILE_DRAG_MIME)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+
+  async function onCanvasDrop(e: DragEvent): Promise<void> {
+    const raw = e.dataTransfer?.getData(WORKSPACE_FILE_DRAG_MIME) ?? '';
+    const payload = raw.length > 0 ? parseWorkspaceFileDragPayload(raw) : null;
+    if (payload === null || payload.files.length === 0) return;
+    e.preventDefault();
+    const origin = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    let created = 0;
+    for (const [index, file] of payload.files.entries()) {
+      const pos = {
+        x: origin.x + index * 18,
+        y: origin.y + index * 18,
+      };
+      try {
+        const item = createCanvasItemFromWorkspaceFile(pos, {
+          absolutePath: file.path,
+          workspaceRoot: file.rootPath,
+          kind: file.kind,
+          sizeBytes: file.sizeBytes,
+        });
+        const committed = await commitNewItem(item);
+        if (committed !== null) created += 1;
+      } catch (err) {
+        toastStore.show({
+          message: `Insert failed: ${err instanceof Error ? err.message : String(err)}`,
+          tone: 'error',
+          durationMs: 6_000,
+        });
+      }
+    }
+    if (created > 0) {
+      toastStore.show({
+        message: `Inserted ${created} workspace file${created === 1 ? '' : 's'}.`,
+        tone: 'success',
+      });
+      void sessionStore.reloadActiveLayout();
+    }
   }
 
   /**
@@ -2897,6 +2944,8 @@
   onpointermovecapture={onCanvasPointerMove}
   onpointerupcapture={onCanvasPointerUp}
   onpointercancelcapture={onCanvasPointerCancel}
+  ondragover={onCanvasDragOver}
+  ondrop={(e: DragEvent) => void onCanvasDrop(e)}
   onpointerleave={() => {
     hoverScreen = null;
     hoverFlow = null;
@@ -3077,6 +3126,8 @@
   open={filePicker.open}
   initialDir={filePicker.initialDir}
   accept={filePicker.accept}
+  rootKind={filePicker.rootKind}
+  rootPath={filePicker.rootPath}
   onCancel={() => filePicker.cancel()}
   onSelect={(abs) => filePicker.select(abs)}
   onUnauthorized={() => { window.location.href = '/auth'; }}

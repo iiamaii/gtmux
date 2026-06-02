@@ -28,20 +28,41 @@
   interface Props {
     /** Menu placement relative to trigger. Default `bottom-end`. */
     placement?: 'bottom-end' | 'bottom-start';
+    /** Extra class applied to the portalled menu surface. */
+    menuClass?: string;
+    /** Pixel inset from trigger left used as the menu anchor. */
+    menuInsetLeft?: number;
+    /** Pixel inset from trigger right used as the menu anchor. */
+    menuInsetRight?: number;
+    /** Match menu width to the trigger width after insets. */
+    matchTriggerWidth?: boolean;
+    /** Pixel gap between trigger and menu. */
+    menuGap?: number;
     trigger: Snippet<[TriggerArgs]>;
     menu: Snippet<[MenuArgs]>;
   }
 
-  const { placement = 'bottom-end', trigger, menu }: Props = $props();
+  const {
+    placement = 'bottom-end',
+    menuClass = '',
+    menuInsetLeft = 0,
+    menuInsetRight = 0,
+    matchTriggerWidth = false,
+    menuGap = 8,
+    trigger,
+    menu,
+  }: Props = $props();
 
   const VIEWPORT_PADDING = 12;
-  const MENU_GAP = 8;
   const MIN_MENU_HEIGHT = 96;
 
   let open = $state(false);
   let host: HTMLDivElement | undefined = $state();
   let menuEl: HTMLDivElement | undefined = $state();
   let menuStyle = $state('left: 0px; top: 0px; visibility: hidden;');
+  const menuClassName = $derived(
+    ['dropdown-menu', `dropdown-menu-${placement}`, menuClass].filter(Boolean).join(' '),
+  );
 
   async function openMenu(): Promise<void> {
     open = true;
@@ -90,30 +111,33 @@
     if (typeof window === 'undefined' || !host || !menuEl) return;
     const triggerRect = host.getBoundingClientRect();
     const menuRect = menuEl.getBoundingClientRect();
-    const maxLeft = window.innerWidth - menuRect.width - VIEWPORT_PADDING;
+    const anchorWidth = Math.max(48, triggerRect.width - menuInsetLeft - menuInsetRight);
+    const menuWidth = matchTriggerWidth ? anchorWidth : menuRect.width;
+    const maxLeft = window.innerWidth - menuWidth - VIEWPORT_PADDING;
     const rawLeft = placement === 'bottom-start'
-      ? triggerRect.left
-      : triggerRect.right - menuRect.width;
+      ? triggerRect.left + menuInsetLeft
+      : triggerRect.right - menuInsetRight - menuWidth;
     const left = Math.max(
       VIEWPORT_PADDING,
       Math.min(rawLeft, Math.max(VIEWPORT_PADDING, maxLeft)),
     );
 
-    const roomBelow = window.innerHeight - triggerRect.bottom - MENU_GAP - VIEWPORT_PADDING;
-    const roomAbove = triggerRect.top - MENU_GAP - VIEWPORT_PADDING;
+    const roomBelow = window.innerHeight - triggerRect.bottom - menuGap - VIEWPORT_PADDING;
+    const roomAbove = triggerRect.top - menuGap - VIEWPORT_PADDING;
     const shouldFlip = roomBelow < Math.min(menuRect.height, 160) && roomAbove > roomBelow;
     const maxHeight = Math.max(
       MIN_MENU_HEIGHT,
       shouldFlip ? roomAbove : roomBelow,
     );
     const rawTop = shouldFlip
-      ? triggerRect.top - MENU_GAP - Math.min(menuRect.height, maxHeight)
-      : triggerRect.bottom + MENU_GAP;
+      ? triggerRect.top - menuGap - Math.min(menuRect.height, maxHeight)
+      : triggerRect.bottom + menuGap;
     const top = Math.max(
       VIEWPORT_PADDING,
       Math.min(rawTop, window.innerHeight - VIEWPORT_PADDING - Math.min(menuRect.height, maxHeight)),
     );
-    menuStyle = `left: ${left}px; top: ${top}px; max-height: ${maxHeight}px; visibility: visible;`;
+    const widthStyle = matchTriggerWidth ? `width: ${menuWidth}px; ` : '';
+    menuStyle = `left: ${left}px; top: ${top}px; ${widthStyle}max-height: ${maxHeight}px; visibility: visible;`;
   }
 
   $effect(() => {
@@ -144,7 +168,7 @@
     <div
       bind:this={menuEl}
       use:portal
-      class="dropdown-menu dropdown-menu-{placement}"
+      class={menuClassName}
       style={menuStyle}
       role="menu"
     >

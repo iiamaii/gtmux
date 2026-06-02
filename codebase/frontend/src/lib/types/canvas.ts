@@ -234,9 +234,11 @@ export interface FreeDrawItem extends ItemCommon {
 
 export interface ImageItem extends ItemCommon {
   type: 'image';
-  /** sha256 hash → `/api/assets/<sha256>`. */
-  asset_id: string;
-  mime: string;
+  /** Workspace(B)-relative path. New source model from ADR-0047. */
+  path?: string;
+  /** sha256 hash → `/api/assets/<sha256>`; legacy read-only fallback. */
+  asset_id?: string;
+  mime?: string;
   original_w?: number;
   original_h?: number;
 }
@@ -245,16 +247,18 @@ export interface DocumentItem extends ItemCommon {
   type: 'document';
   /**
    * ADR-0018 D4 amend ② (2026-05-17, BE schema.rs ship) — 두 mode 상호
-   * 배타. (a) asset-based: `asset_id` set + `mime`/`file_name`/`size_bytes`.
-   * (b) inline-stored: `content` set (UTF-8 markdown, cap 64 KB) +
+   * 배타. (a) workspace-file: `path` set. (b) legacy asset-based:
+   * `asset_id` set + `mime`/`file_name`/`size_bytes`. (c) inline-stored:
+   * `content` set (UTF-8 markdown, cap 64 KB) +
    * `file_name` (display 용). 두 mode 모두 file_name + mime + size_bytes
    * 는 BE struct 의 required field — inline mode 에서도 placeholder 값
    * (mime="", size_bytes=content.length) 필요.
    */
+  path?: string;
   asset_id?: string;
-  mime: string;
-  file_name: string;
-  size_bytes: number;
+  mime?: string;
+  file_name?: string;
+  size_bytes?: number;
   /** Inline-stored mode 의 UTF-8 markdown content (cap 64 KB). */
   content?: string;
 }
@@ -356,6 +360,8 @@ export interface Viewport {
  */
 export interface CanvasLayout {
   schema_version: 2;
+  /** Effective Project Workspace(B) persisted on the session record. */
+  workspace_root?: string | null;
   groups: Group[];
   items: CanvasItem[];
   viewport: Viewport;

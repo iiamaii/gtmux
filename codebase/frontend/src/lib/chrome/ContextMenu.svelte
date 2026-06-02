@@ -35,6 +35,7 @@
   import {
     commitNewItem,
     createCanvasItem,
+    createTextItemFromClipboardText,
     createShapeItem,
     createLineItem,
     createTerminalItem,
@@ -336,7 +337,7 @@
   }
 
   async function onPaste(): Promise<void> {
-    if (!clipboardStore.hasItems) {
+    if (!clipboardStore.canPaste) {
       close();
       return;
     }
@@ -344,6 +345,12 @@
     // 위치 anchor*. clipboard items 의 bbox top-left 이 클릭 위치로 오도록
     // offset 계산. clickPos = pre-clamp 원본 viewport 좌표.
     const flow = screenToFlowPosition({ x: clickPos.x, y: clickPos.y });
+    if (clipboardStore.kind === 'text') {
+      const item = createTextItemFromClipboardText(clipboardStore.text, flow);
+      close();
+      if (item !== null) await commitNewItem(item);
+      return;
+    }
     const sources = clipboardStore.entries;
     const groups = clipboardStore.groups;
     const bboxX = sources.reduce(
@@ -624,7 +631,7 @@
   }
 
   /** Paste 활성 여부 — clipboard 에 내용이 있을 때만. */
-  const canPasteEmpty = $derived(clipboardStore.hasItems);
+  const canPasteEmpty = $derived(clipboardStore.canPaste);
 
   /** ChangeTerminal — open the ChangeTerminalModal targeting this panel. */
   function onChangeTerminal(): void {
@@ -840,7 +847,7 @@
         <button
           type="button"
           class="ctx-item"
-          disabled={!clipboardStore.hasItems}
+          disabled={!clipboardStore.canPaste}
           onclick={() => void onPaste()}
         >
           <span class="label">Paste</span>

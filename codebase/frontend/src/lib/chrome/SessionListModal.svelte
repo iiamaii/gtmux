@@ -32,7 +32,7 @@
     open: boolean;
     onClose: () => void;
     /** Session 선택 — 부모가 attach 흐름 진행. 비활성 row 는 호출 X. */
-    onSelect: (name: string) => void;
+    onSelect: (session: EnrichedSession) => void;
     /** Folder context 에서 새 session 생성. 부모가 NewSessionModal 로 전환. */
     onCreateInFolder?: (folderId: string | null) => void;
     /** 401 시 부모가 redirect 처리 — 호출되면 `/auth` 로 이동. */
@@ -555,7 +555,7 @@
       class="session-row"
       disabled={row.session.active}
       title={row.session.active ? 'In use by another webpage' : undefined}
-      onclick={() => onSelect(row.session.name)}
+      onclick={() => onSelect(row.session)}
     >
       <span class="session-main">
         <span class="session-title">

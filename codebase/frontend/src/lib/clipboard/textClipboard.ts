@@ -1,3 +1,5 @@
+import { clipboardStore } from '$lib/stores/clipboardStore.svelte';
+
 export type TextClipboardMethod = 'async-clipboard' | 'exec-command';
 
 export interface TextClipboardResult {
@@ -19,6 +21,7 @@ export async function copyTextToSystemClipboard(text: string): Promise<TextClipb
   if (canUseAsyncClipboard()) {
     try {
       await navigator.clipboard.writeText(text);
+      clipboardStore.copyText(text);
       return { ok: true, method: 'async-clipboard' };
     } catch (err) {
       return {
@@ -35,7 +38,9 @@ export async function copyTextToSystemClipboard(text: string): Promise<TextClipb
     };
   }
 
-  return copyViaExecCommand(text);
+  const result = copyViaExecCommand(text);
+  if (result.ok) clipboardStore.copyText(text);
+  return result;
 }
 
 function copyViaExecCommand(text: string): TextClipboardResult {
