@@ -1273,6 +1273,35 @@ class SessionStore {
     );
   }
 
+  /**
+   * ADR-0016 amend ④ D19 — local-only layout preview. ColorPicker 드래그처럼
+   * pointerup 전 *시각 미리보기* 를 위해 store(items) 만 surgical 하게 갱신한다.
+   * network PUT 도 history capture 도 하지 않으므로 드래그 전체가 단일 undo
+   * 엔트리로 남는다(최종 확정은 caller 가 applyMutation 으로 priorSnapshot +
+   * captureHistory 를 1회 수행). transform 은 변경 없는 item 은 같은 참조를
+   * 반환하므로(예: Inspector color transform) 바뀐 item 만 reactive churn 한다.
+   */
+  previewLayoutMutation(transform: (cur: CanvasLayout) => CanvasLayout): void {
+    if (this.active === null) return;
+    const workspaceRoot = this.effectiveWorkspaceRoot;
+    const current: CanvasLayout = {
+      schema_version: 2,
+      ...(workspaceRoot.length > 0 ? { workspace_root: workspaceRoot } : {}),
+      groups: Array.from(this.groups.values()),
+      items: Array.from(this.items.values()),
+      viewport: this.viewport,
+    };
+    const next = transform(current);
+    const nextIds = new Set<string>();
+    for (const it of next.items) {
+      nextIds.add(it.id);
+      if (this.items.get(it.id) !== it) this.items.set(it.id, it);
+    }
+    for (const id of [...this.items.keys()]) {
+      if (!nextIds.has(id)) this.items.delete(id);
+    }
+  }
+
   async applyMutation(
     transform: (cur: CanvasLayout) => CanvasLayout,
     options: {
