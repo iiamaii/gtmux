@@ -1,58 +1,102 @@
 <script module lang="ts">
   /**
-   * Module-scope recent-color history — singleton 공유 (모든 picker instance
-   * 가 같은 LRU 본다). max 10, FIFO. Phase 4: localStorage 영속 (ADR-0016 D11).
-   * private/incognito 등 storage 차단 시 in-memory fallback.
+   * Module-scope token palette shared by every picker instance.
+   * Tokens are fixed slots and fall back to memory-only storage.
    */
-  const STORAGE_KEY = 'gtmux:colorpicker:recent';
-  const MAX = 10;
+  const TOKEN_STORAGE_KEY = 'gtmux:colorpicker:tokens';
+  const TOKEN_SLOT_COUNT = 20;
+  type TokenSlot = string | null;
 
-  function loadFromStorage(): string[] {
-    if (typeof window === 'undefined') return [];
-    try {
-      const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw === null) return [];
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) return [];
-      const out: string[] = [];
-      for (const value of parsed) {
+  function normalizeStoredHex(hex: string): string | null {
+    const norm = hex.trim().toLowerCase();
+    if (!/^#[0-9a-f]{6}([0-9a-f]{2})?$/.test(norm)) return null;
+    return norm;
+  }
+
+  function emptyTokenSlots(): TokenSlot[] {
+    return Array.from({ length: TOKEN_SLOT_COUNT }, () => null);
+  }
+
+  function normalizedTokenSlotsFromArray(values: readonly unknown[]): TokenSlot[] {
+    const slots = emptyTokenSlots();
+    if (values.length >= TOKEN_SLOT_COUNT || values.includes(null)) {
+      for (let i = 0; i < TOKEN_SLOT_COUNT; i += 1) {
+        const value = values[i];
         if (typeof value !== 'string') continue;
-        if (!/^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(value)) continue;
-        const norm = value.toLowerCase();
-        if (out.includes(norm)) continue;
-        out.push(norm);
-        if (out.length >= MAX) break;
+        const norm = normalizeStoredHex(value);
+        if (norm === null || slots.includes(norm)) continue;
+        slots[i] = norm;
       }
-      return out;
+      return slots;
+    }
+
+    let slot = 0;
+    for (const value of values) {
+      if (typeof value !== 'string') continue;
+      const norm = normalizeStoredHex(value);
+      if (norm === null) continue;
+      if (slots.includes(norm)) continue;
+      slots[slot] = norm;
+      slot += 1;
+      if (slot >= TOKEN_SLOT_COUNT) break;
+    }
+    return slots;
+  }
+
+  function loadTokenMemory(): TokenSlot[] {
+    if (typeof window === 'undefined') return emptyTokenSlots();
+    try {
+      const raw = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+      if (raw === null) return emptyTokenSlots();
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return normalizedTokenSlotsFromArray(parsed);
+      if (parsed === null || typeof parsed !== 'object') return emptyTokenSlots();
+      // Backward compatibility: older builds stored semantic-token override records.
+      return normalizedTokenSlotsFromArray(Object.values(parsed));
     } catch {
-      return [];
+      return emptyTokenSlots();
     }
   }
 
-  function saveToStorage(list: readonly string[]): void {
+  function saveTokenMemory(list: readonly TokenSlot[]): void {
     if (typeof window === 'undefined') return;
     try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+      window.localStorage.setItem(TOKEN_STORAGE_KEY, JSON.stringify(list));
     } catch {
       // private/incognito or quota exceeded — silent.
     }
   }
 
-  const _recent: { list: string[] } = $state({ list: loadFromStorage() });
-
-  export function recentColorList(): readonly string[] {
-    return _recent.list;
+  function clampTokenIndex(index: number): number {
+    return Math.max(0, Math.min(TOKEN_SLOT_COUNT - 1, Math.trunc(index)));
   }
 
-  export function pushRecentColor(hex: string): void {
-    const norm = hex.toLowerCase();
-    if (!/^#[0-9a-f]{6}([0-9a-f]{2})?$/.test(norm)) return;
-    const i = _recent.list.indexOf(norm);
-    if (i !== -1) _recent.list.splice(i, 1);
-    _recent.list.unshift(norm);
-    if (_recent.list.length > MAX) _recent.list.length = MAX;
-    saveToStorage(_recent.list);
+  const _tokens: { list: TokenSlot[] } = $state({ list: loadTokenMemory() });
+
+  export function tokenColorList(): readonly TokenSlot[] {
+    return _tokens.list;
   }
+
+  export function setTokenColor(index: number, hex: string): number | null {
+    const norm = normalizeStoredHex(hex);
+    if (norm === null) return null;
+    const target = clampTokenIndex(index);
+    // ADR-0016 amend ④ D17 — duplicates allowed: the same color may occupy
+    // multiple slots (no dedup that silently empties another slot).
+    const next = [..._tokens.list];
+    next[target] = norm;
+    _tokens.list = next.slice(0, TOKEN_SLOT_COUNT);
+    saveTokenMemory(_tokens.list);
+    return target;
+  }
+
+  export function removeTokenColor(index: number): number | null {
+    const target = clampTokenIndex(index);
+    _tokens.list[target] = null;
+    saveTokenMemory(_tokens.list);
+    return target;
+  }
+
 </script>
 
 <script lang="ts">
@@ -62,12 +106,10 @@
    *
    * Phase 1: visual shell — trigger swatch + popover layout (v4 시안).
    * Phase 2: SV / hue / alpha drag — pointerdown→move→up, draft preview, 1회 commit.
-   * Phase 3: Format toggle (Hex / RGB / HSL), Eyedropper, Recent (session-scope).
+   * Phase 3: Format toggle (Hex / RGB / HSL), Eyedropper.
    * Phase 4 (현 commit):
    *   - OKLCH format 추가 (ADR-0016 D12).
-   *   - Recent 의 localStorage 영속 (ADR-0016 D11, key `gtmux:colorpicker:recent`).
-   *   - Token-aware Document palette (ADR-0016 D10) — 시안 hardcoded 색 →
-   *     semantic color token 10 개의 resolved hex.
+   *   - Tokens palette = user-managed fixed color slots.
    *
    * 입력 (props):
    *   - value: string | null | undefined  — 현재 색 (#rrggbb / #rrggbbaa /
@@ -85,22 +127,29 @@
   interface Props {
     value: string | null | undefined;
     oncommit: (value: string) => void;
+    /**
+     * Live preview during SV/hue/alpha drag (ADR-0016 amend ④ D19). Fires on
+     * every drag frame with the draft color; the consumer applies a local-only
+     * (no network, no history) update so the canvas object updates in real time.
+     * The final value is still delivered once via `oncommit` on pointerup, so the
+     * whole drag is a single undo entry. Optional — callers without it degrade to
+     * commit-only behaviour.
+     */
+    onpreview?: (value: string) => void;
     disabled?: boolean;
     mixed?: boolean;
     allowTransparent?: boolean;
     allowAlpha?: boolean;
-    /** Commit drag/input previews as they change instead of waiting for pointerup. */
-    live?: boolean;
   }
 
   const {
     value,
     oncommit,
+    onpreview,
     disabled = false,
     mixed = false,
     allowTransparent = false,
     allowAlpha = false,
-    live = false,
   }: Props = $props();
 
   function portal(node: HTMLElement): { destroy: () => void } {
@@ -441,6 +490,8 @@
   /** Drag preview — drag 중 picker 내부 visual 만 update. drag end 1회 commit. */
   let draftHsv = $state<{ h: number; s: number; v: number } | null>(null);
   let draftAlpha = $state<number | null>(null);
+  let activeTokenIndex = $state<number | null>(null);
+  let activeTokenDraftColor = $state<string | null>(null);
 
   const effectiveHsv = $derived(draftHsv ?? hsv);
   const effectiveAlpha = $derived(draftAlpha ?? alphaPercent);
@@ -517,12 +568,12 @@
   $effect(() => {
     if (!editingAlpha) alphaInput = String(Math.round(effectiveAlpha));
   });
-  // Inline 의 표시값 — 항상 hex (#rrggbb), '#' 제거 + uppercase.
+  // Inline 의 표시값 — popover 의 formatMode 를 따른다 (ADR-0016 amend ④ D18).
   $effect(() => {
     if (!inlineEditing) {
       if (mixed) inlineHexInput = '';
       else if (isTransparent) inlineHexInput = '';
-      else inlineHexInput = hexRgb(effectiveHex).replace('#', '').toUpperCase();
+      else inlineHexInput = displayInFormat;
     }
   });
 
@@ -532,20 +583,48 @@
     if (typeof window === 'undefined') return;
     function onDocPointerDown(e: PointerEvent): void {
       const target = e.target as Node;
-      if (popoverEl?.contains(target)) return;
+      // trigger / inline(= color picker) 클릭은 armed 유지.
       if (containerEl?.contains(target)) return;
+      if (popoverEl?.contains(target)) {
+        // popover 내부: 실제 *컨트롤 요소*(SV / 슬라이더 / eyedropper / 값·포맷·메뉴 /
+        // 토큰 swatch / 헤더 버튼) 위 클릭만 armed 유지(편집·선택). 컨테이너 여백·헤더
+        // 타이틀 등 component 가 아닌 빈 영역은 어디든 클릭 시 armed 해제(popover 유지)
+        // — panel 의 '빈 배경 클릭 = 해제' 정합 (ADR-0016 amend ④ D16).
+        const el = target instanceof Element ? target : target.parentElement;
+        const onControl =
+          el?.closest('.cp-sv, .cp-slider, .cp-eye, .cp-input, .cp-format-menu, .sw, .cp-btn') ?? null;
+        if (onControl === null) {
+          formatMenuOpen = false;
+          clearActiveToken();
+        }
+        return;
+      }
+      // popover / trigger 밖(패널 다른 컨트롤·캔버스 등) → token 해제 + (비고정) 닫기.
       formatMenuOpen = false;
+      clearActiveToken();
       if (pinned) return;
       open = false;
     }
+    function onDocKeyDown(e: KeyboardEvent): void {
+      if (e.key !== 'Escape') return;
+      // panel 룰 정합: Esc 는 token 해제 트리거가 아니라 popover 닫기만 한다
+      // (닫기 경로에서 active token 도 함께 해제). pinned 면 무시.
+      if (pinned) return;
+      e.preventDefault();
+      formatMenuOpen = false;
+      open = false;
+      clearActiveToken();
+    }
     const onReflow = () => updatePopoverPos();
     document.addEventListener('pointerdown', onDocPointerDown, true);
+    document.addEventListener('keydown', onDocKeyDown, true);
     const raf = window.requestAnimationFrame(updatePopoverPos);
     window.addEventListener('resize', onReflow);
     window.addEventListener('scroll', onReflow, true);
     return () => {
       window.cancelAnimationFrame(raf);
       document.removeEventListener('pointerdown', onDocPointerDown, true);
+      document.removeEventListener('keydown', onDocKeyDown, true);
       window.removeEventListener('resize', onReflow);
       window.removeEventListener('scroll', onReflow, true);
     };
@@ -556,6 +635,7 @@
     formatMenuOpen = false;
     pinned = false;
     open = false;
+    clearActiveToken();
   }
 
   async function togglePopover(): Promise<void> {
@@ -563,39 +643,59 @@
     open = !open;
     if (!open) {
       formatMenuOpen = false;
+      clearActiveToken();
       return;
     }
+    // 새 picker 열람은 항상 token 선택 해제 상태로 시작 (ADR-0016 amend ④ D16).
+    clearActiveToken();
     await tick();
     updatePopoverPos();
   }
 
-  function commitColor(next: string): void {
-    if (next === value) return;
-    oncommit(next);
-    // Recent: 6자리 hex 정규화 후 prepend (alpha 8자리 도 OK, single token 으로 기억).
-    const norm = normalizeHex(next);
-    if (norm !== null) pushRecentColor(norm);
+  function commitColor(next: string, opts: { rememberActiveToken?: boolean } = {}): void {
+    if (next !== value) oncommit(next);
+    if (opts.rememberActiveToken !== false) rememberCommittedColor(next);
   }
 
   function previewColor(next: string): void {
-    if (!live || next === value) return;
-    oncommit(next);
+    previewActiveToken(next);
+    // ADR-0016 amend ④ D19 — live canvas preview during drag (no commit yet).
+    onpreview?.(next);
+  }
+
+  function releaseTextEditing(): void {
+    editing = false;
+    inlineEditing = false;
+    editingAlpha = false;
+    textInput = displayInFormat;
+    alphaInput = String(Math.round(effectiveAlpha));
+    if (mixed || isTransparent) {
+      inlineHexInput = '';
+    } else {
+      inlineHexInput = displayInFormat;
+    }
+  }
+
+  /**
+   * Parse a raw input string in the current formatMode → normalized hex (or
+   * null). Shared by the popover value row and the inline value field so both
+   * editors accept the same notation (ADR-0016 amend ④ D18).
+   */
+  function parseInFormat(raw: string): string | null {
+    if (formatMode === 'rgb') return parseRgbString(raw);
+    if (formatMode === 'hsl') return parseHslString(raw);
+    if (formatMode === 'oklch') return parseOklchString(raw);
+    return normalizeHex(raw);
   }
 
   function onTextChange(): void {
     const trimmed = textInput.trim().toLowerCase();
     if (allowTransparent && !allowAlpha && isTransparentValue(trimmed)) {
-      if (value !== 'transparent') oncommit('transparent');
+      if (value !== 'transparent') commitColor('transparent');
       textInput = '';
       return;
     }
-    // Format 별 parse.
-    let normRgb: string | null = null;
-    if (formatMode === 'rgb') normRgb = parseRgbString(textInput);
-    else if (formatMode === 'hsl') normRgb = parseHslString(textInput);
-    else if (formatMode === 'oklch') normRgb = parseOklchString(textInput);
-    else normRgb = normalizeHex(textInput);
-
+    const normRgb = parseInFormat(textInput);
     if (normRgb === null) {
       // 잘못된 입력 — revert display.
       textInput = displayInFormat;
@@ -613,6 +713,33 @@
     }
   }
 
+  function memoryColorFromValue(next: string): string | null {
+    const norm = normalizeHex(next);
+    if (norm === null) return null;
+    return allowAlpha ? norm : hexRgb(norm);
+  }
+
+  function rememberCommittedColor(next: string): void {
+    const color = memoryColorFromValue(next);
+    if (color === null) return;
+    if (activeTokenIndex !== null) {
+      activeTokenIndex = activeTokenIndex < tokenColorList().length
+        ? setTokenColor(activeTokenIndex, color)
+        : null;
+      activeTokenDraftColor = null;
+    }
+  }
+
+  function clearActiveToken(): void {
+    activeTokenIndex = null;
+    activeTokenDraftColor = null;
+  }
+
+  function previewActiveToken(next: string): void {
+    if (activeTokenIndex === null) return;
+    activeTokenDraftColor = memoryColorFromValue(next);
+  }
+
   function onAlphaChange(): void {
     const n = Number.parseInt(alphaInput, 10);
     const a = Number.isNaN(n) ? 100 : Math.max(0, Math.min(100, n));
@@ -623,35 +750,65 @@
 
   function toggleTransparent(): void {
     if (disabled) return;
+    releaseTextEditing();
+    clearActiveToken();
     if (isTransparent) {
-      oncommit('#000000');
+      commitColor('#000000');
     } else {
-      oncommit('transparent');
+      commitColor('transparent');
     }
   }
 
-  function onSwatchClick(hex: string): void {
+  function currentMemoryColor(): string | null {
+    if (mixed || isTransparent || resolvedHex === null) return null;
+    const rgb = hexRgb(effectiveHex);
+    return allowAlpha ? combineHexAlpha(rgb, effectiveAlpha) : rgb;
+  }
+
+  function selectToken(index: number, hex: string | null): void {
     if (disabled) return;
-    if (allowAlpha) {
-      const a = Math.max(0, Math.min(100, Number.parseInt(alphaInput || '100', 10)));
-      commitColor(combineHexAlpha(hex, Number.isNaN(a) ? 100 : a));
-    } else {
-      commitColor(hex);
+    // ADR-0016 amend ④ D16 — 같은(active) 슬롯 재click = toggle 해제(사용자 결정).
+    if (activeTokenIndex === index) {
+      clearActiveToken();
+      return;
     }
+    activeTokenIndex = index;
+    activeTokenDraftColor = null;
+    if (hex !== null) {
+      onPaletteSwatchClick(hex);
+      return;
+    }
+    const color = currentMemoryColor();
+    if (color !== null) {
+      activeTokenIndex = setTokenColor(index, color);
+    }
+  }
+
+  function removeToken(index: number): void {
+    removeTokenColor(index);
+    clearActiveToken();
+  }
+
+  function onPaletteSwatchClick(hex: string): void {
+    if (disabled) return;
+    const norm = normalizeHex(hex);
+    if (norm === null) return;
+    releaseTextEditing();
+    commitColor(allowAlpha ? norm : hexRgb(norm), { rememberActiveToken: false });
   }
 
   /** Inline hex input commit — outer 는 hex 만. transparent literal 도 허용. */
   function onInlineHexCommit(): void {
     const trimmed = inlineHexInput.trim().toLowerCase();
     if (allowTransparent && !allowAlpha && isTransparentValue(trimmed)) {
-      if (value !== 'transparent') oncommit('transparent');
+      if (value !== 'transparent') commitColor('transparent');
       inlineHexInput = '';
       return;
     }
-    const norm = normalizeHex(inlineHexInput);
+    const norm = parseInFormat(inlineHexInput);
     if (norm === null) {
-      // revert
-      inlineHexInput = isTransparent || mixed ? '' : hexRgb(effectiveHex).replace('#', '').toUpperCase();
+      // revert to current value in the active format
+      inlineHexInput = isTransparent || mixed ? '' : displayInFormat;
       return;
     }
     if (allowAlpha) {
@@ -699,6 +856,7 @@
   function onSvDown(e: PointerEvent): void {
     if (disabled || svEl === undefined) return;
     e.preventDefault();
+    releaseTextEditing();
     svEl.setPointerCapture(e.pointerId);
     const update = (ev: PointerEvent): void => {
       if (svEl === undefined) return;
@@ -728,6 +886,7 @@
   function onHueDown(e: PointerEvent): void {
     if (disabled || hueEl === undefined) return;
     e.preventDefault();
+    releaseTextEditing();
     hueEl.setPointerCapture(e.pointerId);
     const update = (ev: PointerEvent): void => {
       if (hueEl === undefined) return;
@@ -756,6 +915,7 @@
   function onAlphaDown(e: PointerEvent): void {
     if (disabled || !allowAlpha || alphaEl === undefined) return;
     e.preventDefault();
+    releaseTextEditing();
     alphaEl.setPointerCapture(e.pointerId);
     const update = (ev: PointerEvent): void => {
       if (alphaEl === undefined) return;
@@ -799,6 +959,7 @@
   // ── Phase 3: Eyedropper ─────────────────────────────────────────
   async function pickFromScreen(): Promise<void> {
     if (disabled || !hasEyeDropper) return;
+    releaseTextEditing();
     try {
       const W = window as unknown as {
         EyeDropper: new () => { open: () => Promise<{ sRGBHex: string }> };
@@ -819,32 +980,16 @@
     }
   }
 
-  // ── Phase 4: Token-aware Document palette (ADR-0016 D10) ────────
-  // Semantic color token 10 종을 *현재 theme 의 resolved hex* 로 변환. theme
-  // 전환 시 reactive — themeStore 변경 → CSS computed value 도 변경 → 다음 read.
-  // resolveCssColor 는 document 의존이라 SSR 환경에선 null fallback.
-  const TOKEN_NAMES: readonly { token: string; label: string }[] = [
-    { token: 'var(--color-fg)', label: 'Foreground' },
-    { token: 'var(--color-fg-muted)', label: 'Muted' },
-    { token: 'var(--color-fg-subtle)', label: 'Subtle' },
-    { token: 'var(--color-bg)', label: 'Background' },
-    { token: 'var(--color-surface-2)', label: 'Surface 2' },
-    { token: 'var(--color-accent)', label: 'Accent' },
-    { token: 'var(--color-success)', label: 'Success' },
-    { token: 'var(--color-warning)', label: 'Warning' },
-    { token: 'var(--color-danger)', label: 'Danger' },
-    { token: 'var(--color-info)', label: 'Info' },
-  ];
-  const documentSwatches = $derived.by((): readonly { token: string; hex: string; label: string }[] => {
-    if (!open) return []; // popover 열린 후 에야 measure
-    return TOKEN_NAMES
-      .map(({ token, label }) => {
-        const hex = resolveCssColor(token);
-        return hex !== null ? { token, hex: hexRgb(hex), label } : null;
-      })
-      .filter((v): v is { token: string; hex: string; label: string } => v !== null);
+  // ── Palette memory (ADR-0016 D13-D15 amend) ─────────────────────
+  const tokenSwatches = $derived.by((): readonly { index: number; hex: string | null }[] => {
+    const colors = tokenColorList();
+    return Array.from({ length: TOKEN_SLOT_COUNT }, (_, index) => ({
+      index,
+      hex: activeTokenIndex === index && activeTokenDraftColor !== null
+        ? activeTokenDraftColor
+        : (colors[index] ?? null),
+    }));
   });
-  const recentSwatches = $derived(recentColorList());
 </script>
 
 <div
@@ -895,7 +1040,7 @@
         inlineEditing = true;
         inlineHexInput = (e.currentTarget as HTMLInputElement).value;
       }}
-      placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : '000000'}
+      placeholder={mixed ? 'Mixed' : isTransparent ? 'transparent' : formatMode === 'hex' ? '000000' : formatMode === 'rgb' ? '0, 0, 0' : formatMode === 'hsl' ? '0, 0%, 0%' : '0%, 0, 0'}
       {disabled}
       onfocus={() => (inlineEditing = true)}
       onblur={() => {
@@ -907,7 +1052,7 @@
       }}
       spellcheck="false"
       autocomplete="off"
-      aria-label="Color hex"
+      aria-label="Color value"
     />
   </label>
   {#if allowAlpha}
@@ -980,24 +1125,6 @@
         </div>
       </div>
 
-      <div class="cp-modes" role="group" aria-label="Color mode">
-        <button type="button" class="cp-mode active" title="Solid" aria-label="Solid color" aria-pressed="true">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><circle cx="6" cy="6" r="4"/></svg>
-        </button>
-        <button type="button" class="cp-mode" title="Linear gradient (not available yet)" aria-label="Linear gradient" aria-disabled="true" tabindex="-1">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><defs><linearGradient id="gtmux-cp-linear" x1="0" x2="1"><stop offset="0" stop-color="currentColor" stop-opacity="1"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs><rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="url(#gtmux-cp-linear)" stroke="currentColor" stroke-width="0.8"/></svg>
-        </button>
-        <button type="button" class="cp-mode" title="Radial gradient (not available yet)" aria-label="Radial gradient" aria-disabled="true" tabindex="-1">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><defs><radialGradient id="gtmux-cp-radial" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="currentColor" stop-opacity="1"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></radialGradient></defs><rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="url(#gtmux-cp-radial)" stroke="currentColor" stroke-width="0.8"/></svg>
-        </button>
-        <button type="button" class="cp-mode" title="Angular gradient (not available yet)" aria-label="Angular gradient" aria-disabled="true" tabindex="-1">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" aria-hidden="true"><circle cx="6" cy="6" r="4"/><path d="M6 6 L10 6 A4 4 0 0 0 6 2 Z" fill="currentColor"/></svg>
-        </button>
-        <button type="button" class="cp-mode" title="Image fill (not available yet)" aria-label="Image fill" aria-disabled="true" tabindex="-1">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round" aria-hidden="true"><rect x="1.5" y="2" width="9" height="8" rx="1"/><circle cx="4" cy="5" r=".8" fill="currentColor"/><path d="M2 9l2.4-2.4 1.6 1.6 2.2-2.2L10 8.4"/></svg>
-        </button>
-      </div>
-
       <!-- SV square -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
@@ -1018,6 +1145,7 @@
           title={hasEyeDropper ? 'Pick from screen' : 'Eyedropper (browser unsupported)'}
           disabled={!hasEyeDropper || disabled}
           aria-disabled={!hasEyeDropper || disabled}
+          onpointerdown={releaseTextEditing}
           onclick={() => void pickFromScreen()}
         >
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1124,7 +1252,6 @@
         </div>
 
         {#if formatMenuOpen}
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div class="cp-format-menu is-open" role="menu" aria-label="Color format">
             {#each ['hex', 'rgb', 'hsl', 'oklch'] as const as m (m)}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -1146,25 +1273,70 @@
         {/if}
       </div>
 
-      <!-- Swatches: Document + Recent -->
+      <!-- Swatches: fixed token slots -->
       <div class="cp-swatches">
         <div class="grp">
           <div class="lbl">
-            <span>Document</span>
+            <span>Tokens</span>
           </div>
           <div class="grid">
-            {#each documentSwatches as sw (sw.token)}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
+            {#each tokenSwatches as sw (sw.index)}
               <span
-                class="sw"
-                class:selected={resolvedHex !== null && hexRgb(resolvedHex) === sw.hex}
-                style:--c={sw.hex}
-                role="button"
-                tabindex="0"
-                aria-label={`${sw.label} (${sw.hex})`}
-                title={`${sw.label} · ${sw.hex}`}
-                onclick={() => onSwatchClick(sw.hex)}
-              ></span>
+                class="palette-cell token-cell"
+                class:empty={sw.hex === null}
+                class:active={activeTokenIndex === sw.index}
+              >
+                {#if sw.hex !== null}
+                  <button
+                    type="button"
+                    class="sw token-sw"
+                    class:active-token={activeTokenIndex === sw.index}
+                    style:--c={sw.hex}
+                    aria-pressed={activeTokenIndex === sw.index}
+                    aria-label={activeTokenIndex === sw.index
+                      ? `Deselect token ${sw.index + 1} (${sw.hex})`
+                      : `Apply token ${sw.index + 1} color ${sw.hex}`}
+                    title={activeTokenIndex === sw.index
+                      ? `Token ${sw.index + 1} · ${sw.hex} · editing · click to deselect`
+                      : `Token ${sw.index + 1} · ${sw.hex}`}
+                    onpointerdown={releaseTextEditing}
+                    onclick={() => selectToken(sw.index, sw.hex)}
+                  ></button>
+                  <button
+                    type="button"
+                    class="sw-remove token-remove"
+                    title="Remove token color"
+                    aria-label={`Remove token ${sw.index + 1} color`}
+                    onpointerdown={releaseTextEditing}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      removeToken(sw.index);
+                    }}
+                  >
+                    <svg width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                      <path d="M2 2l4 4M6 2 2 6" />
+                    </svg>
+                  </button>
+                  {#if activeTokenIndex === sw.index}
+                    <span class="token-editing-dot" aria-hidden="true"></span>
+                  {/if}
+                {:else}
+                  <button
+                    type="button"
+                    class="sw token-empty"
+                    class:active-token={activeTokenIndex === sw.index}
+                    aria-pressed={activeTokenIndex === sw.index}
+                    aria-label={activeTokenIndex === sw.index
+                      ? `Deselect empty token ${sw.index + 1}`
+                      : `Select empty token ${sw.index + 1}`}
+                    title={activeTokenIndex === sw.index
+                      ? `Token ${sw.index + 1} · empty · editing · click to deselect`
+                      : `Token ${sw.index + 1} · empty`}
+                    onpointerdown={releaseTextEditing}
+                    onclick={() => selectToken(sw.index, sw.hex)}
+                  ></button>
+                {/if}
+              </span>
             {/each}
             {#if allowTransparent && !allowAlpha}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -1174,30 +1346,12 @@
                 role="button"
                 tabindex="0"
                 aria-label="Transparent"
+                onpointerdown={releaseTextEditing}
                 onclick={toggleTransparent}
               ></span>
             {/if}
           </div>
         </div>
-        {#if recentSwatches.length > 0}
-          <div class="grp">
-            <div class="lbl"><span>Recent</span></div>
-            <div class="grid">
-              {#each recentSwatches as sw, i (`${sw}:${i}`)}
-                <!-- svelte-ignore a11y_click_events_have_key_events -->
-                <span
-                  class="sw"
-                  class:selected={resolvedHex !== null && hexRgb(resolvedHex) === hexRgb(sw)}
-                  style:--c={hexRgb(sw)}
-                  role="button"
-                  tabindex="0"
-                  aria-label={`Set color ${sw}`}
-                  onclick={() => onSwatchClick(hexRgb(sw))}
-                ></span>
-              {/each}
-            </div>
-          </div>
-        {/if}
       </div>
     </div>
   {/if}
@@ -1386,40 +1540,6 @@
   .cp-btn.is-active {
     background: var(--color-accent);
     color: var(--color-accent-fg);
-  }
-
-  .cp-modes {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 2px;
-    padding: 4px;
-    background: var(--color-surface-2);
-    border-bottom: 1px solid var(--color-border);
-  }
-
-  .cp-mode {
-    height: 22px;
-    display: grid;
-    place-items: center;
-    border: none;
-    background: transparent;
-    border-radius: var(--radius-sm);
-    color: var(--color-fg-muted);
-    cursor: default;
-    padding: 0;
-    transition:
-      background var(--motion-fast) var(--motion-easing),
-      color var(--motion-fast) var(--motion-easing);
-  }
-
-  .cp-mode:not(.active) {
-    opacity: 0.55;
-  }
-
-  .cp-mode.active {
-    background: var(--color-surface);
-    color: var(--color-fg);
-    box-shadow: var(--shadow-sm);
   }
 
   .cp-sv {
@@ -1625,6 +1745,11 @@
     gap: 4px;
   }
   .cp-swatches .sw {
+    display: block;
+    width: 100%;
+    padding: 0;
+    box-sizing: border-box;
+    appearance: none;
     aspect-ratio: 1 / 1;
     border-radius: 3px;
     border: 1px solid var(--color-border);
@@ -1653,5 +1778,93 @@
       var(--color-danger) calc(50% + 0.5px),
       transparent calc(50% + 0.5px)
     );
+  }
+  .cp-swatches .palette-cell {
+    position: relative;
+    display: block;
+    aspect-ratio: 1 / 1;
+    min-width: 0;
+  }
+  .cp-swatches .palette-cell .sw {
+    width: 100%;
+    height: 100%;
+    aspect-ratio: auto;
+  }
+  .cp-swatches .token-empty {
+    border-style: dashed;
+    background: color-mix(in srgb, var(--color-surface-2) 58%, transparent);
+    cursor: pointer;
+  }
+  /* ADR-0016 amend ④ D16 — empty slot 의 "현재 색 저장" affordance. */
+  .cp-swatches .token-empty::after {
+    content: '+';
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: none;
+    color: var(--color-fg-subtle);
+    font-size: 13px;
+    font-weight: var(--weight-regular);
+    line-height: 1;
+    opacity: 0;
+    transition: opacity var(--motion-fast) var(--motion-easing);
+  }
+  .cp-swatches .token-cell:hover .token-empty::after,
+  .cp-swatches .token-empty.active-token::after {
+    opacity: 1;
+  }
+  /* ADR-0016 amend ④ D16 — armed(active) slot: 테두리 *색만* accent 로 바꾼다.
+     두께·offset·외곽 ring 등 footprint 를 바꾸는 표현은 쓰지 않아 grid 배열이
+     시각적으로 흔들리지 않게 한다(사용자 결정 2026-06-03). */
+  .cp-swatches .sw.active-token {
+    border-color: var(--color-accent);
+  }
+  /* armed slot 좌상단 badge — absolute(reflow 없음)라 grid 배열을 흔들지 않는다. */
+  .cp-swatches .token-cell .token-editing-dot {
+    position: absolute;
+    top: -3px;
+    left: -3px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--color-accent);
+    border: 1px solid var(--color-surface);
+    box-shadow: var(--shadow-sm);
+    pointer-events: none;
+    z-index: 1;
+  }
+  .cp-swatches .sw-remove {
+    position: absolute;
+    top: -5px;
+    right: -5px;
+    width: 14px;
+    height: 14px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--color-border);
+    border-radius: 50%;
+    background: var(--color-surface);
+    color: var(--color-fg-muted);
+    box-shadow: var(--shadow-sm);
+    cursor: pointer;
+    opacity: 0;
+    transform: scale(0.92);
+    transition:
+      opacity var(--motion-fast) var(--motion-easing),
+      transform var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing),
+      border-color var(--motion-fast) var(--motion-easing);
+    z-index: 1;
+  }
+  .cp-swatches .token-cell:hover .sw-remove,
+  .cp-swatches .sw-remove:focus-visible {
+    opacity: 1;
+    transform: scale(1);
+  }
+  .cp-swatches .sw-remove:hover {
+    color: var(--color-danger);
+    border-color: var(--color-danger);
   }
 </style>
