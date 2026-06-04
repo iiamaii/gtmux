@@ -1330,7 +1330,13 @@
               role="presentation"
               onclick={(e: MouseEvent) => {
                 e.stopPropagation();
-                if (row.entry.kind === 'directory') toggleDirectory(row.path);
+                if (row.entry.kind !== 'directory') return;
+                // ADR-0046 D6 amend ⑨ — replace-select the directory before toggling
+                // so a selected child hidden by collapse moves selection to the visible
+                // directory row (same caret contract as Layer tree, ADR-0024 D25). No
+                // reveal-on-select effect here, so this is selection-visibility only.
+                applyRowSelection([row], row.path, row.path);
+                toggleDirectory(row.path);
               }}
               onkeydown={() => {}}
             >

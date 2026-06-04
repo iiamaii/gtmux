@@ -1059,7 +1059,17 @@
               role="presentation"
               onclick={(e: MouseEvent) => {
                 e.stopPropagation();
-                if (node.hasChildren) toggleExpand(node.id);
+                if (!node.hasChildren) return;
+                // ADR-0024 D25 — replace-select the group before toggling so that
+                // (a) a selected descendant hidden by collapse moves selection to the
+                // visible group row, and (b) it breaks the reveal-on-select $effect
+                // (expandAncestorsOf) ↔ manual-collapse feedback loop: while a
+                // descendant is still in M the effect re-expands this group the instant
+                // toggleExpand removes it. Replace-select (no modifiers) is required —
+                // a toggle/range select would keep the descendant in M and the loop
+                // would persist. Multi/range stays a row-button (label) concern.
+                selectNode(node.id);
+                toggleExpand(node.id);
               }}
               onkeydown={() => {}}
             >
