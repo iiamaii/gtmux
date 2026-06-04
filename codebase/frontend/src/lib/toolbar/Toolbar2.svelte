@@ -34,16 +34,18 @@
   import { chromeStore } from '$lib/stores/chrome.svelte';
   import { historyStore } from '$lib/stores/historyStore.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
-  import { shortcutRegistry, type ShortcutBinding } from '$lib/keyboard/shortcutRegistry.svelte';
+  import { shortcutRegistry } from '$lib/keyboard/shortcutRegistry.svelte';
+  import {
+    formatShortcutBinding,
+    isMacPlatform,
+    labelWithShortcut,
+    primaryModifierBinding,
+  } from '$lib/keyboard/shortcutDisplay';
 
   interface ToolDef {
     id: ToolId;
     name: string;
     hint?: string;
-    /** inline SVG path (viewBox 24 24, stroke="currentColor" 가 적용됨). */
-    path: string;
-    /** filled icon (text 'T' 등) — true 면 fill 사용. */
-    fill?: boolean;
   }
 
   /** 13 tools grouped by semantic. Divider 는 그룹 사이. */
@@ -54,14 +56,11 @@
         id: 'select',
         name: 'Select',
         hint: 'V',
-        path: '<path d="M3 2 L3 17 L7 13 L9.5 18.5 L11.8 17.4 L9.4 12.2 L15 12 Z" fill="currentColor" stroke="none"/>',
-        fill: true,
       },
       {
         id: 'hand',
         name: 'Hand',
         hint: 'H',
-        path: '<path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V12"/><path d="M11 12V4.5a1.5 1.5 0 0 1 3 0V12"/><path d="M14 11.5V5.5a1.5 1.5 0 0 1 3 0V14"/><path d="M17 8.5a1.5 1.5 0 0 1 3 0V16a5 5 0 0 1-5 5h-3a5 5 0 0 1-4.5-2.5L4 13a1.5 1.5 0 0 1 2.5-1.5L8 14"/>',
       },
     ],
     // 2) Terminal (the principal gtmux tool)
@@ -69,7 +68,6 @@
       {
         id: 'terminal',
         name: 'Terminal',
-        path: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/>',
       },
     ],
     // 3) Figures (vector primitives + text). Text shares this band because
@@ -79,36 +77,30 @@
         id: 'rect',
         name: 'Rectangle',
         hint: 'R',
-        path: '<rect x="4" y="5" width="16" height="14" rx="1.5"/>',
       },
       {
         id: 'ellipse',
         name: 'Ellipse',
         hint: 'O',
-        path: '<ellipse cx="12" cy="12" rx="8.5" ry="7"/>',
       },
       {
         id: 'line',
         name: 'Line',
         hint: 'L',
-        path: '<line x1="4.5" y1="19" x2="19.5" y2="5"/>',
       },
       {
         id: 'path',
         name: 'Path',
-        path: '<path d="M4 18h6V7h8"/><path d="m15 4 3 3-3 3"/>',
       },
       {
         id: 'free_draw',
         name: 'Free draw',
         hint: 'P',
-        path: '<path d="M4 17c2-4 4-2 6-5s2-7 5-7 5 4 5 6"/>',
       },
       {
         id: 'text',
         name: 'Text',
         hint: 'T',
-        path: '<path d="M5 5h14M12 5v14M9 19h6" stroke-width="2"/>',
       },
     ],
     // 4) Content (annotations + assets + references). Notes/snippets share
@@ -123,30 +115,25 @@
         id: 'note',
         name: 'Note',
         hint: 'N',
-        path: '<path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/>',
       },
       {
         id: 'snippets',
         name: 'Snippets',
-        path: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 7v10"/><path d="M11 7v10"/><path d="m15 7 2 10"/>',
       },
       {
         id: 'document',
         name: 'Document',
         hint: 'D',
-        path: '<path d="M6 3h8l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v4h4"/><path d="M8 13h8M8 17h5"/>',
       },
       {
         id: 'image',
         name: 'Image',
         hint: 'I',
-        path: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="M3 17l5-4 4 3 5-5 4 4"/>',
       },
       {
         id: 'file_path',
         name: 'File path',
         hint: 'F',
-        path: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
       },
     ],
   ];
@@ -158,29 +145,6 @@
   // 가 ActiveSessionDropdown 으로 session 을 먼저 연결하도록 유도.
   const noActiveSession = $derived(sessionStore.active === null);
 
-  const isMac = (() => {
-    if (typeof navigator === 'undefined') return false;
-    return /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
-  })();
-
-  function formatBinding(binding: ShortcutBinding): string {
-    const parts: string[] = [];
-    if (isMac) {
-      if (binding.ctrl) parts.push('⌃');
-      if (binding.alt) parts.push('⌥');
-      if (binding.shift) parts.push('⇧');
-      if (binding.meta) parts.push('⌘');
-      parts.push(binding.key.length === 1 ? binding.key.toUpperCase() : binding.key);
-      return parts.join('');
-    }
-    if (binding.ctrl) parts.push('Ctrl');
-    if (binding.alt) parts.push('Alt');
-    if (binding.shift) parts.push('Shift');
-    if (binding.meta) parts.push('Win');
-    parts.push(binding.key.length === 1 ? binding.key.toUpperCase() : binding.key);
-    return parts.join('+');
-  }
-
   function toolActionId(id: ToolId): string {
     return id === 'terminal' ? 'canvas.new_terminal' : `tool.${id}`;
   }
@@ -188,8 +152,15 @@
   function activeHint(id: ToolId, fallback?: string): string {
     const action = shortcutActions.find((a) => a.actionId === toolActionId(id));
     const binding = action?.activeBindings[0];
-    return binding ? formatBinding(binding) : fallback ?? '';
+    return binding ? formatShortcutBinding(binding) : fallback ?? '';
   }
+
+  const undoHint = $derived(formatShortcutBinding(primaryModifierBinding('z')));
+  const redoHint = $derived(
+    isMacPlatform()
+      ? formatShortcutBinding({ key: 'z', meta: true, shift: true })
+      : formatShortcutBinding({ key: 'y', ctrl: true }),
+  );
 
   function returnToLayerTabForCanvasWork(): void {
     if (chromeStore.state.leftPanelTab === 'files') {
@@ -220,6 +191,54 @@
   });
 </script>
 
+{#snippet toolIcon(id: ToolId)}
+  {#if id === 'select'}
+    <path d="M3 2 L3 17 L7 13 L9.5 18.5 L11.8 17.4 L9.4 12.2 L15 12 Z" fill="currentColor" stroke="none"/>
+  {:else if id === 'hand'}
+    <path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V12"/>
+    <path d="M11 12V4.5a1.5 1.5 0 0 1 3 0V12"/>
+    <path d="M14 11.5V5.5a1.5 1.5 0 0 1 3 0V14"/>
+    <path d="M17 8.5a1.5 1.5 0 0 1 3 0V16a5 5 0 0 1-5 5h-3a5 5 0 0 1-4.5-2.5L4 13a1.5 1.5 0 0 1 2.5-1.5L8 14"/>
+  {:else if id === 'terminal'}
+    <rect x="3" y="4" width="18" height="16" rx="2"/>
+    <path d="M7 9l3 3-3 3"/>
+    <path d="M13 15h4"/>
+  {:else if id === 'rect'}
+    <rect x="4" y="5" width="16" height="14" rx="1.5"/>
+  {:else if id === 'ellipse'}
+    <ellipse cx="12" cy="12" rx="8.5" ry="7"/>
+  {:else if id === 'line'}
+    <line x1="4.5" y1="19" x2="19.5" y2="5"/>
+  {:else if id === 'path'}
+    <path d="M4 18h6V7h8"/>
+    <path d="m15 4 3 3-3 3"/>
+  {:else if id === 'free_draw'}
+    <path d="M4 17c2-4 4-2 6-5s2-7 5-7 5 4 5 6"/>
+  {:else if id === 'text'}
+    <path d="M5 5h14M12 5v14M9 19h6" stroke-width="2"/>
+  {:else if id === 'note'}
+    <path d="M15 12h-5"/>
+    <path d="M15 8h-5"/>
+    <path d="M19 17V5a2 2 0 0 0-2-2H4"/>
+    <path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/>
+  {:else if id === 'snippets'}
+    <rect x="3" y="3" width="18" height="18" rx="2"/>
+    <path d="M7 7v10"/>
+    <path d="M11 7v10"/>
+    <path d="m15 7 2 10"/>
+  {:else if id === 'document'}
+    <path d="M6 3h8l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/>
+    <path d="M14 3v4h4"/>
+    <path d="M8 13h8M8 17h5"/>
+  {:else if id === 'image'}
+    <rect x="3" y="4" width="18" height="16" rx="2"/>
+    <circle cx="9" cy="10" r="1.5"/>
+    <path d="M3 17l5-4 4 3 5-5 4 4"/>
+  {:else if id === 'file_path'}
+    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+  {/if}
+{/snippet}
+
 <nav class="toolbar" aria-label="Canvas tools">
   <div class="left">
     <!-- ADR-0019 D9 + UX 결정: active session 버튼은 *SessionListModal 직접
@@ -243,7 +262,7 @@
             class:locked={current === tool.id && locked}
             title={noActiveSession
               ? 'Connect a session to use canvas tools'
-              : tool.name + (hint ? ` — ${hint}` : '')}
+              : labelWithShortcut(tool.name, hint)}
             aria-label={tool.name}
             aria-pressed={current === tool.id}
             disabled={noActiveSession}
@@ -267,9 +286,9 @@
               stroke-linejoin="round"
               aria-hidden="true"
             >
-              {@html tool.path}
+              {@render toolIcon(tool.id)}
             </svg>
-            <span class="tooltip">{tool.name}{hint ? ` · ${hint}` : ''}</span>
+            <span class="tooltip">{labelWithShortcut(tool.name, hint)}</span>
           </button>
         {/each}
       </div>
@@ -286,7 +305,7 @@
       <button
         type="button"
         class="tool"
-        title="Undo (⌘Z)"
+        title={labelWithShortcut('Undo', undoHint)}
         aria-label="Undo"
         disabled={!historyStore.canUndo}
         onclick={(e) => {
@@ -298,11 +317,12 @@
           <path d="M3 7v6h6"/>
           <path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>
         </svg>
+        <span class="tooltip">{labelWithShortcut('Undo', undoHint)}</span>
       </button>
       <button
         type="button"
         class="tool"
-        title="Redo (⇧⌘Z)"
+        title={labelWithShortcut('Redo', redoHint)}
         aria-label="Redo"
         disabled={!historyStore.canRedo}
         onclick={(e) => {
@@ -314,6 +334,7 @@
           <path d="M21 7v6h-6"/>
           <path d="M3 17a9 9 0 0 1 15-6.7L21 13"/>
         </svg>
+        <span class="tooltip">{labelWithShortcut('Redo', redoHint)}</span>
       </button>
     </div>
   </div>

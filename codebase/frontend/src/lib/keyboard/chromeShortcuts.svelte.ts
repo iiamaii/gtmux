@@ -8,58 +8,17 @@
 //   Cmd+Shift+L  → toggle LeftPanel  (Layers/Terminals)
 //   Cmd+Shift+I  → toggle RightPanel (Inspect)
 //
-// Deferred (need their own anchor components to land first):
-//   Cmd+N        → new terminal      (Toolbar2 terminal-tool wire)
-//   Cmd+Shift+Q  → ShutdownModal     (SessionMenu)
-//   Cmd+,        → Settings overlay  (Slice C)
+// Terminal tool shortcut lives in toolShortcuts. Cmd/Ctrl+N is browser
+// new-window and must remain reserved.
 
 import { chromeStore } from '$lib/stores/chrome.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { settingsDialog } from '$lib/stores/settingsDialog.svelte';
 import { shutdownDialog } from '$lib/stores/shutdownDialog.svelte';
-import { toolStore } from '$lib/stores/toolStore.svelte';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
 export function bindChromeShortcuts(): () => void {
   const unsubs: Array<() => void> = [];
-
-  // Cmd+N / Ctrl+N → arm the Terminal tool. Subsequent canvas click
-  // spawns the terminal at the click position (matches the Toolbar2
-  // [Terminal] tool behaviour). Doesn't spawn outright because the
-  // user hasn't picked a location yet — picking is part of the gesture.
-  unsubs.push(
-    shortcutRegistry.register({
-      actionId: 'canvas.new_terminal',
-      key: 'n',
-      meta: true,
-      customizable: true,
-      description: 'New terminal (click canvas to place)',
-      category: 'Canvas',
-      handler: () => {
-        // Toolbar2 의 12 도구가 no-session 시 disabled — keyboard 도 같은
-        // 정책으로 일관성 유지 (canvas 가 자체적으로 active===null 시 spawn
-        // 무시하지만, 도구 highlight 만 켜진 confusing UX 차단).
-        if (sessionStore.active === null) return true;
-        toolStore.set('terminal');
-        return true;
-      },
-    }),
-  );
-  unsubs.push(
-    shortcutRegistry.register({
-      actionId: 'canvas.new_terminal',
-      key: 'n',
-      ctrl: true,
-      customizable: true,
-      description: 'New terminal (Win/Linux)',
-      category: 'Canvas',
-      handler: () => {
-        if (sessionStore.active === null) return true;
-        toolStore.set('terminal');
-        return true;
-      },
-    }),
-  );
 
   // Cmd+Shift+Q → Session shutdown confirm modal (ADR-0017 §D6).
   unsubs.push(

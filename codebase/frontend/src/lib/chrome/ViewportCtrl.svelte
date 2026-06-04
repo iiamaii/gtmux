@@ -17,51 +17,207 @@
    *   - M:N  current Manipulation Selection count badge (live)
    */
 
-  import { useSvelteFlow } from '@xyflow/svelte';
+  import { onMount } from 'svelte';
+  import { useSvelteFlow, type Viewport } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { shortcutRegistry, type ShortcutDescriptor } from '$lib/keyboard/shortcutRegistry.svelte';
+  import { labelWithShortcut, shortcutForAction } from '$lib/keyboard/shortcutDisplay';
+  import { VIEWPORT_ZOOM_STEP, clampViewportZoom } from '$lib/canvas/viewportPolicy';
 
   const flow = useSvelteFlow();
 
   const zoomPct = $derived(Math.round(sessionStore.viewport.zoom * 100));
   const mCount = $derived(sessionStore.M.size);
+  const shortcutActions = $derived.by(() => shortcutRegistry.listActions());
+
+  const zoomOutShortcut = $derived(shortcutForAction(shortcutActions, 'viewport.zoom_out'));
+  const resetShortcut = $derived(shortcutForAction(shortcutActions, 'viewport.reset_100'));
+  const zoomInShortcut = $derived(shortcutForAction(shortcutActions, 'viewport.zoom_in'));
+  const fitAllShortcut = $derived(shortcutForAction(shortcutActions, 'viewport.fit_all'));
+  const fitSelectionShortcut = $derived(
+    shortcutForAction(shortcutActions, 'viewport.fit_selection'),
+  );
 
   function onZoomIn(): void {
-    void flow.zoomIn({ duration: 150 });
+    setZoom(sessionStore.viewport.zoom + VIEWPORT_ZOOM_STEP);
   }
   function onZoomOut(): void {
-    void flow.zoomOut({ duration: 150 });
+    setZoom(sessionStore.viewport.zoom - VIEWPORT_ZOOM_STEP);
   }
   function onReset100(): void {
-    void flow.setViewport(
-      { x: sessionStore.viewport.x, y: sessionStore.viewport.y, zoom: 1 },
-      { duration: 150 }
-    );
+    setZoom(1);
   }
   function onFit(): void {
     void flow.fitView({ duration: 200, padding: 0.2 });
   }
-  function onFocusSelection(): void {
-    sessionStore.zoomToSelection();
+  function onFitSelection(): void {
+    sessionStore.zoomToSelection({ mode: 'fit' });
   }
+  function onGoToSelection(): void {
+    sessionStore.zoomToSelection({ mode: 'center' });
+  }
+
+  function setZoom(nextZoom: number): void {
+    const next = viewportForZoom(clampViewportZoom(nextZoom));
+    sessionStore.updateViewport(next);
+    void flow.setViewport(next, { duration: 150 });
+  }
+
+  function viewportForZoom(nextZoom: number): Viewport {
+    const current = sessionStore.viewport;
+    const center = canvasCenter();
+    const currentZoom = current.zoom <= 0 ? 1 : current.zoom;
+    const centerFlow = {
+      x: (center.x - current.x) / currentZoom,
+      y: (center.y - current.y) / currentZoom,
+    };
+    return {
+      x: center.x - centerFlow.x * nextZoom,
+      y: center.y - centerFlow.y * nextZoom,
+      zoom: nextZoom,
+    };
+  }
+
+  function canvasCenter(): { x: number; y: number } {
+    const root = document.querySelector('.canvas-root') as HTMLElement | null;
+    if (root === null) return { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+    const rect = root.getBoundingClientRect();
+    return { x: rect.width / 2, y: rect.height / 2 };
+  }
+
+  function registerViewportShortcuts(): () => void {
+    const unsubs: Array<() => void> = [];
+    const registerPair = (
+      descriptor: Omit<ShortcutDescriptor, 'meta' | 'ctrl'>,
+    ): void => {
+      unsubs.push(shortcutRegistry.register({ ...descriptor, meta: true }));
+      unsubs.push(shortcutRegistry.register({ ...descriptor, ctrl: true }));
+    };
+    const consume = (fn: () => void): boolean => {
+      fn();
+      return true;
+    };
+
+    registerPair({
+      actionId: 'viewport.reset_100',
+      key: '0',
+      description: 'Reset viewport to 100%',
+      category: 'Viewport',
+      customizable: true,
+      handler: () => consume(onReset100),
+    });
+    registerPair({
+      actionId: 'viewport.fit_all',
+      key: '1',
+      description: 'Fit all panels',
+      category: 'Viewport',
+      customizable: true,
+      handler: () => consume(onFit),
+    });
+    registerPair({
+      actionId: 'viewport.fit_selection',
+      key: '2',
+      description: 'Fit selection',
+      category: 'Viewport',
+      customizable: true,
+      handler: () => consume(onFitSelection),
+    });
+    registerPair({
+      actionId: 'viewport.go_to_selection',
+      key: '.',
+      description: 'Go to selection',
+      category: 'Viewport',
+      customizable: true,
+      handler: () => consume(onGoToSelection),
+    });
+    registerPair({
+      actionId: 'viewport.zoom_in',
+      key: '=',
+      description: 'Zoom in',
+      category: 'Viewport',
+      customizable: true,
+      handler: () => consume(onZoomIn),
+    });
+    registerPair({
+      actionId: 'viewport.zoom_in',
+      key: '+',
+      shift: true,
+      description: 'Zoom in',
+      category: 'Viewport',
+      customizable: true,
+      handler: () => consume(onZoomIn),
+    });
+    registerPair({
+      actionId: 'viewport.zoom_out',
+      key: '-',
+      description: 'Zoom out',
+      category: 'Viewport',
+      customizable: true,
+      handler: () => consume(onZoomOut),
+    });
+    unsubs.push(
+      shortcutRegistry.register({
+        actionId: 'viewport.hold_pan',
+        key: ' ',
+        description: 'Hold to pan canvas',
+        category: 'Viewport',
+        customizable: false,
+        protectedReason: 'Space is a hold gesture handled by the canvas.',
+        allowInEditable: false,
+        allowInXterm: false,
+        handler: () => false,
+      }),
+    );
+
+    return () => {
+      for (const fn of unsubs) fn();
+    };
+  }
+
+  onMount(() => registerViewportShortcuts());
 </script>
 
 <div class="viewport-ctrl" role="toolbar" aria-label="Viewport controls">
-  <button type="button" class="vp-btn" aria-label="Zoom out" title="Zoom out" onclick={onZoomOut}>
+  <button
+    type="button"
+    class="vp-btn"
+    aria-label="Zoom out"
+    title={labelWithShortcut('Zoom out', zoomOutShortcut)}
+    onclick={onZoomOut}
+  >
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <line x1="5" y1="12" x2="19" y2="12"/>
     </svg>
   </button>
-  <button type="button" class="vp-zoom" aria-label="Reset zoom to 100%" title="Reset to 100%" onclick={onReset100}>
+  <button
+    type="button"
+    class="vp-zoom"
+    aria-label="Reset zoom to 100%"
+    title={labelWithShortcut('Reset to 100%', resetShortcut)}
+    onclick={onReset100}
+  >
     {zoomPct}%
   </button>
-  <button type="button" class="vp-btn" aria-label="Zoom in" title="Zoom in" onclick={onZoomIn}>
+  <button
+    type="button"
+    class="vp-btn"
+    aria-label="Zoom in"
+    title={labelWithShortcut('Zoom in', zoomInShortcut)}
+    onclick={onZoomIn}
+  >
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <line x1="12" y1="5" x2="12" y2="19"/>
       <line x1="5" y1="12" x2="19" y2="12"/>
     </svg>
   </button>
   <span class="vp-divider" aria-hidden="true"></span>
-  <button type="button" class="vp-btn" aria-label="Fit all panels" title="Fit all panels" onclick={onFit}>
+  <button
+    type="button"
+    class="vp-btn"
+    aria-label="Fit all panels"
+    title={labelWithShortcut('Fit all panels', fitAllShortcut)}
+    onclick={onFit}
+  >
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <polyline points="4 14 4 20 10 20"/>
       <polyline points="20 10 20 4 14 4"/>
@@ -72,10 +228,14 @@
   <button
     type="button"
     class="vp-btn"
-    aria-label={mCount > 1 ? `Focus ${mCount} selected elements` : 'Focus selected element'}
-    title={mCount === 0 ? 'Focus selection (select item or group first)' : mCount > 1 ? `Focus ${mCount} selected — viewport fits all` : 'Focus selected — viewport fits selection'}
+    aria-label={mCount > 1 ? `Fit ${mCount} selected elements` : 'Fit selected element'}
+    title={mCount === 0
+      ? labelWithShortcut('Fit selection (select item or group first)', fitSelectionShortcut)
+      : mCount > 1
+        ? labelWithShortcut(`Fit ${mCount} selected elements`, fitSelectionShortcut)
+        : labelWithShortcut('Fit selected element', fitSelectionShortcut)}
     disabled={mCount === 0}
-    onclick={onFocusSelection}
+    onclick={onFitSelection}
   >
     <!-- target reticle -->
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

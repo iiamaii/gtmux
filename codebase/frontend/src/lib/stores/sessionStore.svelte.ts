@@ -882,30 +882,33 @@ class SessionStore {
   /* ────────────────────────────────────────────────────────────────────── */
 
   /**
-   * Pending zoom-to-selection signal. ViewportCtrl 의 focus 버튼 클릭 시 set.
+   * Pending selection viewport signal. ViewportCtrl 의 focus/fit shortcut 이 set.
    * Canvas 의 $effect 가 본 field 를 watch — SvelteFlow `setViewport` 으로
-   * 해당 item/group selection 의 union BBox 를 viewport 중앙에 + 가득 채움. 처리 후 Canvas
+   * 해당 item/group selection 의 union BBox 를 viewport 에 맞춘다. 처리 후 Canvas
    * 가 null 로 복귀 (1-shot signal).
    *
    * 단일 선택: [id]. 다중 선택: 모든 ids — item 과 group 모두 허용.
    */
   pendingZoomToIds = $state<string[] | null>(null);
+  pendingZoomToMode = $state<'fit' | 'center'>('fit');
 
-  zoomToIds(ids: string[]): void {
+  zoomToIds(ids: string[], options: { mode?: 'fit' | 'center' } = {}): void {
     if (ids.length === 0) {
       this.pendingZoomToIds = null;
       return;
     }
+    this.pendingZoomToMode = options.mode ?? 'fit';
     this.pendingZoomToIds = [...ids];
   }
 
-  zoomToSelection(): void {
+  zoomToSelection(options: { mode?: 'fit' | 'center' } = {}): void {
     const ids = Array.from(this.M);
-    this.zoomToIds(ids);
+    this.zoomToIds(ids, options);
   }
 
   clearPendingZoom(): void {
     this.pendingZoomToIds = null;
+    this.pendingZoomToMode = 'fit';
   }
 
   /* ────────────────────────────────────────────────────────────────────── */
