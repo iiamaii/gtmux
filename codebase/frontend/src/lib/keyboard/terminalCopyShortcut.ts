@@ -1,4 +1,5 @@
 import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
+import { shortcutRegistry } from './shortcutRegistry.svelte';
 
 export interface TerminalCopyProvider {
   containsFocus: () => boolean;
@@ -38,6 +39,30 @@ function providerWithSelection(): TerminalCopyProvider | null {
 
 export function bindGlobalTerminalCopyShortcut(): () => void {
   if (typeof window === 'undefined') return () => {};
+  const shortcutUnsubs = [
+    shortcutRegistry.register({
+      actionId: 'terminal.copy_selection',
+      key: 'c',
+      meta: true,
+      shift: true,
+      description: 'Copy terminal selection',
+      category: 'Terminal',
+      customizable: false,
+      protectedReason: 'Capture-phase browser conflict guard; not rebindable.',
+      handler: () => false,
+    }),
+    shortcutRegistry.register({
+      actionId: 'terminal.copy_selection',
+      key: 'c',
+      ctrl: true,
+      shift: true,
+      description: 'Copy terminal selection (Win/Linux)',
+      category: 'Terminal',
+      customizable: false,
+      protectedReason: 'Capture-phase browser conflict guard; not rebindable.',
+      handler: () => false,
+    }),
+  ];
 
   const onKeyDown = (e: KeyboardEvent): void => {
     if (!isTerminalSelectionCopyShortcut(e)) return;
@@ -62,5 +87,6 @@ export function bindGlobalTerminalCopyShortcut(): () => void {
   window.addEventListener('keydown', onKeyDown, { capture: true });
   return () => {
     window.removeEventListener('keydown', onKeyDown, { capture: true });
+    for (const unsubscribe of shortcutUnsubs) unsubscribe();
   };
 }

@@ -24,6 +24,7 @@
     type ShortcutAction,
     type ShortcutBinding,
   } from '$lib/keyboard/shortcutRegistry.svelte';
+  import { formatShortcutBinding } from '$lib/keyboard/shortcutDisplay';
   import { shortcutOverrides, normalizeShortcutBinding } from '$lib/stores/shortcutOverrides.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -93,32 +94,8 @@
 
   /* ── Shortcuts section ───────────────────────────────────────────── */
 
-  const isMac = (() => {
-    if (typeof navigator === 'undefined') return false;
-    return /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
-  })();
-
   let capturingActionId = $state<string | null>(null);
   let captureError = $state<string | null>(null);
-
-  /** Format a shortcut as a user-facing string like `⌘⇧L` or `Ctrl+Shift+L`. */
-  function formatShortcut(d: ShortcutBinding | undefined): string {
-    if (d === undefined) return 'Unassigned';
-    const parts: string[] = [];
-    if (isMac) {
-      if (d.ctrl) parts.push('⌃');
-      if (d.alt) parts.push('⌥');
-      if (d.shift) parts.push('⇧');
-      if (d.meta) parts.push('⌘');
-    } else {
-      if (d.ctrl) parts.push('Ctrl');
-      if (d.alt) parts.push('Alt');
-      if (d.shift) parts.push('Shift');
-      if (d.meta) parts.push('Win');
-    }
-    parts.push(d.key.length === 1 ? d.key.toUpperCase() : d.key);
-    return isMac ? parts.join('') : parts.join('+');
-  }
 
   function bindingFromEvent(e: KeyboardEvent): ShortcutBinding | null {
     if (['Meta', 'Control', 'Alt', 'Shift'].includes(e.key)) return null;
@@ -326,11 +303,11 @@
 	                                class="shortcut-button mono"
 	                                disabled={!d.customizable}
 	                                title={d.defaultBindings[0]
-	                                  ? `Default: ${formatShortcut(d.defaultBindings[0])}`
+	                                  ? `Default: ${formatShortcutBinding(d.defaultBindings[0])}`
 	                                  : undefined}
 	                                onclick={() => startCapture(d.actionId)}
 	                              >
-	                                {formatShortcut(d.activeBindings[0])}
+	                                {formatShortcutBinding(d.activeBindings[0])}
 	                              </button>
 	                            {/if}
 	                          </td>

@@ -31,6 +31,7 @@ import {
   shortcutOverrides,
   type ShortcutBinding,
 } from '$lib/stores/shortcutOverrides.svelte';
+import { reservedReasonForBinding } from './shortcutReserved';
 
 const LETTER_KEYS = /^[a-z]$/;
 
@@ -183,7 +184,7 @@ class ShortcutRegistry {
 
   conflictFor(actionId: string, binding: ShortcutBinding): ShortcutConflict | null {
     const normalized = normalizeShortcutBinding(binding);
-    const reserved = reservedReason(normalized);
+    const reserved = reservedReasonForBinding(normalized);
     if (reserved !== null) return { kind: 'reserved', description: reserved };
     const wanted = bindingKey(normalized);
     for (const action of this.listActions()) {
@@ -269,7 +270,9 @@ class ShortcutRegistry {
     const first = descriptors[0];
     if (first !== undefined && first.customizable !== false) {
       const override = shortcutOverrides.get(first.actionId);
-      if (override !== null) return override;
+      if (override !== null && override.every((binding) => reservedReasonForBinding(binding) === null)) {
+        return override;
+      }
     }
     return this.#defaultBindings(descriptors);
   }
@@ -290,17 +293,3 @@ class ShortcutRegistry {
 }
 
 export const shortcutRegistry = new ShortcutRegistry();
-
-function reservedReason(binding: ShortcutBinding): string | null {
-  const b = normalizeShortcutBinding(binding);
-  if (b.key === 'Escape') return 'Esc is reserved for cancel and shell input routing.';
-  if (b.key === 'Enter') return 'Enter is reserved for inline edit commit.';
-  if (b.key === 'Backspace' || b.key === 'Delete') return 'Delete and Backspace are reserved destructive keys.';
-  if (b.key === 'Tab') return 'Tab is reserved for browser focus navigation.';
-  if (b.key === ' ') return 'Space is reserved for hold-to-pan.';
-  const mod = b.meta || b.ctrl;
-  if (mod && ['s', 'p', 'w', 'r', 'f'].includes(b.key.toLowerCase())) {
-    return 'This browser or OS standard shortcut is reserved.';
-  }
-  return null;
-}

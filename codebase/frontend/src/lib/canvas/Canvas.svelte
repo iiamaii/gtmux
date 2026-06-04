@@ -75,6 +75,7 @@
   } from './itemFactory';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { projectPointToAngle } from './resizeConstraint';
+  import { VIEWPORT_MAX_ZOOM, VIEWPORT_MIN_ZOOM, clampViewportZoom } from './viewportPolicy';
   import {
     anchorPoint,
     autoRoutePath,
@@ -1929,7 +1930,8 @@
   /* ── Focus / zoom-to-selection (ViewportCtrl 의 focus 버튼) ──────────────
    * sessionStore.zoomToIds(ids) → pendingZoomToIds set. 본 effect 가 watch
    * — items 의 union BBox 를 *visible canvas* (left/right panel 또는 rail 이
-   * 차지한 영역 제외) 중앙 + 가득 채움 으로 setViewport. 처리 후 1-shot clear.
+   * 차지한 영역 제외) 중앙으로 이동. mode='fit' 은 selection 을 가득 채우고,
+   * mode='center' 는 현재 zoom 을 보존한다. 처리 후 1-shot clear.
    *
    * BBox: item.x/y/w/h 의 union. line 은 (x,y)~(x2,y2) 의 BBox 사용.
    * group id 는 visible descendant item BBox union + group overlay padding.
@@ -1972,6 +1974,7 @@
   $effect(() => {
     const ids = sessionStore.pendingZoomToIds;
     if (ids === null || ids.length === 0) return;
+    const mode = sessionStore.pendingZoomToMode;
     untrack(() => {
       let minX = Infinity;
       let minY = Infinity;
@@ -2028,8 +2031,11 @@
       const bh = Math.max(1, maxY - minY);
       const visible = computeVisibleCanvas();
       const padding = 0.88;
-      const zoom = Math.min((visible.w / bw) * padding, (visible.h / bh) * padding, 3);
-      const zoomClamped = Math.max(0.05, zoom);
+      const fitZoom = Math.min((visible.w / bw) * padding, (visible.h / bh) * padding);
+      const zoomClamped =
+        mode === 'center'
+          ? clampViewportZoom(sessionStore.viewport.zoom)
+          : clampViewportZoom(fitZoom);
       const cx = minX + bw / 2;
       const cy = minY + bh / 2;
       // BBox center 가 visible 영역 의 center 와 일치 — sidebar 가 가린 영역 보정.
@@ -2978,8 +2984,8 @@
     elementsSelectable={false}
     selectionKey={null}
     multiSelectionKey={null}
-    minZoom={0.05}
-    maxZoom={3}
+    minZoom={VIEWPORT_MIN_ZOOM}
+    maxZoom={VIEWPORT_MAX_ZOOM}
     fitView={false}
     elevateNodesOnSelect={false}
     onlyRenderVisibleElements={false}

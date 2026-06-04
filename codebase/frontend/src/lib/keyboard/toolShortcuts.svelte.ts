@@ -17,6 +17,7 @@ const TOOL_BINDINGS: Array<{
 }> = [
   { actionId: 'tool.select', key: 'v', tool: 'select', description: 'Select tool' },
   { actionId: 'tool.hand', key: 'h', tool: 'hand', description: 'Hand tool' },
+  { actionId: 'canvas.new_terminal', key: 't', shift: true, tool: 'terminal', description: 'Terminal tool' },
   { actionId: 'tool.text', key: 't', tool: 'text', description: 'Text tool' },
   { actionId: 'tool.rect', key: 'r', tool: 'rect', description: 'Rectangle tool' },
   { actionId: 'tool.ellipse', key: 'o', tool: 'ellipse', description: 'Ellipse tool' },
