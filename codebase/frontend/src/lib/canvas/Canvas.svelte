@@ -1863,7 +1863,6 @@
           data: {
             groupId: g.id,
             mode: 'hitbox',
-            color: 'var(--color-accent)',
           },
         });
       }
@@ -1883,7 +1882,6 @@
         data: {
           groupId: g.id,
           mode,
-          color: 'var(--color-accent)',
         },
       });
     }

@@ -30,6 +30,16 @@ interface BBox {
   h: number;
 }
 
+export interface AlignBox extends BBox {
+  id: string;
+  locked?: boolean;
+}
+
+export interface MoveDelta {
+  dx: number;
+  dy: number;
+}
+
 function itemBBox(it: CanvasItem): BBox {
   if (it.type === 'line') {
     const x2 = (it as unknown as { x2: number }).x2;
@@ -43,12 +53,16 @@ function itemBBox(it: CanvasItem): BBox {
 
 function selectionBBox(items: CanvasItem[]): BBox | null {
   if (items.length === 0) return null;
+  return boxesBBox(items.map(itemBBox));
+}
+
+function boxesBBox(boxes: readonly BBox[]): BBox | null {
+  if (boxes.length === 0) return null;
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
   let maxY = -Infinity;
-  for (const it of items) {
-    const b = itemBBox(it);
+  for (const b of boxes) {
     if (b.x < minX) minX = b.x;
     if (b.y < minY) minY = b.y;
     if (b.x + b.w > maxX) maxX = b.x + b.w;
@@ -81,6 +95,45 @@ function moveItem(it: CanvasItem, dx: number, dy: number): MoveResult {
   return { x: it.x + dx, y: it.y + dy };
 }
 
+export function alignBoxes(
+  boxes: readonly AlignBox[],
+  mode: AlignMode,
+): Map<string, MoveDelta> {
+  const out = new Map<string, MoveDelta>();
+  if (boxes.length < 2) return out;
+  const bbox = boxesBBox(boxes);
+  if (bbox === null) return out;
+
+  for (const box of boxes) {
+    if (box.locked === true) continue;
+    let dx = 0;
+    let dy = 0;
+    switch (mode) {
+      case 'left':
+        dx = bbox.x - box.x;
+        break;
+      case 'center-x':
+        dx = bbox.x + bbox.w / 2 - (box.x + box.w / 2);
+        break;
+      case 'right':
+        dx = bbox.x + bbox.w - (box.x + box.w);
+        break;
+      case 'top':
+        dy = bbox.y - box.y;
+        break;
+      case 'center-y':
+        dy = bbox.y + bbox.h / 2 - (box.y + box.h / 2);
+        break;
+      case 'bottom':
+        dy = bbox.y + bbox.h - (box.y + box.h);
+        break;
+    }
+    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
+    out.set(box.id, { dx, dy });
+  }
+  return out;
+}
+
 /**
  * Align — selection BBox 기준 (D5). locked 는 새 position skip (D7).
  *
@@ -93,36 +146,51 @@ export function alignItems(
 ): Map<string, MoveResult> {
   const out = new Map<string, MoveResult>();
   if (items.length < 2) return out;
-  const bbox = selectionBBox(items);
-  if (bbox === null) return out;
+  const boxes = items.map((it) => ({ id: it.id, ...itemBBox(it), locked: it.locked }));
+  const deltas = alignBoxes(boxes, mode);
 
   for (const it of items) {
-    if (it.locked === true) continue;
-    const b = itemBBox(it);
+    const delta = deltas.get(it.id);
+    if (delta === undefined) continue;
+    out.set(it.id, moveItem(it, delta.dx, delta.dy));
+  }
+  return out;
+}
+
+export function distributeBoxes(
+  boxes: readonly AlignBox[],
+  mode: DistributeMode,
+): Map<string, MoveDelta> {
+  const out = new Map<string, MoveDelta>();
+  if (boxes.length < 3) return out;
+
+  const sorted = [...boxes].sort((a, b) => {
+    if (mode === 'horizontal') return a.x + a.w / 2 - (b.x + b.w / 2);
+    return a.y + a.h / 2 - (b.y + b.h / 2);
+  });
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  if (first === undefined || last === undefined) return out;
+  const startCenter =
+    mode === 'horizontal' ? first.x + first.w / 2 : first.y + first.h / 2;
+  const endCenter =
+    mode === 'horizontal' ? last.x + last.w / 2 : last.y + last.h / 2;
+  const step = (endCenter - startCenter) / (sorted.length - 1);
+
+  for (let i = 1; i < sorted.length - 1; i += 1) {
+    const box = sorted[i];
+    if (box === undefined) continue;
+    if (box.locked === true) continue;
+    const targetCenter = startCenter + step * i;
     let dx = 0;
     let dy = 0;
-    switch (mode) {
-      case 'left':
-        dx = bbox.x - b.x;
-        break;
-      case 'center-x':
-        dx = bbox.x + bbox.w / 2 - (b.x + b.w / 2);
-        break;
-      case 'right':
-        dx = bbox.x + bbox.w - (b.x + b.w);
-        break;
-      case 'top':
-        dy = bbox.y - b.y;
-        break;
-      case 'center-y':
-        dy = bbox.y + bbox.h / 2 - (b.y + b.h / 2);
-        break;
-      case 'bottom':
-        dy = bbox.y + bbox.h - (b.y + b.h);
-        break;
+    if (mode === 'horizontal') {
+      dx = targetCenter - (box.x + box.w / 2);
+    } else {
+      dy = targetCenter - (box.y + box.h / 2);
     }
     if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
-    out.set(it.id, moveItem(it, dx, dy));
+    out.set(box.id, { dx, dy });
   }
   return out;
 }
@@ -137,39 +205,13 @@ export function distributeItems(
 ): Map<string, MoveResult> {
   const out = new Map<string, MoveResult>();
   if (items.length < 3) return out;
+  const boxes = items.map((it) => ({ id: it.id, ...itemBBox(it), locked: it.locked }));
+  const deltas = distributeBoxes(boxes, mode);
 
-  const sorted = [...items].sort((a, b) => {
-    const ba = itemBBox(a);
-    const bb = itemBBox(b);
-    if (mode === 'horizontal') return ba.x + ba.w / 2 - (bb.x + bb.w / 2);
-    return ba.y + ba.h / 2 - (bb.y + bb.h / 2);
-  });
-  const first = sorted[0];
-  const last = sorted[sorted.length - 1];
-  if (first === undefined || last === undefined) return out;
-  const bFirst = itemBBox(first);
-  const bLast = itemBBox(last);
-  const startCenter =
-    mode === 'horizontal' ? bFirst.x + bFirst.w / 2 : bFirst.y + bFirst.h / 2;
-  const endCenter =
-    mode === 'horizontal' ? bLast.x + bLast.w / 2 : bLast.y + bLast.h / 2;
-  const step = (endCenter - startCenter) / (sorted.length - 1);
-
-  for (let i = 1; i < sorted.length - 1; i += 1) {
-    const it = sorted[i];
-    if (it === undefined) continue;
-    if (it.locked === true) continue;
-    const b = itemBBox(it);
-    const targetCenter = startCenter + step * i;
-    let dx = 0;
-    let dy = 0;
-    if (mode === 'horizontal') {
-      dx = targetCenter - (b.x + b.w / 2);
-    } else {
-      dy = targetCenter - (b.y + b.h / 2);
-    }
-    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) continue;
-    out.set(it.id, moveItem(it, dx, dy));
+  for (const it of items) {
+    const delta = deltas.get(it.id);
+    if (delta === undefined) continue;
+    out.set(it.id, moveItem(it, delta.dx, delta.dy));
   }
   return out;
 }

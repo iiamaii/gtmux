@@ -9,9 +9,10 @@
 // 2. 250ms idle 시 flush — applyMutation PUT (history capture + priorSnapshot rollback 계약).
 // 3. 같은 session 안의 다음 tick 은 같은 batch 로 누적; session 전환 시 cancel.
 
-import type { CanvasLayout, CanvasItem, LineItem, PathItem } from '$lib/types/canvas';
+import type { CanvasLayout, CanvasItem, FreeDrawItem, LineItem, PathItem } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { translatePath } from '$lib/canvas/pathGeometry';
+import { materializeNudgeItemIds } from './nudgeSelection';
 
 const NUDGE_FLUSH_MS = 250;
 
@@ -26,6 +27,12 @@ class NudgeBuffer {
     const active = sessionStore.active;
     if (active === null) return;
     if (selectedIds.length === 0) return;
+    const itemIds = materializeNudgeItemIds(
+      selectedIds,
+      sessionStore.items,
+      sessionStore.groups,
+    );
+    if (itemIds.length === 0) return;
 
     if (this.#sessionName !== null && this.#sessionName !== active.name) {
       // session switched 도중 — 이전 session 의 buffer drop (BE 미반영, 회귀 모니터).
@@ -37,7 +44,7 @@ class NudgeBuffer {
       this.#sessionName = active.name;
     }
 
-    for (const id of selectedIds) {
+    for (const id of itemIds) {
       const it = sessionStore.items.get(id);
       if (it === undefined) continue;
       if (it.locked) continue;
@@ -50,6 +57,14 @@ class NudgeBuffer {
         lineOut.y2 = lineSrc.y2 + dy;
       } else if (next.type === 'path') {
         next = translatePath(it as PathItem, dx, dy);
+      } else if (next.type === 'free_draw') {
+        const src = it as FreeDrawItem;
+        next = {
+          ...src,
+          x: src.x + dx,
+          y: src.y + dy,
+          points: src.points.map((p) => ({ x: p.x + dx, y: p.y + dy })),
+        };
       }
       sessionStore.items.set(id, next);
     }
@@ -93,6 +108,8 @@ class NudgeBuffer {
             lineOut.x2 = (fresh as LineItem).x2;
             lineOut.y2 = (fresh as LineItem).y2;
           } else if (next.type === 'path') {
+            return fresh;
+          } else if (next.type === 'free_draw') {
             return fresh;
           }
           return next;

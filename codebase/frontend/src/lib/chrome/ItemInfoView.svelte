@@ -43,15 +43,18 @@
     directParentGroupId,
     effectiveLocked,
     effectiveVisibility,
-    inheritedColor,
     inheritedLabel,
     type Group,
   } from '$lib/types/group';
   import {
     alignItems,
+    alignBoxes,
     distributeItems,
+    distributeBoxes,
     type AlignMode,
+    type AlignBox,
     type DistributeMode,
+    type MoveDelta,
   } from '$lib/canvas/alignment';
   import ColorPicker from '$lib/ui/ColorPicker.svelte';
   import Toggle from '$lib/ui/Toggle.svelte';
@@ -67,6 +70,7 @@
     MINIMIZED_TERMINAL_PANEL_HEIGHT,
     type Anchor,
     type CanvasItem,
+    type CanvasLayout,
     type FigureStrokeDash,
     type FontFamily,
     type FreeDrawItem,
@@ -87,9 +91,12 @@
   import {
     anchorPoint,
     connectedEndpointPoint,
+    computePathBBox,
     editPathGeometry,
     isConnectableItem,
+    isPathConnectedToAny,
     resolveEndpoint,
+    translatePath,
     updatePathBBoxCache,
     type ConnectableItem,
   } from '$lib/canvas/pathGeometry';
@@ -99,9 +106,12 @@
   // ADR-0027 D2 — multi-select aware. selectedIds = M 의 array snapshot.
   // selectedPanelId = first id (display 의 single-item fallback path 용).
   const selectedIds = $derived.by((): string[] => Array.from(sessionStore.M));
-  const selectedPanelId = $derived.by((): string | null =>
-    selectedIds.length === 0 ? null : (selectedIds[0] as string),
-  );
+  const selectedPanelId = $derived.by((): string | null => {
+    for (const id of selectedIds) {
+      if (sessionStore.items.has(id)) return id;
+    }
+    return selectedIds.length === 0 ? null : (selectedIds[0] as string);
+  });
   const selectionCount = $derived(selectedIds.length);
 
   // 다중 선택의 type 동질성 — 모두 동일 type 이면 그 type, 아니면 null (mixed).
@@ -113,6 +123,20 @@
     }
     return out;
   });
+  const selectedGroups = $derived.by((): Group[] => {
+    const out: Group[] = [];
+    for (const id of selectedIds) {
+      const group = sessionStore.groups.get(id);
+      if (group !== undefined) out.push(group);
+    }
+    return out;
+  });
+  const isGroupOnlySelection = $derived(
+    selectionCount > 0 && selectedGroups.length === selectionCount,
+  );
+  const isMultiGroupSelection = $derived(
+    selectionCount > 1 && isGroupOnlySelection,
+  );
   const commonType = $derived.by((): string | null => {
     const first = selectedItems[0];
     if (first === undefined) return null;
@@ -137,6 +161,126 @@
     if (sole === undefined || !sessionStore.isGroupId(sole)) return null;
     return sessionStore.groups.get(sole) ?? null;
   });
+
+  function groupDirectCount(group: Group): number {
+    const gid = group.id;
+    let direct = 0;
+    for (const it of sessionStore.items.values()) {
+      if (it.parent_id === gid) direct += 1;
+    }
+    for (const g of sessionStore.groups.values()) {
+      if (g.parent_id === gid) direct += 1;
+    }
+    return direct;
+  }
+
+  function groupDescendantItemIds(groups: readonly Group[]): Set<string> {
+    const groupsArr = Array.from(sessionStore.groups.values());
+    const itemsArr = Array.from(sessionStore.items.values());
+    const ids = new Set<string>();
+    for (const group of groups) {
+      for (const item of descendantItems(group.id, groupsArr, itemsArr)) {
+        ids.add(item.id);
+      }
+    }
+    return ids;
+  }
+
+  function commonGroupBool(
+    groups: readonly Group[],
+    reader: (group: Group) => boolean,
+  ): boolean | null {
+    const first = groups[0];
+    if (first === undefined) return null;
+    const firstValue = reader(first);
+    for (const group of groups) {
+      if (reader(group) !== firstValue) return null;
+    }
+    return firstValue;
+  }
+
+  function itemAlignBox(item: CanvasItem): AlignBox {
+    if (item.type === 'line') {
+      const box = lineBoxFromEndpoints(
+        { x: item.x, y: item.y },
+        { x: item.x2, y: item.y2 },
+      );
+      return { id: item.id, x: box.x, y: box.y, w: box.w, h: box.h, locked: item.locked };
+    }
+    if (item.type === 'path') {
+      const box = computePathBBox(item, sessionStore.items);
+      return { id: item.id, x: box.x, y: box.y, w: box.w, h: box.h, locked: item.locked };
+    }
+    return { id: item.id, x: item.x, y: item.y, w: item.w, h: item.h, locked: item.locked };
+  }
+
+  function unionAlignBox(id: string, boxes: readonly AlignBox[], locked: boolean): AlignBox | null {
+    if (boxes.length === 0) return null;
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (const box of boxes) {
+      minX = Math.min(minX, box.x);
+      minY = Math.min(minY, box.y);
+      maxX = Math.max(maxX, box.x + box.w);
+      maxY = Math.max(maxY, box.y + box.h);
+    }
+    if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null;
+    return { id, x: minX, y: minY, w: maxX - minX, h: maxY - minY, locked };
+  }
+
+  function topLevelSelectedGroups(groups: readonly Group[]): Group[] {
+    if (groups.length <= 1) return [...groups];
+    const selectedGroupIds = new Set(groups.map((group) => group.id));
+    const groupsById = sessionStore.groups;
+    return groups.filter((group) => {
+      let parentId = group.parent_id;
+      while (parentId !== null) {
+        if (selectedGroupIds.has(parentId)) return false;
+        parentId = groupsById.get(parentId)?.parent_id ?? null;
+      }
+      return true;
+    });
+  }
+
+  const selectedGroupAlignTargets = $derived.by((): AlignBox[] => {
+    if (!isGroupOnlySelection) return [];
+    const groupsArr = Array.from(sessionStore.groups.values());
+    const itemsArr = Array.from(sessionStore.items.values());
+    const groupsById = sessionStore.groups;
+    const targets: AlignBox[] = [];
+    for (const group of topLevelSelectedGroups(selectedGroups)) {
+      const descendants = descendantItems(group.id, groupsArr, itemsArr).filter((item) =>
+        effectiveVisibility(item.visibility, item.parent_id, groupsById),
+      );
+      const boxes = descendants.map(itemAlignBox);
+      const locked = descendants.every((item) =>
+        effectiveLocked(item.locked, item.parent_id, groupsById),
+      );
+      const box = unionAlignBox(group.id, boxes, locked);
+      if (box !== null) targets.push(box);
+    }
+    return targets;
+  });
+  const canAlignSelectedGroups = $derived(selectedGroupAlignTargets.length >= 2);
+  const canDistributeSelectedGroups = $derived(selectedGroupAlignTargets.length >= 3);
+
+  const selectedGroupStats = $derived.by((): { direct: number; total: number } => {
+    if (selectedGroups.length === 0) return { direct: 0, total: 0 };
+    let direct = 0;
+    for (const group of selectedGroups) direct += groupDirectCount(group);
+    return {
+      direct,
+      total: groupDescendantItemIds(selectedGroups).size,
+    };
+  });
+  const selectedGroupVisibilityState = $derived.by(() =>
+    commonGroupBool(selectedGroups, (group) => group.visibility === 'visible'),
+  );
+  const selectedGroupLockedState = $derived.by(() =>
+    commonGroupBool(selectedGroups, (group) => group.locked),
+  );
 
   /** 자손 통계 — direct child item 수 / 전체 자손 item 수. */
   const groupDescendantStats = $derived.by((): { direct: number; total: number } => {
@@ -191,12 +335,6 @@
     if (groupSelection.label !== null) return null;
     return inheritedLabel(null, groupSelection.parent_id, sessionStore.groups);
   });
-  const groupInheritedColor = $derived.by((): string | null => {
-    if (groupSelection === null) return null;
-    if (groupSelection.color !== null) return null;
-    return inheritedColor(null, groupSelection.parent_id, sessionStore.groups);
-  });
-
   /* ── Drill-state breadcrumb (ADR-0010 D22.7 + plan-0013 §3.7 H.6) ──
    *
    * M = leaf item / nested group 일 때 Inspector 상단에 ancestor chain 표시.
@@ -252,16 +390,35 @@
     );
   }
 
+  async function applyGroupSetMutation(
+    groupIds: Iterable<string>,
+    transform: (g: Group) => Group,
+    failMessage: string,
+  ): Promise<void> {
+    const ids = new Set(groupIds);
+    if (ids.size === 0) return;
+    for (const id of ids) {
+      const cur = sessionStore.groups.get(id);
+      if (cur !== undefined) sessionStore.groups.set(id, transform(cur));
+    }
+    await sessionStore.applyMutation(
+      (layout) => ({
+        ...layout,
+        groups: layout.groups.map((g) => (ids.has(g.id) ? transform(g) : g)),
+      }),
+      {
+        abortMessage: 'Group edit aborted — session reconnect failed.',
+        failMessage,
+      },
+    );
+  }
+
   async function applyGroupLabel(next: string): Promise<void> {
     const trimmed = next.trim();
     await applyGroupMutation(
       (g) => ({ ...g, label: trimmed.length === 0 ? null : trimmed }),
       'Group label edit failed',
     );
-  }
-
-  async function applyGroupColor(hex: string | null): Promise<void> {
-    await applyGroupMutation((g) => ({ ...g, color: hex }), 'Group color edit failed');
   }
 
   async function applyGroupVisibility(visible: boolean): Promise<void> {
@@ -273,6 +430,22 @@
 
   async function applyGroupLocked(locked: boolean): Promise<void> {
     await applyGroupMutation((g) => ({ ...g, locked }), 'Group lock edit failed');
+  }
+
+  async function applySelectedGroupVisibility(visible: boolean): Promise<void> {
+    await applyGroupSetMutation(
+      selectedGroups.map((g) => g.id),
+      (g) => ({ ...g, visibility: visible ? 'visible' : 'hidden' }),
+      'Group visibility edit failed',
+    );
+  }
+
+  async function applySelectedGroupLocked(locked: boolean): Promise<void> {
+    await applyGroupSetMutation(
+      selectedGroups.map((g) => g.id),
+      (g) => ({ ...g, locked }),
+      'Group lock edit failed',
+    );
   }
 
   /**
@@ -793,6 +966,101 @@
     return it.type === 'terminal' || it.type === 'note' || it.type === 'document';
   }
 
+  /* ── ColorPicker live preview + single-undo commit (ADR-0016 amend ④ D19) ──
+   * 드래그 중 onpreview → previewColorLayout 은 store(items) 만 local 갱신(network·
+   * history 없음). pointerup 의 oncommit → commitColorLayout 은 드래그 시작 snapshot
+   * 으로 1회 applyMutation(history 1 entry, 실패 시 rollback). pointer capture 로
+   * 동시에 하나의 picker 만 드래그하므로 세션은 단일 변수로 충분하고, selection 이
+   * 바뀌면 stale prior 를 폐기한다. */
+  let colorPreviewPrior: CanvasLayout | null = null;
+
+  $effect(() => {
+    void selectedIds; // selection 변경/해제 시 진행 중 color preview 세션 무효화.
+    colorPreviewPrior = null;
+  });
+
+  function previewColorLayout(transform: (cur: CanvasLayout) => CanvasLayout): void {
+    if (colorPreviewPrior === null) colorPreviewPrior = sessionStore.layoutSnapshot();
+    sessionStore.previewLayoutMutation(transform);
+  }
+
+  async function commitColorLayout(
+    transform: (cur: CanvasLayout) => CanvasLayout,
+    opts: { abortMessage?: string; failMessage?: string },
+  ): Promise<void> {
+    const prior = colorPreviewPrior;
+    colorPreviewPrior = null;
+    if (prior !== null) {
+      // 드래그 세션 종료 — store 는 이미 preview 로 갱신됨. PRE-drag snapshot 으로
+      // 단일 history entry + 실패 시 rollback.
+      await sessionStore.applyMutation(transform, {
+        ...opts,
+        priorSnapshot: prior,
+        captureHistory: true,
+      });
+    } else {
+      // 비드래그 commit (text/hex/eyedropper/token click) — 기존 optimistic 경로.
+      await sessionStore.optimisticMutation(transform, opts);
+    }
+  }
+
+  function shapeColorTransform(
+    field: 'fill' | 'stroke',
+    hex: string,
+  ): (cur: CanvasLayout) => CanvasLayout {
+    const ids = new Set(selectedIds);
+    return (cur) => ({
+      ...cur,
+      items: cur.items.map((it) => {
+        if (!ids.has(it.id)) return it;
+        if (it.locked) return it;
+        if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path' && it.type !== 'free_draw') return it;
+        // line/path/free_draw 에는 fill 이 없음 — 무시.
+        if (field === 'fill' && (it.type === 'line' || it.type === 'path' || it.type === 'free_draw')) return it;
+        return { ...it, [field]: hex } as CanvasItem;
+      }),
+    });
+  }
+
+  function textColorTransform(hex: string): (cur: CanvasLayout) => CanvasLayout {
+    const ids = new Set(selectedIds);
+    return (cur) => ({
+      ...cur,
+      items: cur.items.map((it: CanvasItem) =>
+        ids.has(it.id) && isTextStylable(it) && !it.locked
+          ? ({ ...it, color: hex } as CanvasItem)
+          : it,
+      ),
+    });
+  }
+
+  function noteColorTransform(hex: string): (cur: CanvasLayout) => CanvasLayout {
+    const ids = new Set(selectedIds);
+    return (cur) => ({
+      ...cur,
+      items: cur.items.map((it) =>
+        ids.has(it.id) && it.type === 'note'
+          ? ({ ...(it as NoteItem), color: hex } as NoteItem)
+          : it,
+      ),
+    });
+  }
+
+  function previewShapeColor(field: 'fill' | 'stroke', hex: string): void {
+    if (selectedItems.length === 0) return;
+    previewColorLayout(shapeColorTransform(field, hex));
+  }
+
+  function previewTextColor(hex: string): void {
+    if (selectedIds.length === 0) return;
+    previewColorLayout(textColorTransform(hex));
+  }
+
+  function previewNoteColor(hex: string): void {
+    if (selectedItems.length === 0) return;
+    previewColorLayout(noteColorTransform(hex));
+  }
+
   async function broadcastMutation(
     abortMessage: string,
     transform: (it: CanvasItem) => CanvasItem,
@@ -1206,9 +1474,10 @@
   }
 
   async function applyNoteColor(hex: string): Promise<void> {
-    await broadcastMutation('Color change aborted — session reconnect failed.', (it) => {
-      if (it.type !== 'note') return it;
-      return { ...(it as NoteItem), color: hex } as NoteItem;
+    if (selectedItems.length === 0) return;
+    await commitColorLayout(noteColorTransform(hex), {
+      abortMessage: 'Color change aborted — session reconnect failed.',
+      failMessage: 'Inspector edit failed',
     });
   }
 
@@ -1377,35 +1646,119 @@
     if (moves.size === 0) return;
     await sessionStore.optimisticMutation(
       (cur) => {
-        const itemMap = new Map<string, CanvasItem>(cur.items.map((it) => [it.id, it] as const));
+        const movedById = new Map<string, CanvasItem>();
+        for (const it of cur.items) {
+          const m = moves.get(it.id);
+          if (m === undefined) continue;
+          movedById.set(it.id, moveItemByDelta(it, m.x - it.x, m.y - it.y));
+        }
         return {
           ...cur,
-          items: cur.items.map((it) => {
-            const m = moves.get(it.id);
-            if (m === undefined) return it;
-            if (it.type === 'line' && m.x2 !== undefined && m.y2 !== undefined) {
-              return { ...it, x: m.x, y: m.y, x2: m.x2, y2: m.y2 } as CanvasItem;
-            }
-            if (it.type === 'path') {
-              const movedX = editPathGeometry(it, 'x', m.x, itemMap);
-              const movedMap = new Map(itemMap);
-              movedMap.set(it.id, movedX);
-              return editPathGeometry(movedX, 'y', m.y, movedMap);
-            }
-            return { ...it, x: m.x, y: m.y } as CanvasItem;
-          }),
+          items: mergeMovedItemsWithPathCaches(cur.items, movedById),
         };
       },
       { abortMessage, failMessage: 'Align failed' },
     );
   }
 
+  function moveItemByDelta(item: CanvasItem, dx: number, dy: number): CanvasItem {
+    if (item.type === 'line') {
+      const nextP1 = { x: item.x + dx, y: item.y + dy };
+      const nextP2 = { x: item.x2 + dx, y: item.y2 + dy };
+      const nextBox = lineBoxFromEndpoints(nextP1, nextP2);
+      return {
+        ...item,
+        x: nextP1.x,
+        y: nextP1.y,
+        x2: nextP2.x,
+        y2: nextP2.y,
+        w: nextBox.w,
+        h: nextBox.h,
+      } as CanvasItem;
+    }
+    if (item.type === 'free_draw') {
+      return {
+        ...item,
+        x: item.x + dx,
+        y: item.y + dy,
+        points: item.points.map((point) => ({ x: point.x + dx, y: point.y + dy })),
+      } as CanvasItem;
+    }
+    if (item.type === 'path') {
+      return translatePath(item, dx, dy) as CanvasItem;
+    }
+    return { ...item, x: item.x + dx, y: item.y + dy } as CanvasItem;
+  }
+
+  function mergeMovedItemsWithPathCaches(
+    items: readonly CanvasItem[],
+    movedById: ReadonlyMap<string, CanvasItem>,
+  ): CanvasItem[] {
+    const merged = items.map((item) => movedById.get(item.id) ?? item);
+    const itemMap = new Map(merged.map((item) => [item.id, item] as const));
+    const movedIds = new Set(movedById.keys());
+    return merged.map((item) =>
+      item.type === 'path' && (movedById.has(item.id) || isPathConnectedToAny(item, movedIds))
+        ? updatePathBBoxCache(item, itemMap)
+        : item,
+    );
+  }
+
+  function groupMoveDeltas(
+    groupDeltas: ReadonlyMap<string, MoveDelta>,
+    itemsMap: ReadonlyMap<string, CanvasItem>,
+    groupsMap: Map<string, Group>,
+  ): Map<string, CanvasItem> {
+    const groupsArr = Array.from(groupsMap.values());
+    const itemsArr = Array.from(itemsMap.values());
+    const movedById = new Map<string, CanvasItem>();
+    for (const group of topLevelSelectedGroups(selectedGroups)) {
+      const delta = groupDeltas.get(group.id);
+      if (delta === undefined) continue;
+      for (const item of descendantItems(group.id, groupsArr, itemsArr)) {
+        if (effectiveLocked(item.locked, item.parent_id, groupsMap)) continue;
+        if (movedById.has(item.id)) continue;
+        movedById.set(item.id, moveItemByDelta(item, delta.dx, delta.dy));
+      }
+    }
+    return movedById;
+  }
+
+  async function applyGroupAlignDeltas(
+    groupDeltas: ReadonlyMap<string, MoveDelta>,
+    abortMessage: string,
+  ): Promise<void> {
+    if (groupDeltas.size === 0) return;
+    await sessionStore.optimisticMutation(
+      (cur) => {
+        const itemMap = new Map<string, CanvasItem>(cur.items.map((item) => [item.id, item] as const));
+        const groupMap = new Map<string, Group>(cur.groups.map((group) => [group.id, group] as const));
+        const movedById = groupMoveDeltas(groupDeltas, itemMap, groupMap);
+        return {
+          ...cur,
+          items: mergeMovedItemsWithPathCaches(cur.items, movedById),
+        };
+      },
+      { abortMessage, failMessage: 'Group align failed' },
+    );
+  }
+
   async function onAlign(mode: AlignMode): Promise<void> {
+    if (isGroupOnlySelection) {
+      const moves = alignBoxes(selectedGroupAlignTargets, mode);
+      await applyGroupAlignDeltas(moves, 'Group align aborted — session reconnect failed.');
+      return;
+    }
     const moves = alignItems(selectedItems, mode);
     await applyAlignMutation(moves, 'Align aborted — session reconnect failed.');
   }
 
   async function onDistribute(mode: DistributeMode): Promise<void> {
+    if (isGroupOnlySelection) {
+      const moves = distributeBoxes(selectedGroupAlignTargets, mode);
+      await applyGroupAlignDeltas(moves, 'Group distribute aborted — session reconnect failed.');
+      return;
+    }
     const moves = distributeItems(selectedItems, mode);
     await applyAlignMutation(moves, 'Distribute aborted — session reconnect failed.');
   }
@@ -1422,24 +1775,10 @@
     if (field === 'stroke' && selectedItems.some((it) => it.type === 'line' || it.type === 'path')) {
       rememberPathStyle({ stroke: hex });
     }
-    const ids = new Set(selectedIds);
-    await sessionStore.optimisticMutation(
-      (cur) => ({
-        ...cur,
-        items: cur.items.map((it) => {
-          if (!ids.has(it.id)) return it;
-          if (it.locked) return it;
-          if (it.type !== 'rect' && it.type !== 'ellipse' && it.type !== 'line' && it.type !== 'text' && it.type !== 'path' && it.type !== 'free_draw') return it;
-          // line/path 에는 fill 이 없음 — 무시.
-          if (field === 'fill' && (it.type === 'line' || it.type === 'path' || it.type === 'free_draw')) return it;
-          return { ...it, [field]: hex } as CanvasItem;
-        }),
-      }),
-      {
-        abortMessage: 'Color change aborted — session reconnect failed.',
-        failMessage: 'Color change failed',
-      },
-    );
+    await commitColorLayout(shapeColorTransform(field, hex), {
+      abortMessage: 'Color change aborted — session reconnect failed.',
+      failMessage: 'Color change failed',
+    });
   }
 
   /* ── Shape boolean toggle (batch-5 R1+R2) ──
@@ -1633,20 +1972,8 @@
   }
 
   async function applyTextColor(hex: string): Promise<void> {
-    const ids = new Set(selectedIds);
-    if (ids.size === 0) return;
-    await sessionStore.optimisticMutation(
-      (cur) => ({
-        ...cur,
-        items: cur.items.map((it: CanvasItem) =>
-          ids.has(it.id) && isTextStylable(it)
-            && !it.locked
-            ? ({ ...it, color: hex } as CanvasItem)
-            : it,
-        ),
-      }),
-      { failMessage: 'Text color failed' },
-    );
+    if (selectedIds.length === 0) return;
+    await commitColorLayout(textColorTransform(hex), { failMessage: 'Text color failed' });
   }
 
   async function applyTextFontFamily(next: FontFamily): Promise<void> {
@@ -1710,6 +2037,44 @@
   {/if}
 {/snippet}
 
+{#snippet alignmentControls(showDistribute: boolean)}
+  <!-- ADR-0027 D4/D9 + ADR-0010 D41 — shared item/group alignment controls. -->
+  <div class="align-row" role="group" aria-label="Alignment">
+    <div class="align-group" aria-label="Align horizontal">
+      <button type="button" class="align-btn" title="Align left" aria-label="Align left" onclick={() => onAlign('left')}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="9" height="6" x="6" y="14" rx="2"/><rect width="16" height="6" x="6" y="4" rx="2"/><path d="M2 2v20"/></svg>
+      </button>
+      <button type="button" class="align-btn" title="Align center horizontally" aria-label="Align center horizontally" onclick={() => onAlign('center-x')}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v20"/><path d="M8 10H4a2 2 0 0 1-2-2V6c0-1.1.9-2 2-2h4"/><path d="M16 10h4a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-4"/><path d="M8 20H7a2 2 0 0 1-2-2v-2c0-1.1.9-2 2-2h1"/><path d="M16 14h1a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-1"/></svg>
+      </button>
+      <button type="button" class="align-btn" title="Align right" aria-label="Align right" onclick={() => onAlign('right')}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="16" height="6" x="2" y="4" rx="2"/><rect width="9" height="6" x="9" y="14" rx="2"/><path d="M22 22V2"/></svg>
+      </button>
+    </div>
+    <div class="align-group" aria-label="Align vertical">
+      <button type="button" class="align-btn" title="Align top" aria-label="Align top" onclick={() => onAlign('top')}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="16" x="4" y="6" rx="2"/><rect width="6" height="9" x="14" y="6" rx="2"/><path d="M22 2H2"/></svg>
+      </button>
+      <button type="button" class="align-btn" title="Align center vertically" aria-label="Align center vertically" onclick={() => onAlign('center-y')}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12h20"/><path d="M10 16v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/><path d="M10 8V4a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v4"/><path d="M20 16v1a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-1"/><path d="M14 8V7c0-1.1.9-2 2-2h2a2 2 0 0 1 2 2v1"/></svg>
+      </button>
+      <button type="button" class="align-btn" title="Align bottom" aria-label="Align bottom" onclick={() => onAlign('bottom')}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="16" x="4" y="2" rx="2"/><rect width="6" height="9" x="14" y="9" rx="2"/><path d="M22 22H2"/></svg>
+      </button>
+    </div>
+    {#if showDistribute}
+      <div class="align-group" aria-label="Distribute">
+        <button type="button" class="align-btn" title="Distribute horizontally" aria-label="Distribute horizontally" onclick={() => onDistribute('horizontal')}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="14" x="4" y="5" rx="2"/><rect width="6" height="10" x="14" y="7" rx="2"/><path d="M17 22v-5"/><path d="M17 7V2"/><path d="M7 22v-3"/><path d="M7 5V2"/></svg>
+        </button>
+        <button type="button" class="align-btn" title="Distribute vertically" aria-label="Distribute vertically" onclick={() => onDistribute('vertical')}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 17h-3"/><path d="M22 7h-5"/><path d="M5 17H2"/><path d="M7 7H2"/><rect x="5" y="14" width="14" height="6" rx="2"/><rect x="7" y="4" width="10" height="6" rx="2"/></svg>
+        </button>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 <div class="item-info-view" aria-label="Item info">
   <div class="pane-info-body">
     {#if drillBreadcrumb.length > 0}
@@ -1764,33 +2129,6 @@
             <span class="display-val mono">{groupZIndexDisplay}</span>
           </div>
         </div>
-      </section>
-
-      <section class="prop-section">
-        <div class="prop-head"><h4>Color</h4></div>
-        <div class="prop-row full">
-          <ColorPicker
-            value={groupSelection.color ?? groupInheritedColor ?? null}
-            live={true}
-            oncommit={(hex) => void applyGroupColor(hex)}
-          />
-        </div>
-        {#if groupSelection.color !== null}
-          <div class="prop-row full">
-            <button
-              type="button"
-              class="inline-action"
-              onclick={() => void applyGroupColor(null)}
-              title="Inherit color from parent"
-            >
-              Reset to inherit
-            </button>
-          </div>
-        {:else if groupInheritedColor !== null}
-          <div class="prop-row full">
-            <span class="hint mono">Inherited</span>
-          </div>
-        {/if}
       </section>
 
       <section class="prop-section">
@@ -1866,6 +2204,98 @@
           <div class="display-row">
             <span class="k">total</span>
             <span class="display-val mono">{groupDescendantStats.total}</span>
+          </div>
+        </div>
+      </section>
+
+    {:else if isMultiGroupSelection}
+      <div class="multi-header">
+        <span class="multi-count mono">{selectionCount}</span>
+        <span class="multi-label">groups selected</span>
+      </div>
+
+      <section class="prop-section">
+        <div class="prop-head"><h4>State</h4></div>
+        <div class="state-row" role="group" aria-label="Group state">
+          <button
+            type="button"
+            class="state-btn"
+            class:active={selectedGroupVisibilityState === true}
+            class:mixed={selectedGroupVisibilityState === null}
+            aria-pressed={selectedGroupVisibilityState === true}
+            aria-label={selectedGroupVisibilityState === null ? 'Show all groups' : selectedGroupVisibilityState ? 'Hide groups' : 'Show groups'}
+            title={selectedGroupVisibilityState === null ? 'Visibility mixed (click to show all groups)' : selectedGroupVisibilityState ? 'Visible (click to hide)' : 'Hidden (click to show)'}
+            onclick={() => void applySelectedGroupVisibility(!(selectedGroupVisibilityState ?? false))}
+          >
+            {#if selectedGroupVisibilityState === null}
+              <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+            {:else if selectedGroupVisibilityState === true}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
+                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
+                <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
+                <line x1="1" y1="1" x2="23" y2="23"/>
+              </svg>
+            {/if}
+          </button>
+
+          <button
+            type="button"
+            class="state-btn"
+            class:active={selectedGroupLockedState === true}
+            class:mixed={selectedGroupLockedState === null}
+            aria-pressed={selectedGroupLockedState === true}
+            aria-label={selectedGroupLockedState === null ? 'Lock all groups' : selectedGroupLockedState ? 'Unlock groups' : 'Lock groups'}
+            title={selectedGroupLockedState === null ? 'Lock mixed (click to lock all groups)' : selectedGroupLockedState ? 'Locked (click to unlock)' : 'Unlocked (click to lock)'}
+            onclick={() => void applySelectedGroupLocked(!(selectedGroupLockedState ?? false))}
+          >
+            {#if selectedGroupLockedState === null}
+              <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+            {:else if selectedGroupLockedState === true}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="11" width="16" height="10" rx="2"/>
+                <path d="M8 11V8a4 4 0 1 1 8 0v3"/>
+              </svg>
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="4" y="11" width="16" height="10" rx="2"/>
+                <path d="M8 11V8a4 4 0 0 1 7.5-2"/>
+              </svg>
+            {/if}
+          </button>
+        </div>
+      </section>
+
+      {#if canAlignSelectedGroups}
+        <section class="prop-section">
+          <div class="prop-head"><h4>Align</h4></div>
+          {@render alignmentControls(canDistributeSelectedGroups)}
+        </section>
+      {/if}
+
+      <section class="prop-section">
+        <div class="prop-head"><h4>Contents</h4></div>
+        <div class="prop-row full">
+          <div class="display-row">
+            <span class="k">direct</span>
+            <span class="display-val mono">{selectedGroupStats.direct}</span>
+          </div>
+        </div>
+        <div class="prop-row full">
+          <div class="display-row">
+            <span class="k">total</span>
+            <span class="display-val mono">{selectedGroupStats.total}</span>
           </div>
         </div>
       </section>
@@ -2106,41 +2536,7 @@
           </div>
         {/if}
         {#if selectionCount >= 2}
-          <!-- ADR-0027 D4/D9 — alignment row. Distribute 는 N≥3. -->
-          <div class="align-row" role="group" aria-label="Alignment">
-            <div class="align-group" aria-label="Align horizontal">
-              <button type="button" class="align-btn" title="Align left" aria-label="Align left" onclick={() => onAlign('left')}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="9" height="6" x="6" y="14" rx="2"/><rect width="16" height="6" x="6" y="4" rx="2"/><path d="M2 2v20"/></svg>
-              </button>
-              <button type="button" class="align-btn" title="Align center horizontally" aria-label="Align center horizontally" onclick={() => onAlign('center-x')}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v20"/><path d="M8 10H4a2 2 0 0 1-2-2V6c0-1.1.9-2 2-2h4"/><path d="M16 10h4a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-4"/><path d="M8 20H7a2 2 0 0 1-2-2v-2c0-1.1.9-2 2-2h1"/><path d="M16 14h1a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-1"/></svg>
-              </button>
-              <button type="button" class="align-btn" title="Align right" aria-label="Align right" onclick={() => onAlign('right')}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="16" height="6" x="2" y="4" rx="2"/><rect width="9" height="6" x="9" y="14" rx="2"/><path d="M22 22V2"/></svg>
-              </button>
-            </div>
-            <div class="align-group" aria-label="Align vertical">
-              <button type="button" class="align-btn" title="Align top" aria-label="Align top" onclick={() => onAlign('top')}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="16" x="4" y="6" rx="2"/><rect width="6" height="9" x="14" y="6" rx="2"/><path d="M22 2H2"/></svg>
-              </button>
-              <button type="button" class="align-btn" title="Align center vertically" aria-label="Align center vertically" onclick={() => onAlign('center-y')}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12h20"/><path d="M10 16v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/><path d="M10 8V4a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v4"/><path d="M20 16v1a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-1"/><path d="M14 8V7c0-1.1.9-2 2-2h2a2 2 0 0 1 2 2v1"/></svg>
-              </button>
-              <button type="button" class="align-btn" title="Align bottom" aria-label="Align bottom" onclick={() => onAlign('bottom')}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="16" x="4" y="2" rx="2"/><rect width="6" height="9" x="14" y="9" rx="2"/><path d="M22 22H2"/></svg>
-              </button>
-            </div>
-            {#if selectionCount >= 3}
-              <div class="align-group" aria-label="Distribute">
-                <button type="button" class="align-btn" title="Distribute horizontally" aria-label="Distribute horizontally" onclick={() => onDistribute('horizontal')}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="14" x="4" y="5" rx="2"/><rect width="6" height="10" x="14" y="7" rx="2"/><path d="M17 22v-5"/><path d="M17 7V2"/><path d="M7 22v-3"/><path d="M7 5V2"/></svg>
-                </button>
-                <button type="button" class="align-btn" title="Distribute vertically" aria-label="Distribute vertically" onclick={() => onDistribute('vertical')}>
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 17h-3"/><path d="M22 7h-5"/><path d="M5 17H2"/><path d="M7 7H2"/><rect x="5" y="14" width="14" height="6" rx="2"/><rect x="7" y="4" width="10" height="6" rx="2"/></svg>
-                </button>
-              </div>
-            {/if}
-          </div>
+          {@render alignmentControls(selectionCount >= 3)}
         {/if}
       </section>
 
@@ -2270,7 +2666,7 @@
                 <ColorPicker
                   value={mixedColorValue(sharedTextColor, 'var(--color-fg)')}
                   mixed={sharedTextColor === 'Mixed'}
-                  live={true}
+                  onpreview={(hex) => previewTextColor(hex)}
                   allowAlpha={true}
                   disabled={textStyleLocked}
                   oncommit={(hex) => void applyTextColor(hex)}
@@ -2328,7 +2724,7 @@
                   <ColorPicker
                     value={mixedColorValue(sharedFillColor, 'var(--color-surface)')}
                     mixed={sharedFillColor === 'Mixed'}
-                    live={true}
+                    onpreview={(hex) => previewShapeColor('fill', hex)}
                     allowAlpha={true}
                     allowTransparent={true}
                     disabled={boxStyleLocked}
@@ -2388,7 +2784,7 @@
                   <ColorPicker
                     value={mixedColorValue(sharedStrokeColor, 'var(--color-fg)')}
                     mixed={sharedStrokeColor === 'Mixed'}
-                    live={true}
+                    onpreview={(hex) => previewShapeColor('stroke', hex)}
                     allowAlpha={true}
                     disabled={strokeStyleLocked}
                     oncommit={(hex) => void applyShapeColor('stroke', hex)}
@@ -2576,7 +2972,7 @@
                 <div class="fig-group-body">
                   <ColorPicker
                     value={shape.fill}
-                    live={true}
+                    onpreview={(hex) => previewShapeColor('fill', hex)}
                     allowAlpha={true}
                     allowTransparent={true}
                     disabled={shape.locked}
@@ -2602,7 +2998,7 @@
                 <div class="fig-group-body">
                   <ColorPicker
                     value={shape.stroke}
-                    live={true}
+                    onpreview={(hex) => previewShapeColor('stroke', hex)}
                     allowAlpha={true}
                     disabled={shape.locked}
                     oncommit={(hex) => void applyShapeColor('stroke', hex)}
@@ -2708,7 +3104,7 @@
                 />
                 <ColorPicker
                   value={shape.color ?? 'var(--color-fg)'}
-                  live={true}
+                  onpreview={(hex) => previewTextColor(hex)}
                   allowAlpha={true}
                   disabled={shape.locked}
                   oncommit={(hex) => void applyTextColor(hex)}
@@ -2758,7 +3154,7 @@
               <div class="fig-group-body">
                 <ColorPicker
                   value={line.stroke}
-                  live={true}
+                  onpreview={(hex) => previewShapeColor('stroke', hex)}
                   allowAlpha={true}
                   disabled={line.locked}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
@@ -2990,7 +3386,7 @@
               <div class="fig-group-body">
                 <ColorPicker
                   value={path.stroke}
-                  live={true}
+                  onpreview={(hex) => previewShapeColor('stroke', hex)}
                   allowAlpha={true}
                   disabled={path.locked}
                   oncommit={(hex) => void applyShapeColor('stroke', hex)}
@@ -3263,7 +3659,7 @@
                 />
                 <ColorPicker
                   value={txt.color}
-                  live={true}
+                  onpreview={(hex) => previewTextColor(hex)}
                   allowAlpha={true}
                   disabled={txt.locked}
                   oncommit={(hex) => void applyTextColor(hex)}
@@ -3461,7 +3857,7 @@
                 <div class="fig-group-body">
                   <ColorPicker
                     value={txt.fill ?? 'var(--color-surface)'}
-                    live={true}
+                    onpreview={(hex) => previewShapeColor('fill', hex)}
                     allowAlpha={true}
                     allowTransparent={true}
                     disabled={txt.locked}
@@ -3485,7 +3881,7 @@
                 <div class="fig-group-body">
                   <ColorPicker
                     value={txt.stroke ?? 'var(--color-fg)'}
-                    live={true}
+                    onpreview={(hex) => previewShapeColor('stroke', hex)}
                     allowAlpha={true}
                     disabled={txt.locked}
                     oncommit={(hex) => void applyShapeColor('stroke', hex)}
@@ -3525,7 +3921,7 @@
             <div class="prop-row full">
               <ColorPicker
                 value={sessionItem.color}
-                live={true}
+                onpreview={(hex) => previewNoteColor(hex)}
                 oncommit={(hex) => void applyNoteColor(hex)}
               />
             </div>
@@ -4363,13 +4759,6 @@
   .inline-action:disabled {
     opacity: 0.45;
     cursor: not-allowed;
-  }
-
-  /* "Inherited" hint chip — group color self.null 상태 표시. */
-  .hint.mono {
-    font-size: var(--text-xs);
-    color: var(--color-fg-muted);
-    font-style: italic;
   }
 
   /* ADR-0010 D22.7 + design handover §8.2.2 — drill-state ancestor breadcrumb.

@@ -29,8 +29,6 @@
      *   group selection must be native-selectable without showing extra chrome.
      */
     mode: 'selected' | 'hover' | 'outer-dim' | 'hitbox';
-    /** inheritedColor() 결과 — null 이면 fallback (theme neutral accent). */
-    color: string | null;
   }
 
   let { data }: { data: OverlayData } = $props();
@@ -38,11 +36,9 @@
   // SvelteFlow 의 NodeProps.data 가 unknown 이라 runtime narrow.
   const groupId = $derived(data.groupId);
   const mode = $derived(data.mode);
-  // Fallback = ADR-0010 D18 (root level group 의 inherit chain 종료점).
-  const color = $derived(data.color ?? 'var(--color-accent)');
 </script>
 
-<div class="group-overlay" data-mode={mode} data-group-id={groupId} style="--group-color: {color};"></div>
+<div class="group-overlay" data-mode={mode} data-group-id={groupId}></div>
 
 <style>
   /* Wrapper 가 100% — SvelteFlow node 의 width/height = padded BBox. */
@@ -50,7 +46,7 @@
     position: relative;
     width: 100%;
     height: 100%;
-    border: calc(2px / var(--canvas-zoom, 1)) dashed var(--group-color);
+    border: calc(2px / var(--canvas-zoom, 1)) dashed var(--color-accent);
     border-radius: 2px;
     pointer-events: none;
     box-sizing: border-box;

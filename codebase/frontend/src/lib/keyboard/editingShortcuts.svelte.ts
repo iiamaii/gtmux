@@ -9,18 +9,19 @@
 //   포함 가능** (Cmd+G 직후 / drill-in plain click / sidebar grouped item click).
 //   본 wire 의 batch handler 는 item + group 모두 분기 — Lock / Hide toggle 은
 //   group 의 self.locked / self.visibility 도 동일 패턴으로 갱신.
-//   Nudge / Duplicate / Cmd+A 같은 *geometry / item-only payload* 동작은 item
-//   ids 만 처리 (group 은 frame 없음 — descendant 동작은 별 batch).
+//   Nudge 는 group id 를 descendant item 으로 materialize 하며, group 자체는
+//   frame 이 없으므로 좌표를 저장하지 않는다.
 // - ADR-0017 D6 amend ⑧ (Arrow nudge) — `↑↓←→` 1px / `Shift+↑↓←→` 8px /
 //   `Cmd|Ctrl+↑↓←→` 64px. M.size ≥ 1, locked 제외, 250ms idle debounce
 //   (nudgeBuffer).
 // - ADR-0030 D11 — Cmd/Ctrl+D Duplicate. Clipboard 미오염, paste 와 동일 (24, 24)
 //   offset.
 
-import type { CanvasItem } from '$lib/types/canvas';
 import { chromeStore } from '$lib/stores/chrome.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { pasteItems, materializeSelection } from '$lib/canvas/clipboardOps.svelte';
+import { effectiveLocked } from '$lib/types/group';
+import type { ClipboardPayload } from '$lib/stores/clipboardStore.svelte';
 import { nudgeBuffer } from './nudgeBuffer.svelte';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
@@ -29,33 +30,45 @@ function selectAllVisible(): boolean {
   return sessionStore.selectAllVisibleAtDrillScope();
 }
 
-function selectionMutableItems(): CanvasItem[] {
-  const out: CanvasItem[] = [];
-  for (const id of sessionStore.M) {
-    const it = sessionStore.items.get(id);
-    if (it !== undefined && !it.locked) out.push(it);
-  }
-  return out;
-}
+function filterDuplicatePayload(payload: ClipboardPayload): ClipboardPayload {
+  const items = payload.items.filter(
+    (it) => !effectiveLocked(it.locked, it.parent_id, sessionStore.groups),
+  );
+  if (payload.groups.length === 0) return { items, groups: [] };
 
-function selectionMutableIds(): string[] {
-  return selectionMutableItems().map((it) => it.id);
+  const payloadGroupIds = new Set(payload.groups.map((g) => g.id));
+  const keepGroupIds = new Set<string>();
+  for (const item of items) {
+    let parentId = item.parent_id;
+    while (parentId !== null && payloadGroupIds.has(parentId)) {
+      keepGroupIds.add(parentId);
+      parentId = sessionStore.groups.get(parentId)?.parent_id ?? null;
+    }
+  }
+
+  return {
+    items,
+    groups: payload.groups.filter((g) => keepGroupIds.has(g.id)),
+  };
 }
 
 function doDuplicate(): boolean {
   // ADR-0030 D11 + D12.6 — clipboard state 변경 0, paste 와 동일 (24, 24) offset.
   // Group entity 가 M 에 있으면 자손 sub-tree 까지 materializeSelection 으로
   // 확장 (D12.1). locked item 은 source 에서 제외 (D11 + D12.6).
+  // 2026-06-03 정정: group ancestor locked 도 source 제외로 전파하고, 남은
+  // movable item 을 포함하는 group shell 만 유지한다.
   if (sessionStore.active === null) return false;
-  const payload = materializeSelection(
-    sessionStore.M,
-    sessionStore.items,
-    sessionStore.groups,
+  const payload = filterDuplicatePayload(
+    materializeSelection(
+      sessionStore.M,
+      sessionStore.items,
+      sessionStore.groups,
+    ),
   );
-  const mutableItems = payload.items.filter((it) => !it.locked);
-  if (mutableItems.length === 0 && payload.groups.length === 0) return false;
+  if (payload.items.length === 0 && payload.groups.length === 0) return false;
   void pasteItems(
-    mutableItems,
+    payload.items,
     payload.groups,
     { offset: { dx: 24, dy: 24 }, failMessage: 'Duplicate failed' },
   );
@@ -79,7 +92,7 @@ function dirDelta(key: ArrowKey, step: number): { dx: number; dy: number } {
 }
 
 function doNudge(key: ArrowKey, step: number): boolean {
-  const ids = selectionMutableIds();
+  const ids = selectionIds();
   if (ids.length === 0) return false;
   const { dx, dy } = dirDelta(key, step);
   nudgeBuffer.tick(ids, dx, dy);
