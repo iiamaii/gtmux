@@ -543,6 +543,17 @@ async fn handle_socket(
     let (mut sink, mut stream) = socket.split();
     let backend = hub.backend().clone();
 
+    // ADR-0048: bound every WS write so a dead-but-half-open peer (full
+    // kernel send buffer) cannot make `sink.send(...).await` block forever.
+    // An unbounded send would stall the `select!` loop body and starve the
+    // lowest-priority `ping_timer.tick()` arm, so the pong-timeout never
+    // fires, `handle_socket` never returns, the disconnect sink never emits,
+    // and `release_lock_for_owner` never runs → the session lock leaks and
+    // the row stays `active=true` until process exit. Reuse the pong-timeout
+    // as the write deadline: if a single frame can't flush within the
+    // liveness window, the peer is as good as dead. See `send_bounded`.
+    let write_timeout = hub.heartbeat_timings().pong_timeout;
+
     // Snapshot the heartbeat sink once at upgrade time so a sink registered
     // mid-connection only takes effect for subsequent sockets (matches the
     // disconnect-sink behaviour and avoids a half-state where a new sink
@@ -604,7 +615,10 @@ async fn handle_socket(
         Bytes::from(payload::encode_layout_changed(&hello_etag)),
     );
     if let Ok(buf) = hello.encode() {
-        if sink.send(Message::Binary(buf)).await.is_err() {
+        if send_bounded(&mut sink, Message::Binary(buf), write_timeout)
+            .await
+            .is_err()
+        {
             debug!("ws hello send failed; peer hung up early");
             return;
         }
@@ -628,7 +642,10 @@ async fn handle_socket(
                 Bytes::from(payload::encode_terminal_spawned(&uuid, pane_id)),
             );
             if let Ok(buf) = env.encode() {
-                if sink.send(Message::Binary(buf)).await.is_err() {
+                if send_bounded(&mut sink, Message::Binary(buf), write_timeout)
+                    .await
+                    .is_err()
+                {
                     debug!("ws catch-up terminal-spawned send failed; peer hung up");
                     return;
                 }
@@ -659,7 +676,10 @@ async fn handle_socket(
             )),
         );
         if let Ok(buf) = spawned.encode() {
-            if sink.send(Message::Binary(buf)).await.is_err() {
+            if send_bounded(&mut sink, Message::Binary(buf), write_timeout)
+                .await
+                .is_err()
+            {
                 debug!("ws catch-up spawned send failed; peer hung up during replay");
                 return;
             }
@@ -674,7 +694,10 @@ async fn handle_socket(
                     )),
                 );
                 if let Ok(buf) = env.encode() {
-                    if sink.send(Message::Binary(buf)).await.is_err() {
+                    if send_bounded(&mut sink, Message::Binary(buf), write_timeout)
+                        .await
+                        .is_err()
+                    {
                         debug!("ws catch-up pane-out send failed; peer hung up during replay");
                         return;
                     }
@@ -728,10 +751,12 @@ async fn handle_socket(
                         }
                     }
                     Ok(Message::Text(_)) => {
-                        let _ = sink.send(close_frame(
-                            close_codes::UNSUPPORTED_DATA,
-                            "text frames not supported",
-                        )).await;
+                        let _ = send_bounded(
+                            &mut sink,
+                            close_frame(close_codes::UNSUPPORTED_DATA, "text frames not supported"),
+                            write_timeout,
+                        )
+                        .await;
                         return;
                     }
                     Ok(Message::Pong(_)) => {
@@ -739,14 +764,16 @@ async fn handle_socket(
                         emit_heartbeat(&heartbeat_sink, owner_key.as_deref());
                     }
                     Ok(Message::Ping(p)) => {
-                        let _ = sink.send(Message::Pong(p)).await;
+                        let _ = send_bounded(&mut sink, Message::Pong(p), write_timeout).await;
                         emit_heartbeat(&heartbeat_sink, owner_key.as_deref());
                     }
                     Ok(Message::Close(_)) => {
-                        let _ = sink.send(close_frame(
-                            close_codes::NORMAL,
-                            "peer closed",
-                        )).await;
+                        let _ = send_bounded(
+                            &mut sink,
+                            close_frame(close_codes::NORMAL, "peer closed"),
+                            write_timeout,
+                        )
+                        .await;
                         return;
                     }
                     Err(e) => {
@@ -760,7 +787,7 @@ async fn handle_socket(
                     Ok(notify) => {
                         if let Some(env) = notify_to_envelope(&notify) {
                             if let Ok(buf) = env.encode() {
-                                if sink.send(Message::Binary(buf)).await.is_err() {
+                                if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                     break;
                                 }
                             }
@@ -771,10 +798,12 @@ async fn handle_socket(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         info!("backend notify closed; ending connection");
-                        let _ = sink.send(close_frame(
-                            close_codes::INTERNAL,
-                            "backend gone",
-                        )).await;
+                        let _ = send_bounded(
+                            &mut sink,
+                            close_frame(close_codes::INTERNAL, "backend gone"),
+                            write_timeout,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -803,7 +832,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf)).await.is_err() {
+                            if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                 break;
                             }
                         }
@@ -843,7 +872,7 @@ async fn handle_socket(
                             Bytes::from(payload::encode_layout_changed(&etag)),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf)).await.is_err() {
+                            if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                 break;
                             }
                         }
@@ -880,7 +909,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf)).await.is_err() {
+                            if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                 debug!("ws attach-replay send failed; peer hung up");
                                 break;
                             }
@@ -910,7 +939,7 @@ async fn handle_socket(
                             Bytes::from(payload::encode_terminal_died(&event.uuid, event.reason)),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf)).await.is_err() {
+                            if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                 break;
                             }
                         }
@@ -958,7 +987,7 @@ async fn handle_socket(
                         };
                         let env = Envelope::new(kind, event.payload.clone());
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf)).await.is_err() {
+                            if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                 break;
                             }
                         }
@@ -1003,7 +1032,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf)).await.is_err() {
+                            if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                 break;
                             }
                         }
@@ -1055,7 +1084,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf)).await.is_err() {
+                            if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                 break;
                             }
                         }
@@ -1136,18 +1165,21 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            let _ = sink.send(Message::Binary(buf)).await;
+                            let _ = send_bounded(&mut sink, Message::Binary(buf), write_timeout).await;
                         }
                         // Send the close frame ourselves so the FE sees
                         // a deterministic ordering: 0x89 envelope then
                         // 1000 normal close. The process will exit a
                         // few hundred ms later via the http-api task.
-                        let _ = sink
-                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        let _ = send_bounded(
+                            &mut sink,
+                            Message::Close(Some(axum::extract::ws::CloseFrame {
                                 code: 1000,
                                 reason: "server_shutdown".into(),
-                            })))
-                            .await;
+                            })),
+                            write_timeout,
+                        )
+                        .await;
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -1202,7 +1234,7 @@ async fn handle_socket(
                             )),
                         );
                         if let Ok(buf) = env.encode() {
-                            if sink.send(Message::Binary(buf)).await.is_err() {
+                            if send_bounded(&mut sink, Message::Binary(buf), write_timeout).await.is_err() {
                                 break;
                             }
                         }
@@ -1221,13 +1253,18 @@ async fn handle_socket(
             _ = ping_timer.tick() => {
                 if last_pong.elapsed() > heartbeat.pong_timeout {
                     info!("ws timeout: no pong for {:?}", last_pong.elapsed());
-                    let _ = sink.send(close_frame(
-                        close_codes::INTERNAL,
-                        "heartbeat timeout",
-                    )).await;
+                    let _ = send_bounded(
+                        &mut sink,
+                        close_frame(close_codes::INTERNAL, "heartbeat timeout"),
+                        write_timeout,
+                    )
+                    .await;
                     return;
                 }
-                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                if send_bounded(&mut sink, Message::Ping(Bytes::new()), write_timeout)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1580,6 +1617,39 @@ fn close_frame(code: u16, reason: &'static str) -> Message {
         code,
         reason: reason.into(),
     }))
+}
+
+/// Send one WS message, bounding the flush by `write_timeout` (ADR-0048).
+///
+/// A dead-but-half-open peer whose kernel send buffer is full makes a bare
+/// `sink.send(msg).await` block indefinitely. Because the `select!` loop in
+/// [`handle_socket`] runs a branch body to completion before re-polling, one
+/// such blocked send starves the lowest-priority `ping_timer.tick()` arm —
+/// the pong-timeout never fires, `handle_socket` never returns, and the
+/// disconnect-driven `release_lock_for_owner` never runs, leaking the
+/// session attach lock until process exit (the row stays `active=true`).
+///
+/// Bounding the write closes that hole: a timeout is treated identically to
+/// a socket error (`Err(())`), so the existing caller control flow
+/// (`is_err()` → `break`/`return`) terminates the loop, `handle_socket`
+/// returns, and the lock is released. The deadline is the heartbeat
+/// `pong_timeout` — if a single frame cannot flush within the liveness
+/// window, the peer is as good as dead.
+async fn send_bounded<S>(sink: &mut S, msg: Message, write_timeout: Duration) -> Result<(), ()>
+where
+    S: SinkExt<Message> + Unpin,
+{
+    match tokio::time::timeout(write_timeout, sink.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(()),
+        Err(_elapsed) => {
+            warn!(
+                ?write_timeout,
+                "ws write exceeded deadline; closing as dead peer (ADR-0048)"
+            );
+            Err(())
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3282,6 +3352,60 @@ bind = "127.0.0.1"
             .expect("heartbeat sink emission within 2s")
             .expect("hb channel still open");
         assert_eq!(received, cookie);
+    }
+
+    /// ADR-0048 regression — `send_bounded` must give up on a write that
+    /// never completes. A dead-but-half-open peer with a full kernel send
+    /// buffer manifests as a sink whose `poll_ready`/`poll_flush` stay
+    /// `Pending`; an unbounded `sink.send(...).await` would then block the
+    /// `select!` loop forever and starve the heartbeat-timeout arm, leaking
+    /// the session attach lock (the row stays `active=true` until exit). The
+    /// bound turns it into a recoverable `Err(())` that the loop maps to a
+    /// disconnect → `release_lock_for_owner`.
+    #[tokio::test]
+    async fn send_bounded_times_out_on_stalled_sink() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        /// A sink that never accepts a write — models a saturated socket
+        /// whose peer has stopped reading.
+        struct StallSink;
+        impl futures::Sink<Message> for StallSink {
+            type Error = axum::Error;
+            fn poll_ready(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+            fn start_send(self: Pin<&mut Self>, _: Message) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+            fn poll_close(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+        }
+
+        let mut sink = StallSink;
+        let res = send_bounded(
+            &mut sink,
+            Message::Ping(Bytes::new()),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "a write that never completes must time out instead of blocking forever (ADR-0048)"
+        );
     }
 
     async fn expect_binary(
