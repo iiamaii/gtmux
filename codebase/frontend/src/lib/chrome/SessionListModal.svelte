@@ -24,6 +24,9 @@
     WorkspaceUpdateUnavailableError,
   } from '$lib/http/sessions';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { reconnectGate } from '$lib/stores/reconnectGate.svelte';
+  import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
+  import { workspaceSwitcher } from '$lib/stores/workspaceSwitcher.svelte';
   import { workspaceManifest } from '$lib/stores/workspaceManifest.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { EnrichedSession, Folder as WorkspaceFolder } from '$lib/types/sessions';
@@ -55,6 +58,10 @@
     depth: number;
   };
   type TreeRow = FolderRow | SessionRow;
+  type PendingDelete = {
+    name: string;
+    current: boolean;
+  };
 
   const {
     open,
@@ -69,7 +76,7 @@
   let errorMessage = $state<string | null>(null);
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let search = $state('');
-  let pendingDeleteName = $state<string | null>(null);
+  let pendingDelete = $state<PendingDelete | null>(null);
   let pendingDeleteFolder = $state<WorkspaceFolder | null>(null);
   let pendingRenameSession = $state<EnrichedSession | null>(null);
   let renameName = $state('');
@@ -84,6 +91,7 @@
 
   let sessions = $derived(workspaceManifest.sessions);
   let folders = $derived(workspaceManifest.folders);
+  let currentRows = $derived.by(() => buildCurrentRows());
   let inUseRows = $derived.by(() => buildInUseRows());
   let rows = $derived.by(() => buildSelectableRows());
   let renameInputError = $derived(
@@ -134,12 +142,12 @@
     }
   });
 
-  function canDelete(name: string): boolean {
-    return sessionStore.active?.name !== name;
+  function isCurrentSession(session: EnrichedSession): boolean {
+    return sessionStore.active?.name === session.name;
   }
 
   function canRenameOrDuplicate(session: EnrichedSession): boolean {
-    return !session.active && canDelete(session.name);
+    return !session.active && !isCurrentSession(session);
   }
 
   function normalizeSessionName(value: string): string {
@@ -231,7 +239,7 @@
 
   function buildInUseRows(): SessionRow[] {
     return visibleSessions()
-      .filter((session) => session.active)
+      .filter((session) => session.active && !isCurrentSession(session))
       .sort((a, b) =>
         workspaceManifest.folderPath(a.folder_id).localeCompare(workspaceManifest.folderPath(b.folder_id)) ||
         a.order - b.order ||
@@ -245,8 +253,19 @@
       }));
   }
 
+  function buildCurrentRows(): SessionRow[] {
+    return visibleSessions()
+      .filter((session) => isCurrentSession(session))
+      .map((session) => ({
+        kind: 'session',
+        id: `current:${session.name}`,
+        session,
+        depth: 0,
+      }));
+  }
+
   function buildSelectableRows(): TreeRow[] {
-    const visible = visibleSessions().filter((session) => !session.active);
+    const visible = visibleSessions().filter((session) => !session.active && !isCurrentSession(session));
     const out: TreeRow[] = [];
 
     const appendFolder = (folder: WorkspaceFolder, depth: number): void => {
@@ -413,11 +432,25 @@
   }
 
   async function onConfirmDelete(): Promise<void> {
-    const name = pendingDeleteName;
-    if (name === null) return;
-    pendingDeleteName = null;
+    const pending = pendingDelete;
+    if (pending === null) return;
+    const { name, current } = pending;
+    pendingDelete = null;
     try {
       await deleteSession(name);
+      if (current) {
+        // ADR-0019 D10.1 — deleting the current attached session must leave
+        // this webpage in the same state as an explicit reconnect cancel.
+        sessionStore.clear();
+        reconnectGate.cancel();
+        sessionStorageHint.clear();
+        workspaceSwitcher.open();
+        toastStore.show({
+          message: `Session "${name}" deleted. Terminals remain in the server pool.`,
+          tone: 'success',
+        });
+        return;
+      }
       await refresh();
     } catch (err) {
       if (err instanceof UnauthorizedError) {
@@ -426,6 +459,13 @@
       }
       showMutationError('Delete failed', err);
     }
+  }
+
+  function beginDelete(session: EnrichedSession): void {
+    pendingDelete = {
+      name: session.name,
+      current: isCurrentSession(session),
+    };
   }
 
   async function submitWorkspaceChange(path: string): Promise<void> {
@@ -548,13 +588,22 @@
 {/snippet}
 
 {#snippet sessionRow(row: SessionRow)}
-  <li class="session-row-wrap" class:in-use={row.session.active} style={`padding-left: ${row.depth * 18}px`}>
+  <li
+    class="session-row-wrap"
+    class:in-use={row.session.active}
+    class:current={isCurrentSession(row.session)}
+    style={`padding-left: ${row.depth * 18}px`}
+  >
     <button
       type="button"
-      class:disabled={row.session.active}
+      class:disabled={row.session.active || isCurrentSession(row.session)}
       class="session-row"
-      disabled={row.session.active}
-      title={row.session.active ? 'In use by another webpage' : undefined}
+      disabled={row.session.active || isCurrentSession(row.session)}
+      title={isCurrentSession(row.session)
+        ? 'Current session'
+        : row.session.active
+          ? 'In use by another webpage'
+          : undefined}
       onclick={() => onSelect(row.session)}
     >
       <span class="session-main">
@@ -573,8 +622,10 @@
         </span>
         <span class="session-meta">{sessionMeta(row.session)}</span>
       </span>
-      {#if row.session.active}
-        <span class="badge">in use</span>
+      {#if row.session.active || isCurrentSession(row.session)}
+        <span class="badge" class:current={isCurrentSession(row.session)}>
+          {isCurrentSession(row.session) ? 'current' : 'in use'}
+        </span>
       {/if}
     </button>
     <Dropdown>
@@ -608,6 +659,7 @@
         </button>
         <button
           type="button"
+          disabled={row.session.active && !isCurrentSession(row.session)}
           onclick={() => {
             pendingWorkspaceSession = row.session;
             close();
@@ -619,9 +671,9 @@
         <button
           type="button"
           class="danger"
-          disabled={row.session.active || !canDelete(row.session.name)}
+          disabled={row.session.active && !isCurrentSession(row.session)}
           onclick={() => {
-            pendingDeleteName = row.session.name;
+            beginDelete(row.session);
             close();
           }}
         >
@@ -662,10 +714,21 @@
       <p class="state error" role="alert">{errorMessage}</p>
     {:else if sessions.length === 0}
       <p class="state">No sessions yet.</p>
-    {:else if inUseRows.length === 0 && rows.length === 0}
+    {:else if currentRows.length === 0 && inUseRows.length === 0 && rows.length === 0}
       <p class="state">No matching sessions.</p>
     {:else}
       <div class="session-sections">
+        {#if currentRows.length > 0}
+          <section class="session-section current-section" aria-label="Current session">
+            <h3 class="section-title">Current</h3>
+            <ul class="tree" role="listbox" aria-label="Current session">
+              {#each currentRows as row (row.id)}
+                {@render sessionRow(row)}
+              {/each}
+            </ul>
+          </section>
+        {/if}
+
         {#if inUseRows.length > 0}
           <section class="session-section in-use-section" aria-label="In-use sessions">
             <h3 class="section-title">In use</h3>
@@ -739,9 +802,9 @@
 </Modal>
 
 <SessionDeleteConfirmModal
-  open={pendingDeleteName !== null}
-  sessionName={pendingDeleteName ?? ''}
-  onCancel={() => (pendingDeleteName = null)}
+  open={pendingDelete !== null}
+  sessionName={pendingDelete?.name ?? ''}
+  onCancel={() => (pendingDelete = null)}
   onConfirm={() => void onConfirmDelete()}
 />
 
@@ -985,6 +1048,11 @@
     border-top: 1px solid var(--color-border);
   }
 
+  .in-use-section {
+    padding-top: var(--space-12);
+    border-top: 1px solid var(--color-border);
+  }
+
   .section-title {
     margin: 0;
     color: var(--color-fg-subtle);
@@ -1158,6 +1226,18 @@
 
   .session-row-wrap.in-use .session-row.disabled {
     opacity: 0.72;
+  }
+
+  .session-row-wrap.current .session-row.disabled {
+    opacity: 0.9;
+    border-color: color-mix(in srgb, var(--color-accent) 24%, transparent);
+    background: color-mix(in srgb, var(--color-accent) 8%, var(--color-surface-2));
+  }
+
+  .badge.current {
+    border-color: color-mix(in srgb, var(--color-accent) 32%, transparent);
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 10%, transparent);
   }
 
   .glyph {

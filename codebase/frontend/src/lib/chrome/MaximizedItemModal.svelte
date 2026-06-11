@@ -25,7 +25,11 @@
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import CodeViewer from '$lib/canvas/CodeViewer.svelte';
+  import DocumentMarkdownView from '$lib/viewers/DocumentMarkdownView.svelte';
+  import HtmlViewer from '$lib/viewers/HtmlViewer.svelte';
+  import PdfViewer from '$lib/viewers/PdfViewer.svelte';
   import PanelDanglingOverlay from '$lib/canvas/PanelDanglingOverlay.svelte';
+  import { componentSettings } from '$lib/stores/componentSettings.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
   import {
@@ -463,7 +467,6 @@
             <PanelDanglingOverlay terminalId={itemId} />
           {/if}
         {:else if isNote && item.type === 'note'}
-          <!-- svelte-ignore a11y_click_events_have_key_events -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <!--
             R6 (ADR-0018 D9 amend, batch-5 Grill #13): MaximizedItemModal 안의
@@ -472,6 +475,7 @@
           -->
           <div
             class="note-body-host"
+            style:--note-content-scale={componentSettings.noteScale}
             ondblclick={() => (bodyEditing = true)}
           >
             {#if bodyEditing}
@@ -496,14 +500,10 @@
             {#if isDocumentPdf}
               <!-- ADR-0018 D10 amend ⑦ — PDF iframe (browser-native viewer).
                    sandbox 미지정: PDF plugin 의 same-origin 요구. -->
-              <!-- svelte-ignore a11y_missing_attribute -->
-              <iframe
-                class="document-pdf"
+              <PdfViewer
                 src={documentPdfSrc}
                 title={documentFileName}
-                referrerpolicy="no-referrer"
-                loading="lazy"
-              ></iframe>
+              />
             {:else if !documentIsInline && documentAssetLoading}
               <div class="document-empty">Loading preview…</div>
             {:else if !documentIsInline && !canPreviewDocumentAsset}
@@ -525,21 +525,27 @@
               <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — DocumentNode 와 동일
                    markdown/html/source rendering. -->
               {#if documentViewMode === 'source'}
-                <div class="document-source-view">
+                <div
+                  class="document-source-view"
+                  style:--document-content-scale={componentSettings.documentScale}
+                >
                   <CodeViewer text={documentText} lang={documentSourceLang} filename={documentFileName} />
                 </div>
               {:else if documentFileTypeLabel === 'html'}
-                <!-- svelte-ignore a11y_missing_attribute -->
-                <iframe
-                  class="document-html-frame"
-                  sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+                <HtmlViewer
                   title={documentFileName}
-                  referrerpolicy="no-referrer"
-                  loading="lazy"
                   srcdoc={documentRenderedHtmlSrcdoc}
-                ></iframe>
+                  sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+                />
               {:else}
-                <div class="document-md" use:interceptRenderedLinks>{@html documentHtml}</div>
+                <div class="document-markdown-host" use:interceptRenderedLinks>
+                  <DocumentMarkdownView
+                    html={documentHtml}
+                    label={documentFileName}
+                    eyebrow={documentIsInline ? 'Inline document' : 'Document file'}
+                    scale={componentSettings.documentScale}
+                  />
+                </div>
               {/if}
             {/if}
           </article>
@@ -710,7 +716,7 @@
   .note-body-text {
     margin: 0;
     font-family: var(--font-sans);
-    font-size: var(--text-lg);
+	    font-size: calc(var(--text-lg) * var(--note-content-scale, 1));
     line-height: 1.55;
     letter-spacing: 0;
     color: var(--color-fg);
@@ -759,84 +765,11 @@
     overflow-wrap: anywhere;
   }
 
-  /* ADR-0018 D10 amend ③/④ — markdown rendered + source view (maximize). */
-  .document-md {
-    color: var(--color-fg-muted);
-    font-family: var(--font-sans);
-    font-size: 14px;
-    line-height: 1.6;
-    max-width: 80ch;
-    overflow-wrap: anywhere;
-  }
-  .document-md :global(h1),
-  .document-md :global(h2) {
-    margin: 0 0 18px;
-    font-size: 34px;
-    font-weight: var(--weight-semibold);
-    line-height: 1.12;
-    color: var(--color-fg);
-  }
-  .document-md :global(h3) {
-    margin: 20px 0 10px;
-    font-size: 24px;
-    font-weight: 600;
-    color: var(--color-fg);
-  }
-  .document-md :global(h4),
-  .document-md :global(h5),
-  .document-md :global(h6) {
-    margin: 16px 0 8px;
-    font-size: 16px;
-    font-weight: 600;
-    color: var(--color-fg);
-  }
-  .document-md :global(p) { margin: 0 0 10px; }
-  .document-md :global(ul),
-  .document-md :global(ol) { margin: 0 0 10px; padding-left: 24px; }
-  .document-md :global(li) { margin: 3px 0; }
-  .document-md :global(blockquote) {
-    margin: 0 0 10px; padding-left: 14px;
-    border-left: 3px solid var(--color-border-strong);
-    color: var(--color-fg-subtle);
-  }
-  .document-md :global(code) {
-    font-family: var(--font-mono); font-size: 12.5px;
-    padding: 1px 5px;
-    background: var(--color-surface-2);
-    border-radius: var(--radius-sm);
-  }
-  .document-md :global(pre) {
-    margin: 0 0 12px; padding: 12px 14px;
-    background: var(--color-surface-2);
-    border-radius: var(--radius-sm);
-    overflow-x: auto;
-    font-family: var(--font-mono); font-size: 12.5px;
-    line-height: 1.55;
-  }
-  .document-md :global(pre code) {
-    padding: 0; background: transparent; border-radius: 0;
-  }
-  .document-md :global(a) { color: var(--color-accent); text-decoration: underline; }
-  .document-md :global(table) {
-    border-collapse: collapse; margin: 0 0 12px; font-size: 13px;
-  }
-  .document-md :global(th),
-  .document-md :global(td) {
-    border: 1px solid var(--color-border); padding: 6px 10px; text-align: left;
-  }
-  .document-md :global(th) {
-    background: var(--color-surface-2); font-weight: 600; color: var(--color-fg);
-  }
-  .document-md :global(hr) {
-    border: 0; border-top: 1px solid var(--color-border); margin: 18px 0;
-  }
-  .document-md :global(img) { max-width: 100%; height: auto; }
-
   .document-source-view {
     flex: 1 1 auto;
     min-height: 0;
     height: 100%;
-    --code-viewer-font-size: 13px;
+    --code-viewer-font-size: calc(13px * var(--document-content-scale, 1));
     --code-viewer-line-height: 1.6;
     --code-viewer-gutter-width: 42px;
     --code-viewer-padding: 12px 0;
@@ -851,37 +784,38 @@
     display: none;
   }
 
-  /* ADR-0037 amend — rendered HTML is isolated in a sandboxed iframe. */
-  .document-html-frame {
-    display: block;
-    flex: 1 1 auto;
-    width: 100%;
-    height: 100%;
-    min-height: 100%;
-    border: 0;
-    background: #ffffff;
-  }
-  .document-body-host:has(.document-html-frame) {
+  .document-body-host:has(:global(.document-markdown-view)) {
     padding: 0;
     overflow: hidden;
     display: flex;
     flex-direction: column;
   }
-  .document-body-host:has(.document-html-frame) .document-eyebrow {
+  .document-body-host:has(:global(.document-markdown-view)) .document-eyebrow {
+    display: none;
+  }
+
+  .document-markdown-host {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ADR-0037 amend — rendered HTML is isolated in a sandboxed iframe. */
+  .document-body-host:has(:global(.html-viewer-frame)) {
+    padding: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  .document-body-host:has(:global(.html-viewer-frame)) .document-eyebrow {
     display: none;
   }
 
   /* ADR-0018 D10 amend ⑦ (2026-05-22) — PDF iframe (browser-native viewer).
      rendered HTML iframe 과 달리 height auto-fit 안 함 — PDF plugin 의
      internal scroll + multi-page nav 사용. host 100% 채우고 padding 제거. */
-  .document-pdf {
-    display: block;
-    width: 100%;
-    height: 100%;
-    border: 0;
-    background: #ffffff;
-  }
-  .document-body-host:has(.document-pdf) {
+  .document-body-host:has(:global(.pdf-viewer-frame)) {
     padding: 0;
     overflow: hidden;
     display: flex;

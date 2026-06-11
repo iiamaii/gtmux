@@ -31,6 +31,10 @@
   import { fsFileUrl } from '$lib/http/fs';
   import { UnauthorizedError } from '$lib/http/sessions';
   import CodeViewer from './CodeViewer.svelte';
+  import DocumentMarkdownView from '$lib/viewers/DocumentMarkdownView.svelte';
+  import HtmlViewer from '$lib/viewers/HtmlViewer.svelte';
+  import PdfViewer from '$lib/viewers/PdfViewer.svelte';
+  import { componentSettings } from '$lib/stores/componentSettings.svelte';
   import {
     DOCUMENT_EXTENSIONS,
     basename,
@@ -584,7 +588,7 @@
    */
   function isolateLocalIframes(root: HTMLElement): void {
     const iframes = root.querySelectorAll<HTMLIFrameElement>(
-      'iframe.doc-html-frame, iframe.doc-pdf',
+      'iframe.html-viewer-frame, iframe.pdf-viewer-frame',
     );
     if (iframes.length === 0) return;
     iframes.forEach((f) => {
@@ -801,7 +805,7 @@
           value={data.content ?? ''}
           editing={true}
           plain={true}
-          placeholder={'# Heading\n\nWrite your document — markdown ok.'}
+          placeholder="# Heading\n\nWrite your document — markdown ok."
           rows={8}
           class="doc-content-edit"
           onCommit={(next: string) => void commitContent(next)}
@@ -822,60 +826,68 @@
         <!-- ADR-0018 D10 amend ③/④/⑤ + ADR-0037 — markdown/html rendered
              or source. HTML rendered is sandboxed iframe. -->
         {#if viewMode === 'source'}
-          <div class="doc-source-view">
+          <div
+            class="doc-source-view"
+            style:--document-content-scale={componentSettings.documentScale}
+          >
             <CodeViewer text={data.content ?? ''} lang={sourceLang} filename={displayFileName} />
           </div>
         {:else if fileTypeLabel === 'html'}
-          <!-- svelte-ignore a11y_missing_attribute -->
-          <iframe
-            class="doc-html-frame"
-            class:drag-isolated={dragging}
-            sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+          <HtmlViewer
             title={displayFileName}
-            referrerpolicy="no-referrer"
-            loading="lazy"
             srcdoc={renderedHtmlSrcdoc}
-          ></iframe>
+            sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+            dragIsolated={dragging}
+          />
         {:else}
-          <div class="doc-md" use:interceptRenderedLinks>{@html inlineHtml}</div>
+          <div class="doc-markdown-host" use:interceptRenderedLinks>
+            <DocumentMarkdownView
+              html={inlineHtml}
+              label={displayFileName}
+              eyebrow="Inline document"
+              scale={componentSettings.documentScale}
+            />
+          </div>
         {/if}
       {:else if isPdfAsset}
         <!-- ADR-0018 D10 amend ⑦ — PDF iframe via browser-native plugin.
              sandbox 미지정 (PDF plugin 의 same-origin 요구). same-origin
-             endpoint 라 trust safe. eyebrow 숨김 — :has(.doc-pdf) CSS.
+             endpoint 라 trust safe. eyebrow 숨김 — :has(.pdf-viewer-frame) CSS.
              drag 중 pointer-events:none — iframe 의 PDF plugin 이 mouse
              event 를 capture 해 부모 drag 가 멈추는 회귀 차단. -->
-        <!-- svelte-ignore a11y_missing_attribute -->
-        <iframe
-          class="doc-pdf"
-          class:drag-isolated={dragging}
+        <PdfViewer
           src={pdfAssetSrc}
           title={displayFileName}
-          referrerpolicy="no-referrer"
-          loading="lazy"
-        ></iframe>
+          dragIsolated={dragging}
+        />
       {:else}
         <div class="eyebrow">Document file</div>
         {#if assetPreviewLoading}
           <p>Loading preview…</p>
         {:else if assetPreviewText !== null && (assetPreviewText.trim().length > 0)}
           {#if viewMode === 'source'}
-            <div class="doc-source-view">
+            <div
+              class="doc-source-view"
+              style:--document-content-scale={componentSettings.documentScale}
+            >
               <CodeViewer text={assetPreviewText} lang={sourceLang} filename={displayFileName} />
             </div>
           {:else if fileTypeLabel === 'html'}
-            <!-- svelte-ignore a11y_missing_attribute -->
-            <iframe
-              class="doc-html-frame"
-              class:drag-isolated={dragging}
-              sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+            <HtmlViewer
               title={displayFileName}
-              referrerpolicy="no-referrer"
-              loading="lazy"
               srcdoc={renderedHtmlSrcdocAsset}
-            ></iframe>
+              sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+              dragIsolated={dragging}
+            />
           {:else}
-            <div class="doc-md" use:interceptRenderedLinks>{@html assetHtml}</div>
+            <div class="doc-markdown-host" use:interceptRenderedLinks>
+              <DocumentMarkdownView
+                html={assetHtml}
+                label={displayFileName}
+                eyebrow="Document file"
+                scale={componentSettings.documentScale}
+              />
+            </div>
           {/if}
         {:else}
           <div class="asset-summary">
@@ -1128,22 +1140,13 @@
   /* ADR-0037 amend — rendered HTML lives in a sandboxed iframe. The iframe
      fills the document body and keeps standalone document styles away from
      the app DOM. */
-  .doc-html-frame {
-    display: block;
-    flex: 1 1 auto;
-    width: 100%;
-    height: 100%;
-    min-height: 100%;
-    border: 0;
-    background: #ffffff;
-  }
-  .doc-body:has(.doc-html-frame) {
+  .doc-body:has(:global(.html-viewer-frame)) {
     padding: 0;
     overflow: hidden;
     display: flex;
     flex-direction: column;
   }
-  .doc-body:has(.doc-html-frame) .eyebrow {
+  .doc-body:has(:global(.html-viewer-frame)) .eyebrow {
     display: none;
   }
 
@@ -1152,14 +1155,7 @@
      PDF plugin 이 자체 internal scroll + multi-page navigation 제공 →
      host 영역 100% 채우고 PDF viewer 가 scroll 책임. host overflow 는
      hidden (외부 scroll 미발생). */
-  .doc-pdf {
-    display: block;
-    width: 100%;
-    height: 100%;
-    border: 0;
-    background: #ffffff;
-  }
-  .doc-body:has(.doc-pdf) {
+  .doc-body:has(:global(.pdf-viewer-frame)) {
     padding: 0;
     overflow: hidden;
     display: flex;
@@ -1174,17 +1170,12 @@
      `dragging` prop 이 true 인 동안 iframe 의 pointer-events 만 차단 →
      mouse event 가 iframe 통과해 부모 wrapper 가 catch. drag 종료 후 즉시
      복원. PDF / rendered HTML 양쪽 동일 fix. */
-  .doc-pdf.drag-isolated,
-  .doc-html-frame.drag-isolated {
-    pointer-events: none;
-  }
-
   /* ADR-0037 D7 — source view uses shared CodeViewer. */
   .doc-source-view {
     flex: 1 1 auto;
     min-height: 0;
     height: 100%;
-    --code-viewer-font-size: 11.5px;
+    --code-viewer-font-size: calc(11.5px * var(--document-content-scale, 1));
     --code-viewer-line-height: 1.55;
     --code-viewer-gutter-width: 34px;
     --code-viewer-padding: 10px 0;
@@ -1199,107 +1190,18 @@
     display: none;
   }
 
-  /* plan 0011 follow-up (2026-05-21) — marked output container styling.
-     ADR-0018 D10 의 inline/asset markdown 모두 본 container 안. */
-  .doc-md {
-    color: var(--color-fg-muted);
-    font-family: var(--font-sans);
-    font-size: 12.5px;
-    line-height: 1.55;
-    letter-spacing: -0.1px;
-    overflow-wrap: anywhere;
-  }
-  .doc-md :global(h1),
-  .doc-md :global(h2) {
-    margin: 0 0 12px;
-    font-family: var(--font-sans);
-    font-size: 26px;
-    font-weight: 540;
-    letter-spacing: -0.6px;
-    line-height: 1.15;
-    color: var(--color-fg);
-  }
-  .doc-md :global(h3) {
-    margin: 16px 0 8px;
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--color-fg);
-  }
-  .doc-md :global(h4),
-  .doc-md :global(h5),
-  .doc-md :global(h6) {
-    margin: 14px 0 6px;
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--color-fg);
-  }
-  .doc-md :global(p) {
-    margin: 0 0 10px;
-  }
-  .doc-md :global(ul),
-  .doc-md :global(ol) {
-    margin: 0 0 10px;
-    padding-left: 22px;
-  }
-  .doc-md :global(li) {
-    margin: 2px 0;
-  }
-  .doc-md :global(blockquote) {
-    margin: 0 0 10px;
-    padding-left: 12px;
-    border-left: 2px solid var(--color-border-strong);
-    color: var(--color-fg-subtle);
-  }
-  .doc-md :global(code) {
-    font-family: var(--font-mono);
-    font-size: 11.5px;
-    padding: 0 4px;
-    background: var(--color-surface-2);
-    border-radius: var(--radius-sm);
-  }
-  .doc-md :global(pre) {
-    margin: 0 0 10px;
-    padding: 10px 12px;
-    background: var(--color-surface-2);
-    border-radius: var(--radius-sm);
-    overflow-x: auto;
-    font-family: var(--font-mono);
-    font-size: 11.5px;
-    line-height: 1.5;
-  }
-  .doc-md :global(pre code) {
+  .doc-body:has(:global(.document-markdown-view)) {
     padding: 0;
-    background: transparent;
-    border-radius: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
   }
-  .doc-md :global(a) {
-    color: var(--color-accent);
-    text-decoration: underline;
-  }
-  .doc-md :global(table) {
-    border-collapse: collapse;
-    margin: 0 0 10px;
-    font-size: 12px;
-  }
-  .doc-md :global(th),
-  .doc-md :global(td) {
-    border: 1px solid var(--color-border);
-    padding: 4px 8px;
-    text-align: left;
-  }
-  .doc-md :global(th) {
-    background: var(--color-surface-2);
-    font-weight: 600;
-    color: var(--color-fg);
-  }
-  .doc-md :global(hr) {
-    border: 0;
-    border-top: 1px solid var(--color-border);
-    margin: 14px 0;
-  }
-  .doc-md :global(img) {
-    max-width: 100%;
-    height: auto;
+
+  .doc-markdown-host {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
 
   .asset-summary {

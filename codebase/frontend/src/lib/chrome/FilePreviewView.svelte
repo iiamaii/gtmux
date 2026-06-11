@@ -10,7 +10,12 @@
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { escRouter } from '$lib/common/escRouter.svelte';
   import CodeViewer from '$lib/canvas/CodeViewer.svelte';
+  import DocumentMarkdownView from '$lib/viewers/DocumentMarkdownView.svelte';
+  import HtmlViewer from '$lib/viewers/HtmlViewer.svelte';
+  import ImageViewer from '$lib/viewers/ImageViewer.svelte';
+  import PdfViewer from '$lib/viewers/PdfViewer.svelte';
   import PanelEmptyState from './PanelEmptyState.svelte';
+  import { componentSettings } from '$lib/stores/componentSettings.svelte';
   import { basename, extension, previewMetaForPath, type WorkspacePreviewKind } from '$lib/files/workspaceAssets';
   import { formatPathWithLocation, selectionToRange } from '$lib/files/sourceLocation';
   import {
@@ -309,6 +314,7 @@
     class="preview-surface"
     role="region"
     aria-label="Preview content"
+    style:--preview-content-scale={componentSettings.previewScale}
     oncontextmenu={(e: MouseEvent) => openContentMenu(e, current)}
     onscroll={closeContentMenu}
   >
@@ -331,20 +337,21 @@
         role="alert"
       />
     {:else if kind === 'image' && previewUrl.length > 0}
-      <div class="image-wrap">
-        <img src={previewUrl} alt={basename(current.path)} />
-      </div>
+      <ImageViewer src={previewUrl} alt={basename(current.path)} />
     {:else if kind === 'pdf' && previewUrl.length > 0}
-      <iframe class="pdf-frame" src={previewUrl} title={basename(current.path)}></iframe>
+      <PdfViewer src={previewUrl} title={basename(current.path)} />
     {:else if kind === 'markdown'}
-      <article class="text-preview rendered">{@html renderedMarkdown}</article>
+      <DocumentMarkdownView
+        html={renderedMarkdown}
+        label={basename(current.path)}
+        scale={componentSettings.previewScale}
+      />
     {:else if kind === 'html'}
-      <iframe
-        class="html-frame"
+      <HtmlViewer
         title={basename(current.path)}
-        sandbox={RENDERED_HTML_IFRAME_SANDBOX}
         srcdoc={renderedHtml}
-      ></iframe>
+        sandbox={RENDERED_HTML_IFRAME_SANDBOX}
+      />
     {:else if kind === 'text'}
       <CodeViewer text={textContent ?? ''} lang={codeLang} filename={basename(current.path)} />
     {:else}
@@ -758,37 +765,9 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    --code-viewer-font-size: 10.5px;
+    --code-viewer-font-size: calc(10.5px * var(--preview-content-scale, 1));
     --code-viewer-line-height: 1.6;
     --code-viewer-gutter-width: 28px;
-  }
-
-  .image-wrap {
-    flex: 1 1 auto;
-    min-height: 0;
-    display: grid;
-    place-items: center;
-    padding: var(--space-12);
-    overflow: auto;
-    background:
-      linear-gradient(45deg, var(--color-glass-1) 25%, transparent 25%, transparent 75%, var(--color-glass-1) 75%) 0 0/16px 16px,
-      linear-gradient(45deg, var(--color-glass-1) 25%, transparent 25%, transparent 75%, var(--color-glass-1) 75%) 8px 8px/16px 16px,
-      var(--color-surface);
-  }
-
-  .image-wrap img {
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-  }
-
-  .pdf-frame,
-  .html-frame {
-    flex: 1 1 auto;
-    min-height: 0;
-    width: 100%;
-    border: 0;
-    background: white;
   }
 
   .text-preview {
