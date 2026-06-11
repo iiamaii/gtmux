@@ -10,6 +10,7 @@
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
+  import { componentSettings } from '$lib/stores/componentSettings.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { NoteItem, CanvasItem } from '$lib/types/canvas';
   import {
@@ -247,7 +248,7 @@
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <div
     class="note-node-shell"
-    style="width: 100%; height: 100%; --note-accent: {data.color};"
+    style="width: 100%; height: 100%; --note-accent: {data.color}; --note-content-scale: {componentSettings.noteScale};"
   >
     <NodeResizer
       nodeId={data.id}
@@ -474,7 +475,7 @@
   .note-body {
     margin: 0;
     font-family: inherit;
-    font-size: 12px;
+    font-size: calc(12px * var(--note-content-scale, 1));
     line-height: 1.4;
     letter-spacing: -0.1px;
     color: var(--color-fg);
@@ -483,7 +484,7 @@
   }
   .note-placeholder {
     color: var(--color-fg-subtle);
-    font-size: 12px;
+    font-size: calc(12px * var(--note-content-scale, 1));
     font-style: italic;
     user-select: none;
   }

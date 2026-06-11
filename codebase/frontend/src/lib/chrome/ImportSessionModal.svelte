@@ -4,11 +4,11 @@
    *
    * 흐름:
    *   pick → parse envelope → preview → name confirm → POST import
-   *     → 성공 → "Open imported session?" confirm
+   *     → 성공 → "Open imported layout?" confirm
    *     → 409 → name 재입력 (rename)
    *     → 400/other → toast
    *
-   * Side-effect-free (ADR-0029 D5): import 자체는 새 session file 만 생성.
+   * Side-effect-free (ADR-0029 D5): import 자체는 새 layout-backed session file 만 생성.
    * "Open" 선택 시에만 detach + attach.
    */
 
@@ -44,7 +44,7 @@
   //   pick      → file picker 노출
   //   preview   → envelope OK, target name confirm
   //   importing → POST in-flight
-  //   done      → "Open imported session?" 확인
+  //   done      → "Open imported layout?" 확인
   type Stage = 'pick' | 'preview' | 'importing' | 'done';
   let stage = $state<Stage>('pick');
   let envelope = $state<SessionExportEnvelope | null>(null);
@@ -119,7 +119,7 @@
     if (fromEnv.length > 0 && SESSION_NAME_REGEX.test(fromEnv)) return fromEnv;
     const stripped = file.replace(/\.gtmux-session\.json$/i, '').replace(/\.json$/i, '');
     if (SESSION_NAME_REGEX.test(stripped)) return stripped;
-    return 'imported-session';
+    return 'imported-layout';
   }
 
   function formatMB(bytes: number): string {
@@ -133,7 +133,7 @@
     if (file === undefined) return;
     parseError = null;
     if (file.size > IMPORT_MAX_BYTES) {
-      parseError = `Session file too large (${formatMB(file.size)}). Maximum is ${formatMB(IMPORT_MAX_BYTES)}.`;
+      parseError = `Layout file too large (${formatMB(file.size)}). Maximum is ${formatMB(IMPORT_MAX_BYTES)}.`;
       input.value = '';
       return;
     }
@@ -224,7 +224,7 @@
         });
         sessionStore.loadLayout(res.layout);
         toastStore.show({
-          message: `Opened imported session "${importedName}".`,
+          message: `Opened imported layout "${importedName}".`,
           tone: 'success',
         });
         sessionIODialog.close();
@@ -262,7 +262,7 @@
   function onStayHere(): void {
     if (importedName !== null) {
       toastStore.show({
-        message: `Imported "${importedName}" — open it from the workspace switcher when ready.`,
+        message: `Imported layout "${importedName}" — open it from the workspace switcher when ready.`,
         tone: 'success',
       });
     }
@@ -273,14 +273,14 @@
 <Modal
   {open}
   onclose={close}
-  title={stage === 'done' ? 'Imported' : 'Import session'}
+  title={stage === 'done' ? 'Imported' : 'Import layout'}
   dismissOnBackdrop={stage !== 'importing' && !activeSwapping}
   dismissOnEsc={stage !== 'importing' && !activeSwapping}
 >
   {#snippet body()}
     {#if stage === 'pick'}
       <p class="modal-lead">
-        Pick a <code>.gtmux-session.json</code> file exported from gtmux.
+        Pick a gtmux layout export file (<code>.gtmux-session.json</code>).
       </p>
       <label class="file-pick">
         <input
@@ -294,7 +294,7 @@
         <div class="error" role="alert">{parseError}</div>
       {/if}
       <div class="hint">
-        Imports are side-effect-free — only a new session file is created.
+        Imports are side-effect-free — only a new layout-backed session file is created.
         Terminal panels start fresh when first attached.
         Max file size: 16 MB.
       </div>
@@ -351,12 +351,12 @@
         {#if preview.terminal > 0}
           <div class="caveat">
             Terminal panels will be re-spawned (fresh shell) when the imported
-            session is first attached.
+            layout is first opened.
           </div>
         {/if}
         {#if preview.assetReference > 0}
           <div class="caveat">
-            Binary assets are not bundled in session export files. Asset-backed
+            Binary assets are not bundled in layout export files. Asset-backed
             images/documents may appear dangling unless this workspace already
             has the referenced assets.
           </div>
@@ -390,7 +390,7 @@
         variant="primary"
         onclick={() => void onOpenImported()}
         disabled={activeSwapping}
-      >{activeSwapping ? 'Opening…' : 'Open imported session'}</Button>
+      >{activeSwapping ? 'Opening…' : 'Open imported layout'}</Button>
     {/if}
   {/snippet}
 </Modal>

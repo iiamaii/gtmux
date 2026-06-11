@@ -16,8 +16,11 @@
 
 import {
   getSettings,
+  type AuthInfo,
   patchBehavior,
   type BehaviorSettings,
+  type BuildInfo,
+  type ServerInfo,
   type SettingsSnapshot,
 } from '$lib/http/settings';
 import { UnauthorizedError } from '$lib/http/sessions';
@@ -30,12 +33,18 @@ const DEFAULT_BEHAVIOR: BehaviorSettings = {
 
 class SettingsStore {
   behavior = $state<BehaviorSettings>({ ...DEFAULT_BEHAVIOR });
+  build = $state<BuildInfo | null>(null);
+  server = $state<ServerInfo | null>(null);
+  auth = $state<AuthInfo | null>(null);
   loaded = $state(false);
   errorMessage = $state<string | null>(null);
 
-  /** Server snapshot 으로 store 갱신 (build/server/auth 는 후속 consumer 가 직접 read). */
+  /** Server snapshot 으로 store 갱신. */
   applySnapshot(snap: SettingsSnapshot): void {
     this.behavior = { ...snap.behavior };
+    this.build = snap.build;
+    this.server = snap.server;
+    this.auth = snap.auth;
     this.loaded = true;
     this.errorMessage = null;
   }

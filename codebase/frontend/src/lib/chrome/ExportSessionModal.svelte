@@ -6,7 +6,7 @@
    * download. BE work package 0052 (`GET /api/sessions/{name}/export`) 의존.
    *
    * 동작:
-   * 1. 사용자가 SessionMenu 의 [Export session…] 클릭 → sessionIODialog.openExport()
+   * 1. 사용자가 SessionMenu/Settings 의 [Export layout…] 클릭 → sessionIODialog.openExport()
    * 2. 본 modal 이 active session name + privacy warning 표시
    * 3. [Download] 클릭 → `exportSession(name)` → blob URL 생성 → 임시 a 클릭 → revoke
    * 4. 성공 시 toast + close
@@ -60,7 +60,7 @@
       // Revoke after a tick — Safari/Firefox 안전.
       setTimeout(() => URL.revokeObjectURL(url), 1_000);
       toastStore.show({
-        message: `Exported "${sessionName}" to ${filename}`,
+        message: `Exported layout "${sessionName}" to ${filename}`,
         tone: 'success',
       });
       sessionIODialog.close();
@@ -80,19 +80,19 @@
   }
 </script>
 
-<Modal {open} onclose={close} title="Export session">
+<Modal {open} onclose={close} title="Export layout">
   {#snippet body()}
     {#if activeName === null}
-      <p class="modal-state">No active session — open a session first.</p>
+      <p class="modal-state">No active layout — open a session first.</p>
     {:else}
       <div class="section">
         <div class="kv">
-          <span class="k">Session</span>
+          <span class="k">Layout</span>
           <span class="v mono">{activeName}</span>
         </div>
         <div class="kv">
           <span class="k">Format</span>
-          <span class="v mono">gtmux.session.export · v1</span>
+          <span class="v mono">gtmux layout export · v1</span>
         </div>
       </div>
 
