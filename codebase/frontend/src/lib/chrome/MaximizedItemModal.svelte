@@ -61,9 +61,15 @@
     if (item === null) return '—';
     if (item.type === 'note') return item.title.length > 0 ? item.title : 'Untitled';
     if (item.type === 'document') return documentFileName.length > 0 ? documentFileName : 'document';
-    const pool = itemId !== null ? terminalPool.byId(itemId) : null;
-    const poolLabel = pool?.label?.trim();
-    if (poolLabel !== undefined && poolLabel.length > 0) return poolLabel;
+    // Terminal label = persisted layout item.label (ADR-0050 D3, per-panel) —
+    // same derivation as PanelNode's header. The in-memory terminal_meta label
+    // is no longer consulted (it was wiped every boot). Fall back to a short id
+    // when no persisted label exists. (No pane_id on this item shape — id only.)
+    if (item.type === 'terminal') {
+      const trimmed = item.label?.trim();
+      if (trimmed !== undefined && trimmed.length > 0) return trimmed;
+      return itemId !== null ? itemId.slice(0, 8) : '—';
+    }
     if (item.label !== undefined && item.label !== null && item.label.length > 0) return item.label;
     return itemId !== null ? itemId.slice(0, 8) : '—';
   });

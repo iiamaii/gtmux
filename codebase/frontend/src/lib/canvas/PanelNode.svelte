@@ -21,12 +21,12 @@
   import XtermHost from './XtermHost.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
-  import { ensureMutationOk, sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { settingsStore } from '$lib/stores/settings.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
-  import { UnauthorizedError } from '$lib/http/sessions';
-  import { patchTerminalLabel, TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
+  import { terminalHeaderLabel } from '$lib/canvas/terminalLabel';
+  import { TERMINAL_LABEL_MAX_BYTES } from '$lib/http/terminals';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
   import {
@@ -90,16 +90,16 @@
   // Keep XtermHost mounted while minimized. Recreating xterm on restore drops
   // its screen buffer and leaves the panel blank until new output arrives.
   const shouldMountTerminal = $derived(isVisible);
-  // Label source priority (Task 2 fix):
-  //   1) terminalPool 의 terminal_meta label (server-wide, PATCH /api/terminals 의
-  //      single source of truth — ADR-0021 D7 + terminals.rs:46-48). 빈 문자열은
-  //      미설정 으로 간주.
-  //   2) layout item.label (legacy — disk 의 layout file 안 stale 가능)
-  //   3) pane_id / id fallback.
-  // 옛 우선 (data.label → pane_id) 은 session 진입 시 회귀 — layout 안 label 이
-  // PATCH 와 join 되지 않아 stale. terminal_meta 우선이 정답.
+  // Label source = persisted layout item.label (ADR-0050 D1/D3, per-panel).
+  //   1) layout item.label (persisted on disk per (session, panel)) — blank
+  //      treated as unset.
+  //   2) pane_id / id fallback.
+  // The in-memory terminal_meta label (PATCH /api/terminals) is no longer
+  // consulted: it is wiped every boot, so reading it lost the label after a
+  // server restart. Rename now writes item.label via the layout-persist path
+  // (onLabelCommit below), matching every other canvas item.
   const headerLabel = $derived(
-    terminalPool.byId(data.id)?.label?.trim() || data.label || data.pane_id || data.id,
+    terminalHeaderLabel(data.label, data.pane_id, data.id),
   );
 
   const isInM = $derived(sessionStore.M.has(data.id) && data.group_selected !== true);
@@ -249,9 +249,11 @@
 
   // ─ Inline label rename (0033 §8.2 P1 — InlineEditField consumer wire) ─
   //
-  // terminal panel header label 을 더블 클릭 → 인라인 편집 → commit 시
-  // PATCH /api/terminals/:id { label }. terminalPool 즉시 refresh 로 다른
-  // surface (TerminalsPanel, PaneInfoPanel) 와 정합.
+  // Terminal panel header label is edited inline on double-click. On commit
+  // the new value is written to the persisted layout `item.label` via the
+  // shared layout-mutation path (applyMutation → PUT /api/sessions/:name/layout),
+  // exactly like every other canvas item — and undo/history is captured for
+  // free (ADR-0030 D9). ADR-0050 D2: no longer PATCH /api/terminals.
   let labelEditing = $state(false);
   let labelCommitting = $state(false);
 
@@ -275,27 +277,23 @@
       labelEditing = false;
       return;
     }
-    if (!(await ensureMutationOk('Label rename aborted — session reconnect failed.'))) return;
     labelCommitting = true;
     try {
-      await patchTerminalLabel(data.id, trimmed);
-      // sessionStore.items 안 label 도 갱신 — layout 의 다음 GET 으로 정합되지만
-      // immediate visual feedback 을 위해 in-memory 도 동시 set.
-      const cur = sessionStore.items.get(data.id);
-      if (cur !== undefined) {
-        sessionStore.items.set(data.id, { ...cur, label: trimmed });
-      }
-      void terminalPool.refresh();
+      await sessionStore.applyMutation(
+        (cur) => ({
+          ...cur,
+          items: cur.items.map((it: CanvasItem) =>
+            it.id === data.id && it.type === 'terminal'
+              ? ({ ...it, label: trimmed } as TerminalItem)
+              : it,
+          ),
+        }),
+        {
+          abortMessage: 'Label rename aborted — session reconnect failed.',
+          failMessage: 'Rename failed',
+        },
+      );
       labelEditing = false;
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Rename failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
     } finally {
       labelCommitting = false;
     }
