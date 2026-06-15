@@ -216,6 +216,10 @@
           });
         },
         hint: osc52HintOnce,
+        // ADR-0049 D7 — timestamp for the gesture-backed Cmd+C fallback buffer.
+        // performance.now() is monotonic and matches the clock the copy shortcut
+        // reads when it drains the buffer (see terminalCopyShortcut).
+        now: () => performance.now(),
       }),
     );
 

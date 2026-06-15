@@ -22,6 +22,72 @@
 /** Default decoded-text size cap (D6). Payloads above this are ignored. */
 export const OSC52_MAX_BYTES = 64 * 1024;
 
+/** Default TTL for the gesture-backed Cmd+C fallback buffer (D7), in ms. */
+export const OSC52_FALLBACK_TTL_MS = 10_000;
+
+// ── D7: gesture-backed Cmd+C fallback buffer ─────────────────────────────
+//
+// A mouse-mode TUI (claude) cannot create a native xterm selection, so a plain
+// Cmd+C finds `term.getSelection()` empty and copies nothing. The TUI's only
+// text channel is OSC 52, but the immediate `navigator.clipboard.writeText`
+// from the async OSC handler can be blocked by some browsers (no transient
+// activation). So we bridge: the OSC 52 handler remembers the last gated write
+// here, and the Cmd+C keydown (a real user gesture) drains it.
+//
+// Security (ADR-0049 D7): `rememberOsc52` is wired into the handler ONLY on the
+// post-gate path (consent ON + secure context). If consent is OFF the buffer is
+// never filled, so the fallback can never fire. The buffered text is the
+// already-decoded, size-capped payload (D2/D6 still hold upstream).
+//
+// This buffer is module-scoped state — deliberately NOT importing any store or
+// DOM so osc52.ts stays node-testable. The clock is injected (`nowMs`) by the
+// caller (`performance.now()` in the browser, a fixed value in tests).
+
+interface Osc52Buffer {
+  text: string;
+  at: number;
+}
+
+let osc52Buffer: Osc52Buffer | null = null;
+
+/**
+ * Remember the last successfully-gated OSC 52 write for the gesture-backed
+ * fallback (D7). Call this from the handler write path ONLY after the dual gate
+ * (D3) has passed, so the buffer never holds text the user did not consent to.
+ *
+ * `nowMs` is injected (the caller reads the clock) to keep this module free of
+ * any clock/DOM dependency and node-testable.
+ */
+export function rememberOsc52(text: string, nowMs: number): void {
+  osc52Buffer = { text, at: nowMs };
+}
+
+/**
+ * Return the buffered OSC 52 text if it is fresh (within `ttlMs` of `nowMs`),
+ * else `null`. One-shot: a successful take CLEARS the buffer so the same payload
+ * is not re-copied on a later, unrelated Cmd+C. An expired buffer is also
+ * cleared (it can never become valid again). `nowMs` is injected by the caller.
+ */
+export function takeRecentOsc52(
+  ttlMs: number = OSC52_FALLBACK_TTL_MS,
+  nowMs: number = 0,
+): string | null {
+  const buf = osc52Buffer;
+  if (buf === null) return null;
+  if (nowMs - buf.at > ttlMs) {
+    // Stale — drop it so we do not keep checking a buffer that can never pass.
+    osc52Buffer = null;
+    return null;
+  }
+  osc52Buffer = null; // one-shot: consume on successful take.
+  return buf.text;
+}
+
+/** Test-only: clear the fallback buffer so cases don't bleed into each other. */
+export function __resetOsc52Buffer(): void {
+  osc52Buffer = null;
+}
+
 /**
  * Wrap `fn` so it runs at most once per process. Used for the gate-closed hint
  * (T3): the toast must appear once *per session*, not once per XtermHost — a
@@ -44,6 +110,13 @@ export interface Osc52Deps {
   writeClipboard: (text: string) => void;
   /** One-time hint when the gate is closed (non-secure / disabled). */
   hint: () => void;
+  /**
+   * Monotonic-ish clock for the D7 fallback buffer timestamp. Injected so the
+   * module stays free of clock/DOM imports and node-testable. Defaults to a
+   * constant `0` (sufficient when the gesture-backed fallback is unused, e.g.
+   * pure handler unit tests); the real caller passes `() => performance.now()`.
+   */
+  now?: () => number;
   /** Override the size cap (defaults to OSC52_MAX_BYTES). For tests. */
   maxBytes?: number;
 }
@@ -108,6 +181,7 @@ function base64ToBytes(b64: string): Uint8Array {
  */
 export function makeOsc52Handler(deps: Osc52Deps): (data: string) => boolean {
   const maxBytes = deps.maxBytes ?? OSC52_MAX_BYTES;
+  const now = deps.now ?? (() => 0);
   return (data: string): boolean => {
     const sep = data.indexOf(';');
     if (sep < 0) return true; // malformed (no Pc;Pd split) → swallow
@@ -125,6 +199,11 @@ export function makeOsc52Handler(deps: Osc52Deps): (data: string) => boolean {
     const text = decodeOsc52Base64(pd, maxBytes);
     if (text === null) return true; // malformed / oversized → swallow (D6)
 
+    // Belt: immediate write (auto-copy on drag). Suspenders (D7): remember the
+    // gated text so a following Cmd+C gesture can copy it if the immediate
+    // async write was blocked. Buffer is populated ONLY past the gate, so a
+    // consent-off session never fills it and the fallback never fires.
+    rememberOsc52(text, now());
     deps.writeClipboard(text);
     return true;
   };

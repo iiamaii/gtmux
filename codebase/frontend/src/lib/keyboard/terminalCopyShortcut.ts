@@ -1,5 +1,9 @@
 import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
+import { OSC52_FALLBACK_TTL_MS, takeRecentOsc52 } from '$lib/xterm/osc52';
+import { resolveTerminalCopyText } from './terminalCopyResolve';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
+
+export { resolveTerminalCopyText };
 
 export interface TerminalCopyProvider {
   containsFocus: () => boolean;
@@ -70,14 +74,29 @@ export function bindGlobalTerminalCopyShortcut(): () => void {
     const mustBlockBrowserShortcut = isTerminalCopyShortcut(e);
     const provider = focusedProvider() ?? providerWithSelection();
     const selectedText = provider?.getSelection() ?? '';
-    if (!mustBlockBrowserShortcut && selectedText.length === 0) return;
+
+    // ADR-0049 D7 — a real selection wins; otherwise fall back to a fresh OSC 52
+    // buffer (mouse-mode TUI like claude, whose drag never makes an xterm
+    // selection). The buffer is drained here, inside the keydown gesture, so the
+    // async clipboard write runs under transient activation. The buffer is only
+    // ever filled past the OSC 52 gate (consent ON + secure), so consent-off
+    // sessions resolve to null and this stays a no-op.
+    const copyText = resolveTerminalCopyText(selectedText, () =>
+      takeRecentOsc52(OSC52_FALLBACK_TTL_MS, performance.now()),
+    );
+
+    // Plain Cmd+C with nothing to copy (no selection AND no fresh buffer):
+    // return WITHOUT preventDefault so the browser passthrough is preserved
+    // (unchanged from the pre-D7 behavior). Cmd+Shift+C still proceeds to block
+    // the browser shortcut even with nothing to copy.
+    if (!mustBlockBrowserShortcut && copyText === null) return;
 
     e.preventDefault();
     e.stopImmediatePropagation();
 
-    if (selectedText.length === 0) return;
+    if (copyText === null) return; // Cmd+Shift+C: blocked browser shortcut, no copy.
 
-    void copyTextToSystemClipboard(selectedText).then((result) => {
+    void copyTextToSystemClipboard(copyText).then((result) => {
       if (!result.ok) {
         console.debug('[gtmux] terminal copy failed', result.reason ?? 'Clipboard copy failed');
       }

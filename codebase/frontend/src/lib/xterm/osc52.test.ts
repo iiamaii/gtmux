@@ -1,5 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
-import { decodeOsc52Base64, makeOsc52Handler, OSC52_MAX_BYTES, runOnce } from './osc52';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  __resetOsc52Buffer,
+  decodeOsc52Base64,
+  makeOsc52Handler,
+  OSC52_FALLBACK_TTL_MS,
+  OSC52_MAX_BYTES,
+  rememberOsc52,
+  runOnce,
+  takeRecentOsc52,
+} from './osc52';
 
 // Standard base64 of a UTF-8 string. `btoa` is latin1-only, so encode to UTF-8
 // bytes first and feed each byte as a code unit. Avoids node-only `Buffer` so
@@ -11,6 +20,12 @@ function b64(text: string): string {
   return btoa(binary);
 }
 
+// D7 fallback buffer is module-scoped state — reset it after every test so
+// cases that exercise rememberOsc52 / the handler's buffer write don't bleed.
+afterEach(() => {
+  __resetOsc52Buffer();
+});
+
 interface Harness {
   handler: (data: string) => boolean;
   writes: string[];
@@ -18,7 +33,7 @@ interface Harness {
   allow: { value: boolean };
 }
 
-function harness(opts?: { allow?: boolean; maxBytes?: number }): Harness {
+function harness(opts?: { allow?: boolean; maxBytes?: number; now?: () => number }): Harness {
   const writes: string[] = [];
   const allow = { value: opts?.allow ?? true };
   let hints = 0;
@@ -28,6 +43,7 @@ function harness(opts?: { allow?: boolean; maxBytes?: number }): Harness {
     hint: () => {
       hints += 1;
     },
+    now: opts?.now,
     maxBytes: opts?.maxBytes,
   });
   // hints is captured by closure; expose via getter on the object.
@@ -181,5 +197,95 @@ describe('makeOsc52Handler — gate is queried lazily', () => {
     });
     handler('c;?');
     expect(allowWrite).not.toHaveBeenCalled();
+  });
+});
+
+// ── D7: gesture-backed Cmd+C fallback buffer ─────────────────────────────
+describe('rememberOsc52 + takeRecentOsc52 (D7)', () => {
+  it('default TTL constant is 10s', () => {
+    expect(OSC52_FALLBACK_TTL_MS).toBe(10_000);
+  });
+
+  it('returns the buffered text within the TTL', () => {
+    rememberOsc52('drag-copied', 1_000);
+    expect(takeRecentOsc52(10_000, 5_000)).toBe('drag-copied');
+  });
+
+  it('returns the text exactly at the TTL boundary (inclusive)', () => {
+    rememberOsc52('edge', 0);
+    // age === ttl is still fresh (only strictly-greater is stale).
+    expect(takeRecentOsc52(10_000, 10_000)).toBe('edge');
+  });
+
+  it('returns null once the TTL has elapsed', () => {
+    rememberOsc52('expired', 0);
+    expect(takeRecentOsc52(10_000, 10_001)).toBeNull();
+  });
+
+  it('returns null when the buffer was never filled', () => {
+    expect(takeRecentOsc52(10_000, 0)).toBeNull();
+  });
+
+  it('is one-shot: a successful take clears the buffer (second take → null)', () => {
+    rememberOsc52('once', 1_000);
+    expect(takeRecentOsc52(10_000, 2_000)).toBe('once');
+    expect(takeRecentOsc52(10_000, 2_000)).toBeNull();
+  });
+
+  it('clears a stale buffer on read so it never returns later', () => {
+    rememberOsc52('gone', 0);
+    expect(takeRecentOsc52(10_000, 99_999)).toBeNull(); // stale → cleared
+    // Even a fresh-looking nowMs cannot resurrect it.
+    expect(takeRecentOsc52(10_000, 0)).toBeNull();
+  });
+
+  it('a newer remember overwrites the previous buffered text', () => {
+    rememberOsc52('old', 0);
+    rememberOsc52('new', 100);
+    expect(takeRecentOsc52(10_000, 200)).toBe('new');
+  });
+
+  it('uses the default TTL when omitted', () => {
+    rememberOsc52('def', 0);
+    expect(takeRecentOsc52(undefined, OSC52_FALLBACK_TTL_MS)).toBe('def');
+    rememberOsc52('def2', 0);
+    expect(takeRecentOsc52(undefined, OSC52_FALLBACK_TTL_MS + 1)).toBeNull();
+  });
+});
+
+describe('makeOsc52Handler — D7 buffer is filled only past the gate', () => {
+  it('fills the fallback buffer on a gated write', () => {
+    const h = harness({ allow: true, now: () => 1_000 });
+    h.handler(`c;${b64('payload')}`);
+    expect(h.writes).toEqual(['payload']); // immediate write still happens
+    expect(takeRecentOsc52(10_000, 1_000)).toBe('payload'); // buffer populated
+  });
+
+  it('does NOT fill the buffer when the gate is closed (consent off)', () => {
+    const h = harness({ allow: false, now: () => 1_000 });
+    h.handler(`c;${b64('secret')}`);
+    expect(h.writes).toEqual([]);
+    // Gate closed → no consent → buffer must stay empty so the fallback can
+    // never copy text the user did not consent to (ADR-0049 D7 invariant).
+    expect(takeRecentOsc52(10_000, 1_000)).toBeNull();
+  });
+
+  it('does NOT fill the buffer for a read/query (`?`)', () => {
+    const h = harness({ allow: true, now: () => 1_000 });
+    h.handler('c;?');
+    expect(takeRecentOsc52(10_000, 1_000)).toBeNull();
+  });
+
+  it('does NOT fill the buffer for an oversized payload (D6)', () => {
+    const h = harness({ allow: true, maxBytes: 16, now: () => 1_000 });
+    h.handler(`c;${b64('x'.repeat(64))}`);
+    expect(h.writes).toEqual([]);
+    expect(takeRecentOsc52(10_000, 1_000)).toBeNull();
+  });
+
+  it('buffers the already-decoded, capped text (not the raw base64)', () => {
+    const h = harness({ allow: true, now: () => 0 });
+    h.handler(`c;${b64('héllo 한글 🚀')}`);
+    expect(takeRecentOsc52(10_000, 0)).toBe('héllo 한글 🚀');
   });
 });
