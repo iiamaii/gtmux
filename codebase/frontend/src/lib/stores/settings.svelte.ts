@@ -29,6 +29,9 @@ const DEFAULT_BEHAVIOR: BehaviorSettings = {
   auto_kill_terminal_on_panel_close: false,
   picker_show_hidden: false,
   reload_on_session_switch: true,
+  // ADR-0049 D3-(a) — default false (off). BE 미배선 시 snapshot 에 없을 수 있어
+  // applySnapshot 가 spread 해도 누락되면 이 default 가 남아 false 로 게이트.
+  osc52_clipboard_write_enabled: false,
 };
 
 class SettingsStore {
@@ -41,7 +44,10 @@ class SettingsStore {
 
   /** Server snapshot 으로 store 갱신. */
   applySnapshot(snap: SettingsSnapshot): void {
-    this.behavior = { ...snap.behavior };
+    // Merge over DEFAULT_BEHAVIOR so a field the BE has not wired yet (e.g.
+    // ADR-0049 osc52_clipboard_write_enabled before the BE handover lands)
+    // keeps its safe default instead of becoming undefined.
+    this.behavior = { ...DEFAULT_BEHAVIOR, ...snap.behavior };
     this.build = snap.build;
     this.server = snap.server;
     this.auth = snap.auth;

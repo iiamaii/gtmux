@@ -58,6 +58,14 @@ pub struct BehaviorSettings {
     /// Default `true` per the user request.
     #[serde(default = "default_reload_on_session_switch")]
     pub reload_on_session_switch: bool,
+    /// ADR-0049: when true, the FE may honor terminal OSC 52 clipboard
+    /// *write* sequences (e.g. drag-copy from a mouse-mode TUI like
+    /// `claude`). Default `false` — security-defaults §1.6 forbids
+    /// auto-enable; the user must explicitly opt in. The BE only stores
+    /// and exposes this flag; all clipboard logic, the secure-context
+    /// gate, and OSC 52 read-blocking live entirely in the FE.
+    #[serde(default)]
+    pub osc52_clipboard_write_enabled: bool,
 }
 
 const fn default_reload_on_session_switch() -> bool {
@@ -70,6 +78,9 @@ impl Default for BehaviorSettings {
             auto_kill_terminal_on_panel_close: false,
             picker_show_hidden: false,
             reload_on_session_switch: default_reload_on_session_switch(),
+            // Security default: never auto-enable (ADR-0049 D3-a,
+            // security-defaults §1.6). Must stay `false`.
+            osc52_clipboard_write_enabled: false,
         }
     }
 }
@@ -314,6 +325,20 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
                         .into_response();
                 };
                 next.picker_show_hidden = b;
+            }
+            "osc52_clipboard_write_enabled" => {
+                let Some(b) = value.as_bool() else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": "type_mismatch",
+                            "field": "behavior.osc52_clipboard_write_enabled",
+                            "expected": "bool",
+                        })),
+                    )
+                        .into_response();
+                };
+                next.osc52_clipboard_write_enabled = b;
             }
             other => {
                 return (
@@ -747,6 +772,123 @@ mod tests {
         // it without a re-PATCH.
         let live = *state.behavior_settings.read().await;
         assert!(live.auto_kill_terminal_on_panel_close);
+    }
+
+    #[tokio::test]
+    async fn get_default_osc52_clipboard_write_is_false() {
+        // ADR-0049 D3-a / security-defaults §1.6: the OSC 52 clipboard
+        // write consent flag MUST default to `false` and be present in
+        // the `behavior` section of the GET snapshot.
+        let (state, token) = test_state();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/settings")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["behavior"]["osc52_clipboard_write_enabled"],
+            serde_json::Value::Bool(false),
+            "OSC 52 clipboard write must default to false (ADR-0049 D3-a)"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_osc52_clipboard_write_toggle_roundtrips() {
+        // PATCH the flag to true via the existing behavior partial-merge
+        // path, then confirm both the PATCH response and a follow-up GET
+        // reflect the new value (ADR-0049 D3-a acceptance criteria).
+        let (state, token) = test_state();
+        let app = router(state.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PATCH)
+                    .uri("/api/settings")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"behavior":{"osc52_clipboard_write_enabled":true}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["behavior"]["osc52_clipboard_write_enabled"],
+            serde_json::Value::Bool(true)
+        );
+        // Runtime state reflects the change.
+        let live = *state.behavior_settings.read().await;
+        assert!(live.osc52_clipboard_write_enabled);
+
+        // A follow-up GET surfaces the persisted-in-memory value.
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/settings")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["behavior"]["osc52_clipboard_write_enabled"],
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_osc52_clipboard_write_type_mismatch_rejects_400() {
+        // A non-bool value for the flag must be rejected like the other
+        // behavior toggles.
+        let (state, token) = test_state();
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::PATCH)
+                    .uri("/api/settings")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"behavior":{"osc52_clipboard_write_enabled":"yes"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "type_mismatch");
+        assert_eq!(v["field"], "behavior.osc52_clipboard_write_enabled");
     }
 
     #[tokio::test]

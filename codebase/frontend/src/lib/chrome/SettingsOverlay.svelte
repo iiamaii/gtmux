@@ -33,7 +33,9 @@
   import { formatShortcutBinding } from '$lib/keyboard/shortcutDisplay';
   import { shortcutOverrides, normalizeShortcutBinding } from '$lib/stores/shortcutOverrides.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
+  import type { BehaviorSettings } from '$lib/http/settings';
   import { logout, rotateToken } from '$lib/http/auth';
+  import brandLogoUrl from '$lib/assets/brand.png';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import ShutdownModal from './ShutdownModal.svelte';
   import { sessionIODialog } from '$lib/stores/sessionIOdialog.svelte';
@@ -44,6 +46,17 @@
   const open = $derived(settingsDialog.open);
   const section = $derived(settingsDialog.section);
   const activeSessionName = $derived(sessionStore.active?.name ?? 'current session');
+
+  /**
+   * ADR-0049 D4 — OSC 52 terminal clipboard write needs a secure context
+   * (HTTPS or localhost). We keep the consent toggle enabled regardless so the
+   * user can grant it ahead of an HTTPS switch, but surface an inline warning
+   * when the current page is non-secure so it's clear the setting won't take
+   * effect yet. SSR-safe: `window` may be undefined during prerender.
+   */
+  const isSecureContext = $derived(
+    typeof window !== 'undefined' && window.isSecureContext === true,
+  );
 
   /* ── Section nav ─────────────────────────────────────────────────── */
 
@@ -89,45 +102,23 @@
   /* ── Behavior section ───────────────────────────────────────────── */
 
   /**
-   * `auto_kill_terminal_on_panel_close` 토글 — ADR-0021 G25.1.b.
-   * PATCH 실패 시 사용자에게 surface — 다음 close 가 default (modal 띄움) 로
-   * fallback 되므로 silent 보다 toast 가 안전.
+   * Behavior 토글 공통 처리 — auto_kill (ADR-0021 G25.1.b), picker_show_hidden
+   * (ADR-0035 D7), reload_on_session_switch (0077 follow-up).
+   *
+   * PATCH 실패 시 input.checked 를 store 값으로 되돌린다 — `checked` 는 one-way
+   * 바인딩이라 store 가 안 바뀌면 Svelte 가 DOM 을 재동기화하지 않고, 실패한
+   * 토글이 화면에 뒤집힌 채 남는다. 실패 자체는 toast 로 surface — 이후 동작이
+   * default 로 fallback 되므로 silent 보다 안전.
    */
-  async function setAutoKill(next: boolean): Promise<void> {
+  async function setBehaviorFlag(
+    key: keyof BehaviorSettings,
+    input: HTMLInputElement,
+  ): Promise<void> {
+    const next = input.checked;
     try {
-      await settingsStore.setBehavior({ auto_kill_terminal_on_panel_close: next });
+      await settingsStore.setBehavior({ [key]: next });
     } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Setting save failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
-  }
-
-  /** 0077 follow-up — session switch 완료 시 full page reload toggle. */
-  async function setReloadOnSwitch(next: boolean): Promise<void> {
-    try {
-      await settingsStore.setBehavior({ reload_on_session_switch: next });
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Setting save failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
-  }
-
-  async function setPickerShowHidden(next: boolean): Promise<void> {
-    try {
-      await settingsStore.setBehavior({ picker_show_hidden: next });
-    } catch (err) {
+      input.checked = settingsStore.behavior[key];
       if (err instanceof UnauthorizedError) {
         window.location.href = '/auth';
         return;
@@ -335,15 +326,44 @@
     return Array.from(map.entries()).sort((a, b) => a[0].localeCompare(b[0]));
   });
 
-  /* ── Close ───────────────────────────────────────────────────────── */
+  /* ── Close / keyboard ────────────────────────────────────────────── */
+
+  let overlayEl = $state<HTMLDivElement | undefined>();
 
   function close(): void {
     cancelCapture();
     settingsDialog.close();
   }
 
+  /** Modal primitive 와 동일한 단순 focus trap — Tab 이 overlay 안에서 순환. */
+  function trapTab(e: KeyboardEvent): void {
+    if (overlayEl === undefined) return;
+    const focusables = Array.from(
+      overlayEl.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      )
+    );
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (!first || !last) return;
+    if (document.activeElement === null || !overlayEl.contains(document.activeElement)) {
+      e.preventDefault();
+      first.focus();
+    } else if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
   function onWindowKey(e: KeyboardEvent): void {
     if (!open) return;
+    // ShutdownModal 이 위에 떠 있는 동안 Esc/Tab 소유권은 Modal primitive 쪽
+    // (bubble phase) 에 있다. capture phase 인 이 리스너가 먼저 받으므로
+    // 명시적으로 양보해야 Esc 가 confirm 만 닫고 settings 는 유지된다.
+    if (shutdownDialog.open) return;
     if (capturingActionId !== null) {
       const action = shortcutRegistry
         .listActions()
@@ -355,13 +375,30 @@
     if (e.key === 'Escape') {
       e.preventDefault();
       close();
+      return;
     }
+    if (e.key === 'Tab') trapTab(e);
   }
 
   $effect(() => {
     if (typeof window === 'undefined') return;
-    if (!open) return;
+    if (!open) {
+      // Cmd+, toggle 등 close() 를 거치지 않는 경로로 닫혀도 ShutdownModal 의
+      // dialog state 를 함께 정리 — 안 하면 다음 open 때 confirm 이 곧바로
+      // 다시 뜬다 (modal 은 {#if open} 안에 있어 unmount 만 된다).
+      shutdownDialog.close();
+      return;
+    }
     window.addEventListener('keydown', onWindowKey, { capture: true });
+    // 초기 focus — overlay 안 첫 focusable (Modal primitive 와 동일 정책).
+    queueMicrotask(() => {
+      if (!settingsDialog.open || overlayEl === undefined) return;
+      if (overlayEl.contains(document.activeElement)) return;
+      const focusable = overlayEl.querySelector<HTMLElement>(
+        'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      );
+      focusable?.focus();
+    });
     return () => window.removeEventListener('keydown', onWindowKey, { capture: true });
   });
 </script>
@@ -370,14 +407,6 @@
   <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M13 4.5V1.8h-2.7" />
     <path d="M12.6 4.2A5.2 5.2 0 1 0 13.2 9" />
-  </svg>
-{/snippet}
-
-{#snippet appIcon()}
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-    <rect x="4" y="4" width="16" height="16" rx="4" stroke="currentColor" stroke-width="1.6" />
-    <path d="M8 9.2h8M8 14.8h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-    <circle cx="16" cy="14.8" r="1.2" fill="currentColor" />
   </svg>
 {/snippet}
 
@@ -451,6 +480,7 @@
     onkeydown={() => {}}
   >
     <div
+      bind:this={overlayEl}
       class="settings-overlay"
       role="dialog"
       aria-modal="true"
@@ -537,63 +567,63 @@
                 <div class="shortcut-group">
                   <h4 class="group-head">{category}</h4>
                   <table class="shortcut-table">
-	                    <tbody>
-	                      {#each items as d (d.actionId)}
-	                        <tr>
-	                          <td class="desc">
-	                            <span>{d.description}</span>
-	                            {#if d.overridden}
-	                              <span class="shortcut-state">custom</span>
-	                            {/if}
-	                            {#if d.customizable === false && d.protectedReason}
-	                              <span class="shortcut-sub">{d.protectedReason}</span>
-	                            {/if}
-	                          </td>
-	                          <td class="combo mono">
-	                            {#if capturingActionId === d.actionId}
-	                              <button
-	                                type="button"
-	                                class="shortcut-capture"
-	                                onkeydown={(e) => commitShortcutCapture(d, e)}
-	                              >
-	                                Press keys…
-	                              </button>
-	                            {:else}
-	                              <button
-	                                type="button"
-	                                class="shortcut-button mono"
-	                                disabled={!d.customizable}
-	                                title={d.defaultBindings[0]
-	                                  ? `Default: ${formatShortcutBinding(d.defaultBindings[0])}`
-	                                  : undefined}
-	                                onclick={() => startCapture(d.actionId)}
-	                              >
-	                                {formatShortcutBinding(d.activeBindings[0])}
-	                              </button>
-	                            {/if}
-	                          </td>
-	                          <td class="shortcut-actions">
-	                            <button
-	                              type="button"
-	                              class="reset-btn"
-                                aria-label={`Reset shortcut for ${d.description}`}
-                                title="Reset shortcut"
-	                              disabled={!d.overridden}
-	                              onclick={() => resetShortcut(d.actionId)}
-	                            >
-	                              {@render resetIcon()}
-	                            </button>
-	                          </td>
-	                        </tr>
-	                      {/each}
-	                    </tbody>
-	                  </table>
-	                </div>
-	              {/each}
-	              {#if captureError !== null}
-	                <p class="shortcut-error" role="alert">{captureError}</p>
-	              {/if}
-	            {/if}
+                    <tbody>
+                      {#each items as d (d.actionId)}
+                        <tr>
+                          <td class="desc">
+                            <span>{d.description}</span>
+                            {#if d.overridden}
+                              <span class="shortcut-state">custom</span>
+                            {/if}
+                            {#if d.customizable === false && d.protectedReason}
+                              <span class="shortcut-sub">{d.protectedReason}</span>
+                            {/if}
+                          </td>
+                          <td class="combo mono">
+                            {#if capturingActionId === d.actionId}
+                              <button
+                                type="button"
+                                class="shortcut-capture"
+                                onkeydown={(e) => commitShortcutCapture(d, e)}
+                              >
+                                Press keys…
+                              </button>
+                            {:else}
+                              <button
+                                type="button"
+                                class="shortcut-button mono"
+                                disabled={!d.customizable}
+                                title={d.defaultBindings[0]
+                                  ? `Default: ${formatShortcutBinding(d.defaultBindings[0])}`
+                                  : undefined}
+                                onclick={() => startCapture(d.actionId)}
+                              >
+                                {formatShortcutBinding(d.activeBindings[0])}
+                              </button>
+                            {/if}
+                          </td>
+                          <td class="shortcut-actions">
+                            <button
+                              type="button"
+                              class="reset-btn"
+                              aria-label={`Reset shortcut for ${d.description}`}
+                              title="Reset shortcut"
+                              disabled={!d.overridden}
+                              onclick={() => resetShortcut(d.actionId)}
+                            >
+                              {@render resetIcon()}
+                            </button>
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {/each}
+              {#if captureError !== null}
+                <p class="shortcut-error" role="alert">{captureError}</p>
+              {/if}
+            {/if}
           {:else if section === 'storage'}
             <h3 class="section-head">Storage</h3>
             <p class="section-hint">Layout files, workspace file visibility, and storage-facing defaults.</p>
@@ -635,7 +665,7 @@
                   class="native-toggle"
                   type="checkbox"
                   checked={settingsStore.behavior.picker_show_hidden}
-                  onchange={(e) => void setPickerShowHidden((e.currentTarget as HTMLInputElement).checked)}
+                  onchange={(e) => void setBehaviorFlag('picker_show_hidden', e.currentTarget as HTMLInputElement)}
                 />
               </div>
             </label>
@@ -683,7 +713,7 @@
                   class="native-toggle"
                   type="checkbox"
                   checked={settingsStore.behavior.auto_kill_terminal_on_panel_close}
-                  onchange={(e) => void setAutoKill((e.currentTarget as HTMLInputElement).checked)}
+                  onchange={(e) => void setBehaviorFlag('auto_kill_terminal_on_panel_close', e.currentTarget as HTMLInputElement)}
                 />
               </div>
             </label>
@@ -698,7 +728,31 @@
                   class="native-toggle"
                   type="checkbox"
                   checked={settingsStore.behavior.reload_on_session_switch}
-                  onchange={(e) => void setReloadOnSwitch((e.currentTarget as HTMLInputElement).checked)}
+                  onchange={(e) => void setBehaviorFlag('reload_on_session_switch', e.currentTarget as HTMLInputElement)}
+                />
+              </div>
+            </label>
+            <div class="sgroup-head">Terminal</div>
+            <label class="srow">
+              <div>
+                <div class="lbl">Allow terminal clipboard copy (OSC 52)</div>
+                <div class="dsc">
+                  Lets terminal apps (e.g. claude) copy to your clipboard via OSC 52.
+                  Requires HTTPS or localhost; over plain HTTP it stays inactive.
+                </div>
+                {#if !isSecureContext}
+                  <div class="dsc-warn" role="note">
+                    This page is not a secure context, so this setting won't take
+                    effect until you reach gtmux over HTTPS or localhost.
+                  </div>
+                {/if}
+              </div>
+              <div class="ctl">
+                <input
+                  class="native-toggle"
+                  type="checkbox"
+                  checked={settingsStore.behavior.osc52_clipboard_write_enabled}
+                  onchange={(e) => void setBehaviorFlag('osc52_clipboard_write_enabled', e.currentTarget as HTMLInputElement)}
                 />
               </div>
             </label>
@@ -752,7 +806,7 @@
               Product identity, build metadata, local server status, and system-level actions.
             </p>
             <div class="about-id">
-              <div class="about-mark" aria-hidden="true">{@render appIcon()}</div>
+              <img class="about-mark" src={brandLogoUrl} alt="" aria-hidden="true" />
               <div>
                 <div class="about-name">gtmux</div>
                 <div class="about-tagline">tmux-backed Web Canvas Workspace</div>
@@ -761,6 +815,12 @@
                 </div>
               </div>
             </div>
+            <p class="about-desc">
+              gtmux renders your tmux sessions, windows, and panes as draggable
+              panels on an infinite web canvas. tmux owns the processes and
+              session lifecycle; the canvas owns the visual layout — terminals
+              keep running even when the browser is closed.
+            </p>
             <div class="sgroup-head">Build</div>
             <div class="info-row">
               <span class="info-icon">{@render packageIcon()}</span>
@@ -1079,6 +1139,14 @@
     max-width: 50ch;
   }
 
+  .dsc-warn {
+    color: var(--color-warning, var(--color-danger));
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
+    margin-top: 5px;
+    max-width: 50ch;
+  }
+
   .ctl {
     display: flex;
     align-items: center;
@@ -1300,20 +1368,28 @@
     display: flex;
     align-items: center;
     gap: 14px;
-    padding: 13px 0 15px;
-    border-bottom: 1px solid var(--color-border);
+    padding: 13px 0 0;
   }
 
+  /* Brand-mark — Titlebar/.auth 와 동일 asset (src/lib/assets/brand.png). */
   .about-mark {
     width: 40px;
     height: 40px;
-    display: grid;
-    place-items: center;
     border: 1px solid var(--color-border);
     border-radius: var(--radius-md);
-    background: var(--color-surface-2);
-    color: var(--color-accent);
+    object-fit: cover;
+    display: block;
     flex: 0 0 auto;
+  }
+
+  .about-desc {
+    margin: 0;
+    padding: 12px 0 15px;
+    border-bottom: 1px solid var(--color-border);
+    color: var(--color-fg-muted);
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
+    max-width: 58ch;
   }
 
   .about-name {

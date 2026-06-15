@@ -19,6 +19,10 @@ export interface BehaviorSettings {
    *  시 `window.location.reload()`. 첫 attach / modal cancel path 는 제외.
    *  Default `true` (BE 기본). state 정합의 *강제 reset* 의도. */
   reload_on_session_switch: boolean;
+  /** ADR-0049 D3-(a) — terminal OSC 52 클립보드 write 동의. Default `false`
+   *  (security-defaults §1.6). secure context 와 AND 되어야 실제 write 수행.
+   *  BE 미배선 시 snapshot 에서 누락될 수 있어 store default 가 false fallback. */
+  osc52_clipboard_write_enabled: boolean;
 }
 
 export interface BuildInfo {
