@@ -1,5 +1,6 @@
 // xterm.js 옵션 디폴트 — R2 F6 SECURE_XTERM_OPTIONS.
-// OSC 52 비활성, link handler non-http 금지, scrollback 500.
+// OSC 52 write = 게이트(secure context + 동의 setting) 시에만, read 금지 (ADR-0049).
+// link handler non-http 금지, scrollback 500.
 import type { ITerminalOptions } from '@xterm/xterm';
 
 export const SECURE_XTERM_OPTIONS: ITerminalOptions = {

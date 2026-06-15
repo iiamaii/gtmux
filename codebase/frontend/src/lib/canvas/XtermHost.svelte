@@ -1,3 +1,18 @@
+<script module lang="ts">
+  import { runOnce } from '$lib/xterm/osc52';
+  import { toastStore } from '$lib/ui/toast-store.svelte';
+
+  // ADR-0049 D3 / T3 — gate-closed hint, fired once PER SESSION (not per
+  // component). Lives in the module script so the once-guard is shared across
+  // every XtermHost instance, including mirrored instances of the same pane.
+  const osc52HintOnce = runOnce(() => {
+    toastStore.show({
+      message: 'Terminal clipboard copy needs HTTPS (or localhost) and the OSC 52 setting enabled.',
+      tone: 'warning',
+    });
+  });
+</script>
+
 <script lang="ts">
   // xterm.js hand-rolled wrapper — R8 §F1 (ADR-0012 D4·O1).
   //
@@ -38,7 +53,21 @@
   import { debugCount } from '$lib/common/debugCounts';
   import { themeStore } from '$lib/stores/theme.svelte';
   import { registerTerminalCopyProvider } from '$lib/keyboard/terminalCopyShortcut';
+  import { makeOsc52Handler } from '$lib/xterm/osc52';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
+  import { settingsStore } from '$lib/stores/settings.svelte';
   import type { WsClient } from '$lib/ws/client';
+
+  // ADR-0049 D3 dual gate: OSC 52 clipboard write is performed only when BOTH
+  // (a) the consent setting is on AND (b) the page is a secure context. Missing
+  // / undefined setting (BE not yet wired) falls back to false → off.
+  function osc52WriteAllowed(): boolean {
+    return (
+      settingsStore.behavior.osc52_clipboard_write_enabled === true &&
+      typeof window !== 'undefined' &&
+      window.isSecureContext === true
+    );
+  }
 
   // paneId 는 항상 numeric (legacy `%N` 의 N 또는 0x88 binding 으로 얻은 PaneId).
   // multi-session terminal item 의 UUID 는 본 컴포넌트에 도달하기 전에 PanelNode
@@ -171,6 +200,25 @@
       getSelection: () => term.getSelection(),
     });
 
+    // ADR-0049 — OSC 52 write-only clipboard handler. Registered per xterm
+    // instance, disposed in the cleanup below (mirror the copy provider / pane
+    // out lifecycle). Read/query (`?`) is swallowed (D2); the write is dual-gated
+    // (D3) and size-capped (D6). The handler never throws.
+    const osc52Disposable = term.parser.registerOscHandler(
+      52,
+      makeOsc52Handler({
+        allowWrite: osc52WriteAllowed,
+        writeClipboard: (text) => {
+          void copyTextToSystemClipboard(text).then((result) => {
+            if (!result.ok) {
+              console.debug('[gtmux] osc52 clipboard write failed', result.reason ?? 'unknown');
+            }
+          });
+        },
+        hint: osc52HintOnce,
+      }),
+    );
+
     // PaneOut 등록 — WS dispatcher 가 이 paneId 로 도착한 PANE_OUT(0x02) 을 본
     // 핸들러로 라우팅. `cb` 는 R2 F4 백프레셔 watermark 갱신 콜백 (term.write 가
     // 내부 buffer 플러시 후 호출).
@@ -296,6 +344,7 @@
         }
       }
       unregisterTerminalCopyProvider();
+      osc52Disposable.dispose();
       termRef = null;
       term.dispose();
     };
