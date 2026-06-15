@@ -47,6 +47,17 @@
   const section = $derived(settingsDialog.section);
   const activeSessionName = $derived(sessionStore.active?.name ?? 'current session');
 
+  /**
+   * ADR-0049 D4 — OSC 52 terminal clipboard write needs a secure context
+   * (HTTPS or localhost). We keep the consent toggle enabled regardless so the
+   * user can grant it ahead of an HTTPS switch, but surface an inline warning
+   * when the current page is non-secure so it's clear the setting won't take
+   * effect yet. SSR-safe: `window` may be undefined during prerender.
+   */
+  const isSecureContext = $derived(
+    typeof window !== 'undefined' && window.isSecureContext === true,
+  );
+
   /* ── Section nav ─────────────────────────────────────────────────── */
 
   const SECTION_GROUPS: {
@@ -721,6 +732,30 @@
                 />
               </div>
             </label>
+            <div class="sgroup-head">Terminal</div>
+            <label class="srow">
+              <div>
+                <div class="lbl">Allow terminal clipboard copy (OSC 52)</div>
+                <div class="dsc">
+                  Lets terminal apps (e.g. claude) copy to your clipboard via OSC 52.
+                  Requires HTTPS or localhost; over plain HTTP it stays inactive.
+                </div>
+                {#if !isSecureContext}
+                  <div class="dsc-warn" role="note">
+                    This page is not a secure context, so this setting won't take
+                    effect until you reach gtmux over HTTPS or localhost.
+                  </div>
+                {/if}
+              </div>
+              <div class="ctl">
+                <input
+                  class="native-toggle"
+                  type="checkbox"
+                  checked={settingsStore.behavior.osc52_clipboard_write_enabled}
+                  onchange={(e) => void setBehaviorFlag('osc52_clipboard_write_enabled', e.currentTarget as HTMLInputElement)}
+                />
+              </div>
+            </label>
           {:else if section === 'components'}
             <h3 class="section-head">Components</h3>
             <p class="section-hint">Browser-local presentation defaults for component viewers.</p>
@@ -1101,6 +1136,14 @@
     font-size: var(--text-base);
     line-height: var(--leading-normal);
     margin-top: 3px;
+    max-width: 50ch;
+  }
+
+  .dsc-warn {
+    color: var(--color-warning, var(--color-danger));
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
+    margin-top: 5px;
     max-width: 50ch;
   }
 
