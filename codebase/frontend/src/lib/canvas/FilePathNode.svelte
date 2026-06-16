@@ -104,9 +104,11 @@
   function onPickClick(e: MouseEvent): void {
     if (isLocked) return;
     e.stopPropagation();
-    filePicker.openFor('', (path) => {
-      void onCommit(path);
-    });
+    // ADR-0035 / ADR-0047 — file_path 는 파일/디렉터리 둘 다 참조 가능하므로
+    // picker 에 directory 선택을 허용하고 picked kind 를 그대로 반영.
+    filePicker.openFor('', (path, kind) => {
+      void onCommit(path, kind);
+    }, { allowDirectories: true });
   }
 
   async function onCopyPathDblClick(e: MouseEvent): Promise<void> {
@@ -130,14 +132,16 @@
     });
   }
 
-  async function onCommit(next: string): Promise<void> {
-    if (next === data.path) return;
+  async function onCommit(next: string, kind: 'directory' | 'file'): Promise<void> {
+    // Allow a kind-only change (file → directory at the same path is unusual
+    // but possible via the picker); skip only when both are unchanged.
+    if (next === data.path && kind === data.kind) return;
     await sessionStore.applyMutation(
       (cur) => ({
         ...cur,
         items: cur.items.map((it: CanvasItem) =>
           it.id === data.id && it.type === 'file_path'
-            ? ({ ...it, path: next, kind: 'file' } as FilePathItem)
+            ? ({ ...it, path: next, kind } as FilePathItem)
             : it,
         ),
       }),

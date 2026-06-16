@@ -2387,9 +2387,12 @@
       }
       if (tool === 'file_path') {
         const pos = centered('file_path');
-        filePicker.openFor('', (path) => {
+        // ADR-0035 / ADR-0047 — file_path 는 파일/디렉터리 둘 다 참조 가능.
+        // allowDirectories 로 picker 가 directory 선택을 노출하고, picked
+        // kind 를 그대로 item 에 반영 (files-tab drag-add 와 동일 동작).
+        filePicker.openFor('', (path, kind) => {
           const item = createCanvasItem('file_path', pos);
-          const withPath = { ...item, path, kind: 'file' as const };
+          const withPath = { ...item, path, kind };
           void commitNewItem(withPath)
             .then(() => {
               toolStore.consume();
@@ -2401,7 +2404,7 @@
               void sessionStore.reloadActiveLayout();
             })
             .catch(onSpawnError);
-        });
+        }, { allowDirectories: true });
         return;
       }
       if (tool === 'image') {
@@ -3384,8 +3387,9 @@
   accept={filePicker.accept}
   rootKind={filePicker.rootKind}
   rootPath={filePicker.rootPath}
+  allowDirectories={filePicker.allowDirectories}
   onCancel={() => filePicker.cancel()}
-  onSelect={(abs) => filePicker.select(abs)}
+  onSelect={(abs, kind) => filePicker.select(abs, kind)}
   onUnauthorized={() => { window.location.href = '/auth'; }}
 />
 
