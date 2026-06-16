@@ -60,7 +60,6 @@
     nearestDockCandidate,
     computeDock,
     dockMinForType,
-    type DockBox,
     type DockSide,
     type DockTarget,
   } from './edgeDock';
@@ -2596,8 +2595,11 @@
    * zoom 보정). 단일 item 드래그에서만 (M.size>1 이면 skip, D7).
    */
   const DOCK_DWELL_MS = 400; // proximity dwell before affordance activates (D2).
-  const DOCK_PROXIMITY_PX = 20; // threshold T in CANVAS coords (D2).
-  const DOCK_MOVE_EPSILON_PX = 4; // canvas-space movement that resets dwell (D2).
+  // Threshold T in SCREEN px (amend ②): converted to canvas coords as
+  // DOCK_PROXIMITY_SCREEN_PX / zoom so on-screen sensitivity is uniform across
+  // zoom levels (ADR-0051 D2). Detection is pointer ↔ side-line distance.
+  const DOCK_PROXIMITY_SCREEN_PX = 16;
+  const DOCK_MOVE_EPSILON_PX = 4; // canvas-space pointer movement that resets dwell (D2).
 
   /** Active dock affordance — non-null only after dwell, drives the overlay. */
   type ActiveDock = {
@@ -2614,7 +2616,9 @@
   // Pending dwell bookkeeping (not reactive — internal to the drag session).
   let dockDwellTimer: ReturnType<typeof setTimeout> | null = null;
   let dockDwellKey: string | null = null; // `${targetId}:${side}` of the pending candidate.
-  let dockLastDraggedPos: { x: number; y: number } | null = null; // last box top-left (canvas).
+  // Last *pointer* position (canvas) — dwell is pointer-driven now (amend ②), so
+  // "significant movement" tracks the pointer, not the dragged box top-left.
+  let dockLastPointer: { x: number; y: number } | null = null;
 
   function clearDockDwellTimer(): void {
     if (dockDwellTimer !== null) {
@@ -2627,7 +2631,7 @@
   /** Full reset of all dock state — call on drag stop / cancel. */
   function resetDockState(): void {
     clearDockDwellTimer();
-    dockLastDraggedPos = null;
+    dockLastPointer = null;
     activeDock = null;
   }
 
@@ -2679,35 +2683,40 @@
 
   /**
    * onnodedrag tick — scan for the nearest dock candidate and manage the dwell
-   * timer (ADR-0051 D2 / D3). Only for single-item drags of eligible items.
-   * `dragged` is the live (already store-updated) dragged item.
+   * timer (ADR-0051 D2 / D3 amend ②). Only for single-item drags of eligible
+   * items. `dragged` is the live (already store-updated) dragged item; `pointer`
+   * is the mouse pointer in canvas (flow) coords — detection is pointer-driven.
    */
-  function updateDockDwell(dragged: CanvasItem): void {
+  function updateDockDwell(dragged: CanvasItem, pointer: { x: number; y: number }): void {
     // Single-item only (D7) + eligible dragged type (D1).
     if (sessionStore.M.size > 1 || !eligibleForDock(dragged.type)) {
       resetDockState();
       return;
     }
 
-    const draggedBox: DockBox = { x: dragged.x, y: dragged.y, w: dragged.w, h: dragged.h };
-    // Threshold T is canvas-space; DOCK_PROXIMITY_PX is already canvas coords.
-    const candidate = nearestDockCandidate(draggedBox, dockTargetsFor(dragged.id), DOCK_PROXIMITY_PX);
+    // Threshold T is canvas-space: screen 16px / zoom (amend ②) so on-screen
+    // sensitivity is uniform across zoom levels. Detection is the pointer's
+    // point-to-segment distance to each target side line.
+    const zoom = sessionStore.viewport.zoom || 1;
+    const T = DOCK_PROXIMITY_SCREEN_PX / zoom;
+    const candidate = nearestDockCandidate(pointer, dockTargetsFor(dragged.id), T);
 
     if (candidate === null) {
       // Proximity exit — cancel any pending dwell + active affordance (D8).
       clearDockDwellTimer();
-      dockLastDraggedPos = { x: dragged.x, y: dragged.y };
+      dockLastPointer = { x: pointer.x, y: pointer.y };
       if (activeDock !== null) activeDock = null;
       return;
     }
 
     const key = `${candidate.targetId}:${candidate.side}`;
-    // "Significant movement" since last tick resets the dwell (D2).
+    // "Significant movement" since last tick resets the dwell (D2) — tracks the
+    // pointer (canvas), since detection is pointer-driven (amend ②).
     const moved =
-      dockLastDraggedPos !== null &&
-      (Math.abs(dragged.x - dockLastDraggedPos.x) > DOCK_MOVE_EPSILON_PX ||
-        Math.abs(dragged.y - dockLastDraggedPos.y) > DOCK_MOVE_EPSILON_PX);
-    dockLastDraggedPos = { x: dragged.x, y: dragged.y };
+      dockLastPointer !== null &&
+      (Math.abs(pointer.x - dockLastPointer.x) > DOCK_MOVE_EPSILON_PX ||
+        Math.abs(pointer.y - dockLastPointer.y) > DOCK_MOVE_EPSILON_PX);
+    dockLastPointer = { x: pointer.x, y: pointer.y };
 
     // Candidate changed → drop any already-active affordance + restart dwell.
     if (key !== dockDwellKey) {
@@ -2819,7 +2828,14 @@
     return movedById;
   }
 
-  function onnodedrag({ nodes }: { targetNode: Node | null; nodes: Node[] }) {
+  function onnodedrag({
+    nodes,
+    event,
+  }: {
+    targetNode: Node | null;
+    nodes: Node[];
+    event: MouseEvent | TouchEvent;
+  }) {
     if (nodes.length === 0) return;
     if (sessionStore.active === null) return;
     const movedById = movedItemsFromNodes(nodes);
@@ -2833,12 +2849,20 @@
     }
     refreshLivePathCaches(movedById);
 
-    // ADR-0051 — edge-dock dwell scan. Single-item drag only (D7). The dragged
-    // item's box is already in canvas (flow) coords from movedItemsFromNodes,
-    // so nearestDockCandidate's threshold is correctly in canvas space (D2).
-    if (movedById.size === 1) {
+    // ADR-0051 (amend ②) — edge-dock dwell scan. Single-item drag only (D7).
+    // Detection is pointer-driven: convert the drag event's screen pointer to
+    // canvas (flow) coords via screenToFlowPosition. If there is no usable
+    // pointer (e.g. keyboard-driven moves expose no clientX), skip dock.
+    const px = (event as MouseEvent | undefined)?.clientX;
+    const py = (event as MouseEvent | undefined)?.clientY;
+    if (movedById.size === 1 && typeof px === 'number' && typeof py === 'number') {
       const [dragged] = movedById.values();
-      if (dragged !== undefined) updateDockDwell(dragged);
+      if (dragged !== undefined) {
+        const pointer = screenToFlowPosition({ x: px, y: py });
+        updateDockDwell(dragged, pointer);
+      } else {
+        resetDockState();
+      }
     } else {
       resetDockState();
     }

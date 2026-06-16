@@ -7,6 +7,11 @@
 // commit 을 수행한다. 좌표는 모두 *canvas (flow) space* — caller 가 screen px 를
 // viewport zoom 으로 나눠 canvas 좌표로 변환한 뒤 넘긴다 (ADR-0051 D2).
 //
+// Detection (amend ②): side 판정은 dragged-box-edge 가 아니라 *마우스 포인터*
+// (canvas 좌표) ↔ target 4 side line segment 의 point-to-segment 거리 기반이다.
+// 최소 거리 side 가 후보이며 grab-offset/박스 크기에 무관해 전 컴포넌트 동일
+// 민감도를 갖는다 (ADR-0051 D2/D3 amend ②). 배치/커밋(computeDock) 은 불변.
+//
 // 재사용: 박스 수학은 `alignment.ts` 의 BBox 규약(x/y/w/h, top-left origin)과
 // 정합. min-size 는 per-node NodeResizer minimum(아래 DOCK_MIN_SIZE)과 일치.
 
@@ -36,12 +41,23 @@ export interface DockTarget {
   type: CanvasItemType;
 }
 
-/** Result of proximity scan — the chosen (target, side) and its edge gap. */
+/** Result of proximity scan — the chosen (target, side) and its line distance. */
 export interface DockCandidate {
   targetId: string;
   side: DockSide;
-  /** Perpendicular distance between dragged edge and target side (canvas px). */
+  /**
+   * Point-to-segment distance (canvas px) between the mouse pointer and the
+   * chosen target side line segment (ADR-0051 D2/D3 amend ②). Smaller = closer.
+   * Named `gap` for continuity with the prior box-edge model; the value now
+   * measures pointer ↔ side-line proximity, not dragged-edge ↔ side gap.
+   */
   gap: number;
+}
+
+/** A point in canvas (flow) coordinates. */
+export interface DockPoint {
+  x: number;
+  y: number;
 }
 
 /** Final landing box after size-match + flush placement (ADR-0051 D5). */
@@ -98,38 +114,79 @@ function isVerticalSide(side: DockSide): boolean {
   return side === 'L' || side === 'R';
 }
 
-/** Overlap length of [a0,a1] ∩ [b0,b1]. ≤0 means no overlap. */
-function overlapLength(a0: number, a1: number, b0: number, b1: number): number {
-  return Math.min(a1, b1) - Math.max(a0, b0);
+/**
+ * Perpendicular distance from point (px,py) to the axis-aligned line segment
+ * [(ax,ay)→(bx,by)], clamped to the segment endpoints. For our 4 sides the
+ * segment is always axis-aligned, so this reduces to: distance along the
+ * constant axis + (if the point projects beyond the segment) the overshoot
+ * along the varying axis. A pointer beyond a corner therefore measures the
+ * straight-line distance to the nearest segment endpoint (ADR-0051 D3 amend ②).
+ */
+function pointToSegmentDist(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  // Degenerate (zero-length) segment → distance to the point.
+  if (lenSq === 0) return Math.hypot(px - ax, py - ay);
+  // Project (p − a) onto the segment, clamped to [0,1].
+  let t = ((px - ax) * dx + (py - ay) * dy) / lenSq;
+  if (t < 0) t = 0;
+  else if (t > 1) t = 1;
+  const cx = ax + t * dx;
+  const cy = ay + t * dy;
+  return Math.hypot(px - cx, py - cy);
 }
 
 /**
- * Find the nearest dock candidate for the dragged box across `targets`
- * (ADR-0051 D3).
+ * Find the nearest dock candidate for the mouse `pointer` across `targets`
+ * (ADR-0051 D2/D3 amend ②).
  *
- * For each target side the dragged item's matching edge gap is measured and the
- * perpendicular-axis overlap is required (so a box far above/below a target's
- * right side does NOT dock). Among candidates within threshold `T` the minimum
- * gap wins; ties broken by deterministic side order L,R,T,B.
+ * Detection is now POINTER-BASED, not dragged-box-edge-based. Each target's 4
+ * sides are treated as line SEGMENTS (their actual edge extents); for every
+ * side the point-to-segment distance from the pointer is measured (clamped to
+ * the segment endpoints — a pointer beyond a corner measures distance to the
+ * nearest endpoint). A side is a candidate only if its distance ≤ threshold
+ * `T`. Among all candidates across all targets the MINIMUM distance wins; exact
+ * ties broken by deterministic side order L,R,T,B (target iteration is stable).
+ *
+ * There is NO overlap requirement anymore — the pointer fully determines both
+ * the target and the side. If the pointer is farther than `T` from every side
+ * segment (e.g. deep inside a large target, away from all edges) there is no
+ * candidate → null ("라인 위에서만 인지", user decision 2026-06-16 ②). Because
+ * the metric is pointer-to-line distance it is size-independent and free of
+ * grab-offset bias → uniform on-screen sensitivity across all components.
+ *
+ * Side segments (target box = x,y,w,h):
+ *   L: x = x,     y ∈ [y, y+h]
+ *   R: x = x+w,   y ∈ [y, y+h]
+ *   T: y = y,     x ∈ [x, x+w]
+ *   B: y = y+h,   x ∈ [x, x+w]
  *
  * Targets MUST be pre-filtered by the caller to: eligible type, not locked,
  * visible, not minimized, not the dragged item itself (ADR-0051 D8). This keeps
  * the high-frequency onnodedrag path linear in the (small) target count.
  *
- * @returns the chosen candidate, or null if none is within `T` with overlap.
+ * @param pointer mouse pointer in canvas (flow) coordinates.
+ * @param T proximity threshold in canvas coords (caller: screen px / zoom).
+ * @returns the chosen candidate, or null if no side is within `T`.
  */
 export function nearestDockCandidate(
-  draggedBox: DockBox,
+  pointer: DockPoint,
   targets: readonly DockTarget[],
   T: number,
 ): DockCandidate | null {
-  const dl = draggedBox.x;
-  const dr = draggedBox.x + draggedBox.w;
-  const dt = draggedBox.y;
-  const db = draggedBox.y + draggedBox.h;
+  const px = pointer.x;
+  const py = pointer.y;
 
   let best: DockCandidate | null = null;
-  // Deterministic side precedence on exact gap ties (ADR-0051 D3).
+  // Deterministic side precedence on exact distance ties (ADR-0051 D3).
   const sideRank: Record<DockSide, number> = { L: 0, R: 1, T: 2, B: 3 };
 
   for (const target of targets) {
@@ -139,38 +196,29 @@ export function nearestDockCandidate(
     const tt = tb.y;
     const tbot = tb.y + tb.h;
 
-    // Vertical sides (L/R): require vertical-axis overlap.
-    const vOverlap = overlapLength(dt, db, tt, tbot);
-    if (vOverlap > 0) {
-      // Right side: dragged left edge approaches target right edge.
-      considerCandidate(target.id, 'R', Math.abs(dl - tr));
-      // Left side: dragged right edge approaches target left edge.
-      considerCandidate(target.id, 'L', Math.abs(dr - tl));
-    }
-
-    // Horizontal sides (T/B): require horizontal-axis overlap.
-    const hOverlap = overlapLength(dl, dr, tl, tr);
-    if (hOverlap > 0) {
-      // Bottom side: dragged top edge approaches target bottom edge.
-      considerCandidate(target.id, 'B', Math.abs(dt - tbot));
-      // Top side: dragged bottom edge approaches target top edge.
-      considerCandidate(target.id, 'T', Math.abs(db - tt));
-    }
+    // L side: vertical segment at x = tl, y ∈ [tt, tbot].
+    considerCandidate(target.id, 'L', pointToSegmentDist(px, py, tl, tt, tl, tbot));
+    // R side: vertical segment at x = tr, y ∈ [tt, tbot].
+    considerCandidate(target.id, 'R', pointToSegmentDist(px, py, tr, tt, tr, tbot));
+    // T side: horizontal segment at y = tt, x ∈ [tl, tr].
+    considerCandidate(target.id, 'T', pointToSegmentDist(px, py, tl, tt, tr, tt));
+    // B side: horizontal segment at y = tbot, x ∈ [tl, tr].
+    considerCandidate(target.id, 'B', pointToSegmentDist(px, py, tl, tbot, tr, tbot));
   }
 
-  function considerCandidate(targetId: string, side: DockSide, gap: number): void {
-    if (gap > T) return;
+  function considerCandidate(targetId: string, side: DockSide, dist: number): void {
+    if (dist > T) return;
     if (best === null) {
-      best = { targetId, side, gap };
+      best = { targetId, side, gap: dist };
       return;
     }
-    if (gap < best.gap - 1e-6) {
-      best = { targetId, side, gap };
+    if (dist < best.gap - 1e-6) {
+      best = { targetId, side, gap: dist };
       return;
     }
-    // Exact-gap tie → deterministic side order.
-    if (Math.abs(gap - best.gap) <= 1e-6 && sideRank[side] < sideRank[best.side]) {
-      best = { targetId, side, gap };
+    // Exact-distance tie → deterministic side order.
+    if (Math.abs(dist - best.gap) <= 1e-6 && sideRank[side] < sideRank[best.side]) {
+      best = { targetId, side, gap: dist };
     }
   }
 

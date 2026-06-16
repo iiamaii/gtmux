@@ -10,8 +10,10 @@ import {
 } from '$lib/canvas/edgeDock';
 
 // ADR-0051 — edge-dock with size-match. Pure geometry coverage:
-// 4 sides × { normal, min-clamp, image-aspect-preserve } + no-overlap→null +
-// figure-excluded→null.
+// detection (amend ②, pointer-based): pointer near each of the 4 side segments,
+// deep-center → null, beyond-corner (segment-endpoint) within/over T, nearest of
+// two targets, tie-break order. Placement (computeDock) is UNCHANGED:
+// 4 sides × { normal, min-clamp, image-aspect-preserve }.
 
 const T = 20; // proximity threshold (canvas px).
 
@@ -21,6 +23,7 @@ function target(box: DockBox, type: DockTarget['type'] = 'note'): DockTarget {
 }
 
 const TARGET: DockBox = { x: 100, y: 100, w: 200, h: 160 };
+// TARGET sides: L x=100, R x=300, T y=100, B y=260; extents x∈[100,300] y∈[100,260].
 
 describe('eligibleForDock', () => {
   it('accepts the 6 eligible types', () => {
@@ -35,71 +38,97 @@ describe('eligibleForDock', () => {
   });
 });
 
-describe('nearestDockCandidate — 4 sides with overlap', () => {
-  it('RIGHT side: dragged left edge near target right edge', () => {
-    // target right = 300. dragged at x=312 (gap 12), vertically overlapping.
-    const dragged: DockBox = { x: 312, y: 120, w: 150, h: 100 };
-    const c = nearestDockCandidate(dragged, [target(TARGET)], T);
+describe('nearestDockCandidate — pointer near each side segment (amend ②)', () => {
+  it('RIGHT side: pointer just outside the right edge', () => {
+    // R segment x=300, y∈[100,260]. Pointer (312, 180) → dist 12, within extent.
+    const c = nearestDockCandidate({ x: 312, y: 180 }, [target(TARGET)], T);
     expect(c).not.toBeNull();
     expect(c?.side).toBe('R');
     expect(c?.gap).toBeCloseTo(12);
   });
 
-  it('LEFT side: dragged right edge near target left edge', () => {
-    // target left = 100. dragged right edge at 90 (x=-60+w=150 → right 90, gap 10).
-    const dragged: DockBox = { x: -60, y: 120, w: 150, h: 100 };
-    const c = nearestDockCandidate(dragged, [target(TARGET)], T);
+  it('LEFT side: pointer just outside the left edge', () => {
+    // L segment x=100, y∈[100,260]. Pointer (90, 180) → dist 10.
+    const c = nearestDockCandidate({ x: 90, y: 180 }, [target(TARGET)], T);
     expect(c?.side).toBe('L');
     expect(c?.gap).toBeCloseTo(10);
   });
 
-  it('BOTTOM side: dragged top edge near target bottom edge', () => {
-    // target bottom = 260. dragged top at 275 (gap 15), horizontally overlapping.
-    const dragged: DockBox = { x: 120, y: 275, w: 150, h: 100 };
-    const c = nearestDockCandidate(dragged, [target(TARGET)], T);
+  it('BOTTOM side: pointer just below the bottom edge', () => {
+    // B segment y=260, x∈[100,300]. Pointer (200, 275) → dist 15.
+    const c = nearestDockCandidate({ x: 200, y: 275 }, [target(TARGET)], T);
     expect(c?.side).toBe('B');
     expect(c?.gap).toBeCloseTo(15);
   });
 
-  it('TOP side: dragged bottom edge near target top edge', () => {
-    // target top = 100. dragged bottom at 92 (y=-8+h=100 → bottom 92, gap 8).
-    const dragged: DockBox = { x: 120, y: -8, w: 150, h: 100 };
-    const c = nearestDockCandidate(dragged, [target(TARGET)], T);
+  it('TOP side: pointer just above the top edge', () => {
+    // T segment y=100, x∈[100,300]. Pointer (200, 92) → dist 8.
+    const c = nearestDockCandidate({ x: 200, y: 92 }, [target(TARGET)], T);
     expect(c?.side).toBe('T');
     expect(c?.gap).toBeCloseTo(8);
   });
 
-  it('picks the minimum gap across candidates (D3)', () => {
-    // Two targets: t-right gap 12, t-left gap 4 → left wins.
-    const tRight: DockTarget = { id: 'right', box: { x: 100, y: 100, w: 100, h: 100 }, type: 'note' };
-    const tLeft: DockTarget = { id: 'left', box: { x: 470, y: 100, w: 100, h: 100 }, type: 'note' };
-    // dragged occupies x 300..466 → right edge 466, near tLeft.x=470 (gap 4);
-    // left edge 300, near tRight.right=200 (gap 100). Min gap = tLeft (4).
-    const dragged: DockBox = { x: 300, y: 120, w: 166, h: 60 };
-    const c = nearestDockCandidate(dragged, [tRight, tLeft], T);
-    expect(c?.targetId).toBe('left');
-    expect(c?.side).toBe('L');
-    expect(c?.gap).toBeCloseTo(4);
+  it('pointer just inside an edge still detects that side (line-band, both sides)', () => {
+    // Pointer (305, 180): 5 outside the R line → R wins (T(20) band straddles edge).
+    const c = nearestDockCandidate({ x: 305, y: 180 }, [target(TARGET)], T);
+    expect(c?.side).toBe('R');
+    expect(c?.gap).toBeCloseTo(5);
   });
 });
 
-describe('nearestDockCandidate — no candidate', () => {
-  it('no perpendicular overlap → null even when gap small', () => {
-    // Horizontally near target right (gap 5) but far below → no vertical overlap.
-    const dragged: DockBox = { x: 305, y: 400, w: 150, h: 100 };
-    expect(nearestDockCandidate(dragged, [target(TARGET)], T)).toBeNull();
+describe('nearestDockCandidate — no candidate (line-only detection)', () => {
+  it('deep center of a large target → null (away from all edges)', () => {
+    // Center (200,180): nearest side distances are 80 (L/R reach) and 80 (T/B
+    // reach) — all > T(20). Pointer is not near any line → no candidate.
+    expect(nearestDockCandidate({ x: 200, y: 180 }, [target(TARGET)], T)).toBeNull();
   });
 
-  it('gap beyond threshold → null', () => {
-    // Vertically overlapping but gap 50 > T(20).
-    const dragged: DockBox = { x: 350, y: 120, w: 150, h: 100 };
-    expect(nearestDockCandidate(dragged, [target(TARGET)], T)).toBeNull();
+  it('pointer beyond the threshold from every side → null', () => {
+    // (350,180) is 50 right of R line (x=300), far from L/T/B too → null.
+    expect(nearestDockCandidate({ x: 350, y: 180 }, [target(TARGET)], T)).toBeNull();
   });
 
   it('empty target list (figure-excluded pre-filter) → null', () => {
     // Caller pre-filters figures; with all figures excluded the list is empty.
-    const dragged: DockBox = { x: 312, y: 120, w: 150, h: 100 };
-    expect(nearestDockCandidate(dragged, [], T)).toBeNull();
+    expect(nearestDockCandidate({ x: 312, y: 180 }, [], T)).toBeNull();
+  });
+});
+
+describe('nearestDockCandidate — corner / segment-endpoint distance (amend ②)', () => {
+  it('pointer beyond a corner uses distance to the nearest endpoint (within T)', () => {
+    // Top-right corner is (300,100). Pointer (306,92): beyond the R segment top
+    // and beyond the T segment right → both clamp to the corner endpoint.
+    // dist = hypot(6,8) = 10 ≤ T → candidate. Exact L,R,T,B tie-break: R before T.
+    const c = nearestDockCandidate({ x: 306, y: 92 }, [target(TARGET)], T);
+    expect(c).not.toBeNull();
+    expect(c?.gap).toBeCloseTo(10);
+    expect(c?.side).toBe('R');
+  });
+
+  it('pointer beyond a corner farther than T → null', () => {
+    // Top-right corner (300,100). Pointer (320,80): hypot(20,20)=28.28 > T(20).
+    expect(nearestDockCandidate({ x: 320, y: 80 }, [target(TARGET)], T)).toBeNull();
+  });
+});
+
+describe('nearestDockCandidate — multiple targets + tie-break', () => {
+  it('picks the nearest of two competing targets (min distance wins)', () => {
+    // tA right line x=200 (10 from pointer x=210); tB left line x=470 — far.
+    const tA: DockTarget = { id: 'A', box: { x: 100, y: 100, w: 100, h: 200 }, type: 'note' };
+    const tB: DockTarget = { id: 'B', box: { x: 470, y: 100, w: 100, h: 200 }, type: 'note' };
+    const c = nearestDockCandidate({ x: 210, y: 180 }, [tA, tB], T);
+    expect(c?.targetId).toBe('A');
+    expect(c?.side).toBe('R');
+    expect(c?.gap).toBeCloseTo(10);
+  });
+
+  it('exact-distance tie within one target → deterministic side order L,R,T,B', () => {
+    // Pointer at the exact center of a small square: equal distance to all 4
+    // sides → L (rank 0) wins. Box 40×40 at (0,0), center (20,20), each dist 20.
+    const sq: DockTarget = { id: 'sq', box: { x: 0, y: 0, w: 40, h: 40 }, type: 'note' };
+    const c = nearestDockCandidate({ x: 20, y: 20 }, [sq], T);
+    expect(c?.side).toBe('L');
+    expect(c?.gap).toBeCloseTo(20);
   });
 });
 
