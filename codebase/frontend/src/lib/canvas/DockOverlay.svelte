@@ -25,17 +25,26 @@
   import type { DockSide } from './edgeDock';
 
   interface OverlayData {
-    /** Which side of the ghost touches the target (the flush edge). */
+    /** Side of the *target* the dragged item docks against (matches `DockSide`). */
     side: DockSide;
   }
 
+  /**
+   * The ghost is placed flush on the target's `side`, so the ghost edge that
+   * actually TOUCHES the target is the OPPOSITE one (docked against target's
+   * right → ghost's left edge interfaces; etc.). The solid "interfacing" line
+   * must go on that touching edge, not the same-named outer edge.
+   */
+  const OPPOSITE_SIDE: Record<DockSide, DockSide> = { L: 'R', R: 'L', T: 'B', B: 'T' };
+
   let { data }: { data: OverlayData } = $props();
   const side = $derived(data.side);
+  const interfaceSide = $derived(OPPOSITE_SIDE[side]);
 </script>
 
 <div class="dock-overlay" data-side={side}>
   <div class="dock-ghost"></div>
-  <div class="dock-side" data-side={side}></div>
+  <div class="dock-side" data-side={interfaceSide}></div>
 </div>
 
 <style>
