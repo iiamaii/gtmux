@@ -20,8 +20,21 @@
 //!
 //! Metadata is *in-memory only* — it is recreated whenever the server boots,
 //! since both the `terminal_map` and the alive PTY pool are themselves
-//! ephemeral. Persistence would buy nothing the schema doesn't already give
-//! us (the UUID itself survives in session files, ADR-0018 D2).
+//! ephemeral. The `created_at` timestamp is the only authoritative datum
+//! here; losing it on reboot is acceptable (the row simply shows the
+//! re-registration time).
+//!
+//! **`label` is no longer authoritative (ADR-0050 D4).** An earlier version
+//! of this comment claimed in-memory metadata was sufficient because "the
+//! UUID survives in session files (ADR-0018 D2)" — that rested on the false
+//! premise that the layout already persisted the terminal's label. It did
+//! not: the rename path wrote only to this in-memory store, so the label was
+//! lost on every reboot. ADR-0050 makes the persisted layout `ItemCommon.label`
+//! (per-panel, on disk) the single source of truth for a terminal panel's
+//! label. The `label` carried here (and exposed by `GET /api/terminals` +
+//! `PATCH /api/terminals/:id`) is therefore **deprecated and vestigial** —
+//! kept only so in-flight FE readers / generated TS types don't break during
+//! the transition. Full removal is a tracked follow-up, not this change.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,8 +58,18 @@ pub const MAX_LABEL_BYTES: usize = 4096;
 /// unregisters (terminal death or explicit kill).
 #[derive(Debug, Clone)]
 pub struct TerminalMetadata {
-    /// User-supplied free-form label. Empty by default; populated via PATCH
-    /// (P1+). Bound by [`MAX_LABEL_BYTES`].
+    /// **DEPRECATED (ADR-0050 D4).** User-supplied free-form label, populated
+    /// via the now-deprecated `PATCH /api/terminals/:id` path. The terminal
+    /// panel label's source of truth is the persisted layout `ItemCommon.label`
+    /// (per-panel, on disk), *not* this in-memory field. Retained only so the
+    /// `GET /api/terminals` response shape and any in-flight FE reader stay
+    /// stable during the transition; it is no longer authoritative and full
+    /// removal is a tracked follow-up. Bound by [`MAX_LABEL_BYTES`].
+    ///
+    /// Note: a `#[deprecated]` attribute is intentionally *not* used here — the
+    /// field is still read internally (e.g. by [`list_handler`]) and CI builds
+    /// with `-D warnings`, so the deprecated-self-use warning would fail the
+    /// build. Doc-comment deprecation is used instead.
     pub label: String,
     /// Unix epoch seconds at which this UUID was first registered with the
     /// store. Stable across re-spawns of the same UUID (e.g. dangling →
@@ -96,9 +119,17 @@ impl TerminalMetadataStore {
         self.inner.read().await.get(uuid).cloned()
     }
 
-    /// Set the label on an existing entry. Returns `false` when the UUID
-    /// is unknown — callers map that to 404 so the FE does not silently
-    /// race with a terminal deletion.
+    /// **DEPRECATED (ADR-0050 D4).** Set the label on an existing entry.
+    /// Returns `false` when the UUID is unknown — callers map that to 404 so
+    /// the FE does not silently race with a terminal deletion.
+    ///
+    /// The terminal panel label now lives in the persisted layout
+    /// `ItemCommon.label`; this in-memory write is vestigial and no longer
+    /// authoritative. Kept (along with [`patch_handler`]) only so the route
+    /// and response shape stay stable during the FE transition. Full removal
+    /// is a tracked follow-up. (No `#[deprecated]` attribute: the method is
+    /// still called internally by [`patch_handler`] and CI builds with
+    /// `-D warnings`.)
     pub async fn set_label(&self, uuid: &str, label: String) -> bool {
         let mut g = self.inner.write().await;
         match g.get_mut(uuid) {
@@ -131,7 +162,12 @@ pub struct TerminalInfo {
     /// terminals are unregistered, but kept as a field for forward compat
     /// with the dangling state coming in Batch 4-D.
     pub alive: bool,
-    /// User label, empty by default.
+    /// **DEPRECATED (ADR-0050 D4).** Mirror of the in-memory
+    /// [`TerminalMetadata::label`]. The terminal panel label's source of
+    /// truth is the persisted layout `ItemCommon.label`, not this field.
+    /// Retained in the response (always present, may be empty) so in-flight
+    /// FE readers / generated TS types don't break during the transition;
+    /// it is vestigial and full removal is a tracked follow-up.
     pub label: String,
     /// Unix seconds; stable across re-spawns of the same UUID.
     pub created_at: u64,
@@ -321,14 +357,35 @@ pub async fn respawn_handler(
 }
 
 /// Body for [`patch_handler`].
+///
+/// **DEPRECATED (ADR-0050 D4).** See [`patch_handler`].
 #[derive(Debug, Deserialize)]
 pub struct PatchTerminalBody {
-    /// New free-form label. Cap = [`MAX_LABEL_BYTES`].
+    /// **DEPRECATED (ADR-0050 D4).** New free-form label. Cap =
+    /// [`MAX_LABEL_BYTES`]. Writes only to the vestigial in-memory
+    /// [`TerminalMetadata::label`]; the authoritative terminal panel label
+    /// is the persisted layout `ItemCommon.label`.
     pub label: String,
 }
 
-/// `PATCH /api/terminals/:id` — update the user-supplied label on an
-/// existing Terminal metadata entry (BE-8). Returns:
+/// **DEPRECATED (ADR-0050 D4).** `PATCH /api/terminals/:id` — update the
+/// user-supplied label on an existing Terminal metadata entry (BE-8).
+///
+/// This endpoint is **vestigial**. The terminal panel label now lives in the
+/// persisted layout `ItemCommon.label` (per-panel, on disk), written via the
+/// layout-mutation path (`PUT /api/sessions/:name/layout`). The route is kept
+/// present, and continues to return its documented status codes, only so any
+/// in-flight FE caller / generated TS type doesn't break during the transition
+/// — its label write no longer feeds any authoritative display surface. Full
+/// removal (route + body + [`TerminalMetadataStore::set_label`]) is a tracked
+/// follow-up, not this change.
+///
+/// (No `#[deprecated]` attribute: the handler self-uses the deprecated
+/// [`PatchTerminalBody`] / [`TerminalMetadataStore::set_label`] and CI builds
+/// with `-D warnings`, so the attribute would fail the build. Doc-comment
+/// deprecation is used instead.)
+///
+/// Returns:
 ///   * 204 on success
 ///   * 400 when the label exceeds [`MAX_LABEL_BYTES`]
 ///   * 404 when the UUID is not in the metadata store (either never

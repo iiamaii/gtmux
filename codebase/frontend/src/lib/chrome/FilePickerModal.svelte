@@ -12,12 +12,14 @@
   interface Props {
     open: boolean;
     onCancel: () => void;
-    onSelect: (absolutePath: string) => void;
+    onSelect: (absolutePath: string, kind: 'directory' | 'file') => void;
     onUnauthorized?: () => void;
     initialDir?: string;
     accept?: { extensions: string[]; description: string } | null;
     rootKind?: 'server' | 'workspace';
     rootPath?: string;
+    /** ADR-0035 — opt-in to picking a directory as a file_path reference. */
+    allowDirectories?: boolean;
   }
 
   const {
@@ -29,12 +31,13 @@
     accept = null,
     rootKind = 'server',
     rootPath = '',
+    allowDirectories = false,
   }: Props = $props();
 </script>
 
 <FileExplorer
   {open}
-  mode="file"
+  mode={allowDirectories ? 'file-or-dir' : 'file'}
   title={accept === null ? 'Pick a file' : `Pick ${accept.description}`}
   filter={accept?.extensions ?? []}
   filterDescription={accept?.description ?? 'files'}
@@ -42,6 +45,6 @@
   {rootPath}
   {initialDir}
   onCancel={onCancel}
-  onPick={onSelect}
+  onPick={(abs, kind) => onSelect(abs, kind)}
   onUnauthorized={onUnauthorized}
 />

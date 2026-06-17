@@ -5,6 +5,11 @@
    * Modes:
    * - `dir`: pick current directory or a selected child directory.
    * - `file`: pick a selected file, optionally filtered by extension.
+   * - `file-or-dir`: pick a selected file (filtered) OR a selected directory.
+   *   Selection is required (no current-directory fallback) — ADR-0035 makes
+   *   `file_path` a file-or-directory reference, so the picker must reach the
+   *   same surface as the files-tab drag-add (ADR-0047
+   *   `createCanvasItemFromWorkspaceFile`).
    */
 
   import Modal from '$lib/ui/Modal.svelte';
@@ -28,15 +33,16 @@
   import { isPathWithinRoot } from '$lib/files/workspaceAssets';
   import { pickLocalFiles } from '$lib/files/localFilePicker';
 
-  type Mode = 'dir' | 'file';
+  type Mode = 'dir' | 'file' | 'file-or-dir';
   type RootKind = 'server' | 'workspace';
+  type PickKind = 'directory' | 'file';
 
   interface Props {
     open: boolean;
     mode?: Mode;
     title?: string;
     onCancel: () => void;
-    onPick: (absolutePath: string) => void;
+    onPick: (absolutePath: string, kind: PickKind) => void;
     onUnauthorized?: () => void;
     initialDir?: string;
     filter?: string[];
@@ -75,7 +81,14 @@
   let pendingRemoveDir = $state<string | null>(null);
 
   const normalizedFilter = $derived(filter.map((ext) => ext.toLowerCase()));
-  const modalTitle = $derived(title ?? (mode === 'dir' ? 'Choose workspace root' : 'Pick a file'));
+  const modalTitle = $derived(
+    title ??
+      (mode === 'dir'
+        ? 'Choose workspace root'
+        : mode === 'file-or-dir'
+          ? 'Pick a file or folder'
+          : 'Pick a file'),
+  );
   const boundaryRoot = $derived(rootKind === 'workspace' ? rootPath || initialDir : '');
 
   function joinPath(dir: string, name: string): string {
@@ -111,9 +124,25 @@
       if (selectedEntry?.kind === 'directory' && selectedAbsolute !== null) return selectedAbsolute;
       return currentDir.length > 0 ? currentDir : null;
     }
+    if (mode === 'file-or-dir') {
+      // Option A — selection required (no current-directory fallback). A
+      // directory is always pickable; a file is pickable only when it matches
+      // the active filter (file_path passes none, so all files qualify).
+      if (selectedEntry === null || selectedAbsolute === null) return null;
+      if (selectedEntry.kind === 'directory') return selectedAbsolute;
+      return entryMatchesFilter(selectedEntry) ? selectedAbsolute : null;
+    }
     if (selectedEntry?.kind !== 'file' || selectedAbsolute === null) return null;
     if (!entryMatchesFilter(selectedEntry)) return null;
     return selectedAbsolute;
+  });
+
+  // Kind that accompanies the picked path. `dir` always yields a directory,
+  // `file` always a file, and `file-or-dir` mirrors the selected entry.
+  const pickKind = $derived.by((): PickKind => {
+    if (mode === 'dir') return 'directory';
+    if (mode === 'file-or-dir' && selectedEntry?.kind === 'directory') return 'directory';
+    return 'file';
   });
 
   const canPick = $derived(!loading && !mutating && pickTarget !== null);
@@ -218,12 +247,14 @@
       void navigate(abs);
       return;
     }
-    if (mode === 'file' && entryMatchesFilter(entry)) onPick(abs);
+    if ((mode === 'file' || mode === 'file-or-dir') && entryMatchesFilter(entry)) {
+      onPick(abs, 'file');
+    }
   }
 
   function onPickClick(): void {
     if (pickTarget === null) return;
-    onPick(pickTarget);
+    onPick(pickTarget, pickKind);
   }
 
   function onUpClick(): void {
@@ -390,7 +421,11 @@
       {#if pickTarget !== null}
         Selected · <b>{pickTarget}</b>
       {:else}
-        {mode === 'dir' ? 'Select current or child directory.' : 'Select a file.'}
+        {mode === 'dir'
+          ? 'Select current or child directory.'
+          : mode === 'file-or-dir'
+            ? 'Select a file or folder.'
+            : 'Select a file.'}
       {/if}
     </span>
   {/snippet}
@@ -582,7 +617,7 @@
     <div class="fx-foot">
       <Button variant="ghost" onclick={onCancel} disabled={mutating}>Cancel</Button>
       <Button variant="primary" onclick={onPickClick} disabled={!canPick}>
-        {mode === 'dir' ? 'Select this folder' : 'Open file'}
+        {mode === 'dir' ? 'Select this folder' : mode === 'file-or-dir' ? 'Select' : 'Open file'}
       </Button>
     </div>
   {/snippet}

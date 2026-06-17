@@ -83,11 +83,21 @@ export async function respawnTerminal(id: string): Promise<{ id: string }> {
   return json<{ id: string }>(res);
 }
 
-/** `patchTerminalLabel` 의 label 길이 cap. BE `MAX_LABEL_BYTES = 4096` 정합. */
+/**
+ * Terminal label byte cap (BE `MAX_LABEL_BYTES = 4096`). Still consumed by the
+ * panel-header inline editor's `validateLabel`, even though terminal labels now
+ * persist via layout `item.label` (ADR-0050) rather than `patchTerminalLabel`.
+ */
 export const TERMINAL_LABEL_MAX_BYTES = 4096;
 
 /**
  * `PATCH /api/terminals/<id>` — BE Stage 4 cleanup C (0034 §1.5).
+ *
+ * @deprecated ADR-0050 D2/D4: terminal labels are now persisted in the layout
+ * `item.label` via the shared layout-mutation path (PUT /api/sessions/:name/
+ * layout). This function has **zero callers** and is retained only because the
+ * BE keeps the endpoint deprecated-but-present during the transition (avoids a
+ * wire break). Do not add new callers.
  *
  * body: `{ label: string }`. 4 KiB cap (BE 의 `MAX_LABEL_BYTES`). 빈 string 허용
  * — BE 가 metadata 의 label field 를 그대로 set.

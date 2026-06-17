@@ -54,6 +54,15 @@
   import FreeDrawNode from './FreeDrawNode.svelte';
   import SnippetsNode from './SnippetsNode.svelte';
   import GroupOverlay from './GroupOverlay.svelte';
+  import DockOverlay from './DockOverlay.svelte';
+  import {
+    eligibleForDock,
+    nearestDockCandidate,
+    computeDock,
+    dockMinForType,
+    type DockSide,
+    type DockTarget,
+  } from './edgeDock';
   import { groupHover } from '$lib/stores/groupHover.svelte';
   import {
     commitNewItem,
@@ -316,6 +325,14 @@
       if (isEditableFocused()) return;
       e.preventDefault();
       pathCreateStart = null;
+      return;
+    }
+
+    // ADR-0051 D8 — Esc cancels an active edge-dock affordance. The drag itself
+    // continues; the subsequent drop is then a plain move (no dock).
+    if (e.key === 'Escape' && (activeDock !== null || dockDwellTimer !== null)) {
+      if (isEditableFocused()) return;
+      resetDockState();
       return;
     }
 
@@ -849,6 +866,8 @@
   let hoveredCanvasGroupId: string | null = null;
   const GROUP_OVERLAY_PREFIX = '__group-overlay-';
   const GROUP_HITBOX_PREFIX = '__group-hitbox-';
+  // ADR-0051 — single edge-dock affordance overlay node id (one at a time).
+  const DOCK_OVERLAY_ID = '__dock-overlay';
 
   function updateCanvasGroupHover(e: PointerEvent): void {
     if (!isSelectMode || lassoState !== null || dragState !== null) {
@@ -1458,6 +1477,8 @@
     snippets: SnippetsNode,
     // ADR-0010 D15 — group entity overlay (dotted BBox outline).
     'gtmux-group': GroupOverlay,
+    // ADR-0051 D4 — edge-dock affordance (ghost landing box + side highlight).
+    'gtmux-dock': DockOverlay,
   };
 
   // M cardinality — PanelNode 가 single/multi 분기를 위해 참조.
@@ -1884,6 +1905,25 @@
           groupId: g.id,
           mode,
         },
+      });
+    }
+    // ADR-0051 D4 — edge-dock affordance overlay. Non-destructive ghost of the
+    // size-matched + flush landing box, drawn above all nodes. Injected only
+    // while a dock is active (after dwell). The real item is untouched.
+    const dock = activeDock;
+    if (dock !== null) {
+      out.push({
+        id: DOCK_OVERLAY_ID,
+        type: 'gtmux-dock',
+        position: { x: dock.landing.x, y: dock.landing.y },
+        width: dock.landing.w,
+        height: dock.landing.h,
+        draggable: false,
+        selectable: false,
+        selected: false,
+        zIndex: OVERLAY_Z + 3,
+        class: 'gtmux-dock',
+        data: { side: dock.side },
       });
     }
     return out;
@@ -2347,9 +2387,12 @@
       }
       if (tool === 'file_path') {
         const pos = centered('file_path');
-        filePicker.openFor('', (path) => {
+        // ADR-0035 / ADR-0047 — file_path 는 파일/디렉터리 둘 다 참조 가능.
+        // allowDirectories 로 picker 가 directory 선택을 노출하고, picked
+        // kind 를 그대로 item 에 반영 (files-tab drag-add 와 동일 동작).
+        filePicker.openFor('', (path, kind) => {
           const item = createCanvasItem('file_path', pos);
-          const withPath = { ...item, path, kind: 'file' as const };
+          const withPath = { ...item, path, kind };
           void commitNewItem(withPath)
             .then(() => {
               toolStore.consume();
@@ -2361,7 +2404,7 @@
               void sessionStore.reloadActiveLayout();
             })
             .catch(onSpawnError);
-        });
+        }, { allowDirectories: true });
         return;
       }
       if (tool === 'image') {
@@ -2547,6 +2590,169 @@
    */
   let nodeDragPriorSnapshot: CanvasLayout | null = null;
 
+  /* ── ADR-0051: edge-dock with size-match ──────────────────────────────────
+   *
+   * 드래그 중 다른 eligible item 의 한 변에 근접+dwell 하면 도킹 affordance 가
+   * 뜨고, 드롭 시 대응 치수 매칭 + flush 배치 + layout 영속. drag-session 스코프
+   * state — drag stop / cancel 시 clear. 좌표는 canvas (flow) space (viewport
+   * zoom 보정). 단일 item 드래그에서만 (M.size>1 이면 skip, D7).
+   */
+  const DOCK_DWELL_MS = 400; // proximity dwell before affordance activates (D2).
+  // Threshold T in SCREEN px (amend ②): converted to canvas coords as
+  // DOCK_PROXIMITY_SCREEN_PX / zoom so on-screen sensitivity is uniform across
+  // zoom levels (ADR-0051 D2). Detection is pointer ↔ side-line distance.
+  const DOCK_PROXIMITY_SCREEN_PX = 16;
+  const DOCK_MOVE_EPSILON_PX = 4; // canvas-space pointer movement that resets dwell (D2).
+
+  /** Active dock affordance — non-null only after dwell, drives the overlay. */
+  type ActiveDock = {
+    /** The dragged item being placed. */
+    draggedId: string;
+    /** The target item the dragged item docks against. */
+    targetId: string;
+    side: DockSide;
+    /** Pre-computed landing box (size-match + flush) for the ghost overlay. */
+    landing: { x: number; y: number; w: number; h: number };
+  };
+  let activeDock = $state<ActiveDock | null>(null);
+
+  // Pending dwell bookkeeping (not reactive — internal to the drag session).
+  let dockDwellTimer: ReturnType<typeof setTimeout> | null = null;
+  let dockDwellKey: string | null = null; // `${targetId}:${side}` of the pending candidate.
+  // Last *pointer* position (canvas) — dwell is pointer-driven now (amend ②), so
+  // "significant movement" tracks the pointer, not the dragged box top-left.
+  let dockLastPointer: { x: number; y: number } | null = null;
+
+  function clearDockDwellTimer(): void {
+    if (dockDwellTimer !== null) {
+      clearTimeout(dockDwellTimer);
+      dockDwellTimer = null;
+    }
+    dockDwellKey = null;
+  }
+
+  /** Full reset of all dock state — call on drag stop / cancel. */
+  function resetDockState(): void {
+    clearDockDwellTimer();
+    dockLastPointer = null;
+    activeDock = null;
+  }
+
+  /** Source aspect (w/h) for an image item — mirrors ImageNode.sourceAspect. */
+  function imageSourceAspect(item: CanvasItem): number | undefined {
+    if (item.type !== 'image') return undefined;
+    const ow = item.original_w;
+    const oh = item.original_h;
+    if (ow !== undefined && oh !== undefined && oh > 0) return ow / oh;
+    if (item.h > 0) return item.w / item.h;
+    return undefined;
+  }
+
+  /**
+   * Build the eligible dock-target list for the dragged item (ADR-0051 D8).
+   * Pre-filters to: eligible type, not locked, visible, not minimized, not self.
+   * Current-session items only (sessionStore.items is the active session).
+   */
+  function dockTargetsFor(draggedId: string): DockTarget[] {
+    const out: DockTarget[] = [];
+    for (const it of sessionStore.items.values()) {
+      if (it.id === draggedId) continue;
+      if (!eligibleForDock(it.type)) continue;
+      if (it.minimized) continue;
+      if (!effectiveVisibility(it.visibility, it.parent_id, sessionGroupsById)) continue;
+      if (effectiveLocked(it.locked, it.parent_id, sessionGroupsById)) continue;
+      out.push({ id: it.id, type: it.type, box: { x: it.x, y: it.y, w: it.w, h: it.h } });
+    }
+    return out;
+  }
+
+  /** Landing box for an active candidate — size-match + flush + min clamp. */
+  function dockLandingBox(
+    dragged: CanvasItem,
+    target: CanvasItem,
+    side: DockSide,
+  ): { x: number; y: number; w: number; h: number } {
+    return computeDock(
+      {
+        box: { x: dragged.x, y: dragged.y, w: dragged.w, h: dragged.h },
+        type: dragged.type,
+        min: dockMinForType(dragged.type),
+        aspect: imageSourceAspect(dragged),
+      },
+      { x: target.x, y: target.y, w: target.w, h: target.h },
+      side,
+    );
+  }
+
+  /**
+   * onnodedrag tick — scan for the nearest dock candidate and manage the dwell
+   * timer (ADR-0051 D2 / D3 amend ②). Only for single-item drags of eligible
+   * items. `dragged` is the live (already store-updated) dragged item; `pointer`
+   * is the mouse pointer in canvas (flow) coords — detection is pointer-driven.
+   */
+  function updateDockDwell(dragged: CanvasItem, pointer: { x: number; y: number }): void {
+    // Single-item only (D7) + eligible dragged type (D1).
+    if (sessionStore.M.size > 1 || !eligibleForDock(dragged.type)) {
+      resetDockState();
+      return;
+    }
+
+    // Threshold T is canvas-space: screen 16px / zoom (amend ②) so on-screen
+    // sensitivity is uniform across zoom levels. Detection is the pointer's
+    // point-to-segment distance to each target side line.
+    const zoom = sessionStore.viewport.zoom || 1;
+    const T = DOCK_PROXIMITY_SCREEN_PX / zoom;
+    const candidate = nearestDockCandidate(pointer, dockTargetsFor(dragged.id), T);
+
+    if (candidate === null) {
+      // Proximity exit — cancel any pending dwell + active affordance (D8).
+      clearDockDwellTimer();
+      dockLastPointer = { x: pointer.x, y: pointer.y };
+      if (activeDock !== null) activeDock = null;
+      return;
+    }
+
+    const key = `${candidate.targetId}:${candidate.side}`;
+    // "Significant movement" since last tick resets the dwell (D2) — tracks the
+    // pointer (canvas), since detection is pointer-driven (amend ②).
+    const moved =
+      dockLastPointer !== null &&
+      (Math.abs(pointer.x - dockLastPointer.x) > DOCK_MOVE_EPSILON_PX ||
+        Math.abs(pointer.y - dockLastPointer.y) > DOCK_MOVE_EPSILON_PX);
+    dockLastPointer = { x: pointer.x, y: pointer.y };
+
+    // Candidate changed → drop any already-active affordance + restart dwell.
+    if (key !== dockDwellKey) {
+      clearDockDwellTimer();
+      if (activeDock !== null && `${activeDock.targetId}:${activeDock.side}` !== key) {
+        activeDock = null;
+      }
+    } else if (moved) {
+      // Same candidate but the user is still sliding — restart the dwell so the
+      // affordance only fires on a genuine pause (D2).
+      clearDockDwellTimer();
+      if (activeDock !== null) activeDock = null;
+    } else if (dockDwellTimer !== null || activeDock !== null) {
+      // Same candidate, paused, already pending or active — nothing to do.
+      return;
+    }
+
+    dockDwellKey = key;
+    dockDwellTimer = setTimeout(() => {
+      dockDwellTimer = null;
+      // Re-read both items at fire time — positions/sizes may have shifted.
+      const draggedNow = sessionStore.items.get(dragged.id);
+      const targetNow = sessionStore.items.get(candidate.targetId);
+      if (draggedNow === undefined || targetNow === undefined) return;
+      activeDock = {
+        draggedId: dragged.id,
+        targetId: candidate.targetId,
+        side: candidate.side,
+        landing: dockLandingBox(draggedNow, targetNow, candidate.side),
+      };
+    }, DOCK_DWELL_MS);
+  }
+
   function mergeMovedItemsWithPathCaches(
     items: readonly CanvasItem[],
     movedById: ReadonlyMap<string, CanvasItem>,
@@ -2625,7 +2831,14 @@
     return movedById;
   }
 
-  function onnodedrag({ nodes }: { targetNode: Node | null; nodes: Node[] }) {
+  function onnodedrag({
+    nodes,
+    event,
+  }: {
+    targetNode: Node | null;
+    nodes: Node[];
+    event: MouseEvent | TouchEvent;
+  }) {
     if (nodes.length === 0) return;
     if (sessionStore.active === null) return;
     const movedById = movedItemsFromNodes(nodes);
@@ -2638,6 +2851,24 @@
       sessionStore.items.set(id, next);
     }
     refreshLivePathCaches(movedById);
+
+    // ADR-0051 (amend ②) — edge-dock dwell scan. Single-item drag only (D7).
+    // Detection is pointer-driven: convert the drag event's screen pointer to
+    // canvas (flow) coords via screenToFlowPosition. If there is no usable
+    // pointer (e.g. keyboard-driven moves expose no clientX), skip dock.
+    const px = (event as MouseEvent | undefined)?.clientX;
+    const py = (event as MouseEvent | undefined)?.clientY;
+    if (movedById.size === 1 && typeof px === 'number' && typeof py === 'number') {
+      const [dragged] = movedById.values();
+      if (dragged !== undefined) {
+        const pointer = screenToFlowPosition({ x: px, y: py });
+        updateDockDwell(dragged, pointer);
+      } else {
+        resetDockState();
+      }
+    } else {
+      resetDockState();
+    }
   }
 
   function onnodedragstop({
@@ -2650,8 +2881,32 @@
     const movedById = movedItemsFromNodes(nodes);
     if (movedById.size === 0) {
       nodeDragPriorSnapshot = null;
+      resetDockState();
       return;
     }
+
+    // ADR-0051 D5 — edge-dock commit. If a dock affordance is active on a
+    // single-item drag and the dragged node matches, override the moved item's
+    // box with the size-matched + flush landing box. The size + position are
+    // applied together in the SAME applyMutation below → 1 PUT / 1 history entry.
+    const dock = activeDock;
+    if (dock !== null && movedById.size === 1 && movedById.has(dock.draggedId)) {
+      const moved = movedById.get(dock.draggedId);
+      const target = sessionStore.items.get(dock.targetId);
+      if (moved !== undefined && target !== undefined && moved.type !== 'line') {
+        // Recompute against the *moved* item so its live (post-drag) aspect /
+        // type is honored; flush coords come straight from the target box.
+        const landing = dockLandingBox(moved, target, dock.side);
+        movedById.set(dock.draggedId, {
+          ...moved,
+          x: landing.x,
+          y: landing.y,
+          w: landing.w,
+          h: landing.h,
+        });
+      }
+    }
+    resetDockState();
 
     // PRE-state snapshot — optimistic update 직전에 잡아 history capture 의
     // 입력으로 명시 (ADR-0028 D7). 그렇지 않으면 layoutSnapshot() 이 이미
@@ -3132,8 +3387,9 @@
   accept={filePicker.accept}
   rootKind={filePicker.rootKind}
   rootPath={filePicker.rootPath}
+  allowDirectories={filePicker.allowDirectories}
   onCancel={() => filePicker.cancel()}
-  onSelect={(abs) => filePicker.select(abs)}
+  onSelect={(abs, kind) => filePicker.select(abs, kind)}
   onUnauthorized={() => { window.location.href = '/auth'; }}
 />
 

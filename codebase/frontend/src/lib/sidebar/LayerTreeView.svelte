@@ -19,14 +19,11 @@
   import { SvelteSet } from 'svelte/reactivity';
   import { muxStore } from '$lib/stores/mux.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
-  import { terminalPool } from '$lib/stores/terminalPool.svelte';
-  import { UnauthorizedError } from '$lib/http/sessions';
-  import { patchTerminalLabel } from '$lib/http/terminals';
   import PanelEmptyState from '$lib/chrome/PanelEmptyState.svelte';
-  import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { CanvasItem, CanvasItemType, CanvasLayout } from '$lib/types/canvas';
   import { groupHover } from '$lib/stores/groupHover.svelte';
   import { buildChildBlocks, normalizeLayout } from '$lib/stores/zSpace';
+  import { renameItemLabel } from '$lib/canvas/terminalLabel';
   import { directParentGroupId, effectiveLocked } from '$lib/types/group';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
@@ -81,28 +78,13 @@
     const trimmed = next.trim();
     const item = sessionStore.items.get(id);
     if (item === undefined) return;
+    // All item types (terminal included) persist the rename through the shared
+    // layout-mutation path — terminal labels live in layout item.label per
+    // ADR-0050 D2, no longer in the in-memory terminal_meta.
     await mutateActiveLayout((cur) => ({
       ...cur,
-      items: cur.items.map((it) => {
-        if (it.id !== id) return it;
-        if (it.type === 'note') return { ...it, title: trimmed } as CanvasItem;
-        return { ...it, label: trimmed } as CanvasItem;
-      }),
+      items: cur.items.map((it) => (it.id === id ? renameItemLabel(it, trimmed) : it)),
     }));
-    if (item.type !== 'terminal') return;
-    try {
-      await patchTerminalLabel(id, trimmed);
-      await terminalPool.refresh();
-    } catch (err) {
-      if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
-        return;
-      }
-      toastStore.show({
-        message: `Terminal label sync failed: ${err instanceof Error ? err.message : String(err)}`,
-        tone: 'error',
-      });
-    }
   }
 
   function onCancelRenameItem(): void {
@@ -332,17 +314,12 @@
     return Number.isNaN(n) ? null : n;
   }
 
-  // Panel 행 표시 라벨 우선순위 (Task 2 fix — terminal_meta 우선):
-  //   1) terminalPool 의 terminal_meta label (server-wide, ADR-0021 D7) — terminal/
-  //      panel type 에만 적용. 빈 문자열은 미설정 으로 간주.
-  //   2) layout Panel.label (legacy, disk stale 가능)
-  //   3) "%${paneNum}" — pane id fallback
+  // Panel 행 표시 라벨 우선순위 (ADR-0050 D3 — layout item.label 정본):
+  //   1) layout Panel.label (persisted, per-panel). terminal/panel type 도
+  //      동일 — terminal_meta 우선순위 제거(매 부팅 소실되던 stale source).
+  //   2) "%${paneNum}" — pane id fallback (terminal/panel)
+  //   3) "${type}:${shortId}"
   function panelDisplayLabel(p: PanelData): string {
-    const isTerminal = p.type === 'terminal' || p.type === 'panel' || p.type == null;
-    if (isTerminal) {
-      const poolLabel = terminalPool.byId(p.id)?.label?.trim();
-      if (poolLabel != null && poolLabel.length > 0) return poolLabel;
-    }
     if (p.type === 'note' && p.title != null && p.title.length > 0) return p.title;
     if (p.type === 'snippets') {
       // Sync with canvas head displayLabel + inspector identity. User-set

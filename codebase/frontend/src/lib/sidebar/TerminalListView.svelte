@@ -34,6 +34,7 @@
   import { killTerminal } from '$lib/http/terminals';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
+  import { terminalPoolDisplayName } from '$lib/canvas/terminalLabel';
   import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
   import PanelEmptyState from '$lib/chrome/PanelEmptyState.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -80,13 +81,15 @@
     return terminalPool.subscribe();
   });
 
-  function shortId(id: string): string {
-    return id.replace(/-/g, '').slice(0, 8);
-  }
-
+  // Pool-list display name (ADR-0050 D3). Per-panel model: a terminal's label
+  // lives in the layout item.label of *each* (session, panel). This pool list
+  // is cross-session per-UUID, so it can only resolve a label when the
+  // terminal has an item in the *current* session layout — then it shows that
+  // item.label; otherwise it falls back to a short id. The in-memory
+  // terminal_meta label (t.label) is intentionally no longer read.
   function displayName(t: TerminalInfo): string {
-    if (t.label.length > 0) return t.label;
-    return `t${shortId(t.id)}`;
+    const item = sessionStore.items.get(t.id);
+    return terminalPoolDisplayName(item?.label, t.id);
   }
 
   function ago(unixSec: number): string {
