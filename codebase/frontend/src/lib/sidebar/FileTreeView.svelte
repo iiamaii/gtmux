@@ -245,7 +245,7 @@
   // Save the scroll offset to module scope on scroll (cheap, in-memory); restore
   // it once the tree has rendered after a remount. Keyed by workspace so an
   // unrelated workspace never inherits a stale offset.
-  let treeScrollEl = $state<HTMLDivElement | undefined>(undefined);
+  let treeScrollEl = $state<HTMLElement | undefined>(undefined);
   let scrollRestored = false; // per-mount; resets on remount (new instance).
 
   function currentTreeScrollKey(): string {
@@ -1280,13 +1280,12 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-  bind:this={treeScrollEl}
   class="file-tree"
   class:drop-root={dropTargetDir === rootDropTargetDir}
   onclick={onFileTreeClick}
   onkeydown={() => {}}
   oncontextmenu={onEmptyContextMenu}
-  onscroll={onTreeScroll}
+  onscroll={closeContextMenu}
   ondragover={onRootDragOver}
   ondragleave={onRootDragLeave}
   ondrop={(e: DragEvent) => onRootDrop(e)}
@@ -1375,7 +1374,13 @@
       description="This folder has no visible files."
     />
   {:else}
-    <ul class="tree" role="tree" aria-label="Workspace file tree">
+    <ul
+      bind:this={treeScrollEl}
+      class="tree"
+      role="tree"
+      aria-label="Workspace file tree"
+      onscroll={onTreeScroll}
+    >
       {#each rows as row (row.path)}
         {@const selected = filePreviewStore.selectedPaths.has(row.path)}
         <li
