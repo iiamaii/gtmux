@@ -84,7 +84,7 @@
     open = false;
   }
 
-  function onWindowClick(e: MouseEvent): void {
+  function onWindowPointerDown(e: PointerEvent): void {
     if (!open || !host) return;
     const target = e.target as Node;
     if (host.contains(target) || menuEl?.contains(target)) return;
@@ -142,10 +142,10 @@
 
   $effect(() => {
     if (typeof window === 'undefined') return;
-    window.addEventListener('mousedown', onWindowClick);
+    window.addEventListener('pointerdown', onWindowPointerDown, { capture: true });
     window.addEventListener('keydown', onWindowKeydown);
     return () => {
-      window.removeEventListener('mousedown', onWindowClick);
+      window.removeEventListener('pointerdown', onWindowPointerDown, { capture: true });
       window.removeEventListener('keydown', onWindowKeydown);
     };
   });
