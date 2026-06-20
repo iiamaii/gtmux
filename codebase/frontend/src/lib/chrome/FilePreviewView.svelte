@@ -4,6 +4,7 @@
    */
 
   import { filePreviewStore } from '$lib/stores/filePreview.svelte';
+  import { chromeStore } from '$lib/stores/chrome.svelte';
   import { fsFileUrl } from '$lib/http/fs';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
@@ -53,6 +54,11 @@
   let previewMaximized = $state(false);
   let contentMenu = $state<PreviewContentMenu | null>(null);
   let contentMenuEl: HTMLDivElement | undefined = $state();
+  // ADR-0046 D6 amend ⑩ — ref to the currently-mounted preview surface so the
+  // Cmd/Ctrl+C shortcut can scope the selection to it (same root the right-click
+  // menu uses). The previewSurface snippet renders in two places (inline +
+  // maximize body) but only one is shown at a time, so a single ref is correct.
+  let previewSurfaceEl: HTMLDivElement | undefined = $state();
 
   const selection = $derived(filePreviewStore.selection);
   const selectedEntries = $derived(filePreviewStore.selectedEntries);
@@ -257,7 +263,58 @@
   }
 
   function onWindowKeydown(e: KeyboardEvent): void {
-    if (e.key === 'Escape') closeContentMenu();
+    if (e.key === 'Escape') {
+      closeContentMenu();
+      return;
+    }
+    // ADR-0046 D6 amend ⑩ — Cmd/Ctrl+C in the active Preview = Copy path (with
+    // selection location), mirroring the right-click "Copy path". Additive: the
+    // right-click menu's Copy (raw selection text) / Copy path are unchanged.
+    if (
+      (e.metaKey || e.ctrlKey) &&
+      !e.shiftKey &&
+      !e.altKey &&
+      (e.key === 'c' || e.key === 'C')
+    ) {
+      if (!canKeyboardCopyPath()) return;
+      e.preventDefault();
+      e.stopPropagation();
+      void copyPathViaShortcut();
+    }
+  }
+
+  /** Gate for the amend ⑩ keyboard copy-path: Preview active + single file +
+   *  focus not in an editable field / xterm (so normal field copy still works). */
+  function canKeyboardCopyPath(): boolean {
+    if (chromeStore.state.rightPanelTab !== 'preview') return false;
+    if (selection === null || isMultiSelection) return false;
+    const el = document.activeElement as HTMLElement | null;
+    if (el !== null) {
+      const tag = el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return false;
+      if (el.isContentEditable) return false;
+      if (el.classList.contains('xterm-helper-textarea')) return false;
+    }
+    return true;
+  }
+
+  async function copyPathViaShortcut(): Promise<void> {
+    const current = selection;
+    if (current === null) return;
+    closeContentMenu();
+    const root = previewSurfaceEl;
+    // Include the selection's source location only when a real text selection
+    // lies within the preview surface (same rule the right-click menu uses);
+    // otherwise copy the plain absolute path.
+    const hasSelInPreview =
+      root !== undefined && kind === 'text' && selectedTextWithin(root).length > 0;
+    const sourceRange = hasSelInPreview ? selectionToRange(root, window.getSelection()) : null;
+    const value = formatPathWithLocation(current.path, sourceRange);
+    const result = await copyTextToSystemClipboard(value);
+    toastStore.show({
+      message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
   }
 
   async function copySelectedText(): Promise<void> {
@@ -311,6 +368,7 @@
 
 {#snippet previewSurface(current: FilePreviewSelection)}
   <div
+    bind:this={previewSurfaceEl}
     class="preview-surface"
     role="region"
     aria-label="Preview content"
