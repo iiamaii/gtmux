@@ -46,8 +46,10 @@
     moveFs,
     removeFs,
     renameFs,
+    searchFs,
     uploadFs,
     type FsEntry,
+    type FsSearchEntry,
     type MoveFsEntry,
   } from '$lib/http/fs';
   import {
@@ -71,6 +73,9 @@
   import { commitNewItem, createCanvasItemFromWorkspaceFile } from '$lib/canvas/itemFactory';
   import { shortcutRegistry, type ShortcutDescriptor } from '$lib/keyboard/shortcutRegistry.svelte';
   import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
+  import { matchNamePath } from './treeMatch';
+  import { ancestorIndices } from './stickyAncestors';
+  import { debounce } from '$lib/common/debounce';
 
   type Row = {
     path: string;
@@ -84,9 +89,25 @@
     sourceRows: Row[];
     sourcePaths: string[];
   };
+  // ADR-0052 D4 — a single flat search hit (Phase 1 client row or Phase 2 server
+  // result), keyed by absolute `path` for dedupe and ranked for the flat list.
+  type SearchResult = {
+    path: string;
+    entry: FsEntry;
+    relpath: string;
+    ranges: [number, number][];
+  };
 
   const FILE_TREE_EXPANSION_STORAGE_KEY = 'gtmux:file-tree-expanded:v1';
   const MAX_FILE_TREE_EXPANSIONS = 200;
+  // ADR-0052 D7 — sticky parent header stack depth cap.
+  const MAX_STICKY = 6;
+  // Fallback row height when the live `.row` offsetHeight cannot be measured yet
+  // (≈ icon row + 2px row gap; matches the CSS in this file). Replaced by the
+  // measured value on first render — ADR-0052 D7.
+  const STICKY_ROW_HEIGHT_FALLBACK = 26;
+  // ADR-0052 D4 — cap the flat result list so a broad query stays cheap to render.
+  const MAX_SEARCH_RESULTS = 500;
 
   let rootPath = $state('');
   let rootError = $state<string | null>(null);
@@ -123,6 +144,25 @@
   let dropTargetDir = $state<string | null>(null);
   let moveSubmitting = $state(false);
 
+  // ── Search (ADR-0052 D2/D4) — component-local, ephemeral (reset on remount) ──
+  let query = $state('');
+  let searchInputEl: HTMLInputElement | undefined = $state();
+  // Phase 2 (server) state. `serverResults` holds the latest server response for
+  // the *current* query; `searchLoading` reflects an in-flight request and
+  // `serverTruncated` surfaces the BE `truncated` flag.
+  let serverResults = $state<FsSearchEntry[]>([]);
+  let serverTruncated = $state(false);
+  let searchLoading = $state(false);
+  // AbortController for the in-flight Phase 2 request, and a monotonically
+  // increasing request id so a slow/stale response is ignored (ADR-0052 D4).
+  let searchAbort: AbortController | null = null;
+  let searchSeq = 0;
+
+  // ── Sticky parent headers (ADR-0052 D7) ──
+  let stickyIndices = $state<number[]>([]);
+  let measuredRowHeight = $state(0);
+  const searching = $derived(query.trim().length > 0);
+
   const activeName = $derived(sessionStore.active?.name ?? null);
   const activeSession = $derived(
     activeName === null
@@ -143,6 +183,43 @@
   const uploadTargetDir = $derived(resolveUploadTargetDir());
   const rootDropTargetDir = $derived(rootPath || targetRoot);
 
+  // ── Search results (ADR-0052 D4) ──
+  // Phase 1 (client, instant): filter the already-loaded tree rows. Reacts
+  // synchronously to `query`/`rows` — no debounce, no network.
+  const phase1Results = $derived.by((): SearchResult[] => {
+    if (!searching) return [];
+    const out: SearchResult[] = [];
+    for (const row of rows) {
+      const relpath = relpathOf(row.path);
+      const match = matchNamePath(query, row.entry.name, relpath);
+      if (!match.matched) continue;
+      out.push({ path: row.path, entry: row.entry, relpath, ranges: match.ranges });
+    }
+    return out;
+  });
+
+  // Phase 1 + Phase 2 merged, deduped by absolute path (Phase 1 wins — it carries
+  // the full FsEntry incl. size/mtime), then ranked. ADR-0052 D4.
+  const searchResults = $derived.by((): SearchResult[] => {
+    if (!searching) return [];
+    const byPath = new Map<string, SearchResult>();
+    for (const result of phase1Results) byPath.set(result.path, result);
+    for (const hit of serverResults) {
+      if (byPath.has(hit.path)) continue; // dedupe — Phase-1 row already present.
+      const relpath = relpathOf(hit.path);
+      const match = matchNamePath(query, hit.name, relpath);
+      // The server already applied the same matcher (D3 shared semantics); recompute
+      // only to obtain the name highlight ranges for the flat-list render.
+      byPath.set(hit.path, {
+        path: hit.path,
+        entry: { name: hit.name, kind: hit.kind, size_bytes: null, mtime_unix: null },
+        relpath,
+        ranges: match.ranges,
+      });
+    }
+    return rankSearchResults([...byPath.values()], query).slice(0, MAX_SEARCH_RESULTS);
+  });
+
   function joinPath(dir: string, name: string): string {
     if (dir.length === 0 || dir.endsWith('/')) return `${dir}${name}`;
     return `${dir}/${name}`;
@@ -162,6 +239,29 @@
     const slash = trimmed.lastIndexOf('/');
     if (slash <= 0) return rootPath || targetRoot;
     return trimmed.slice(0, slash);
+  }
+
+  // ADR-0052 D4 — workspace-relative path (strip `rootPath` + leading slash) used
+  // as the second match key and the dim dir-context in the flat result list.
+  function relpathOf(absPath: string): string {
+    const root = rootPath || targetRoot;
+    if (root.length === 0) return absPath;
+    if (absPath === root) return '';
+    const prefix = root.endsWith('/') ? root : `${root}/`;
+    if (absPath.startsWith(prefix)) return absPath.slice(prefix.length);
+    return absPath;
+  }
+
+  // ADR-0052 D4 — dim relative-dir context shown after the name in a result row.
+  function resultContextDir(result: SearchResult): string {
+    const slash = result.relpath.lastIndexOf('/');
+    return slash < 0 ? '' : result.relpath.slice(0, slash);
+  }
+
+  // Adapt a flat search result to the `Row` shape so the shared `fileIconSvg`
+  // snippet (reads only `entry.kind` + `path`) can render its icon.
+  function resultIconRow(result: SearchResult): Row {
+    return { path: result.path, entry: result.entry, depth: 0, expanded: false, loading: false };
   }
 
   function isSameOrChild(path: string, parent: string): boolean {
@@ -257,7 +357,66 @@
     const el = treeScrollEl;
     if (el === undefined) return;
     savedTreeScroll = { key: currentTreeScrollKey(), top: el.scrollTop };
+    recomputeSticky(); // ADR-0052 D7 — keep the sticky stack in sync with scroll.
   }
+
+  // ── Sticky parent headers (ADR-0052 D7) ──
+  // Uniform-row arithmetic: measure the first `.row` offsetHeight (fallback to a
+  // CSS-derived constant), derive the topmost visible row index, then collect its
+  // ancestor row indices from the flat `rows` + `depth` via `ancestorIndices`.
+  function effectiveRowHeight(): number {
+    return measuredRowHeight > 0 ? measuredRowHeight : STICKY_ROW_HEIGHT_FALLBACK;
+  }
+
+  function measureRowHeight(): void {
+    const el = treeScrollEl;
+    if (el === undefined) return;
+    const firstRow = el.querySelector('.row') as HTMLElement | null;
+    if (firstRow !== null && firstRow.offsetHeight > 0) {
+      measuredRowHeight = firstRow.offsetHeight;
+    }
+  }
+
+  function recomputeSticky(): void {
+    // Sticky is hierarchy-only; the flat search list has no ancestors (D7).
+    if (searching) {
+      if (stickyIndices.length > 0) stickyIndices = [];
+      return;
+    }
+    const el = treeScrollEl;
+    if (el === undefined || rows.length === 0) {
+      if (stickyIndices.length > 0) stickyIndices = [];
+      return;
+    }
+    if (measuredRowHeight === 0) measureRowHeight();
+    const rowHeight = effectiveRowHeight();
+    const topIndex = Math.floor(el.scrollTop / rowHeight);
+    const next = ancestorIndices(rows, topIndex, MAX_STICKY);
+    if (!sameIndices(next, stickyIndices)) stickyIndices = next;
+  }
+
+  function sameIndices(a: number[], b: number[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  function onStickyClick(index: number): void {
+    const el = treeScrollEl;
+    if (el === undefined) return;
+    // Scroll the clicked ancestor row to the top of the viewport (D7).
+    el.scrollTop = index * effectiveRowHeight();
+    recomputeSticky();
+  }
+
+  // Recompute the sticky stack whenever the flattened rows change (expand/collapse,
+  // lazy load, prune) or search toggles — uniform-row arithmetic depends on `rows`.
+  $effect(() => {
+    void rows;
+    void searching;
+    measureRowHeight();
+    recomputeSticky();
+  });
 
   $effect(() => {
     // Re-runs as rows hydrate (childrenByDir grows). Restore once the content is
@@ -280,6 +439,104 @@
       contextMenu = null;
     }
   });
+
+  // When the flat search list is dismissed (query cleared), the tree `<ul>` is
+  // re-created by the `{#if}` branch swap and loses its scrollTop. Re-arm the
+  // restore effect so the pre-search offset (still in `savedTreeScroll`, since
+  // `onTreeScroll` only fires on the tree) is re-applied. ADR-0052 D4 + amend ⑪.
+  let wasSearching = false;
+  $effect(() => {
+    const now = searching;
+    if (wasSearching && !now) scrollRestored = false;
+    wasSearching = now;
+  });
+
+  // ── Search Phase 2 (ADR-0052 D4) — debounced recursive server search ──
+  // `runServerSearch` issues the request; the debounced wrapper coalesces rapid
+  // keystrokes (~150ms). Each call cancels the prior in-flight request and bumps
+  // `searchSeq`, so a late response from a stale query is dropped.
+  const debouncedServerSearch = debounce((q: string, root: string) => {
+    void runServerSearch(q, root);
+  }, 150);
+
+  async function runServerSearch(q: string, root: string): Promise<void> {
+    if (searchAbort !== null) searchAbort.abort();
+    const controller = new AbortController();
+    searchAbort = controller;
+    const seq = ++searchSeq;
+    searchLoading = true;
+    try {
+      const res = await searchFs(root, q, { limit: MAX_SEARCH_RESULTS, signal: controller.signal });
+      if (seq !== searchSeq) return; // a newer query superseded this one — ignore.
+      serverResults = res.results;
+      serverTruncated = res.truncated;
+    } catch (err) {
+      if (seq !== searchSeq) return;
+      // Abort is expected on supersession; ignore it. Any other failure degrades
+      // gracefully to Phase-1-only results (D4) — no destructive surface.
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      serverResults = [];
+      serverTruncated = false;
+      console.debug('[gtmux] fs search failed', err);
+    } finally {
+      if (seq === searchSeq) searchLoading = false;
+    }
+  }
+
+  // Drive Phase 2 from `query`/`rootPath`. Empty query cancels any in-flight
+  // request and clears server state; a non-empty query schedules a debounced call.
+  // Only `query` + root are read here — server-result writes must NOT re-trigger
+  // this effect (that would re-issue the search on every response, ADR-0052 D4).
+  $effect(() => {
+    const q = query.trim();
+    const root = rootPath || targetRoot;
+    if (q.length === 0 || root.length === 0) {
+      cancelServerSearch();
+      return;
+    }
+    debouncedServerSearch(q, root);
+  });
+
+  // Cancel the debounce + abort the in-flight request and reset server state.
+  // Reads/writes server state imperatively (outside the reactive read graph).
+  function cancelServerSearch(): void {
+    debouncedServerSearch.cancel();
+    if (searchAbort !== null) {
+      searchAbort.abort();
+      searchAbort = null;
+    }
+    searchSeq += 1; // invalidate any pending response.
+    searchLoading = false;
+    serverResults = [];
+    serverTruncated = false;
+  }
+
+  function clearSearch(): void {
+    query = '';
+  }
+
+  function onSearchKeydown(e: KeyboardEvent): void {
+    if (e.key !== 'Escape') return;
+    e.stopPropagation();
+    if (query.length > 0) {
+      // First Escape clears the query (keeps focus for a fresh search).
+      clearSearch();
+    } else {
+      // Already empty — blur the input.
+      searchInputEl?.blur();
+    }
+  }
+
+  function onSearchResultClick(result: SearchResult): void {
+    // Single-select into the preview store — same contract as a tree row click
+    // (ADR-0046 amend ④), so the Preview updates. Does not disturb the tree.
+    filePreviewStore.select(result.path, result.entry);
+    chromeStore.setRightPanelTab('preview');
+  }
 
   async function loadRoot(dir: string): Promise<void> {
     const sessionName = activeName;
@@ -442,6 +699,74 @@
     };
     if (rootPath.length > 0) walk(rootPath, 0);
     return out;
+  }
+
+  // ── Search ranking (ADR-0052 D4) ──
+  // Tiers: 0 = exact name (case-insensitive), 1 = name-substring (earlier match
+  // index first), 2 = path-only match. Stable within a tier by `path` so the
+  // order is deterministic across Phase-1/Phase-2 merges and re-renders.
+  function rankSearchResults(results: SearchResult[], q: string): SearchResult[] {
+    const tokens = q
+      .trim()
+      .toLowerCase()
+      .split(/[\s/]+/)
+      .filter((token) => token.length > 0);
+    const scored = results.map((result) => ({
+      result,
+      ...searchTier(result, tokens),
+    }));
+    scored.sort((a, b) => {
+      if (a.tier !== b.tier) return a.tier - b.tier;
+      if (a.nameIndex !== b.nameIndex) return a.nameIndex - b.nameIndex;
+      return a.result.path < b.result.path ? -1 : a.result.path > b.result.path ? 1 : 0;
+    });
+    return scored.map((entry) => entry.result);
+  }
+
+  // Classify a result into a ranking tier plus the earliest name-substring index.
+  function searchTier(
+    result: SearchResult,
+    tokens: string[],
+  ): { tier: number; nameIndex: number } {
+    const lowerName = result.entry.name.toLowerCase();
+    // Exact whole-name match against the joined query (case-insensitive).
+    if (tokens.length > 0 && lowerName === tokens.join('')) {
+      return { tier: 0, nameIndex: 0 };
+    }
+    // Earliest position at which any token appears inside the name; if the name
+    // has a highlight range we already know the name matched (use its start).
+    let nameIndex = Number.POSITIVE_INFINITY;
+    for (const token of tokens) {
+      const index = lowerName.indexOf(token);
+      if (index >= 0 && index < nameIndex) nameIndex = index;
+    }
+    if (Number.isFinite(nameIndex)) return { tier: 1, nameIndex };
+    // No token in the name → matched via path only.
+    return { tier: 2, nameIndex: Number.MAX_SAFE_INTEGER };
+  }
+
+  // ADR-0052 D4 — split a name into text-safe segments around the highlight
+  // ranges. NEVER use innerHTML; the template renders plain text + <mark> spans.
+  function highlightSegments(
+    name: string,
+    ranges: [number, number][],
+  ): { text: string; mark: boolean }[] {
+    if (ranges.length === 0) return [{ text: name, mark: false }];
+    const segments: { text: string; mark: boolean }[] = [];
+    let cursor = 0;
+    for (const [start, end] of ranges) {
+      const clampedStart = Math.max(cursor, Math.min(start, name.length));
+      const clampedEnd = Math.max(clampedStart, Math.min(end, name.length));
+      if (clampedStart > cursor) {
+        segments.push({ text: name.slice(cursor, clampedStart), mark: false });
+      }
+      if (clampedEnd > clampedStart) {
+        segments.push({ text: name.slice(clampedStart, clampedEnd), mark: true });
+      }
+      cursor = clampedEnd;
+    }
+    if (cursor < name.length) segments.push({ text: name.slice(cursor), mark: false });
+    return segments;
   }
 
   function toggleDirectory(path: string): void {
@@ -901,6 +1226,9 @@
     ];
     return () => {
       for (const unsub of unsubs) unsub();
+      // ADR-0052 D4 — tear down any pending/in-flight search on unmount.
+      debouncedServerSearch.cancel();
+      if (searchAbort !== null) searchAbort.abort();
     };
   });
 
@@ -1271,6 +1599,14 @@
   </span>
 {/snippet}
 
+<!-- ADR-0052 D4/D8 — text-safe highlight: split the name into plain-text and
+     <mark> segments. NEVER innerHTML; every segment is a Svelte text node. -->
+{#snippet highlightedName(name: string, ranges: [number, number][])}
+  {#each highlightSegments(name, ranges) as segment}
+    {#if segment.mark}<mark class="search-mark">{segment.text}</mark>{:else}{segment.text}{/if}
+  {/each}
+{/snippet}
+
 <svelte:window
   onpointerdowncapture={onWindowPointerDown}
   onkeydown={onWindowKeydown}
@@ -1349,6 +1685,52 @@
     </div>
   </header>
 
+  {#if activeName !== null}
+    <!-- Files search input (ADR-0052 D2/D4). Phase 1 reacts to `query`
+         immediately; Phase 2 (server) is debounced in an effect. -->
+    <div class="files-search">
+      <span class="search-icon" aria-hidden="true">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="7" cy="7" r="4.5"/>
+          <path d="M10.5 10.5 14 14"/>
+        </svg>
+      </span>
+      <input
+        bind:this={searchInputEl}
+        class="search-input"
+        type="search"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        placeholder="Search files…"
+        aria-label="Search files"
+        bind:value={query}
+        onclick={(e: MouseEvent) => e.stopPropagation()}
+        onkeydown={onSearchKeydown}
+      />
+      {#if searchLoading}
+        <span class="search-spin" aria-label="Searching" title="Searching workspace…"></span>
+      {/if}
+      {#if query.length > 0}
+        <button
+          type="button"
+          class="search-clear"
+          title="Clear search"
+          aria-label="Clear search"
+          onclick={(e: MouseEvent) => {
+            e.stopPropagation();
+            clearSearch();
+            searchInputEl?.focus();
+          }}
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+            <path d="M4 4l8 8M12 4l-8 8"/>
+          </svg>
+        </button>
+      {/if}
+    </div>
+  {/if}
+
   {#if activeName === null}
     <PanelEmptyState
       icon="files"
@@ -1367,6 +1749,52 @@
       tone="danger"
       role="alert"
     />
+  {:else if searching}
+    <!-- ADR-0052 D4 — flat ranked results list replaces the tree while searching. -->
+    <div class="search-results-wrap">
+      {#if searchResults.length === 0}
+        <PanelEmptyState
+          icon="files"
+          lead={searchLoading ? 'Searching…' : 'No matches'}
+          description={searchLoading
+            ? 'Searching the workspace.'
+            : 'No files or folders match this search.'}
+        />
+      {:else}
+        <ul class="search-results" role="listbox" aria-label="Search results">
+          {#each searchResults as result (result.path)}
+            {@const selected = filePreviewStore.selectedPaths.has(result.path)}
+            {@const contextDir = resultContextDir(result)}
+            <li class="search-result" class:selected role="presentation">
+              <button
+                type="button"
+                class="search-result-button"
+                role="option"
+                aria-selected={selected}
+                title={result.path}
+                onclick={(e: MouseEvent) => {
+                  e.stopPropagation();
+                  onSearchResultClick(result);
+                }}
+              >
+                {@render fileIconSvg(resultIconRow(result))}
+                <span class="search-result-name">
+                  {@render highlightedName(result.entry.name, result.ranges)}
+                </span>
+                {#if contextDir.length > 0}
+                  <span class="search-result-dir mono">{contextDir}</span>
+                {/if}
+              </button>
+            </li>
+          {/each}
+        </ul>
+        {#if serverTruncated}
+          <p class="search-truncated" role="status">
+            Showing the first {searchResults.length} matches — refine your search to narrow results.
+          </p>
+        {/if}
+      {/if}
+    </div>
   {:else if rows.length === 0}
     <PanelEmptyState
       icon="files"
@@ -1374,14 +1802,39 @@
       description="This folder has no visible files."
     />
   {:else}
-    <ul
-      bind:this={treeScrollEl}
-      class="tree"
-      role="tree"
-      aria-label="Workspace file tree"
-      onscroll={onTreeScroll}
-    >
-      {#each rows as row (row.path)}
+    <div class="tree-viewport">
+      <!-- ADR-0052 D7 — sticky parent header overlay (hierarchy-only; hidden while
+           searching). Pinned at the top of the scroll viewport, above normal rows. -->
+      {#if stickyIndices.length > 0}
+        <div class="sticky-stack">
+          {#each stickyIndices as stickyIndex (stickyIndex)}
+            {@const stickyRow = rows[stickyIndex]}
+            {#if stickyRow !== undefined}
+              <button
+                type="button"
+                class="sticky-row"
+                style:padding-left={`${stickyRow.depth * 16 + 4}px`}
+                title={stickyRow.path}
+                onclick={(e: MouseEvent) => {
+                  e.stopPropagation();
+                  onStickyClick(stickyIndex);
+                }}
+              >
+                {@render fileIconSvg(stickyRow)}
+                <span class="label">{stickyRow.entry.name}</span>
+              </button>
+            {/if}
+          {/each}
+        </div>
+      {/if}
+      <ul
+        bind:this={treeScrollEl}
+        class="tree"
+        role="tree"
+        aria-label="Workspace file tree"
+        onscroll={onTreeScroll}
+      >
+        {#each rows as row (row.path)}
         {@const selected = filePreviewStore.selectedPaths.has(row.path)}
         <li
           class="row"
@@ -1442,7 +1895,8 @@
           {/if}
         </li>
       {/each}
-    </ul>
+      </ul>
+    </div>
   {/if}
 
   {#if contextMenu !== null}
@@ -1839,6 +2293,214 @@
   .icon-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* ── Search input (ADR-0052 D2) ── */
+  .files-search {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-6);
+    padding: var(--space-6) var(--space-10);
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+    flex: 0 0 auto;
+  }
+
+  .search-icon {
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    color: var(--color-fg-muted);
+    pointer-events: none;
+  }
+
+  .search-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 26px;
+    padding: 0 var(--space-4);
+    border: 0;
+    background: transparent;
+    color: var(--color-fg);
+    font: inherit;
+    font-size: var(--text-base);
+  }
+
+  .search-input::placeholder {
+    color: var(--color-fg-subtle);
+  }
+
+  .search-input:focus-visible {
+    outline: none;
+  }
+
+  /* Hide the native search-cancel affordance (we provide our own × button). */
+  .search-input::-webkit-search-cancel-button {
+    appearance: none;
+  }
+
+  .search-clear {
+    flex: 0 0 auto;
+    width: 18px;
+    height: 18px;
+    display: inline-grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-fg-muted);
+    cursor: pointer;
+  }
+
+  .search-clear:hover {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
+  }
+
+  .search-spin {
+    flex: 0 0 auto;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    border: 1.5px solid var(--color-border-strong);
+    border-top-color: var(--color-accent);
+    animation: spin 900ms linear infinite;
+  }
+
+  .search-mark {
+    background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+
+  /* ── Tree viewport (sticky overlay anchor) (ADR-0052 D7) ── */
+  .tree-viewport {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Search results (flat ranked list) (ADR-0052 D4) ── */
+  .search-results-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .search-results {
+    list-style: none;
+    margin: 0;
+    padding: var(--space-4) 0;
+  }
+
+  .search-result {
+    display: block;
+    position: relative;
+  }
+
+  .search-result + .search-result {
+    margin-top: 2px;
+  }
+
+  .search-result:hover {
+    background: var(--color-glass-1);
+  }
+
+  .search-result.selected {
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+    color: var(--color-accent);
+    box-shadow: inset 2px 0 0 var(--color-accent);
+  }
+
+  .search-result.selected .type-icon {
+    color: var(--color-accent);
+  }
+
+  .search-result-button {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    width: 100%;
+    min-width: 0;
+    padding: var(--space-4) var(--space-8) var(--space-4) var(--space-8);
+    background: transparent;
+    border: 0;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+  }
+
+  .search-result-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .search-result-dir {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--color-fg-subtle);
+    font-size: var(--text-sm);
+    direction: rtl;
+    text-align: left;
+  }
+
+  .search-truncated {
+    margin: 0;
+    padding: var(--space-6) var(--space-10);
+    color: var(--color-fg-muted);
+    font-size: var(--text-sm);
+    border-top: 1px solid var(--color-border);
+  }
+
+  /* ── Sticky parent headers (ADR-0052 D7) ── */
+  .sticky-stack {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 2; /* above .tree rows; below the fixed context menu (--z-context-menu). */
+    display: flex;
+    flex-direction: column;
+    background: var(--color-surface);
+    border-bottom: 1px solid var(--color-border);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.12);
+    pointer-events: none; /* container ignores events; rows opt back in below. */
+  }
+
+  .sticky-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    width: 100%;
+    min-width: 0;
+    height: 24px;
+    padding-right: var(--space-8);
+    border: 0;
+    background: var(--color-surface);
+    color: var(--color-fg-muted);
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    pointer-events: auto; /* clickable even though the container opted out. */
+  }
+
+  .sticky-row:hover {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
   }
 
   .tree {

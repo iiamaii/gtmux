@@ -4,6 +4,7 @@
 // land in Stage 3 with the toml schema mutation.
 
 import { UnauthorizedError } from './sessions';
+import type { components } from '$lib/types/api';
 
 export interface FsEntry {
   name: string;
@@ -179,6 +180,69 @@ export async function listDir(dir: string, options: ListDirOptions = {}): Promis
   if (res.status === 404) throw new DirNotFoundError();
   if (!res.ok) throw new Error(`GET /api/fs/list returned ${res.status}`);
   return res.json() as Promise<FsListResponse>;
+}
+
+/** One `GET /api/fs/search` hit (ADR-0052 D5). `kind` narrowed from the
+ * generated `string` to the same union as `FsEntry.kind`. */
+export interface FsSearchEntry {
+  path: string;
+  name: string;
+  kind: 'file' | 'directory';
+}
+
+/** `GET /api/fs/search` response (ADR-0052 D5), `kind` narrowed per entry. */
+export interface FsSearchResult {
+  results: FsSearchEntry[];
+  truncated: boolean;
+  scanned: number;
+}
+
+export interface SearchFsOptions {
+  /** Result cap (BE default applies when omitted — ADR-0052 D5). */
+  limit?: number;
+  /** ADR-0035 D7 — per-request hidden-file toggle; `undefined` → BE default. */
+  showHidden?: boolean;
+  /** Abort the in-flight request (ADR-0052 D4 — cancel stale searches). */
+  signal?: AbortSignal;
+}
+
+/**
+ * `GET /api/fs/search?root=&q=&limit=&show_hidden=` — recursive name/path search
+ * across the whole workspace (ADR-0052 D4 Phase 2 / D5). Mirrors `listDir`'s
+ * fetch contract (credentials, UnauthorizedError, dir guard errors).
+ */
+export async function searchFs(
+  root: string,
+  q: string,
+  options: SearchFsOptions = {},
+): Promise<FsSearchResult> {
+  const qs = new URLSearchParams({ root, q });
+  if (options.limit !== undefined) qs.set('limit', String(options.limit));
+  if (options.showHidden !== undefined) qs.set('show_hidden', String(options.showHidden));
+  const res = await fetch(`/api/fs/search?${qs}`, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+    credentials: 'include',
+    signal: options.signal,
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.status === 403) throw new DirNotAllowedError();
+  if (res.status === 404) throw new DirNotFoundError();
+  if (res.status === 405) throw new FsApiUnavailableError();
+  if (!res.ok) throw new Error(`GET /api/fs/search returned ${res.status}`);
+
+  const body = (await res.json()) as components['schemas']['FsSearchResponse'];
+  return {
+    results: (body.results ?? []).map((entry) => ({
+      path: entry.path,
+      name: entry.name,
+      // BE emits the same `"file"`/`"directory"` representation as fs_list; any
+      // other value is coerced to `file` so the union stays sound.
+      kind: entry.kind === 'directory' ? 'directory' : 'file',
+    })),
+    truncated: body.truncated === true,
+    scanned: typeof body.scanned === 'number' ? body.scanned : 0,
+  };
 }
 
 async function errorBodyCode(res: Response): Promise<string | null> {
