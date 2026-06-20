@@ -1,3 +1,12 @@
+<script module lang="ts">
+  // Module-scoped (persists across FileTreeView remounts — LeftPanel
+  // {#if}-unmounts the Files tab). Tracks the workspace/session key the Files
+  // selection was last cleared for, so we clear it ONLY when that key actually
+  // changes — not on every remount (ADR-0046 D6 amend ⑪: the Files selection
+  // persists across tab transitions and is re-displayed on return).
+  let lastClearedWorkspaceKey = '';
+</script>
+
 <script lang="ts">
   /**
    * FileTreeView — Project Workspace file tree.
@@ -211,9 +220,19 @@
 
   $effect(() => {
     const key = `${activeName ?? ''}:${targetRoot}`;
-    if (activeName === null || key === loadedKey) return;
+    if (activeName === null) return;
+    // ADR-0046 D6 amend ⑪ — clear the Files selection only when the
+    // workspace/session actually changed (guard persists across remounts), so
+    // the selection survives Files↔Layers/Terminals tab switches and is
+    // re-displayed on return. A bare remount (same key) keeps the selection.
+    if (key !== lastClearedWorkspaceKey) {
+      lastClearedWorkspaceKey = key;
+      filePreviewStore.clear();
+    }
+    // Reload the tree when this instance hasn't loaded this key yet (loadedKey
+    // is component-local, so a remount repopulates the local tree state).
+    if (key === loadedKey) return;
     loadedKey = key;
-    filePreviewStore.clear();
     void loadRoot(targetRoot);
   });
 
