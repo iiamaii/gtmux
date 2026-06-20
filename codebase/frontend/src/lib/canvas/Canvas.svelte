@@ -2170,13 +2170,20 @@
   function clearCanvasDrillAndSelection(): void {
     blurActiveCanvasElement();
     pathEditStore.end();
-    sessionStore.clearDrill();
-    sessionStore.clearM();
-    // ADR-0046 D6 amend ⑪ — every empty-canvas deselect gesture also clears the
-    // Files selection, mirroring an empty Files-panel click. This lives in the
-    // shared helper (not just onpaneclick) because a plain empty-canvas click is
-    // dispatched as a zero-distance lasso → finishLasso, NOT onpaneclick.
-    filePreviewStore.clear();
+    // ADR-0046 D6 amend ⑫ — an empty-canvas deselect clears only the ACTIVE
+    // left-tab's selection domain: Files tab → the Files selection
+    // (filePreviewStore); Layers/Terminals → canvas M + drill. So clicking the
+    // canvas in Layers/Terminals does NOT wipe a preserved Files selection
+    // (amend ⑪), and a deselect in Files does not touch canvas selection. The
+    // two domains are independent. (Lives in the shared helper because a plain
+    // empty-canvas click is dispatched as a zero-distance lasso → finishLasso,
+    // NOT onpaneclick.)
+    if (chromeStore.state.leftPanelTab === 'files') {
+      filePreviewStore.clear();
+    } else {
+      sessionStore.clearDrill();
+      sessionStore.clearM();
+    }
   }
 
   function returnToLayerTabForCanvasSelection(): void {
