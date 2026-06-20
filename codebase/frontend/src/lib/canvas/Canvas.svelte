@@ -2172,6 +2172,11 @@
     pathEditStore.end();
     sessionStore.clearDrill();
     sessionStore.clearM();
+    // ADR-0046 D6 amend ⑪ — every empty-canvas deselect gesture also clears the
+    // Files selection, mirroring an empty Files-panel click. This lives in the
+    // shared helper (not just onpaneclick) because a plain empty-canvas click is
+    // dispatched as a zero-distance lasso → finishLasso, NOT onpaneclick.
+    filePreviewStore.clear();
   }
 
   function returnToLayerTabForCanvasSelection(): void {
@@ -2468,11 +2473,6 @@
       }
     }
     clearCanvasDrillAndSelection();
-    // ADR-0046 D6 amend ⑪ — an empty-canvas click also clears the Files
-    // selection (always, regardless of active tab), mirroring an empty
-    // Files-panel click. (Only here, not in clearCanvasDrillAndSelection, which
-    // is also reached from Escape / lasso / programmatic deselect.)
-    filePreviewStore.clear();
   }
 
   function onCanvasDragOver(e: DragEvent): void {
