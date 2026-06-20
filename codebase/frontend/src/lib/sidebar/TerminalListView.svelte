@@ -38,8 +38,15 @@
   import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
   import PanelEmptyState from '$lib/chrome/PanelEmptyState.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
+  import { matchNamePath } from '$lib/sidebar/treeMatch';
   import type { TerminalInfo } from '$lib/types/terminals';
   import type { CanvasItem, TerminalItem } from '$lib/types/canvas';
+
+  // Search query is owned by LeftPanel's unified footer search bar and passed
+  // down (ADR-0052 D2/D6). This component no longer renders its own input; it
+  // reads `query` as a prop and updates per keystroke (in-memory flat list, so
+  // filtering is cheap — no debounce needed on this side).
+  let { query = '' }: { query?: string } = $props();
 
   const PANEL_DEFAULT_W = 480;
   const PANEL_DEFAULT_H = 320;
@@ -90,6 +97,46 @@
   function displayName(t: TerminalInfo): string {
     const item = sessionStore.items.get(t.id);
     return terminalPoolDisplayName(item?.label, t.id);
+  }
+
+  // ── Search / filter (ADR-0052 D2/D6) ──────────────────────────────────────
+  // The query text is owned by LeftPanel's unified footer search bar and flows
+  // in via the `query` prop (web-only — never sent to tmux). Terminals are a
+  // *flat* in-memory list with no path, so D6 reduces to a name substring
+  // filter and there are no sticky headers. Filtering reads the prop directly;
+  // it updates per keystroke but the in-memory list is small enough that no
+  // debounce is needed on this side.
+
+  // D6 — filter the (already scope-filtered) list by the rendered display name.
+  // Terminals have no relpath, so `name` is passed for both match keys; an empty
+  // query short-circuits to the full list (matchNamePath returns matched=true).
+  let filteredTerminals = $derived.by<TerminalInfo[]>(() => {
+    if (query.trim().length === 0) return terminals;
+    return terminals.filter((t) => {
+      const name = displayName(t);
+      return matchNamePath(query, name, name).matched;
+    });
+  });
+
+  // Highlight segments for a name (D8 — text-safe: render as plain `{text}`
+  // spans, never innerHTML). Returns alternating non-match / match chunks.
+  interface NameSegment {
+    text: string;
+    hit: boolean;
+  }
+  function nameSegments(name: string): NameSegment[] {
+    if (query.trim().length === 0) return [{ text: name, hit: false }];
+    const { ranges } = matchNamePath(query, name, name);
+    if (ranges.length === 0) return [{ text: name, hit: false }];
+    const out: NameSegment[] = [];
+    let cursor = 0;
+    for (const [start, end] of ranges) {
+      if (start > cursor) out.push({ text: name.slice(cursor, start), hit: false });
+      out.push({ text: name.slice(start, end), hit: true });
+      cursor = end;
+    }
+    if (cursor < name.length) out.push({ text: name.slice(cursor), hit: false });
+    return out;
   }
 
   function ago(unixSec: number): string {
@@ -298,9 +345,12 @@
           ? 'Create a terminal panel from the toolbar to start one.'
           : 'Switch to ALL to show terminals attached only to other sessions.'}
       />
+    {:else if filteredTerminals.length === 0}
+      <!-- Scope has terminals but none match the active query (D6). -->
+      <p class="state no-match">No terminals match “{query}”.</p>
     {:else}
       <ul class="term-list">
-        {#each terminals as t (t.id)}
+        {#each filteredTerminals as t (t.id)}
           {@const onCanvas = isOnCurrentCanvas(t.id)}
           {@const busy = attaching.has(t.id)}
           {@const unplaced = t.attach_count === 0}
@@ -319,7 +369,11 @@
               class:on={t.alive && !danglingTerminals.has(t.id)}
               aria-hidden="true"
             ></span>
-            <span class="name">{displayName(t)}</span>
+            <span class="name"
+              >{#each nameSegments(displayName(t)) as seg}<span class:hl={seg.hit}
+                >{seg.text}</span
+              >{/each}</span
+            >
             {#if isDesynced(t)}
               <!-- F4 desync badge — BE attach_index 가 본 UUID 를 못 잡은 상태.
                    클릭 시 즉시 GET /api/terminals 으로 자가 회복 시도. -->
@@ -521,6 +575,10 @@
     color: var(--color-danger);
   }
 
+  .state.no-match {
+    color: var(--color-fg-subtle);
+  }
+
   .term-list {
     list-style: none;
     padding: var(--space-4) 0;
@@ -637,6 +695,13 @@
     color: var(--color-fg);
     font-family: var(--font-mono);
     font-size: var(--text-md);
+  }
+
+  /* Search match highlight (ADR-0052 D8) — text-safe segments, no innerHTML. */
+  .name :global(.hl) {
+    background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+    color: var(--color-fg);
+    border-radius: 2px;
   }
 
   .badge {

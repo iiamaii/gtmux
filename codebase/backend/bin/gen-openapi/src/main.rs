@@ -12,6 +12,11 @@ use gtmux_http_api::schema::{
     PathEndpoint, PathWaypoint, Point, Routing, SnippetEntry, TextAlign, TextVerticalAlign,
     Viewport, Visibility,
 };
+// ADR-0052 D5 — Files-tab recursive search (`GET /api/fs/search`) response
+// contract. Surfaced as component schemas so the FE `api.d.ts` carries the
+// `FsSearchResponse` / `FsSearchEntry` types (the query params are `IntoParams`,
+// not component schemas — this doc is schema-only, `paths: {}`).
+use gtmux_http_api::{FsSearchEntry, FsSearchResponse};
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -40,6 +45,9 @@ use utoipa::OpenApi;
         Routing,
         PathEndpoint,
         PathWaypoint,
+        // ADR-0052 D5 — Files-tab recursive search response.
+        FsSearchResponse,
+        FsSearchEntry,
     ))
 )]
 struct ApiDoc;

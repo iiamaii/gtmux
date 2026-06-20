@@ -27,6 +27,15 @@
   import { directParentGroupId, effectiveLocked } from '$lib/types/group';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
+  import { matchNamePath } from '$lib/sidebar/treeMatch';
+  import { ancestorIndices } from '$lib/sidebar/stickyAncestors';
+
+  // ADR-0052 D2 — the single unified search bar now lives in LeftPanel's footer.
+  // This component no longer renders its own input; it receives the active tab's
+  // query text as a prop and filters in-memory off it. LeftPanel updates `query`
+  // per keystroke; Layers filtering is cheap (all data is already in
+  // sessionStore), so no local debounce is needed.
+  let { query = '' }: { query?: string } = $props();
 
   interface ContextMenuHolder {
     openAt: (args: {
@@ -177,6 +186,19 @@
 
   const activeSessionName = $derived(sessionStore.active?.name ?? null);
 
+  /* ── Layers search (ADR-0052 D6 — client-side filter + reveal) ─────────
+   * web-only, ephemeral (D8). The query text comes from the `query` PROP owned
+   * by LeftPanel's footer search bar (ADR-0052 D2). All layer data is already in
+   * sessionStore, so the tree structure is KEPT while searching: a node is
+   * "kept" when its label (or its ancestor-group label path) matches the query,
+   * and every kept node's ancestor groups are revealed (force-expanded,
+   * non-destructively) so the match is visible. No tmux/layout mutation.
+   *
+   * The prop is read directly for both filter and highlight — Layers filtering
+   * is in-memory and cheap, so no debounce is needed (LeftPanel updates the prop
+   * per keystroke). The prop resets naturally on tab unmount/remount. */
+  const searching = $derived(query.trim().length > 0);
+
   // 펼침 상태 — 세션별로 localStorage 에 저장해 탭 전환/새로고침 후에도 복원.
   const expanded = new SvelteSet<string>();
   let restoredExpansionKey = $state<string | null | undefined>(undefined);
@@ -214,6 +236,94 @@
   // ADR-0024 의 2026-05-22 ② amend (Tree=Z): Sidebar 는 *단일 view* (Tree).
   // 옛 Z tab 의 group atomic row + fold/unfold 는 Tree 가 이미 동일 affordance 제공
   // → Z tab UI 폐기. z-index 값 표시는 Inspector 로 단일화.
+
+  /* ── Search kept-set + reveal (ADR-0052 D6) ───────────────────────────
+   * Compute, over the *full* in-memory group/panel data, which nodes are kept
+   * for the current query and which ancestor groups must be revealed so each
+   * match stays visible. `labelPath` for a node = the `/`-joined ancestor group
+   * labels + own label, so a query can match by ancestor path too (matchNamePath
+   * uses `relpath` as the second candidate key). A node is kept when
+   * matchNamePath(query, ownLabel, labelPath).matched; for every kept node, its
+   * ancestor groups are added to the reveal set. Branches with no kept descendant
+   * stay hidden because `visibleTree` filters on the kept ∪ ancestor sets. */
+  interface SearchSets {
+    kept: Set<string>;
+    forced: Set<string>;
+  }
+
+  const searchSets = $derived.by<SearchSets>(() => {
+    const kept = new Set<string>();
+    const forced = new Set<string>();
+    if (!searching) return { kept, forced };
+
+    const q = query;
+
+    // Ancestor-group label chain (root → … → direct parent) for a node, using
+    // the same groups map walkAncestors reads. Outermost first.
+    const ancestorLabels = (parentId: string | null): { ids: string[]; labels: string[] } => {
+      const ids: string[] = [];
+      const labels: string[] = [];
+      // walkAncestors returns nearest-first; reverse to outermost-first.
+      const chain = walkAncestors(parentId);
+      for (let i = chain.length - 1; i >= 0; i -= 1) {
+        const node = chain[i];
+        if (node === undefined) continue;
+        const g = sessionStore.groups.get(node.id);
+        if (g === undefined) continue;
+        ids.push(g.id);
+        labels.push(groupDisplayLabel(g));
+      }
+      return { ids, labels };
+    };
+
+    const consider = (id: string, ownLabel: string, parentId: string | null): void => {
+      const { ids, labels } = ancestorLabels(parentId);
+      const labelPath = [...labels, ownLabel].join('/');
+      if (matchNamePath(q, ownLabel, labelPath).matched) {
+        kept.add(id);
+        // Reveal every ancestor group so the match is visible without mutating
+        // the persisted `expanded` set.
+        for (const aid of ids) {
+          kept.add(aid);
+          forced.add(aid);
+        }
+      }
+    };
+
+    for (const g of sessionStore.groups.values()) {
+      consider(g.id, groupDisplayLabel(g), g.parent_id ?? null);
+    }
+    for (const it of sessionStore.items.values()) {
+      const panelView: PanelData = {
+        id: it.id,
+        parent_id: it.parent_id,
+        pane_id: it.type === 'terminal' ? it.id : undefined,
+        type: it.type,
+        label: it.label ?? null,
+        title: it.type === 'note' ? it.title : undefined,
+        file_name: it.type === 'document' ? it.file_name : undefined,
+        entries: it.type === 'snippets' ? it.entries : undefined,
+      };
+      consider(it.id, panelDisplayLabel(panelView), it.parent_id ?? null);
+    }
+    return { kept, forced };
+  });
+
+  /**
+   * Effective expansion used by the tree walk: the persisted `expanded` set,
+   * unioned with the search-forced ancestor set while searching. This keeps the
+   * reveal non-destructive — `expanded` (and its localStorage mirror) is never
+   * mutated by search, so clearing the query restores the user's expand state.
+   */
+  const effectiveExpanded = $derived.by<(id: string) => boolean>(() => {
+    if (!searching) {
+      // Reference `expanded` for reactivity even on the non-search path.
+      void expanded.size;
+      return (id: string) => expanded.has(id);
+    }
+    const forced = searchSets.forced;
+    return (id: string) => expanded.has(id) || forced.has(id);
+  });
 
   // 트리 평탄화 — Group/Panel 을 parent_id 기준으로 묶어 DFS 순회.
   // 평탄화된 결과를 {each} 로 렌더하면 들여쓰기는 depth * 16 px 로 표현 가능.
@@ -292,7 +402,9 @@
             group: g,
             hasChildren: ownChildren > 0,
           });
-          if (expanded.has(g.id) && ownChildren > 0) {
+          // Use effective expansion so search can reveal ancestor groups
+          // without mutating the persisted `expanded` set (ADR-0052 D6).
+          if (effectiveExpanded(g.id) && ownChildren > 0) {
             walk(g.id, depth + 1);
           }
         } else {
@@ -304,6 +416,17 @@
     };
     walk(null, 0);
     return out;
+  });
+
+  /* Visible tree (ADR-0052 D6) — while searching, drop rows that are neither a
+   * match nor a revealed ancestor; the structure (z-order, depth, indent) is
+   * preserved. When not searching this is `tree` unchanged. All selection / drag
+   * / sticky logic reads `visibleTree` so they stay in sync with what is on
+   * screen. */
+  const visibleTree = $derived.by<TreeNode[]>(() => {
+    if (!searching) return tree;
+    const kept = searchSets.kept;
+    return tree.filter((n) => kept.has(n.id));
   });
 
   // Panel.pane_id (e.g. "%3") → muxStore.panes 의 정수 key (3) 변환.
@@ -383,9 +506,53 @@
   // Group 행 표시 라벨 — Group.label || id.
   // ADR-0010 D6 의 ancestor inherit 은 effective 계산이며 self.label null 일 때 ancestor 라벨을
   // *추론* 한다고 명시. MVP 본 v0 은 self.label 만 표시 (inherit 은 P1+에서 effective 계산기 도입).
-  function groupDisplayLabel(g: GroupData): string {
+  // Accepts any object with `{ id, label? }` — both the GroupData view and the
+  // session-store Group (whose `visibility` is a string enum) satisfy this, so
+  // search code can resolve a group label without an unsound `as GroupData` cast.
+  function groupDisplayLabel(g: { id: string; label?: string | null }): string {
     if (g.label != null && g.label.length > 0) return g.label;
     return g.id;
+  }
+
+  /* ── Search highlight (ADR-0052 D8 — text-safe, no innerHTML) ──────────
+   * Split a label into alternating {text, hit} segments from matchNamePath
+   * `ranges` so the template can wrap matched runs in <mark> via {#each}. All
+   * segment text is rendered as Svelte text (auto-escaped) — user input is never
+   * passed through innerHTML (CLAUDE.md invariant 4). When not searching (or no
+   * ranges) the whole label is one non-hit segment. `labelPath` is passed so a
+   * path-only match still highlights name occurrences consistently. */
+  interface LabelSegment {
+    text: string;
+    hit: boolean;
+  }
+
+  function labelSegments(label: string, labelPath: string): LabelSegment[] {
+    if (!searching) return [{ text: label, hit: false }];
+    const { matched, ranges } = matchNamePath(query, label, labelPath);
+    if (!matched || ranges.length === 0) return [{ text: label, hit: false }];
+    const segs: LabelSegment[] = [];
+    let cursor = 0;
+    for (const [start, end] of ranges) {
+      if (start > cursor) segs.push({ text: label.slice(cursor, start), hit: false });
+      segs.push({ text: label.slice(start, end), hit: true });
+      cursor = end;
+    }
+    if (cursor < label.length) segs.push({ text: label.slice(cursor), hit: false });
+    return segs;
+  }
+
+  /** `/`-joined ancestor group label path + own label — the second match key. */
+  function nodeLabelPath(parentId: string | null, ownLabel: string): string {
+    const chain = walkAncestors(parentId); // nearest-first
+    const labels: string[] = [];
+    for (let i = chain.length - 1; i >= 0; i -= 1) {
+      const node = chain[i];
+      if (node === undefined) continue;
+      const g = sessionStore.groups.get(node.id);
+      if (g !== undefined) labels.push(groupDisplayLabel(g));
+    }
+    labels.push(ownLabel);
+    return labels.join('/');
   }
 
   function toggleExpand(id: string): void {
@@ -559,7 +726,7 @@
    * 둘 중 하나라도 invisible 면 빈 배열.
    */
   function visibleRangeIds(a: string, b: string): string[] {
-    const order = tree.map((n) => n.id);
+    const order = visibleTree.map((n) => n.id);
     const ia = order.indexOf(a);
     const ib = order.indexOf(b);
     if (ia < 0 || ib < 0) return [];
@@ -573,6 +740,103 @@
     sessionStore.clearM();
     sessionStore.clearDrill();
     selectionAnchor = null;
+  }
+
+  /* ── Sticky parent headers (ADR-0052 D7 — VSCode-style sticky scroll) ──
+   * When NOT searching, pin the FULL ancestor chain (root → … → direct parent)
+   * of the topmost visible row to the top of the `.tree` scroll container,
+   * stacked like VSCode. The tree is non-virtualized with uniform row pitch, so
+   * the chain is pure arithmetic over `visibleTree`:
+   *   rowHeight  = measured per-row PITCH (see measureRowPitch)
+   *   topIndex   = floor(scrollTop / rowHeight)
+   *   indices    = ancestorIndices(visibleTree, topIndex, MAX_STICKY)
+   * `ancestorIndices` already returns the full chain top-down; the earlier bug
+   * (only the top-most ancestor showing) was a rowHeight measurement error, not
+   * an algorithm error — see measureRowPitch. Recomputes on scroll, on mount,
+   * and whenever the visible tree changes. Hidden while searching (the filtered
+   * tree has no reliable hierarchy to pin). */
+  const MAX_STICKY = 6;
+  const STICKY_ROW_HEIGHT_FALLBACK = 28;
+
+  let treeScrollEl = $state<HTMLUListElement | null>(null);
+  let scrollTop = $state(0);
+  let rowHeight = $state(STICKY_ROW_HEIGHT_FALLBACK);
+
+  /**
+   * Measure the true per-row vertical PITCH of a single tree row.
+   *
+   * Bug fix (ADR-0052 D7): the row pitch is NOT `.row` `offsetHeight`. Rows are
+   * separated by `.row + .row { margin-top: 2px }`, and margins live OUTSIDE the
+   * offset box, so `offsetHeight` undercounts the real advance per index. A wrong
+   * pitch makes `topIndex = floor(scrollTop / rowHeight)` inaccurate at depth: an
+   * over-estimated pitch yields a too-small `topIndex`, so the scan starts above
+   * the real top row and only the outermost ancestor is recovered (the reported
+   * symptom — only the top-level group sticks).
+   *
+   * Robust measure: take the offset DELTA between the first two real tree rows
+   * (`row1.offsetTop - row0.offsetTop`). This is the exact pitch including any
+   * inter-row margin, and is immune to which element is the row vs. a wrapper.
+   * We explicitly query `.row` (the `<li>` tree rows) so the taller `.sticky-row`
+   * stack is never measured. Fallbacks: single-row `offsetHeight`, then the CSS
+   * constant.
+   */
+  function measureRowPitch(): void {
+    const el = treeScrollEl;
+    if (el === null) return;
+    const rows = el.querySelectorAll('.row');
+    const row0 = rows[0] as HTMLElement | undefined;
+    if (row0 === undefined) return;
+    const row1 = rows[1] as HTMLElement | undefined;
+    if (row1 !== undefined) {
+      const pitch = row1.offsetTop - row0.offsetTop;
+      if (pitch > 0) {
+        rowHeight = pitch;
+        return;
+      }
+    }
+    // Single row visible — fall back to its own height (no inter-row delta yet).
+    const h = row0.offsetHeight;
+    if (h > 0) rowHeight = h;
+  }
+
+  function onTreeScroll(e: Event): void {
+    scrollTop = (e.currentTarget as HTMLElement).scrollTop;
+  }
+
+  // Re-measure the row pitch on mount and whenever the visible tree changes
+  // (rows may have just mounted / changed depth). Keyed on the live scroll el so
+  // it also runs once `bind:this` resolves after the first render.
+  $effect(() => {
+    // Touch the scroll el + visibleTree so this re-runs on structural change.
+    void treeScrollEl;
+    void visibleTree.length;
+    measureRowPitch();
+  });
+
+  // Topmost fully-or-partially visible row index from the live scroll position.
+  const stickyTopIndex = $derived.by<number>(() => {
+    if (rowHeight <= 0) return 0;
+    const idx = Math.floor(scrollTop / rowHeight);
+    return idx < 0 ? 0 : idx;
+  });
+
+  // Ancestor rows (TreeNode + their flattened index) to pin, top-down.
+  const stickyRows = $derived.by<Array<{ index: number; node: TreeNode }>>(() => {
+    if (searching) return [];
+    const indices = ancestorIndices(visibleTree, stickyTopIndex, MAX_STICKY);
+    const out: Array<{ index: number; node: TreeNode }> = [];
+    for (const idx of indices) {
+      const node = visibleTree[idx];
+      if (node !== undefined) out.push({ index: idx, node });
+    }
+    return out;
+  });
+
+  /** Click a sticky header → scroll that ancestor row to the top of the view. */
+  function scrollRowToTop(index: number): void {
+    const el = treeScrollEl;
+    if (el === null) return;
+    el.scrollTop = index * rowHeight;
   }
 
   // Panel 행이 dead pane 인지 — 회색/취소선 표시 트리거.
@@ -990,23 +1254,82 @@
   </span>
 {/snippet}
 
+<!-- Reusable highlighted-label snippet — renders matchNamePath segments as
+     text-safe runs (auto-escaped); matched runs wrapped in <mark>. No innerHTML
+     (ADR-0052 D8). -->
+{#snippet highlightedLabel(label: string, labelPath: string, suffix: string)}{#each labelSegments(label, labelPath) as seg, i (i)}{#if seg.hit}<mark class="search-hit">{seg.text}</mark>{:else}{seg.text}{/if}{/each}{suffix}{/snippet}
+
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="layer-tree-view" aria-label="Layer tree" onclick={onLayerTreeBackgroundClick} onkeydown={() => {}}>
   <!-- ADR-0024 의 2026-05-22 ② amend (Tree=Z) — Z tab UI 제거. Tree 가 단일 view.
        z-index 값 표시는 Inspector 로 단일화. -->
+
+  <!-- ADR-0052 D2 — the search input is owned by LeftPanel's footer; this
+       component receives the active query as the `query` prop and only renders
+       the (filtered) tree. -->
+
   {#if tree.length === 0}
     <PanelEmptyState
       icon="layers"
       lead="No canvas items"
       description="Add items from the toolbar to build the layer tree."
     />
+  {:else if visibleTree.length === 0}
+    <PanelEmptyState
+      icon="layers"
+      lead="No matching layers"
+      description="No group or panel label matches the search."
+    />
   {:else}
-    <ul class="tree" role="tree" aria-label="Canvas layer tree">
-      {#each tree as node (node.kind + ':' + node.id)}
+    <ul
+      class="tree"
+      role="tree"
+      aria-label="Canvas layer tree"
+      bind:this={treeScrollEl}
+      onscroll={onTreeScroll}
+    >
+      {#if stickyRows.length > 0}
+        <!-- Sticky ancestor stack (ADR-0052 D7). Absolutely pinned to the top of
+             the scroll container; pointer-events active, above rows / below the
+             context menu. Hidden while searching. -->
+        <div
+          class="sticky-stack"
+          aria-hidden="true"
+          style:top={`${scrollTop}px`}
+        >
+          {#each stickyRows as sr (sr.node.id)}
+            {#if sr.node.kind === 'group'}
+              {@const sg = sr.node.group}
+              <button
+                type="button"
+                class="sticky-row"
+                tabindex="-1"
+                style:height={`${rowHeight}px`}
+                style:padding-left={`${sr.node.depth * 16 + 4}px`}
+                title={groupDisplayLabel(sg)}
+                onclick={() => scrollRowToTop(sr.index)}
+              >
+                <span class="type-icon group-type-icon" aria-hidden="true">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 8V5a1 1 0 0 1 1-1h3"/>
+                    <path d="M16 4h3a1 1 0 0 1 1 1v3"/>
+                    <path d="M20 16v3a1 1 0 0 1-1 1h-3"/>
+                    <path d="M8 20H5a1 1 0 0 1-1-1v-3"/>
+                    <rect x="8" y="8" width="4" height="4" rx="0.8"/>
+                    <rect x="13" y="13" width="3" height="3" rx="0.7"/>
+                  </svg>
+                </span>
+                <span class="label">{groupDisplayLabel(sg)}</span>
+              </button>
+            {/if}
+          {/each}
+        </div>
+      {/if}
+      {#each visibleTree as node (node.kind + ':' + node.id)}
         {#if node.kind === 'group'}
         {@const g = node.group}
         {@const selected = sessionStore.M.has(node.id)}
-        {@const isOpen = expanded.has(node.id)}
+        {@const isOpen = effectiveExpanded(node.id)}
         <li
           class="row group-row"
           class:selected
@@ -1082,7 +1405,12 @@
                     <rect x="13" y="13" width="3" height="3" rx="0.7"/>
                   </svg>
                 </span>
-                <span class="label">{groupDisplayLabel(g)}</span>
+                <span class="label"
+                  >{@render highlightedLabel(
+                    groupDisplayLabel(g),
+                    nodeLabelPath(g.parent_id ?? null, groupDisplayLabel(g)),
+                    '',
+                  )}</span>
               </button>
             {/if}
             {#snippet groupIcons()}
@@ -1199,7 +1527,12 @@
                 title={`${panelDisplayLabel(p)} (double-click to rename)`}
               >
                 {@render typeIconSvg(p)}
-                <span class="label">{panelDisplayLabel(p)}{dead ? ' (Dead)' : ''}</span>
+                <span class="label"
+                  >{@render highlightedLabel(
+                    panelDisplayLabel(p),
+                    nodeLabelPath(p.parent_id ?? null, panelDisplayLabel(p)),
+                    dead ? ' (Dead)' : '',
+                  )}</span>
                 {#if p.type === 'snippets'}
                   {@const sc = snippetsCount(p)}
                   {#if sc !== null}
@@ -1292,6 +1625,16 @@
     user-select: none;
   }
 
+  /* The Layers search input lives in LeftPanel's footer (ADR-0052 D2); this
+   * component keeps only the matched-substring highlight style below. */
+
+  /* Matched-substring highlight on labels (text-safe segments). */
+  .search-hit {
+    background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+    color: inherit;
+    border-radius: 2px;
+  }
+
   .tree {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -1299,6 +1642,49 @@
     list-style: none;
     margin: 0;
     padding: var(--space-4) 0;
+    position: relative;
+  }
+
+  /* Sticky parent header stack (ADR-0052 D7). Absolutely positioned inside the
+   * scroll container; `top` tracks scrollTop so the stack stays pinned to the
+   * viewport's top edge. Above rows, below the context menu; clickable. */
+  .sticky-stack {
+    position: absolute;
+    left: 0;
+    right: 0;
+    z-index: 2;
+    pointer-events: auto;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 2px 4px color-mix(in srgb, var(--color-shadow, #000) 18%, transparent);
+  }
+
+  .sticky-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    width: 100%;
+    padding-right: var(--space-8);
+    border: 0;
+    background: var(--color-bg);
+    color: var(--color-fg-muted);
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    font-size: var(--text-md);
+  }
+
+  .sticky-row:hover {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
+  }
+
+  .sticky-row .label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .row {

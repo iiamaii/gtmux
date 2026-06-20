@@ -1,3 +1,17 @@
+<script module lang="ts">
+  // Module-scoped (persists across FileTreeView remounts — LeftPanel
+  // {#if}-unmounts the Files tab). Tracks the workspace/session key the Files
+  // selection was last cleared for, so we clear it ONLY when that key actually
+  // changes — not on every remount (ADR-0046 D6 amend ⑪: the Files selection
+  // persists across tab transitions and is re-displayed on return).
+  let lastClearedWorkspaceKey = '';
+
+  // Module-scoped scroll memory (survives remounts, in-memory only — no
+  // localStorage write per scroll). One {key, top} for the active workspace, so
+  // returning to the Files tab restores the previous scroll offset cheaply.
+  let savedTreeScroll: { key: string; top: number } = { key: '', top: 0 };
+</script>
+
 <script lang="ts">
   /**
    * FileTreeView — Project Workspace file tree.
@@ -32,8 +46,10 @@
     moveFs,
     removeFs,
     renameFs,
+    searchFs,
     uploadFs,
     type FsEntry,
+    type FsSearchEntry,
     type MoveFsEntry,
   } from '$lib/http/fs';
   import {
@@ -57,6 +73,15 @@
   import { commitNewItem, createCanvasItemFromWorkspaceFile } from '$lib/canvas/itemFactory';
   import { shortcutRegistry, type ShortcutDescriptor } from '$lib/keyboard/shortcutRegistry.svelte';
   import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
+  import { matchNamePath } from './treeMatch';
+  import { ancestorIndices } from './stickyAncestors';
+  import { debounce } from '$lib/common/debounce';
+
+  // ADR-0052 D2 — the search input now lives in the LeftPanel footer (one
+  // unified search bar shared across tabs). This component no longer owns the
+  // input/clear-button/local query state; it receives the active query text as
+  // a prop and reacts to it (Phase 1 client filter + Phase 2 server search, D4).
+  let { query = '' }: { query?: string } = $props();
 
   type Row = {
     path: string;
@@ -70,9 +95,25 @@
     sourceRows: Row[];
     sourcePaths: string[];
   };
+  // ADR-0052 D4 — a single flat search hit (Phase 1 client row or Phase 2 server
+  // result), keyed by absolute `path` for dedupe and ranked for the flat list.
+  type SearchResult = {
+    path: string;
+    entry: FsEntry;
+    relpath: string;
+    ranges: [number, number][];
+  };
 
   const FILE_TREE_EXPANSION_STORAGE_KEY = 'gtmux:file-tree-expanded:v1';
   const MAX_FILE_TREE_EXPANSIONS = 200;
+  // ADR-0052 D7 — sticky parent header stack depth cap.
+  const MAX_STICKY = 6;
+  // Fallback row height when the live `.row` offsetHeight cannot be measured yet
+  // (≈ icon row + 2px row gap; matches the CSS in this file). Replaced by the
+  // measured value on first render — ADR-0052 D7.
+  const STICKY_ROW_HEIGHT_FALLBACK = 26;
+  // ADR-0052 D4 — cap the flat result list so a broad query stays cheap to render.
+  const MAX_SEARCH_RESULTS = 500;
 
   let rootPath = $state('');
   let rootError = $state<string | null>(null);
@@ -109,6 +150,23 @@
   let dropTargetDir = $state<string | null>(null);
   let moveSubmitting = $state(false);
 
+  // ── Search (ADR-0052 D2/D4) — driven by the `query` PROP (footer-owned). ──
+  // Phase 2 (server) state. `serverResults` holds the latest server response for
+  // the *current* query; `searchLoading` reflects an in-flight request and
+  // `serverTruncated` surfaces the BE `truncated` flag.
+  let serverResults = $state<FsSearchEntry[]>([]);
+  let serverTruncated = $state(false);
+  let searchLoading = $state(false);
+  // AbortController for the in-flight Phase 2 request, and a monotonically
+  // increasing request id so a slow/stale response is ignored (ADR-0052 D4).
+  let searchAbort: AbortController | null = null;
+  let searchSeq = 0;
+
+  // ── Sticky parent headers (ADR-0052 D7) ──
+  let stickyIndices = $state<number[]>([]);
+  let measuredRowHeight = $state(0);
+  const searching = $derived(query.trim().length > 0);
+
   const activeName = $derived(sessionStore.active?.name ?? null);
   const activeSession = $derived(
     activeName === null
@@ -129,6 +187,43 @@
   const uploadTargetDir = $derived(resolveUploadTargetDir());
   const rootDropTargetDir = $derived(rootPath || targetRoot);
 
+  // ── Search results (ADR-0052 D4) ──
+  // Phase 1 (client, instant): filter the already-loaded tree rows. Reacts
+  // synchronously to `query`/`rows` — no debounce, no network.
+  const phase1Results = $derived.by((): SearchResult[] => {
+    if (!searching) return [];
+    const out: SearchResult[] = [];
+    for (const row of rows) {
+      const relpath = relpathOf(row.path);
+      const match = matchNamePath(query, row.entry.name, relpath);
+      if (!match.matched) continue;
+      out.push({ path: row.path, entry: row.entry, relpath, ranges: match.ranges });
+    }
+    return out;
+  });
+
+  // Phase 1 + Phase 2 merged, deduped by absolute path (Phase 1 wins — it carries
+  // the full FsEntry incl. size/mtime), then ranked. ADR-0052 D4.
+  const searchResults = $derived.by((): SearchResult[] => {
+    if (!searching) return [];
+    const byPath = new Map<string, SearchResult>();
+    for (const result of phase1Results) byPath.set(result.path, result);
+    for (const hit of serverResults) {
+      if (byPath.has(hit.path)) continue; // dedupe — Phase-1 row already present.
+      const relpath = relpathOf(hit.path);
+      const match = matchNamePath(query, hit.name, relpath);
+      // The server already applied the same matcher (D3 shared semantics); recompute
+      // only to obtain the name highlight ranges for the flat-list render.
+      byPath.set(hit.path, {
+        path: hit.path,
+        entry: { name: hit.name, kind: hit.kind, size_bytes: null, mtime_unix: null },
+        relpath,
+        ranges: match.ranges,
+      });
+    }
+    return rankSearchResults([...byPath.values()], query).slice(0, MAX_SEARCH_RESULTS);
+  });
+
   function joinPath(dir: string, name: string): string {
     if (dir.length === 0 || dir.endsWith('/')) return `${dir}${name}`;
     return `${dir}/${name}`;
@@ -148,6 +243,29 @@
     const slash = trimmed.lastIndexOf('/');
     if (slash <= 0) return rootPath || targetRoot;
     return trimmed.slice(0, slash);
+  }
+
+  // ADR-0052 D4 — workspace-relative path (strip `rootPath` + leading slash) used
+  // as the second match key and the dim dir-context in the flat result list.
+  function relpathOf(absPath: string): string {
+    const root = rootPath || targetRoot;
+    if (root.length === 0) return absPath;
+    if (absPath === root) return '';
+    const prefix = root.endsWith('/') ? root : `${root}/`;
+    if (absPath.startsWith(prefix)) return absPath.slice(prefix.length);
+    return absPath;
+  }
+
+  // ADR-0052 D4 — dim relative-dir context shown after the name in a result row.
+  function resultContextDir(result: SearchResult): string {
+    const slash = result.relpath.lastIndexOf('/');
+    return slash < 0 ? '' : result.relpath.slice(0, slash);
+  }
+
+  // Adapt a flat search result to the `Row` shape so the shared `fileIconSvg`
+  // snippet (reads only `entry.kind` + `path`) can render its icon.
+  function resultIconRow(result: SearchResult): Row {
+    return { path: result.path, entry: result.entry, depth: 0, expanded: false, loading: false };
   }
 
   function isSameOrChild(path: string, parent: string): boolean {
@@ -211,10 +329,142 @@
 
   $effect(() => {
     const key = `${activeName ?? ''}:${targetRoot}`;
-    if (activeName === null || key === loadedKey) return;
+    if (activeName === null) return;
+    // ADR-0046 D6 amend ⑪ — clear the Files selection only when the
+    // workspace/session actually changed (guard persists across remounts), so
+    // the selection survives Files↔Layers/Terminals tab switches and is
+    // re-displayed on return. A bare remount (same key) keeps the selection.
+    if (key !== lastClearedWorkspaceKey) {
+      lastClearedWorkspaceKey = key;
+      filePreviewStore.clear();
+    }
+    // Reload the tree when this instance hasn't loaded this key yet (loadedKey
+    // is component-local, so a remount repopulates the local tree state).
+    if (key === loadedKey) return;
     loadedKey = key;
-    filePreviewStore.clear();
     void loadRoot(targetRoot);
+  });
+
+  // ── Scroll restore (ADR-0046 D6 amend ⑪ follow-up) ───────────────────
+  // Save the scroll offset to module scope on scroll (cheap, in-memory); restore
+  // it once the tree has rendered after a remount. Keyed by workspace so an
+  // unrelated workspace never inherits a stale offset.
+  let treeScrollEl = $state<HTMLElement | undefined>(undefined);
+  let scrollRestored = false; // per-mount; resets on remount (new instance).
+
+  function currentTreeScrollKey(): string {
+    return `${activeName ?? ''}:${rootPath || targetRoot}`;
+  }
+
+  function onTreeScroll(): void {
+    closeContextMenu();
+    const el = treeScrollEl;
+    if (el === undefined) return;
+    savedTreeScroll = { key: currentTreeScrollKey(), top: el.scrollTop };
+    recomputeSticky(); // ADR-0052 D7 — keep the sticky stack in sync with scroll.
+  }
+
+  // ── Sticky parent headers (ADR-0052 D7) ──
+  // Uniform-row arithmetic: measure the true per-row SCROLL PITCH, derive the
+  // topmost visible row index, then collect its ancestor row indices from the
+  // flat `rows` + `depth` via `ancestorIndices`.
+  function effectiveRowHeight(): number {
+    return measuredRowHeight > 0 ? measuredRowHeight : STICKY_ROW_HEIGHT_FALLBACK;
+  }
+
+  // ADR-0052 D7 (bug fix) — the divisor for `topIndex` must be the real per-row
+  // PITCH, not a single row's box height. Tree rows carry inter-row spacing
+  // (`.row + .row { margin-top }`), so the on-screen step between consecutive
+  // rows = offsetHeight + margin. Measuring `offsetHeight` alone yields a divisor
+  // a couple px too small, which inflates `topIndex = floor(scrollTop / pitch)`;
+  // the error accumulates with scroll distance and points `ancestorIndices` at
+  // the wrong row, collapsing the sticky chain to only its shallow head. Measure
+  // the pitch directly as the vertical offset between the first two `.row`
+  // elements so depth/scroll stay accurate. Only `.row` <li>s exist in the tree
+  // <ul> (the taller `.sticky-row`s live in a sibling overlay), so this never
+  // measures a sticky/wrapper element.
+  function measureRowHeight(): void {
+    const el = treeScrollEl;
+    if (el === undefined) return;
+    const rowEls = el.querySelectorAll('.row');
+    const first = rowEls[0] as HTMLElement | undefined;
+    if (first === undefined) return;
+    const second = rowEls[1] as HTMLElement | undefined;
+    if (second !== undefined) {
+      // True pitch = vertical step between consecutive rows (includes the
+      // inter-row margin). This is the value `topIndex` must divide by.
+      const pitch = second.offsetTop - first.offsetTop;
+      if (pitch > 0) {
+        measuredRowHeight = pitch;
+        return;
+      }
+    }
+    // Single-row fallback: box height (margin only appears between rows, so a
+    // lone row has none to add). Still better than the static constant.
+    if (first.offsetHeight > 0) measuredRowHeight = first.offsetHeight;
+  }
+
+  function recomputeSticky(): void {
+    // Sticky is hierarchy-only; the flat search list has no ancestors (D7).
+    if (searching) {
+      if (stickyIndices.length > 0) stickyIndices = [];
+      return;
+    }
+    const el = treeScrollEl;
+    if (el === undefined || rows.length === 0) {
+      if (stickyIndices.length > 0) stickyIndices = [];
+      return;
+    }
+    if (measuredRowHeight === 0) measureRowHeight();
+    const rowHeight = effectiveRowHeight();
+    const topIndex = Math.floor(el.scrollTop / rowHeight);
+    const next = ancestorIndices(rows, topIndex, MAX_STICKY);
+    if (!sameIndices(next, stickyIndices)) stickyIndices = next;
+  }
+
+  function sameIndices(a: number[], b: number[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  function onStickyClick(index: number): void {
+    const el = treeScrollEl;
+    if (el === undefined) return;
+    // Scroll the clicked ancestor row to the top of the viewport (D7).
+    el.scrollTop = index * effectiveRowHeight();
+    recomputeSticky();
+  }
+
+  // Recompute the sticky stack whenever the flattened rows change (expand/collapse,
+  // lazy load, prune), search toggles, or the live scroll element (re)binds —
+  // uniform-row arithmetic depends on `rows` and on `treeScrollEl` existing.
+  // Reading `treeScrollEl` here makes this run on mount (once the <ul> binds) and
+  // again after the search→tree branch swap re-creates it, not only on scroll.
+  // ADR-0052 D7. `measureRowHeight()` runs unconditionally so the pitch is
+  // re-measured once a second row exists (upgrading the single-row fallback).
+  $effect(() => {
+    void rows;
+    void searching;
+    void treeScrollEl;
+    measureRowHeight();
+    recomputeSticky();
+  });
+
+  $effect(() => {
+    // Re-runs as rows hydrate (childrenByDir grows). Restore once the content is
+    // tall enough to honor the saved offset, so deep offsets survive async
+    // expanded-dir hydration. O(1) work; a few runs during load, then idle.
+    void childrenByDir;
+    const el = treeScrollEl;
+    if (el === undefined || scrollRestored || rootLoading) return;
+    if (savedTreeScroll.key !== currentTreeScrollKey() || savedTreeScroll.top <= 0) {
+      scrollRestored = true;
+      return;
+    }
+    if (el.scrollHeight - el.clientHeight < savedTreeScroll.top) return; // more rows incoming
+    el.scrollTop = savedTreeScroll.top;
+    scrollRestored = true;
   });
 
   $effect(() => {
@@ -222,6 +472,88 @@
       contextMenu = null;
     }
   });
+
+  // When the flat search list is dismissed (query cleared), the tree `<ul>` is
+  // re-created by the `{#if}` branch swap and loses its scrollTop. Re-arm the
+  // restore effect so the pre-search offset (still in `savedTreeScroll`, since
+  // `onTreeScroll` only fires on the tree) is re-applied. ADR-0052 D4 + amend ⑪.
+  let wasSearching = false;
+  $effect(() => {
+    const now = searching;
+    if (wasSearching && !now) scrollRestored = false;
+    wasSearching = now;
+  });
+
+  // ── Search Phase 2 (ADR-0052 D4) — debounced recursive server search ──
+  // `runServerSearch` issues the request; the debounced wrapper coalesces rapid
+  // keystrokes (~150ms). Each call cancels the prior in-flight request and bumps
+  // `searchSeq`, so a late response from a stale query is dropped.
+  const debouncedServerSearch = debounce((q: string, root: string) => {
+    void runServerSearch(q, root);
+  }, 150);
+
+  async function runServerSearch(q: string, root: string): Promise<void> {
+    if (searchAbort !== null) searchAbort.abort();
+    const controller = new AbortController();
+    searchAbort = controller;
+    const seq = ++searchSeq;
+    searchLoading = true;
+    try {
+      const res = await searchFs(root, q, { limit: MAX_SEARCH_RESULTS, signal: controller.signal });
+      if (seq !== searchSeq) return; // a newer query superseded this one — ignore.
+      serverResults = res.results;
+      serverTruncated = res.truncated;
+    } catch (err) {
+      if (seq !== searchSeq) return;
+      // Abort is expected on supersession; ignore it. Any other failure degrades
+      // gracefully to Phase-1-only results (D4) — no destructive surface.
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      serverResults = [];
+      serverTruncated = false;
+      console.debug('[gtmux] fs search failed', err);
+    } finally {
+      if (seq === searchSeq) searchLoading = false;
+    }
+  }
+
+  // Drive Phase 2 from `query`/`rootPath`. Empty query cancels any in-flight
+  // request and clears server state; a non-empty query schedules a debounced call.
+  // Only `query` + root are read here — server-result writes must NOT re-trigger
+  // this effect (that would re-issue the search on every response, ADR-0052 D4).
+  $effect(() => {
+    const q = query.trim();
+    const root = rootPath || targetRoot;
+    if (q.length === 0 || root.length === 0) {
+      cancelServerSearch();
+      return;
+    }
+    debouncedServerSearch(q, root);
+  });
+
+  // Cancel the debounce + abort the in-flight request and reset server state.
+  // Reads/writes server state imperatively (outside the reactive read graph).
+  function cancelServerSearch(): void {
+    debouncedServerSearch.cancel();
+    if (searchAbort !== null) {
+      searchAbort.abort();
+      searchAbort = null;
+    }
+    searchSeq += 1; // invalidate any pending response.
+    searchLoading = false;
+    serverResults = [];
+    serverTruncated = false;
+  }
+
+  function onSearchResultClick(result: SearchResult): void {
+    // Single-select into the preview store — same contract as a tree row click
+    // (ADR-0046 amend ④), so the Preview updates. Does not disturb the tree.
+    filePreviewStore.select(result.path, result.entry);
+    chromeStore.setRightPanelTab('preview');
+  }
 
   async function loadRoot(dir: string): Promise<void> {
     const sessionName = activeName;
@@ -336,6 +668,21 @@
         window.location.href = '/auth';
         return;
       }
+      // A directory that no longer exists (deleted on disk) must not stay in the
+      // persisted expanded set — otherwise it is re-listed and 404s on every
+      // Files-tab entry. Prune it (self-healing) instead of surfacing an error.
+      if (err instanceof DirNotFoundError) {
+        if (expandedDirs.has(path)) {
+          const nextExpanded = new Set(expandedDirs);
+          nextExpanded.delete(path);
+          expandedDirs = nextExpanded;
+          persistExpandedDirs();
+        }
+        const prunedChildren = new Map(childrenByDir);
+        prunedChildren.delete(path);
+        childrenByDir = prunedChildren;
+        return;
+      }
       errorByDir = new Map(errorByDir).set(path, fsErrorMessage(err));
     } finally {
       const nextLoading = new Set(loadingDirs);
@@ -369,6 +716,74 @@
     };
     if (rootPath.length > 0) walk(rootPath, 0);
     return out;
+  }
+
+  // ── Search ranking (ADR-0052 D4) ──
+  // Tiers: 0 = exact name (case-insensitive), 1 = name-substring (earlier match
+  // index first), 2 = path-only match. Stable within a tier by `path` so the
+  // order is deterministic across Phase-1/Phase-2 merges and re-renders.
+  function rankSearchResults(results: SearchResult[], q: string): SearchResult[] {
+    const tokens = q
+      .trim()
+      .toLowerCase()
+      .split(/[\s/]+/)
+      .filter((token) => token.length > 0);
+    const scored = results.map((result) => ({
+      result,
+      ...searchTier(result, tokens),
+    }));
+    scored.sort((a, b) => {
+      if (a.tier !== b.tier) return a.tier - b.tier;
+      if (a.nameIndex !== b.nameIndex) return a.nameIndex - b.nameIndex;
+      return a.result.path < b.result.path ? -1 : a.result.path > b.result.path ? 1 : 0;
+    });
+    return scored.map((entry) => entry.result);
+  }
+
+  // Classify a result into a ranking tier plus the earliest name-substring index.
+  function searchTier(
+    result: SearchResult,
+    tokens: string[],
+  ): { tier: number; nameIndex: number } {
+    const lowerName = result.entry.name.toLowerCase();
+    // Exact whole-name match against the joined query (case-insensitive).
+    if (tokens.length > 0 && lowerName === tokens.join('')) {
+      return { tier: 0, nameIndex: 0 };
+    }
+    // Earliest position at which any token appears inside the name; if the name
+    // has a highlight range we already know the name matched (use its start).
+    let nameIndex = Number.POSITIVE_INFINITY;
+    for (const token of tokens) {
+      const index = lowerName.indexOf(token);
+      if (index >= 0 && index < nameIndex) nameIndex = index;
+    }
+    if (Number.isFinite(nameIndex)) return { tier: 1, nameIndex };
+    // No token in the name → matched via path only.
+    return { tier: 2, nameIndex: Number.MAX_SAFE_INTEGER };
+  }
+
+  // ADR-0052 D4 — split a name into text-safe segments around the highlight
+  // ranges. NEVER use innerHTML; the template renders plain text + <mark> spans.
+  function highlightSegments(
+    name: string,
+    ranges: [number, number][],
+  ): { text: string; mark: boolean }[] {
+    if (ranges.length === 0) return [{ text: name, mark: false }];
+    const segments: { text: string; mark: boolean }[] = [];
+    let cursor = 0;
+    for (const [start, end] of ranges) {
+      const clampedStart = Math.max(cursor, Math.min(start, name.length));
+      const clampedEnd = Math.max(clampedStart, Math.min(end, name.length));
+      if (clampedStart > cursor) {
+        segments.push({ text: name.slice(cursor, clampedStart), mark: false });
+      }
+      if (clampedEnd > clampedStart) {
+        segments.push({ text: name.slice(clampedStart, clampedEnd), mark: true });
+      }
+      cursor = clampedEnd;
+    }
+    if (cursor < name.length) segments.push({ text: name.slice(cursor), mark: false });
+    return segments;
   }
 
   function toggleDirectory(path: string): void {
@@ -828,6 +1243,9 @@
     ];
     return () => {
       for (const unsub of unsubs) unsub();
+      // ADR-0052 D4 — tear down any pending/in-flight search on unmount.
+      debouncedServerSearch.cancel();
+      if (searchAbort !== null) searchAbort.abort();
     };
   });
 
@@ -1198,6 +1616,14 @@
   </span>
 {/snippet}
 
+<!-- ADR-0052 D4/D8 — text-safe highlight: split the name into plain-text and
+     <mark> segments. NEVER innerHTML; every segment is a Svelte text node. -->
+{#snippet highlightedName(name: string, ranges: [number, number][])}
+  {#each highlightSegments(name, ranges) as segment}
+    {#if segment.mark}<mark class="search-mark">{segment.text}</mark>{:else}{segment.text}{/if}
+  {/each}
+{/snippet}
+
 <svelte:window
   onpointerdowncapture={onWindowPointerDown}
   onkeydown={onWindowKeydown}
@@ -1276,6 +1702,10 @@
     </div>
   </header>
 
+  <!-- ADR-0052 D2 — the search input moved to the LeftPanel footer; this
+       component renders only results. The footer passes the active query down
+       via the `query` prop. -->
+
   {#if activeName === null}
     <PanelEmptyState
       icon="files"
@@ -1294,6 +1724,52 @@
       tone="danger"
       role="alert"
     />
+  {:else if searching}
+    <!-- ADR-0052 D4 — flat ranked results list replaces the tree while searching. -->
+    <div class="search-results-wrap">
+      {#if searchResults.length === 0}
+        <PanelEmptyState
+          icon="files"
+          lead={searchLoading ? 'Searching…' : 'No matches'}
+          description={searchLoading
+            ? 'Searching the workspace.'
+            : 'No files or folders match this search.'}
+        />
+      {:else}
+        <ul class="search-results" role="listbox" aria-label="Search results">
+          {#each searchResults as result (result.path)}
+            {@const selected = filePreviewStore.selectedPaths.has(result.path)}
+            {@const contextDir = resultContextDir(result)}
+            <li class="search-result" class:selected role="presentation">
+              <button
+                type="button"
+                class="search-result-button"
+                role="option"
+                aria-selected={selected}
+                title={result.path}
+                onclick={(e: MouseEvent) => {
+                  e.stopPropagation();
+                  onSearchResultClick(result);
+                }}
+              >
+                {@render fileIconSvg(resultIconRow(result))}
+                <span class="search-result-name">
+                  {@render highlightedName(result.entry.name, result.ranges)}
+                </span>
+                {#if contextDir.length > 0}
+                  <span class="search-result-dir mono">{contextDir}</span>
+                {/if}
+              </button>
+            </li>
+          {/each}
+        </ul>
+        {#if serverTruncated}
+          <p class="search-truncated" role="status">
+            Showing the first {searchResults.length} matches — refine your search to narrow results.
+          </p>
+        {/if}
+      {/if}
+    </div>
   {:else if rows.length === 0}
     <PanelEmptyState
       icon="files"
@@ -1301,8 +1777,39 @@
       description="This folder has no visible files."
     />
   {:else}
-    <ul class="tree" role="tree" aria-label="Workspace file tree">
-      {#each rows as row (row.path)}
+    <div class="tree-viewport">
+      <!-- ADR-0052 D7 — sticky parent header overlay (hierarchy-only; hidden while
+           searching). Pinned at the top of the scroll viewport, above normal rows. -->
+      {#if stickyIndices.length > 0}
+        <div class="sticky-stack">
+          {#each stickyIndices as stickyIndex (stickyIndex)}
+            {@const stickyRow = rows[stickyIndex]}
+            {#if stickyRow !== undefined}
+              <button
+                type="button"
+                class="sticky-row"
+                style:padding-left={`${stickyRow.depth * 16 + 4}px`}
+                title={stickyRow.path}
+                onclick={(e: MouseEvent) => {
+                  e.stopPropagation();
+                  onStickyClick(stickyIndex);
+                }}
+              >
+                {@render fileIconSvg(stickyRow)}
+                <span class="label">{stickyRow.entry.name}</span>
+              </button>
+            {/if}
+          {/each}
+        </div>
+      {/if}
+      <ul
+        bind:this={treeScrollEl}
+        class="tree"
+        role="tree"
+        aria-label="Workspace file tree"
+        onscroll={onTreeScroll}
+      >
+        {#each rows as row (row.path)}
         {@const selected = filePreviewStore.selectedPaths.has(row.path)}
         <li
           class="row"
@@ -1363,7 +1870,8 @@
           {/if}
         </li>
       {/each}
-    </ul>
+      </ul>
+    </div>
   {/if}
 
   {#if contextMenu !== null}
@@ -1760,6 +2268,142 @@
   .icon-btn:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  /* ── Search highlight (ADR-0052 D4) — the input itself lives in the
+       LeftPanel footer (D2); only the result highlight styling stays here. ── */
+  .search-mark {
+    background: color-mix(in srgb, var(--color-accent) 28%, transparent);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+  }
+
+  /* ── Tree viewport (sticky overlay anchor) (ADR-0052 D7) ── */
+  .tree-viewport {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── Search results (flat ranked list) (ADR-0052 D4) ── */
+  .search-results-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .search-results {
+    list-style: none;
+    margin: 0;
+    padding: var(--space-4) 0;
+  }
+
+  .search-result {
+    display: block;
+    position: relative;
+  }
+
+  .search-result + .search-result {
+    margin-top: 2px;
+  }
+
+  .search-result:hover {
+    background: var(--color-glass-1);
+  }
+
+  .search-result.selected {
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+    color: var(--color-accent);
+    box-shadow: inset 2px 0 0 var(--color-accent);
+  }
+
+  .search-result.selected .type-icon {
+    color: var(--color-accent);
+  }
+
+  .search-result-button {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    width: 100%;
+    min-width: 0;
+    padding: var(--space-4) var(--space-8) var(--space-4) var(--space-8);
+    background: transparent;
+    border: 0;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+  }
+
+  .search-result-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .search-result-dir {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--color-fg-subtle);
+    font-size: var(--text-sm);
+    direction: rtl;
+    text-align: left;
+  }
+
+  .search-truncated {
+    margin: 0;
+    padding: var(--space-6) var(--space-10);
+    color: var(--color-fg-muted);
+    font-size: var(--text-sm);
+    border-top: 1px solid var(--color-border);
+  }
+
+  /* ── Sticky parent headers (ADR-0052 D7) ── */
+  .sticky-stack {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 2; /* above .tree rows; below the fixed context menu (--z-context-menu). */
+    display: flex;
+    flex-direction: column;
+    background: var(--color-surface);
+    border-bottom: 1px solid var(--color-border);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.12);
+    pointer-events: none; /* container ignores events; rows opt back in below. */
+  }
+
+  .sticky-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    width: 100%;
+    min-width: 0;
+    height: 24px;
+    padding-right: var(--space-8);
+    border: 0;
+    background: var(--color-surface);
+    color: var(--color-fg-muted);
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+    pointer-events: auto; /* clickable even though the container opted out. */
+  }
+
+  .sticky-row:hover {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
   }
 
   .tree {

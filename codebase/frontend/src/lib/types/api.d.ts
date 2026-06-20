@@ -44,6 +44,36 @@ export interface components {
          * @enum {string}
          */
         FontWeight: "light" | "normal" | "bold";
+        /** @description One search hit (ADR-0052 D5). */
+        FsSearchEntry: {
+            /**
+             * @description `"file"` or `"directory"` — the same representation as `fs_list`'s
+             *     `FsEntry.kind`.
+             */
+            kind: string;
+            /** @description Basename of the matched entry. */
+            name: string;
+            /**
+             * @description Absolute path of the matched entry (the FE relativizes against
+             *     `workspace_root` itself — ADR-0052 D5 note).
+             */
+            path: string;
+        };
+        /** @description `GET /api/fs/search` 200 response body (ADR-0052 D5). */
+        FsSearchResponse: {
+            /**
+             * @description Matching entries, deterministically ordered (directories first, then
+             *     case-insensitive name — `fs_list` ordering).
+             */
+            results: components["schemas"]["FsSearchEntry"][];
+            /** @description Number of entries visited during the walk (diagnostics / UX). */
+            scanned: number;
+            /**
+             * @description `true` when the result `limit` **or** the walk budget was reached (the
+             *     result set is incomplete).
+             */
+            truncated: boolean;
+        };
         /**
          * @description Group node — shape locked by ADR-0010, kept identical across the v1→v2
          *     cutover so `boot_migration_v1_to_v2` can preserve `groups[]` verbatim.

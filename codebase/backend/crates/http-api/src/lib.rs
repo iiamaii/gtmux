@@ -53,6 +53,7 @@ mod fs_file;
 mod fs_guard;
 mod fs_list;
 mod fs_move;
+pub mod fs_search;
 pub mod schema;
 mod session_lock;
 mod session_pane_set;
@@ -76,6 +77,7 @@ pub use fs_guard::{
     build_denylist, effective_workspace, resolve_server_workspace, validate_workspace_root,
     ServerWorkspaceError, WorkspaceRootError,
 };
+pub use fs_search::{FsSearchEntry, FsSearchResponse};
 pub use schema::{
     degrade_dangling_path_endpoints, detect_shape, migrate_v1_to_v2, recompute_path_bboxes,
     validate as validate_layout_v2, Anchor, Group, Head, Item, ItemCommon, Layout, PathEndpoint,
@@ -853,6 +855,13 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             // tree drag-move. Returns the source→target mapping for FE rebind.
             "/api/fs/move",
             axum::routing::post(fs_move::fs_move_handler),
+        )
+        .route(
+            // ADR-0052 D5 — recursive name+path search across a workspace root
+            // (Files-tab search Phase 2). A-scope + denylist guard, symlink
+            // fail-closed, walk budget + result limit (spawn_blocking).
+            "/api/fs/search",
+            get(fs_search::fs_search_handler),
         )
         .route(
             "/api/shutdown",

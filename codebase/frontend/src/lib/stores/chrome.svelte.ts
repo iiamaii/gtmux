@@ -8,7 +8,6 @@
 // State persists in localStorage so the preference survives reload.
 // Web-only state, no backend round-trip.
 
-import { filePreviewStore } from '$lib/stores/filePreview.svelte';
 import { pathEditStore } from '$lib/stores/pathEditStore.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 
@@ -181,18 +180,21 @@ function leftPanelTabForRight(tab: RightPanelTab, current: LeftPanelTab): LeftPa
 function clearSelectionsForTabTransition(side: 'left', tab: LeftPanelTab): void;
 function clearSelectionsForTabTransition(side: 'right', tab: RightPanelTab): void;
 function clearSelectionsForTabTransition(side: 'left' | 'right', tab: LeftPanelTab | RightPanelTab): void {
+  // ADR-0046 D6 amend ⑪: tab transitions only clear canvas selection (M + drill).
+  // The Files selection (filePreviewStore) PERSISTS across left/right tab transitions
+  // and across canvas-component selection, so returning to the Files / Preview tab
+  // re-displays the previously-selected item. Clearing the Files selection is the
+  // responsibility of an empty-area click (Canvas / Files panel) or a
+  // session/workspace change — not of tab switching.
+  void side;
+  void tab;
   clearCanvasSelectionState();
-  if (side === 'left' || tab === 'inspect') clearFilePreviewSelectionState();
 }
 
 function clearCanvasSelectionState(): void {
   pathEditStore.end();
   sessionStore.clearDrill();
   sessionStore.clearM();
-}
-
-function clearFilePreviewSelectionState(): void {
-  filePreviewStore.clear();
 }
 
 function clamp(value: number, min: number, max: number): number {

@@ -35,6 +35,42 @@
   let panelEl = $state<HTMLElement | null>(null);
   let resizing = $state(false);
 
+  // Unified search query, kept per tab (ADR-0052 D2: a single search bar
+  // pinned at the panel footer; LeftPanel owns the query and feeds the active
+  // tab's text to the mounted tree as a `query` prop). web-only ephemeral state
+  // — never persisted, never sent to tmux.
+  let searchByTab = $state<Record<LeftPanelTab, string>>({
+    layers: '',
+    terminals: '',
+    files: '',
+  });
+  let searchInputEl = $state<HTMLInputElement | null>(null);
+
+  // Placeholder copy follows the active tab so the single input reads naturally.
+  const searchPlaceholder = $derived(
+    activeTab === 'files'
+      ? 'Search files…'
+      : activeTab === 'layers'
+        ? 'Search layers…'
+        : 'Search terminals…',
+  );
+
+  function clearSearch(): void {
+    searchByTab[activeTab] = '';
+    searchInputEl?.focus();
+  }
+
+  function onSearchKeydown(e: KeyboardEvent): void {
+    if (e.key !== 'Escape') return;
+    // Escape clears the query; if already empty, release focus instead.
+    if (searchByTab[activeTab] !== '') {
+      e.preventDefault();
+      searchByTab[activeTab] = '';
+    } else {
+      searchInputEl?.blur();
+    }
+  }
+
   function selectTab(tab: LeftPanelTab): void {
     chromeStore.setLeftPanelTab(tab);
   }
@@ -180,13 +216,65 @@
 
     <div class="left-panel-body" class:no-session={noActiveSession} inert={noActiveSession}>
       {#if activeTab === 'layers'}
-        <LayerTreeView />
+        <LayerTreeView query={searchByTab.layers} />
       {:else if activeTab === 'terminals'}
-        <TerminalListView />
+        <TerminalListView query={searchByTab.terminals} />
       {:else}
-        <FileTreeView />
+        <FileTreeView query={searchByTab.files} />
       {/if}
     </div>
+
+    <!--
+      Unified search footer (ADR-0052 D2). Pinned at the bottom of the panel,
+      fixed (does not scroll — only `.left-panel-body` scrolls). A single input
+      drives whichever tab is active via `searchByTab[activeTab]`. Hidden when
+      there is no active session, matching the dimmed/inert body.
+    -->
+    {#if !noActiveSession}
+      <footer class="left-panel-footer">
+        <div class="footer-search">
+          <svg
+            class="footer-search-icon"
+            width="14"
+            height="14"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="11" cy="11" r="7" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <input
+            bind:this={searchInputEl}
+            class="footer-search-input"
+            type="search"
+            placeholder={searchPlaceholder}
+            aria-label={searchPlaceholder}
+            bind:value={searchByTab[activeTab]}
+            onkeydown={onSearchKeydown}
+          />
+          {#if searchByTab[activeTab] !== ''}
+            <button
+              type="button"
+              class="footer-search-clear"
+              title="Clear search"
+              aria-label="Clear search"
+              onclick={clearSearch}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          {/if}
+        </div>
+      </footer>
+    {/if}
+
     <button
       type="button"
       class="resize-handle"
@@ -316,6 +404,89 @@
   .left-panel-body.no-session {
     opacity: 0.4;
     pointer-events: none;
+  }
+
+  /* Unified search footer (ADR-0052 D2) — fixed at the bottom of the panel,
+   * never scrolls. Single design shared by all three tabs. */
+  .left-panel-footer {
+    flex: 0 0 auto;
+    box-sizing: border-box;
+    padding: var(--space-6) var(--space-8);
+    border-top: 1px solid var(--color-border);
+    background: var(--color-surface);
+  }
+
+  .footer-search {
+    display: flex;
+    align-items: center;
+    gap: var(--space-6);
+    box-sizing: border-box;
+    width: 100%;
+    padding: 0 var(--space-6);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-glass-2);
+    transition: border-color var(--motion-fast) var(--motion-easing);
+  }
+
+  .footer-search:focus-within {
+    border-color: var(--color-accent);
+  }
+
+  .footer-search-icon {
+    flex: 0 0 auto;
+    color: var(--color-fg-muted);
+  }
+
+  .footer-search-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    margin: 0;
+    padding: var(--space-6) 0;
+    border: 0;
+    background: transparent;
+    color: var(--color-fg);
+    font-family: var(--font-mono);
+    font-size: var(--text-base);
+    line-height: 1.2;
+  }
+
+  .footer-search-input::placeholder {
+    color: var(--color-fg-muted);
+  }
+
+  .footer-search-input:focus {
+    outline: none;
+  }
+
+  /* Strip the native search "clear" affordance — we render our own. */
+  .footer-search-input::-webkit-search-decoration,
+  .footer-search-input::-webkit-search-cancel-button {
+    -webkit-appearance: none;
+    appearance: none;
+  }
+
+  .footer-search-clear {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-fg-muted);
+    cursor: pointer;
+    transition:
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  .footer-search-clear:hover {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
   }
 
   .panel-tab:disabled,
