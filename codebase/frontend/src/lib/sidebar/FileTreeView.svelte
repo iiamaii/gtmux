@@ -359,7 +359,7 @@
   function onTreeScroll(): void {
     closeContextMenu();
     const el = treeScrollEl;
-    if (el === undefined) return;
+    if (!el) return;
     savedTreeScroll = { key: currentTreeScrollKey(), top: el.scrollTop };
     recomputeSticky(); // ADR-0052 D7 — keep the sticky stack in sync with scroll.
   }
@@ -385,7 +385,10 @@
   // measures a sticky/wrapper element.
   function measureRowHeight(): void {
     const el = treeScrollEl;
-    if (el === undefined) return;
+    // `bind:this` resets to null when the <ul> unmounts (e.g. while the flat
+    // search results render instead of the tree), so guard null AND undefined —
+    // a `=== undefined`-only check let `null.querySelectorAll` crash on search.
+    if (!el) return;
     const rowEls = el.querySelectorAll('.row');
     const first = rowEls[0] as HTMLElement | undefined;
     if (first === undefined) return;
@@ -411,7 +414,7 @@
       return;
     }
     const el = treeScrollEl;
-    if (el === undefined || rows.length === 0) {
+    if (!el || rows.length === 0) {
       if (stickyIndices.length > 0) stickyIndices = [];
       return;
     }
@@ -430,7 +433,7 @@
 
   function onStickyClick(index: number): void {
     const el = treeScrollEl;
-    if (el === undefined) return;
+    if (!el) return;
     // Scroll the clicked ancestor row to the top of the viewport (D7).
     el.scrollTop = index * effectiveRowHeight();
     recomputeSticky();
@@ -457,7 +460,7 @@
     // expanded-dir hydration. O(1) work; a few runs during load, then idle.
     void childrenByDir;
     const el = treeScrollEl;
-    if (el === undefined || scrollRestored || rootLoading) return;
+    if (!el || scrollRestored || rootLoading) return;
     if (savedTreeScroll.key !== currentTreeScrollKey() || savedTreeScroll.top <= 0) {
       scrollRestored = true;
       return;
