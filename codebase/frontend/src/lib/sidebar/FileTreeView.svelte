@@ -329,7 +329,13 @@
 
   $effect(() => {
     const key = `${activeName ?? ''}:${targetRoot}`;
-    if (activeName === null) return;
+    // `targetRoot` is empty until workspaceManifest resolves the active session's
+    // workspace_root. Loading with '' would call `listDir('')`, which the server
+    // resolves to the A-root (/Users/ws), and `loadRoot` would then clobber the
+    // canvas workspace anchor (sessionStore.effectiveWorkspaceRoot) with the
+    // A-root — breaking document/image relative-path resolution → fs/file 404.
+    // Wait for a real workspace_root; the effect re-runs once it arrives.
+    if (activeName === null || targetRoot === '') return;
     // ADR-0046 D6 amend ⑪ — clear the Files selection only when the
     // workspace/session actually changed (guard persists across remounts), so
     // the selection survives Files↔Layers/Terminals tab switches and is
@@ -359,7 +365,7 @@
   function onTreeScroll(): void {
     closeContextMenu();
     const el = treeScrollEl;
-    if (el === undefined) return;
+    if (!el) return;
     savedTreeScroll = { key: currentTreeScrollKey(), top: el.scrollTop };
     recomputeSticky(); // ADR-0052 D7 — keep the sticky stack in sync with scroll.
   }
@@ -385,7 +391,10 @@
   // measures a sticky/wrapper element.
   function measureRowHeight(): void {
     const el = treeScrollEl;
-    if (el === undefined) return;
+    // `bind:this` resets to null when the <ul> unmounts (e.g. while the flat
+    // search results render instead of the tree), so guard null AND undefined —
+    // a `=== undefined`-only check let `null.querySelectorAll` crash on search.
+    if (!el) return;
     const rowEls = el.querySelectorAll('.row');
     const first = rowEls[0] as HTMLElement | undefined;
     if (first === undefined) return;
@@ -411,7 +420,7 @@
       return;
     }
     const el = treeScrollEl;
-    if (el === undefined || rows.length === 0) {
+    if (!el || rows.length === 0) {
       if (stickyIndices.length > 0) stickyIndices = [];
       return;
     }
@@ -430,7 +439,7 @@
 
   function onStickyClick(index: number): void {
     const el = treeScrollEl;
-    if (el === undefined) return;
+    if (!el) return;
     // Scroll the clicked ancestor row to the top of the viewport (D7).
     el.scrollTop = index * effectiveRowHeight();
     recomputeSticky();
@@ -457,7 +466,7 @@
     // expanded-dir hydration. O(1) work; a few runs during load, then idle.
     void childrenByDir;
     const el = treeScrollEl;
-    if (el === undefined || scrollRestored || rootLoading) return;
+    if (!el || scrollRestored || rootLoading) return;
     if (savedTreeScroll.key !== currentTreeScrollKey() || savedTreeScroll.top <= 0) {
       scrollRestored = true;
       return;
@@ -556,6 +565,10 @@
   }
 
   async function loadRoot(dir: string): Promise<void> {
+    // Defensive — never list an empty dir: the server resolves '' to the A-root
+    // (/Users/ws), and `setActiveWorkspaceRoot(res.dir)` below would clobber the
+    // canvas workspace anchor with the A-root → document/image 404 (see effect).
+    if (dir === '') return;
     const sessionName = activeName;
     rootLoading = true;
     rootError = null;
