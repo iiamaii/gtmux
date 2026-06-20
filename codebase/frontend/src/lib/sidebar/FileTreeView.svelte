@@ -329,7 +329,13 @@
 
   $effect(() => {
     const key = `${activeName ?? ''}:${targetRoot}`;
-    if (activeName === null) return;
+    // `targetRoot` is empty until workspaceManifest resolves the active session's
+    // workspace_root. Loading with '' would call `listDir('')`, which the server
+    // resolves to the A-root (/Users/ws), and `loadRoot` would then clobber the
+    // canvas workspace anchor (sessionStore.effectiveWorkspaceRoot) with the
+    // A-root — breaking document/image relative-path resolution → fs/file 404.
+    // Wait for a real workspace_root; the effect re-runs once it arrives.
+    if (activeName === null || targetRoot === '') return;
     // ADR-0046 D6 amend ⑪ — clear the Files selection only when the
     // workspace/session actually changed (guard persists across remounts), so
     // the selection survives Files↔Layers/Terminals tab switches and is
@@ -559,6 +565,10 @@
   }
 
   async function loadRoot(dir: string): Promise<void> {
+    // Defensive — never list an empty dir: the server resolves '' to the A-root
+    // (/Users/ws), and `setActiveWorkspaceRoot(res.dir)` below would clobber the
+    // canvas workspace anchor with the A-root → document/image 404 (see effect).
+    if (dir === '') return;
     const sessionName = activeName;
     rootLoading = true;
     rootError = null;
