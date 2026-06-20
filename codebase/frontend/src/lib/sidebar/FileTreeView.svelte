@@ -77,6 +77,12 @@
   import { ancestorIndices } from './stickyAncestors';
   import { debounce } from '$lib/common/debounce';
 
+  // ADR-0052 D2 — the search input now lives in the LeftPanel footer (one
+  // unified search bar shared across tabs). This component no longer owns the
+  // input/clear-button/local query state; it receives the active query text as
+  // a prop and reacts to it (Phase 1 client filter + Phase 2 server search, D4).
+  let { query = '' }: { query?: string } = $props();
+
   type Row = {
     path: string;
     entry: FsEntry;
@@ -144,9 +150,7 @@
   let dropTargetDir = $state<string | null>(null);
   let moveSubmitting = $state(false);
 
-  // ── Search (ADR-0052 D2/D4) — component-local, ephemeral (reset on remount) ──
-  let query = $state('');
-  let searchInputEl: HTMLInputElement | undefined = $state();
+  // ── Search (ADR-0052 D2/D4) — driven by the `query` PROP (footer-owned). ──
   // Phase 2 (server) state. `serverResults` holds the latest server response for
   // the *current* query; `searchLoading` reflects an in-flight request and
   // `serverTruncated` surfaces the BE `truncated` flag.
@@ -361,20 +365,43 @@
   }
 
   // ── Sticky parent headers (ADR-0052 D7) ──
-  // Uniform-row arithmetic: measure the first `.row` offsetHeight (fallback to a
-  // CSS-derived constant), derive the topmost visible row index, then collect its
-  // ancestor row indices from the flat `rows` + `depth` via `ancestorIndices`.
+  // Uniform-row arithmetic: measure the true per-row SCROLL PITCH, derive the
+  // topmost visible row index, then collect its ancestor row indices from the
+  // flat `rows` + `depth` via `ancestorIndices`.
   function effectiveRowHeight(): number {
     return measuredRowHeight > 0 ? measuredRowHeight : STICKY_ROW_HEIGHT_FALLBACK;
   }
 
+  // ADR-0052 D7 (bug fix) — the divisor for `topIndex` must be the real per-row
+  // PITCH, not a single row's box height. Tree rows carry inter-row spacing
+  // (`.row + .row { margin-top }`), so the on-screen step between consecutive
+  // rows = offsetHeight + margin. Measuring `offsetHeight` alone yields a divisor
+  // a couple px too small, which inflates `topIndex = floor(scrollTop / pitch)`;
+  // the error accumulates with scroll distance and points `ancestorIndices` at
+  // the wrong row, collapsing the sticky chain to only its shallow head. Measure
+  // the pitch directly as the vertical offset between the first two `.row`
+  // elements so depth/scroll stay accurate. Only `.row` <li>s exist in the tree
+  // <ul> (the taller `.sticky-row`s live in a sibling overlay), so this never
+  // measures a sticky/wrapper element.
   function measureRowHeight(): void {
     const el = treeScrollEl;
     if (el === undefined) return;
-    const firstRow = el.querySelector('.row') as HTMLElement | null;
-    if (firstRow !== null && firstRow.offsetHeight > 0) {
-      measuredRowHeight = firstRow.offsetHeight;
+    const rowEls = el.querySelectorAll('.row');
+    const first = rowEls[0] as HTMLElement | undefined;
+    if (first === undefined) return;
+    const second = rowEls[1] as HTMLElement | undefined;
+    if (second !== undefined) {
+      // True pitch = vertical step between consecutive rows (includes the
+      // inter-row margin). This is the value `topIndex` must divide by.
+      const pitch = second.offsetTop - first.offsetTop;
+      if (pitch > 0) {
+        measuredRowHeight = pitch;
+        return;
+      }
     }
+    // Single-row fallback: box height (margin only appears between rows, so a
+    // lone row has none to add). Still better than the static constant.
+    if (first.offsetHeight > 0) measuredRowHeight = first.offsetHeight;
   }
 
   function recomputeSticky(): void {
@@ -410,10 +437,16 @@
   }
 
   // Recompute the sticky stack whenever the flattened rows change (expand/collapse,
-  // lazy load, prune) or search toggles — uniform-row arithmetic depends on `rows`.
+  // lazy load, prune), search toggles, or the live scroll element (re)binds —
+  // uniform-row arithmetic depends on `rows` and on `treeScrollEl` existing.
+  // Reading `treeScrollEl` here makes this run on mount (once the <ul> binds) and
+  // again after the search→tree branch swap re-creates it, not only on scroll.
+  // ADR-0052 D7. `measureRowHeight()` runs unconditionally so the pitch is
+  // re-measured once a second row exists (upgrading the single-row fallback).
   $effect(() => {
     void rows;
     void searching;
+    void treeScrollEl;
     measureRowHeight();
     recomputeSticky();
   });
@@ -513,22 +546,6 @@
     searchLoading = false;
     serverResults = [];
     serverTruncated = false;
-  }
-
-  function clearSearch(): void {
-    query = '';
-  }
-
-  function onSearchKeydown(e: KeyboardEvent): void {
-    if (e.key !== 'Escape') return;
-    e.stopPropagation();
-    if (query.length > 0) {
-      // First Escape clears the query (keeps focus for a fresh search).
-      clearSearch();
-    } else {
-      // Already empty — blur the input.
-      searchInputEl?.blur();
-    }
   }
 
   function onSearchResultClick(result: SearchResult): void {
@@ -1685,51 +1702,9 @@
     </div>
   </header>
 
-  {#if activeName !== null}
-    <!-- Files search input (ADR-0052 D2/D4). Phase 1 reacts to `query`
-         immediately; Phase 2 (server) is debounced in an effect. -->
-    <div class="files-search">
-      <span class="search-icon" aria-hidden="true">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="7" cy="7" r="4.5"/>
-          <path d="M10.5 10.5 14 14"/>
-        </svg>
-      </span>
-      <input
-        bind:this={searchInputEl}
-        class="search-input"
-        type="search"
-        autocomplete="off"
-        autocapitalize="off"
-        spellcheck="false"
-        placeholder="Search files…"
-        aria-label="Search files"
-        bind:value={query}
-        onclick={(e: MouseEvent) => e.stopPropagation()}
-        onkeydown={onSearchKeydown}
-      />
-      {#if searchLoading}
-        <span class="search-spin" aria-label="Searching" title="Searching workspace…"></span>
-      {/if}
-      {#if query.length > 0}
-        <button
-          type="button"
-          class="search-clear"
-          title="Clear search"
-          aria-label="Clear search"
-          onclick={(e: MouseEvent) => {
-            e.stopPropagation();
-            clearSearch();
-            searchInputEl?.focus();
-          }}
-        >
-          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
-            <path d="M4 4l8 8M12 4l-8 8"/>
-          </svg>
-        </button>
-      {/if}
-    </div>
-  {/if}
+  <!-- ADR-0052 D2 — the search input moved to the LeftPanel footer; this
+       component renders only results. The footer passes the active query down
+       via the `query` prop. -->
 
   {#if activeName === null}
     <PanelEmptyState
@@ -2295,80 +2270,8 @@
     cursor: not-allowed;
   }
 
-  /* ── Search input (ADR-0052 D2) ── */
-  .files-search {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: var(--space-6);
-    padding: var(--space-6) var(--space-10);
-    border-bottom: 1px solid var(--color-border);
-    background: var(--color-surface-2);
-    flex: 0 0 auto;
-  }
-
-  .search-icon {
-    flex: 0 0 auto;
-    display: grid;
-    place-items: center;
-    color: var(--color-fg-muted);
-    pointer-events: none;
-  }
-
-  .search-input {
-    flex: 1 1 auto;
-    min-width: 0;
-    height: 26px;
-    padding: 0 var(--space-4);
-    border: 0;
-    background: transparent;
-    color: var(--color-fg);
-    font: inherit;
-    font-size: var(--text-base);
-  }
-
-  .search-input::placeholder {
-    color: var(--color-fg-subtle);
-  }
-
-  .search-input:focus-visible {
-    outline: none;
-  }
-
-  /* Hide the native search-cancel affordance (we provide our own × button). */
-  .search-input::-webkit-search-cancel-button {
-    appearance: none;
-  }
-
-  .search-clear {
-    flex: 0 0 auto;
-    width: 18px;
-    height: 18px;
-    display: inline-grid;
-    place-items: center;
-    padding: 0;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--color-fg-muted);
-    cursor: pointer;
-  }
-
-  .search-clear:hover {
-    background: var(--color-glass-1);
-    color: var(--color-fg);
-  }
-
-  .search-spin {
-    flex: 0 0 auto;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    border: 1.5px solid var(--color-border-strong);
-    border-top-color: var(--color-accent);
-    animation: spin 900ms linear infinite;
-  }
-
+  /* ── Search highlight (ADR-0052 D4) — the input itself lives in the
+       LeftPanel footer (D2); only the result highlight styling stays here. ── */
   .search-mark {
     background: color-mix(in srgb, var(--color-accent) 28%, transparent);
     color: inherit;

@@ -28,8 +28,14 @@
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
   import { matchNamePath } from '$lib/sidebar/treeMatch';
-  import { debounce } from '$lib/common/debounce';
   import { ancestorIndices } from '$lib/sidebar/stickyAncestors';
+
+  // ADR-0052 D2 — the single unified search bar now lives in LeftPanel's footer.
+  // This component no longer renders its own input; it receives the active tab's
+  // query text as a prop and filters in-memory off it. LeftPanel updates `query`
+  // per keystroke; Layers filtering is cheap (all data is already in
+  // sessionStore), so no local debounce is needed.
+  let { query = '' }: { query?: string } = $props();
 
   interface ContextMenuHolder {
     openAt: (args: {
@@ -181,45 +187,17 @@
   const activeSessionName = $derived(sessionStore.active?.name ?? null);
 
   /* ── Layers search (ADR-0052 D6 — client-side filter + reveal) ─────────
-   * web-only, ephemeral (D8). All layer data is already in sessionStore, so the
-   * tree structure is KEPT while searching: a node is "kept" when its label (or
-   * its ancestor-group label path) matches the query, and every kept node's
-   * ancestor groups are revealed (force-expanded, non-destructively) so the
-   * match is visible. No tmux/layout mutation.
+   * web-only, ephemeral (D8). The query text comes from the `query` PROP owned
+   * by LeftPanel's footer search bar (ADR-0052 D2). All layer data is already in
+   * sessionStore, so the tree structure is KEPT while searching: a node is
+   * "kept" when its label (or its ancestor-group label path) matches the query,
+   * and every kept node's ancestor groups are revealed (force-expanded,
+   * non-destructively) so the match is visible. No tmux/layout mutation.
    *
-   * `query` drives the filter immediately for highlight; `debouncedQuery` is the
-   * (debounced) value that the heavier kept-set computation reads, matching the
-   * D2 ~150ms input debounce. Both reset naturally on tab unmount/remount. */
-  let query = $state('');
-  let debouncedQuery = $state('');
-  const applyDebouncedQuery = debounce((q: string) => {
-    debouncedQuery = q;
-  }, 150);
-
-  function onSearchInput(e: Event): void {
-    query = (e.currentTarget as HTMLInputElement).value;
-    applyDebouncedQuery(query);
-  }
-
-  function clearSearch(): void {
-    query = '';
-    applyDebouncedQuery.cancel();
-    debouncedQuery = '';
-  }
-
-  function onSearchKeydown(e: KeyboardEvent): void {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopPropagation();
-      if (query.length > 0) {
-        clearSearch();
-      } else {
-        (e.currentTarget as HTMLInputElement).blur();
-      }
-    }
-  }
-
-  const searching = $derived(debouncedQuery.trim().length > 0);
+   * The prop is read directly for both filter and highlight — Layers filtering
+   * is in-memory and cheap, so no debounce is needed (LeftPanel updates the prop
+   * per keystroke). The prop resets naturally on tab unmount/remount. */
+  const searching = $derived(query.trim().length > 0);
 
   // 펼침 상태 — 세션별로 localStorage 에 저장해 탭 전환/새로고침 후에도 복원.
   const expanded = new SvelteSet<string>();
@@ -278,7 +256,7 @@
     const forced = new Set<string>();
     if (!searching) return { kept, forced };
 
-    const q = debouncedQuery;
+    const q = query;
 
     // Ancestor-group label chain (root → … → direct parent) for a node, using
     // the same groups map walkAncestors reads. Outermost first.
@@ -550,7 +528,7 @@
 
   function labelSegments(label: string, labelPath: string): LabelSegment[] {
     if (!searching) return [{ text: label, hit: false }];
-    const { matched, ranges } = matchNamePath(debouncedQuery, label, labelPath);
+    const { matched, ranges } = matchNamePath(query, label, labelPath);
     if (!matched || ranges.length === 0) return [{ text: label, hit: false }];
     const segs: LabelSegment[] = [];
     let cursor = 0;
@@ -765,14 +743,18 @@
   }
 
   /* ── Sticky parent headers (ADR-0052 D7 — VSCode-style sticky scroll) ──
-   * When NOT searching, pin the ancestor chain of the topmost visible row to the
-   * top of the `.tree` scroll container. The tree is non-virtualized with uniform
-   * row height, so the chain is pure arithmetic over `visibleTree`:
-   *   rowHeight  = measured `.row` offsetHeight (fallback constant)
+   * When NOT searching, pin the FULL ancestor chain (root → … → direct parent)
+   * of the topmost visible row to the top of the `.tree` scroll container,
+   * stacked like VSCode. The tree is non-virtualized with uniform row pitch, so
+   * the chain is pure arithmetic over `visibleTree`:
+   *   rowHeight  = measured per-row PITCH (see measureRowPitch)
    *   topIndex   = floor(scrollTop / rowHeight)
    *   indices    = ancestorIndices(visibleTree, topIndex, MAX_STICKY)
-   * Recomputes on scroll and whenever `visibleTree` changes. Hidden while
-   * searching (the filtered tree has no reliable hierarchy to pin). */
+   * `ancestorIndices` already returns the full chain top-down; the earlier bug
+   * (only the top-most ancestor showing) was a rowHeight measurement error, not
+   * an algorithm error — see measureRowPitch. Recomputes on scroll, on mount,
+   * and whenever the visible tree changes. Hidden while searching (the filtered
+   * tree has no reliable hierarchy to pin). */
   const MAX_STICKY = 6;
   const STICKY_ROW_HEIGHT_FALLBACK = 28;
 
@@ -780,11 +762,40 @@
   let scrollTop = $state(0);
   let rowHeight = $state(STICKY_ROW_HEIGHT_FALLBACK);
 
-  function measureRowHeight(): void {
+  /**
+   * Measure the true per-row vertical PITCH of a single tree row.
+   *
+   * Bug fix (ADR-0052 D7): the row pitch is NOT `.row` `offsetHeight`. Rows are
+   * separated by `.row + .row { margin-top: 2px }`, and margins live OUTSIDE the
+   * offset box, so `offsetHeight` undercounts the real advance per index. A wrong
+   * pitch makes `topIndex = floor(scrollTop / rowHeight)` inaccurate at depth: an
+   * over-estimated pitch yields a too-small `topIndex`, so the scan starts above
+   * the real top row and only the outermost ancestor is recovered (the reported
+   * symptom — only the top-level group sticks).
+   *
+   * Robust measure: take the offset DELTA between the first two real tree rows
+   * (`row1.offsetTop - row0.offsetTop`). This is the exact pitch including any
+   * inter-row margin, and is immune to which element is the row vs. a wrapper.
+   * We explicitly query `.row` (the `<li>` tree rows) so the taller `.sticky-row`
+   * stack is never measured. Fallbacks: single-row `offsetHeight`, then the CSS
+   * constant.
+   */
+  function measureRowPitch(): void {
     const el = treeScrollEl;
     if (el === null) return;
-    const firstRow = el.querySelector('.row') as HTMLElement | null;
-    const h = firstRow?.offsetHeight ?? 0;
+    const rows = el.querySelectorAll('.row');
+    const row0 = rows[0] as HTMLElement | undefined;
+    if (row0 === undefined) return;
+    const row1 = rows[1] as HTMLElement | undefined;
+    if (row1 !== undefined) {
+      const pitch = row1.offsetTop - row0.offsetTop;
+      if (pitch > 0) {
+        rowHeight = pitch;
+        return;
+      }
+    }
+    // Single row visible — fall back to its own height (no inter-row delta yet).
+    const h = row0.offsetHeight;
     if (h > 0) rowHeight = h;
   }
 
@@ -792,14 +803,17 @@
     scrollTop = (e.currentTarget as HTMLElement).scrollTop;
   }
 
-  // Re-measure when the visible tree changes (rows may have just mounted).
+  // Re-measure the row pitch on mount and whenever the visible tree changes
+  // (rows may have just mounted / changed depth). Keyed on the live scroll el so
+  // it also runs once `bind:this` resolves after the first render.
   $effect(() => {
-    // Touch visibleTree so this re-runs on structural change.
+    // Touch the scroll el + visibleTree so this re-runs on structural change.
+    void treeScrollEl;
     void visibleTree.length;
-    measureRowHeight();
+    measureRowPitch();
   });
 
-  // Topmost fully-or-partially visible row index from scroll position.
+  // Topmost fully-or-partially visible row index from the live scroll position.
   const stickyTopIndex = $derived.by<number>(() => {
     if (rowHeight <= 0) return 0;
     const idx = Math.floor(scrollTop / rowHeight);
@@ -1250,39 +1264,9 @@
   <!-- ADR-0024 의 2026-05-22 ② amend (Tree=Z) — Z tab UI 제거. Tree 가 단일 view.
        z-index 값 표시는 Inspector 로 단일화. -->
 
-  <!-- Layers search (ADR-0052 D6) — client-side filter + reveal. -->
-  <div class="layer-search">
-    <span class="search-icon" aria-hidden="true">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="11" cy="11" r="7"/>
-        <path d="m20 20-3.5-3.5"/>
-      </svg>
-    </span>
-    <input
-      class="search-input"
-      type="text"
-      autocomplete="off"
-      spellcheck="false"
-      placeholder="Search layers…"
-      aria-label="Search layers"
-      value={query}
-      oninput={onSearchInput}
-      onkeydown={onSearchKeydown}
-    />
-    {#if query.length > 0}
-      <button
-        type="button"
-        class="search-clear"
-        title="Clear search"
-        aria-label="Clear search"
-        onclick={clearSearch}
-      >
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M6 6l12 12M18 6 6 18"/>
-        </svg>
-      </button>
-    {/if}
-  </div>
+  <!-- ADR-0052 D2 — the search input is owned by LeftPanel's footer; this
+       component receives the active query as the `query` prop and only renders
+       the (filtered) tree. -->
 
   {#if tree.length === 0}
     <PanelEmptyState
@@ -1641,73 +1625,8 @@
     user-select: none;
   }
 
-  /* Layers search (ADR-0052 D6) — input lives at the top of the tab body,
-   * above the scrollable tree. */
-  .layer-search {
-    flex: 0 0 auto;
-    position: relative;
-    display: flex;
-    align-items: center;
-    margin: var(--space-4) var(--space-8);
-  }
-
-  .search-icon {
-    position: absolute;
-    left: var(--space-8);
-    display: inline-flex;
-    align-items: center;
-    color: var(--color-fg-muted);
-    pointer-events: none;
-  }
-
-  .search-input {
-    flex: 1 1 auto;
-    min-width: 0;
-    height: 26px;
-    padding: 0 26px 0 28px;
-    background: var(--color-bg);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-sm);
-    color: var(--color-fg);
-    font: inherit;
-    font-size: var(--text-md);
-    transition: border-color var(--motion-fast) var(--motion-easing);
-  }
-
-  .search-input::placeholder {
-    color: var(--color-fg-subtle);
-  }
-
-  .search-input:hover {
-    border-color: var(--color-border-strong);
-  }
-
-  .search-input:focus-visible {
-    outline: 0;
-    border-color: var(--color-accent);
-  }
-
-  .search-clear {
-    position: absolute;
-    right: var(--space-4);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 18px;
-    height: 18px;
-    padding: 0;
-    border: 0;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--color-fg-muted);
-    cursor: pointer;
-    transition: background var(--motion-fast) var(--motion-easing);
-  }
-
-  .search-clear:hover {
-    background: var(--color-glass-2);
-    color: var(--color-fg);
-  }
+  /* The Layers search input lives in LeftPanel's footer (ADR-0052 D2); this
+   * component keeps only the matched-substring highlight style below. */
 
   /* Matched-substring highlight on labels (text-safe segments). */
   .search-hit {
