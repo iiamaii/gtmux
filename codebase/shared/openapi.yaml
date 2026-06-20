@@ -65,6 +65,51 @@ components:
       - light
       - normal
       - bold
+    FsSearchEntry:
+      type: object
+      description: One search hit (ADR-0052 D5).
+      required:
+      - path
+      - name
+      - kind
+      properties:
+        kind:
+          type: string
+          description: |-
+            `"file"` or `"directory"` — the same representation as `fs_list`'s
+            `FsEntry.kind`.
+        name:
+          type: string
+          description: Basename of the matched entry.
+        path:
+          type: string
+          description: |-
+            Absolute path of the matched entry (the FE relativizes against
+            `workspace_root` itself — ADR-0052 D5 note).
+    FsSearchResponse:
+      type: object
+      description: '`GET /api/fs/search` 200 response body (ADR-0052 D5).'
+      required:
+      - results
+      - truncated
+      - scanned
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/FsSearchEntry'
+          description: |-
+            Matching entries, deterministically ordered (directories first, then
+            case-insensitive name — `fs_list` ordering).
+        scanned:
+          type: integer
+          description: Number of entries visited during the walk (diagnostics / UX).
+          minimum: 0
+        truncated:
+          type: boolean
+          description: |-
+            `true` when the result `limit` **or** the walk budget was reached (the
+            result set is incomplete).
     Group:
       type: object
       description: |-
