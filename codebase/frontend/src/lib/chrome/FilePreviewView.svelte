@@ -263,13 +263,17 @@
   }
 
   function onWindowKeydown(e: KeyboardEvent): void {
-    if (e.key === 'Escape') {
-      closeContentMenu();
-      return;
-    }
-    // ADR-0046 D6 amend ⑩ — Cmd/Ctrl+C in the active Preview = Copy path (with
-    // selection location), mirroring the right-click "Copy path". Additive: the
-    // right-click menu's Copy (raw selection text) / Copy path are unchanged.
+    if (e.key === 'Escape') closeContentMenu();
+  }
+
+  // ADR-0046 D6 amend ⑩ — Cmd/Ctrl+C in the active Preview = Copy path (with
+  // selection location), mirroring the right-click "Copy path". Handled in
+  // CAPTURE phase so it runs before the global bubble keydown handlers
+  // (shortcutRegistry / canvas) and before the native copy event, guaranteeing
+  // the path-copy wins when the Preview is the active surface with a selected
+  // file. The gate returns false everywhere else, so normal Cmd/Ctrl+C and the
+  // right-click menu's Copy (raw text) / Copy path are unaffected.
+  function onWindowKeydownCapture(e: KeyboardEvent): void {
     if (
       (e.metaKey || e.ctrlKey) &&
       !e.shiftKey &&
@@ -278,7 +282,7 @@
     ) {
       if (!canKeyboardCopyPath()) return;
       e.preventDefault();
-      e.stopPropagation();
+      e.stopImmediatePropagation();
       void copyPathViaShortcut();
     }
   }
@@ -361,6 +365,7 @@
 
 <svelte:window
   onpointerdowncapture={onWindowPointerDown}
+  onkeydowncapture={onWindowKeydownCapture}
   onkeydown={onWindowKeydown}
   onresize={closeContentMenu}
   onblur={closeContentMenu}
