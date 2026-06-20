@@ -150,6 +150,15 @@
         headers: { Accept: 'text/plain,application/json,text/html,text/markdown,*/*' },
       });
       if (res.status === 401) throw new UnauthorizedError();
+      if (res.status === 404) {
+        // The selected file no longer exists (moved/deleted). Drop the stale
+        // selection so it doesn't re-fetch and 404 on every Files-tab entry
+        // (ADR-0046 amend ⑪ persists the selection), and fall back to the empty
+        // state instead of surfacing an error. The selection $effect resets the
+        // rest of the preview once `selection` becomes null.
+        if (loadedPath === path) filePreviewStore.clear();
+        return;
+      }
       if (!res.ok) throw new Error(`GET /api/fs/file returned ${res.status}`);
       const nextText = await res.text();
       if (loadedPath !== path) return;
