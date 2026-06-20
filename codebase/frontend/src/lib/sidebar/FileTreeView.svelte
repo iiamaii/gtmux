@@ -5,6 +5,11 @@
   // changes — not on every remount (ADR-0046 D6 amend ⑪: the Files selection
   // persists across tab transitions and is re-displayed on return).
   let lastClearedWorkspaceKey = '';
+
+  // Module-scoped scroll memory (survives remounts, in-memory only — no
+  // localStorage write per scroll). One {key, top} for the active workspace, so
+  // returning to the Files tab restores the previous scroll offset cheaply.
+  let savedTreeScroll: { key: string; top: number } = { key: '', top: 0 };
 </script>
 
 <script lang="ts">
@@ -236,6 +241,40 @@
     void loadRoot(targetRoot);
   });
 
+  // ── Scroll restore (ADR-0046 D6 amend ⑪ follow-up) ───────────────────
+  // Save the scroll offset to module scope on scroll (cheap, in-memory); restore
+  // it once the tree has rendered after a remount. Keyed by workspace so an
+  // unrelated workspace never inherits a stale offset.
+  let treeScrollEl = $state<HTMLDivElement | undefined>(undefined);
+  let scrollRestored = false; // per-mount; resets on remount (new instance).
+
+  function currentTreeScrollKey(): string {
+    return `${activeName ?? ''}:${rootPath || targetRoot}`;
+  }
+
+  function onTreeScroll(): void {
+    closeContextMenu();
+    const el = treeScrollEl;
+    if (el === undefined) return;
+    savedTreeScroll = { key: currentTreeScrollKey(), top: el.scrollTop };
+  }
+
+  $effect(() => {
+    // Re-runs as rows hydrate (childrenByDir grows). Restore once the content is
+    // tall enough to honor the saved offset, so deep offsets survive async
+    // expanded-dir hydration. O(1) work; a few runs during load, then idle.
+    void childrenByDir;
+    const el = treeScrollEl;
+    if (el === undefined || scrollRestored || rootLoading) return;
+    if (savedTreeScroll.key !== currentTreeScrollKey() || savedTreeScroll.top <= 0) {
+      scrollRestored = true;
+      return;
+    }
+    if (el.scrollHeight - el.clientHeight < savedTreeScroll.top) return; // more rows incoming
+    el.scrollTop = savedTreeScroll.top;
+    scrollRestored = true;
+  });
+
   $effect(() => {
     if (chromeStore.state.leftPanelTab !== 'files') {
       contextMenu = null;
@@ -353,6 +392,21 @@
     } catch (err) {
       if (err instanceof UnauthorizedError) {
         window.location.href = '/auth';
+        return;
+      }
+      // A directory that no longer exists (deleted on disk) must not stay in the
+      // persisted expanded set — otherwise it is re-listed and 404s on every
+      // Files-tab entry. Prune it (self-healing) instead of surfacing an error.
+      if (err instanceof DirNotFoundError) {
+        if (expandedDirs.has(path)) {
+          const nextExpanded = new Set(expandedDirs);
+          nextExpanded.delete(path);
+          expandedDirs = nextExpanded;
+          persistExpandedDirs();
+        }
+        const prunedChildren = new Map(childrenByDir);
+        prunedChildren.delete(path);
+        childrenByDir = prunedChildren;
         return;
       }
       errorByDir = new Map(errorByDir).set(path, fsErrorMessage(err));
@@ -1226,12 +1280,13 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
+  bind:this={treeScrollEl}
   class="file-tree"
   class:drop-root={dropTargetDir === rootDropTargetDir}
   onclick={onFileTreeClick}
   onkeydown={() => {}}
   oncontextmenu={onEmptyContextMenu}
-  onscroll={closeContextMenu}
+  onscroll={onTreeScroll}
   ondragover={onRootDragOver}
   ondragleave={onRootDragLeave}
   ondrop={(e: DragEvent) => onRootDrop(e)}
