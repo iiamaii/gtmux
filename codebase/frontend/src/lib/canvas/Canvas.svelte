@@ -19,6 +19,7 @@
   import '@xyflow/svelte/dist/style.css';
   import { debugCount } from '$lib/common/debugCounts';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { filePreviewStore } from '$lib/stores/filePreview.svelte';
   import { toolStore } from '$lib/stores/toolStore.svelte';
   import { chromeStore } from '$lib/stores/chrome.svelte';
   import { attachConfirm, UnauthorizedError } from '$lib/http/sessions';
@@ -2467,6 +2468,11 @@
       }
     }
     clearCanvasDrillAndSelection();
+    // ADR-0046 D6 amend ⑪ — an empty-canvas click also clears the Files
+    // selection (always, regardless of active tab), mirroring an empty
+    // Files-panel click. (Only here, not in clearCanvasDrillAndSelection, which
+    // is also reached from Escape / lasso / programmatic deselect.)
+    filePreviewStore.clear();
   }
 
   function onCanvasDragOver(e: DragEvent): void {
