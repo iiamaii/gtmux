@@ -106,7 +106,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Json;
 use axum::Router;
-use gtmux_auth::TokenString;
+use gtmux_auth::{SharedToken, TokenString};
 use gtmux_config::{Config, Mode};
 use serde::Deserialize;
 use serde_json::json;
@@ -128,8 +128,14 @@ use tracing::warn;
 pub struct AppState {
     /// Loaded gtmux config — used for mode, host/origin allowlists, port.
     pub config: Arc<Config>,
-    /// The session token for this Server run.
-    pub token: Arc<TokenString>,
+    /// The server token for this Server run (ADR-0020 D18.3). Shared,
+    /// runtime-mutable cell: the *same* `Arc<RwLock<TokenString>>` is held by
+    /// the ws-server router state (boot wires one cell into both), so a live
+    /// `POST /auth/rotate` swap is reflected on every read path — login,
+    /// bearer middleware, step-up, WS handshake — the instant the write lock
+    /// drops. Read sites clone the inner [`TokenString`] out under the read
+    /// lock before the constant-time `verify_token` compare.
+    pub token: SharedToken,
     /// Auth-failure counter exposed for downstream rate-limit middleware
     /// (P1 enforcement; ADR-0003 D12 cloud-only). The counter is monotonic.
     pub auth_failure_counter: Arc<AtomicU64>,
@@ -249,7 +255,20 @@ pub struct AppState {
 impl AppState {
     /// Assemble shared state with a fresh empty layout snapshot.
     /// `hub` is `None`; production callers must use [`AppState::with_hub`].
+    ///
+    /// Wraps `token` in a fresh [`SharedToken`] cell. Production boot wires
+    /// *one* cell into both this state and the ws-server router via
+    /// [`AppState::new_shared`] — this owned-token entry point is for tests
+    /// and any single-router caller that doesn't share with ws-server.
     pub fn new(config: Config, token: TokenString) -> Self {
+        Self::new_shared(config, gtmux_auth::shared_token(token))
+    }
+
+    /// Like [`AppState::new`] but takes a pre-built [`SharedToken`] cell so
+    /// boot can hand the *same* `Arc<RwLock<TokenString>>` to both this state
+    /// and `ws_server::router()` — a live `POST /auth/rotate` then updates
+    /// both readers at once (ADR-0020 D18.3).
+    pub fn new_shared(config: Config, token: SharedToken) -> Self {
         let session_table = default_session_table(config.auth.cookie_max_age_days);
         Self {
             session_table,
@@ -264,7 +283,7 @@ impl AppState {
             terminal_map: Arc::new(TerminalMap::new()),
             terminal_meta: Arc::new(TerminalMetadataStore::new()),
             config: Arc::new(config),
-            token: Arc::new(token),
+            token,
             auth_failure_counter: Arc::new(AtomicU64::new(0)),
             hub: None,
             workspace: None,
@@ -292,11 +311,19 @@ impl AppState {
     /// Attach a pre-loaded Argon2id password hash (read from the file
     /// produced by `gtmux set-password`). Without this `POST /auth/login`
     /// returns 503 in password mode.
-    pub fn with_password_hash(self, hash: String) -> Self {
-        // Use `blocking_write` because this builder runs synchronously
-        // during boot, before any axum handler holds the lock. There is
-        // no live contention to block on.
-        *self.password_hash.blocking_write() = Some(hash);
+    pub fn with_password_hash(mut self, hash: String) -> Self {
+        // Replace the Arc rather than `blocking_write()` into it: this builder
+        // runs both at sync boot *and* from inside `#[tokio::test]` async
+        // contexts, and `blocking_write()` panics on a runtime thread (tokio
+        // RwLock) regardless of contention. The Arc is not yet shared at this
+        // point (AppState hasn't been cloned into any handler), so a swap is
+        // sound and lock-free. Mirrors `with_workspace` (G1).
+        //
+        // Pre-D18 this only ran in `config.auth.mode == "password"`, so the
+        // old `blocking_write()` never executed in the default token-mode boot.
+        // D18 T5 loads the hash whenever the file exists, which newly exercised
+        // this path on the runtime thread → boot panic. Fixed here.
+        self.password_hash = Arc::new(RwLock::new(Some(hash)));
         self
     }
 
@@ -530,6 +557,19 @@ impl AppState {
         me
     }
 
+    /// Like [`with_hub`](Self::with_hub) but takes a pre-built [`SharedToken`]
+    /// cell so boot can share the *same* token with ws-server (ADR-0020
+    /// D18.3 — live rotation reflected on both routers at once).
+    pub fn with_hub_shared(
+        config: Config,
+        token: SharedToken,
+        hub: gtmux_ws_server::Hub,
+    ) -> Self {
+        let mut me = Self::new_shared(config, token);
+        me.hub = Some(hub);
+        me
+    }
+
     /// Like [`with_hub`](Self::with_hub) plus a workspace handle. Convenience
     /// for `gtmux start`'s boot wiring.
     pub fn with_hub_and_workspace(
@@ -539,6 +579,18 @@ impl AppState {
         workspace: WorkspaceManager,
     ) -> Self {
         Self::with_hub(config, token, hub).with_workspace(workspace)
+    }
+
+    /// Like [`with_hub_and_workspace`](Self::with_hub_and_workspace) but takes
+    /// a pre-built [`SharedToken`] cell (boot path — shared with ws-server,
+    /// ADR-0020 D18.3).
+    pub fn with_hub_and_workspace_shared(
+        config: Config,
+        token: SharedToken,
+        hub: gtmux_ws_server::Hub,
+        workspace: WorkspaceManager,
+    ) -> Self {
+        Self::with_hub_shared(config, token, hub).with_workspace(workspace)
     }
 }
 
@@ -763,7 +815,8 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         )
         .route(
             "/api/settings/password",
-            axum::routing::post(settings::password_handler),
+            axum::routing::post(settings::password_handler)
+                .delete(settings::reset_password_handler),
         )
         .route(
             "/api/settings/logout-all",
@@ -880,6 +933,9 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         // redirect to `/auth?t=…` (the FE AuthPage's magic-link contract)
         // so URLs printed by `gtmux start` keep working.
         .route("/auth/login", axum::routing::post(auth::auth_login_handler))
+        // ADR-0020 D18.6 — unauthenticated public probe so the FE auth page
+        // (pre-cookie) can learn whether a password is set.
+        .route("/auth/methods", get(auth::auth_methods_handler))
         .route(
             "/auth/logout",
             axum::routing::post(auth::auth_logout_handler),
@@ -937,6 +993,10 @@ async fn origin_check_middleware(
         || path == "/auth"
         || path == "/auth/login"
         || path == "/auth/logout"
+        // ADR-0020 D18.6 — unauthenticated public probe. Same-origin fetch
+        // from the pre-cookie auth page must reach it (it's a read-only
+        // boolean; no CSRF surface — bearer middleware doesn't gate it either).
+        || path == "/auth/methods"
     {
         return next.run(req).await;
     }
@@ -1039,13 +1099,39 @@ struct BootstrapQuery {
 /// work, but the body is now a 303 to `/auth?t=…` — the FE AuthPage's
 /// magic-link contract. The token is then POSTed to `/auth/login` by the FE
 /// to mint the cookie.
+///
+/// Security (ADR-0020 plan-0022 S1-a / audit M1): this route sits outside the
+/// `/api/*` bearer middleware *and* the origin check, so it is reachable
+/// completely unauthenticated. Before this guard it reflected *any* non-empty
+/// `?token=` into `/auth?t=…` without checking it, making the server an
+/// unauthenticated reflector that could seed a victim's FE with an
+/// attacker-chosen token (login/token fixation; the forged token never
+/// actually authenticates — WS handshake and `/auth/login` both constant-time
+/// compare — but the reflection violates ADR-0003 R(rej)2's URL-token surface
+/// reduction). We now constant-time `verify_token` the presented value against
+/// the live server token *before* redirecting, and fail closed
+/// (`MissingToken` → 400) on mismatch. The token is read out of the
+/// `SharedToken` cell under the read lock and cloned before the compare, so a
+/// concurrent `/auth/rotate` swap (D18.3) is reflected immediately.
 async fn bootstrap_handler(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Query(q): Query<BootstrapQuery>,
 ) -> Response {
     let Some(token) = q.token.filter(|t| !t.is_empty()) else {
         return HttpApiError::MissingToken.into_response();
     };
+    // Verify before reflecting (M1). Clone the current server token out under
+    // the read lock, then constant-time compare — never hold the lock across
+    // the comparator. An unknown / forged token fails closed with the same
+    // `missing_token` shape an empty `?token=` returns, so the endpoint never
+    // discloses whether a candidate token was "close".
+    let token_ok = {
+        let current = state.token.read().await.clone();
+        gtmux_auth::verify_token(&token, &current)
+    };
+    if !token_ok {
+        return HttpApiError::MissingToken.into_response();
+    }
     // Re-encode token + redirect so a path-traversal-shaped redirect from a
     // stale bookmark isn't laundered into a header-splitting payload.
     let target = match q.redirect.as_deref() {
@@ -1320,6 +1406,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bootstrap_rejects_unknown_token() {
+        // plan-0022 S1-a / audit M1: an attacker-chosen (non-matching) token
+        // must NOT be reflected into `/auth?t=…`. The handler now verifies the
+        // token against the live server token before redirecting and fails
+        // closed (`missing_token` → 400) on mismatch, with no Location header.
+        let (app, _token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/bootstrap?token=an-attacker-chosen-value")
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unknown bootstrap token must be rejected (no unauthenticated reflector)"
+        );
+        assert!(
+            resp.headers().get(header::LOCATION).is_none(),
+            "rejected bootstrap must not emit a redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_accepts_valid_token() {
+        // The valid server token still 303-redirects to the FE magic-link
+        // path `/auth?t=…` (the verified happy path).
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/auth/bootstrap?token={}", token.0))
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("valid token must redirect")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            location.starts_with("/auth?t="),
+            "valid token must redirect to /auth?t=…, got {location}"
+        );
+    }
+
+    #[tokio::test]
     async fn cookie_auth_works_after_login() {
         let (app, token) = make_app();
         // D13: cookies are minted by `POST /auth/login`, not the legacy
@@ -1590,12 +1733,61 @@ mod tests {
         set_cookie.split(';').next().unwrap().trim().to_string()
     }
 
-    #[tokio::test]
-    async fn auth_rotate_issues_fresh_cookie_and_revokes_old() {
-        let (app, token) = make_app();
-        let old_cookie = login_and_get_cookie_value(&app, &token).await;
+    /// Serialise tests that mutate the process-global `XDG_STATE_HOME` env so
+    /// `POST /auth/rotate`'s `save_token` write lands in an isolated tempdir
+    /// (and never the operator's real `~/.local/state/gtmux`).
+    static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-        // Rotate.
+    struct XdgStateHomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl XdgStateHomeGuard {
+        fn new() -> Self {
+            let lock = XDG_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("XDG_STATE_HOME");
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("XDG_STATE_HOME", tmp.path());
+            Self {
+                _lock: lock,
+                prev,
+                _tmp: tmp,
+            }
+        }
+    }
+
+    impl Drop for XdgStateHomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("XDG_STATE_HOME", v),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
+    /// Build an app over an explicit `AppState` so the test can later read the
+    /// shared token cell back (to confirm a live rotation swapped it). Token
+    /// mode (no password hash).
+    fn make_app_with_state() -> (Router, TokenString, AppState) {
+        let token = issue_token().expect("token");
+        let state = AppState::new(test_config(), token.clone());
+        let app = router_with_state(state.clone());
+        (app, token, state)
+    }
+
+    #[tokio::test]
+    async fn rotate_reissues_server_token() {
+        // ADR-0020 D18.3: rotate re-mints the *server* token (not a cookie).
+        // After rotation: old token → login/bearer 401, new token → login 200;
+        // caller cookie is cleared (Max-Age=0, no replacement session cookie).
+        let _xdg = XdgStateHomeGuard::new();
+        let (app, old_token, state) = make_app_with_state();
+        let old_cookie = login_and_get_cookie_value(&app, &old_token).await;
+
+        // Token-mode step-up: present the *current* server token as credential.
+        let cred_body = serde_json::to_vec(&json!({ "credential": old_token.0 })).unwrap();
         let resp = app
             .clone()
             .oneshot(
@@ -1604,85 +1796,105 @@ mod tests {
                     .uri("/auth/rotate")
                     .header(header::HOST, TEST_HOST)
                     .header(header::COOKIE, &old_cookie)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(cred_body))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let new_set_cookie = resp
+
+        // Caller cookie cleared (Max-Age=0), no new session cookie minted.
+        let set_cookie = resp
             .headers()
             .get(header::SET_COOKIE)
-            .expect("rotate emits a new Set-Cookie")
+            .expect("rotate clears the caller cookie")
             .to_str()
             .unwrap()
             .to_string();
-        assert!(new_set_cookie.starts_with(&format!("{COOKIE_NAME_STR}=")));
-        assert!(new_set_cookie.contains("HttpOnly"));
-        let new_cookie = new_set_cookie.split(';').next().unwrap().trim().to_string();
-        assert_ne!(
-            new_cookie, old_cookie,
-            "rotate must mint a fresh opaque value"
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "caller cookie must be cleared, got: {set_cookie}"
         );
 
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["ok"], json!(true));
-        // Only the caller was alive → revoked_count == 1 (caller's old session).
-        assert_eq!(v["revoked_count"], json!(1));
-
-        // The new cookie must satisfy the auth middleware.
-        let ok = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/sessions")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::COOKIE, &new_cookie)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_ne!(
-            ok.status(),
-            StatusCode::UNAUTHORIZED,
-            "fresh rotated cookie must authenticate (got {:?})",
-            ok.status()
+        let new_token = v["new_token"].as_str().expect("new_token in body").to_string();
+        assert_ne!(new_token, old_token.0, "rotate must mint a fresh token");
+        assert!(
+            v["url"].as_str().unwrap().contains(&format!("t={new_token}")),
+            "url carries the new token: {}",
+            v["url"]
         );
 
-        // The old cookie must now 401.
-        let stale = app
+        // The in-memory shared cell now holds the new token (live swap).
+        assert_eq!(state.token.read().await.0, new_token);
+
+        // Old token no longer logs in.
+        let old_login = serde_json::to_vec(&json!({ "token": old_token.0 })).unwrap();
+        let resp = app
             .clone()
             .oneshot(
                 HttpRequest::builder()
-                    .uri("/api/sessions")
+                    .method(Method::POST)
+                    .uri("/auth/login")
                     .header(header::HOST, TEST_HOST)
-                    .header(header::COOKIE, &old_cookie)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(old_login))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(
-            stale.status(),
+            resp.status(),
             StatusCode::UNAUTHORIZED,
-            "old cookie must be revoked after rotate"
+            "old token must be rejected after rotate"
         );
+
+        // Old token bearer no longer authenticates `/api/*`.
+        let bearer_resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, format!("Bearer {}", old_token.0))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bearer_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // New token logs in.
+        let new_login = serde_json::to_vec(&json!({ "token": new_token })).unwrap();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/login")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(new_login))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "new token must log in");
     }
 
     #[tokio::test]
-    async fn auth_rotate_revokes_other_sessions_too() {
+    async fn rotate_revokes_all_cookies() {
+        // ADR-0020 D18.4: rotate revokes *every* cookie session (caller + all
+        // others). Two independent logins; rotate via one; both must 401.
+        let _xdg = XdgStateHomeGuard::new();
         let (app, token) = make_app();
-        // Two independent logins → two cookies. Rotating one must revoke
-        // both the rotator's old cookie *and* the other live session.
         let cookie_a = login_and_get_cookie_value(&app, &token).await;
         let cookie_b = login_and_get_cookie_value(&app, &token).await;
-        assert_ne!(
-            cookie_a, cookie_b,
-            "two logins should mint distinct cookies"
-        );
+        assert_ne!(cookie_a, cookie_b);
 
+        let cred_body = serde_json::to_vec(&json!({ "credential": token.0 })).unwrap();
         let resp = app
             .clone()
             .oneshot(
@@ -1691,31 +1903,34 @@ mod tests {
                     .uri("/auth/rotate")
                     .header(header::HOST, TEST_HOST)
                     .header(header::COOKIE, &cookie_a)
-                    .body(Body::empty())
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(cred_body))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let v: Value = serde_json::from_slice(&body).unwrap();
-        // Caller (a) was revoked + the other session (b) — count of 2.
-        assert_eq!(v["revoked_count"], json!(2));
 
-        // cookie_b must now 401 even though it never touched /rotate.
-        let stale = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/sessions")
-                    .header(header::HOST, TEST_HOST)
-                    .header(header::COOKIE, &cookie_b)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        // Both cookies must now 401 on `/api/*`.
+        for c in [&cookie_a, &cookie_b] {
+            let stale = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/api/sessions")
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::COOKIE, c)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                stale.status(),
+                StatusCode::UNAUTHORIZED,
+                "all cookies must be revoked after rotate"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1753,6 +1968,354 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    // ── ADR-0020 D16: step-up re-auth on /auth/rotate ──
+
+    #[tokio::test]
+    async fn rotate_requires_credential() {
+        // Valid session cookie but no `credential` in the body → 401
+        // `credential_required`, and the session is NOT rotated (cookie still
+        // valid afterwards, no Set-Cookie emitted).
+        let (app, token) = make_app();
+        let cookie = login_and_get_cookie_value(&app, &token).await;
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/rotate")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.headers().get(header::SET_COOKIE).is_none(),
+            "no rotation on missing credential"
+        );
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "credential_required");
+        // The original cookie still authenticates — nothing was revoked.
+        let ok = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            ok.status(),
+            StatusCode::UNAUTHORIZED,
+            "cookie must survive a credential-less rotate attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_verifies_then_rotates() {
+        // Token-mode step-up: wrong credential → 401 invalid_credential, no
+        // rotation. Correct credential → 200 `{ ok, new_token, url }`
+        // (ADR-0020 D18.3) + caller cookie cleared.
+        let _xdg = XdgStateHomeGuard::new();
+        let (app, token) = make_app();
+        let cookie = login_and_get_cookie_value(&app, &token).await;
+
+        // Wrong credential.
+        let bad = serde_json::to_vec(&json!({ "credential": "wrong-token" })).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/rotate")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(bad))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "invalid_credential");
+
+        // Correct credential → server-token reissue.
+        let good = serde_json::to_vec(&json!({ "credential": token.0 })).unwrap();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/rotate")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(good))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The caller cookie is cleared (Max-Age=0), not re-issued.
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("rotate clears caller cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.contains("Max-Age=0"), "got: {set_cookie}");
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], json!(true));
+        assert!(v["new_token"].as_str().is_some(), "new_token present");
+        assert!(v["url"].as_str().is_some(), "url present");
+        assert!(v.get("revoked_count").is_none(), "D18 drops revoked_count");
+    }
+
+    #[tokio::test]
+    async fn stepup_password_rate_limited() {
+        // Password-mode step-up: repeated wrong credentials trip the per-IP
+        // RateLimiter (ADR-0020 D5/D16.4) → 429 + Retry-After. Exercised via
+        // /auth/rotate, but the limiter is the shared step-up path.
+        let token = issue_token().expect("token");
+        let cfg = test_config();
+        let limit = cfg.auth.rate_limit_per_5min;
+        let state = AppState::new(cfg, token.clone());
+        // Put the server in password mode.
+        let hash = crate::auth::hash_password("realpw123").expect("hash");
+        *state.password_hash.write().await = Some(hash);
+        // A valid session cookie so we clear the cookie precondition and reach
+        // the credential check on every attempt.
+        let cookie_value = state
+            .session_table
+            .issue(crate::auth::AuthMode::Password)
+            .await
+            .expect("issue cookie");
+        let cookie = format!("{COOKIE_NAME_STR}={cookie_value}");
+        let app = router_with_state(state);
+
+        // `limit` wrong attempts are 401; the next one trips 429. The
+        // per-IP key in Local mode is the shared `_local` bucket.
+        let bad = serde_json::to_vec(&json!({ "credential": "wrongpw" })).unwrap();
+        let mut saw_429 = false;
+        for i in 0..=limit {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri("/auth/rotate")
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::COOKIE, &cookie)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(bad.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                saw_429 = true;
+                assert!(
+                    resp.headers().get(header::RETRY_AFTER).is_some(),
+                    "429 must carry Retry-After"
+                );
+                break;
+            }
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {i} should be 401 before the limit trips"
+            );
+        }
+        assert!(saw_429, "exceeding the rate limit must yield a 429");
+    }
+
+    // ── ADR-0020 D18.1: union login `{ token } ∪ { password }` ──
+
+    /// POST `/auth/login` with the given JSON body; return the response.
+    async fn post_login(app: &Router, body: Value) -> Response {
+        let bytes = serde_json::to_vec(&body).unwrap();
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/login")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Build a token-mode app over an explicit state, then set a password hash
+    /// so the password axis of the union is also active (mirrors a server
+    /// that was started token-only and then had a password set via D17).
+    async fn make_app_with_password(plaintext: &str) -> (Router, TokenString) {
+        let token = issue_token().expect("token");
+        let state = AppState::new(test_config(), token.clone());
+        let hash = crate::auth::hash_password(plaintext).expect("hash");
+        *state.password_hash.write().await = Some(hash);
+        (router_with_state(state), token)
+    }
+
+    /// Regression (D18 T5): the `with_password_hash` *boot builder* previously
+    /// used `blocking_write()`, which panics on a tokio runtime thread
+    /// ("Cannot block the current thread from within a runtime"). Pre-D18 this
+    /// only ran in password-mode boot, so the default token-mode boot never hit
+    /// it; D18 T5 loads the hash whenever the file exists, newly exercising the
+    /// builder on the CLI boot runtime thread. The unit tests above set the hash
+    /// via async `.write().await` and so never covered the builder — this test
+    /// calls the builder itself inside `#[tokio::test]` (a runtime thread), so
+    /// it would panic if the `blocking_write()` ever returns.
+    #[tokio::test]
+    async fn with_password_hash_builder_is_lock_free_on_runtime_thread() {
+        let token = issue_token().expect("token");
+        let hash = crate::auth::hash_password("Passw0rd!").expect("hash");
+        let state = AppState::new(test_config(), token).with_password_hash(hash);
+        assert!(
+            state.password_hash.read().await.is_some(),
+            "with_password_hash must set the hash without blocking on the runtime thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_accepts_token_when_no_password() {
+        // Token-only server (no hash) + valid token → 200 + Set-Cookie.
+        let (app, token) = make_app();
+        let resp = post_login(&app, json!({ "token": token.0 })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn login_accepts_password_when_set() {
+        // Password set + valid password → 200.
+        let (app, _token) = make_app_with_password("hunter2pass").await;
+        let resp = post_login(&app, json!({ "password": "hunter2pass" })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn login_accepts_token_even_when_password_set() {
+        // Union core: password is set, but a valid *token* must still log in
+        // (token + password run concurrently, ADR-0020 D18.1).
+        let (app, token) = make_app_with_password("hunter2pass").await;
+        let resp = post_login(&app, json!({ "token": token.0 })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn login_rejects_wrong_credential() {
+        // Both axes fail → 401; sustained failures → 429.
+        let (app, _token) = make_app_with_password("hunter2pass").await;
+        let resp = post_login(&app, json!({ "password": "nope-wrong" })).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        // A bogus token is also rejected.
+        let resp = post_login(&app, json!({ "token": "A".repeat(43) })).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Drive the per-IP limiter over the edge → 429.
+        let limit = test_config().auth.rate_limit_per_5min;
+        let mut saw_429 = false;
+        for _ in 0..=limit {
+            let r = post_login(&app, json!({ "password": "still-wrong" })).await;
+            if r.status() == StatusCode::TOO_MANY_REQUESTS {
+                saw_429 = true;
+                assert!(r.headers().get(header::RETRY_AFTER).is_some());
+                break;
+            }
+        }
+        assert!(saw_429, "repeated wrong credentials must rate-limit");
+    }
+
+    #[tokio::test]
+    async fn login_missing_credential_400() {
+        // Neither token nor password present → 400 (nothing to verify).
+        let (app, _token) = make_app();
+        let resp = post_login(&app, json!({})).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+        // Empty-string credentials are treated as absent → also 400.
+        let resp = post_login(&app, json!({ "token": "", "password": "" })).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn password_set_enables_login_without_restart() {
+        // ADR-0020 D18.2: setting a password at runtime (here directly into
+        // the same `password_hash` cell that `POST /api/settings/password`
+        // writes) makes the password axis live immediately — no restart.
+        let token = issue_token().expect("token");
+        let state = AppState::new(test_config(), token.clone());
+        let app = router_with_state(state.clone());
+
+        // Before: password login is rejected (no hash).
+        let before = post_login(&app, json!({ "password": "freshpass1" })).await;
+        assert_eq!(before.status(), StatusCode::UNAUTHORIZED);
+
+        // Set the hash in-process (what the D17 handler does).
+        let hash = crate::auth::hash_password("freshpass1").expect("hash");
+        *state.password_hash.write().await = Some(hash);
+
+        // After: same process, same router — password login now succeeds.
+        let after = post_login(&app, json!({ "password": "freshpass1" })).await;
+        assert_eq!(after.status(), StatusCode::OK);
+        assert!(after.headers().contains_key(header::SET_COOKIE));
+    }
+
+    // ── ADR-0020 D18.6: GET /auth/methods (unauthenticated public probe) ──
+
+    async fn get_auth_methods(app: &Router) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/methods")
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "methods is unauthenticated");
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_methods_reflects_password_set() {
+        // `token` always true; `password` false before a hash is set, true
+        // after — and the probe needs no cookie/bearer.
+        let token = issue_token().expect("token");
+        let state = AppState::new(test_config(), token.clone());
+        let app = router_with_state(state.clone());
+
+        let before = get_auth_methods(&app).await;
+        assert_eq!(before["token"], json!(true));
+        assert_eq!(before["password"], json!(false));
+
+        *state.password_hash.write().await =
+            Some(crate::auth::hash_password("set-now-1").expect("hash"));
+
+        let after = get_auth_methods(&app).await;
+        assert_eq!(after["token"], json!(true));
+        assert_eq!(after["password"], json!(true));
     }
 
     #[test]

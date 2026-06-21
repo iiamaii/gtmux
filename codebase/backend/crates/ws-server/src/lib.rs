@@ -39,7 +39,7 @@ use axum::routing::get;
 use axum::Router;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
-use gtmux_auth::TokenString;
+use gtmux_auth::SharedToken;
 use gtmux_config::Config;
 use gtmux_pty_backend::{BackendNotify, PaneId};
 use thiserror::Error;
@@ -56,7 +56,8 @@ pub use cmd_router::{dispatch_ctrl, is_allowed_ctrl_cmd, CtrlOutcome, ALLOWLISTE
 pub use hub::{
     AttachReplayEvent, CookieValidator, Hub, ManipulationEvent, MountCascadeEvent,
     ServerShutdownEvent, SessionChangeEvent, SessionPaneSetProvider, TerminalDiedEvent,
-    TerminalListChangeEvent, TerminalSpawnedEvent, TerminalUuidProvider, HUB_BROADCAST_CAPACITY,
+    TerminalListChangeEvent, TerminalSpawnedEvent, TerminalUuidProvider, TokenRevokedEvent,
+    HUB_BROADCAST_CAPACITY,
 };
 pub use ring::{RingBuffer, RING_BUFFER_CAPACITY};
 
@@ -105,6 +106,12 @@ mod close_codes {
     pub const UNSUPPORTED_DATA: u16 = 1003;
     pub const POLICY_VIOLATION: u16 = 1008;
     pub const INTERNAL: u16 = 1011;
+    /// Application close code emitted when the server token is rotated
+    /// (`POST /auth/rotate`, ADR-0020 D18.3 / ADR-0003 D12). Every live WS
+    /// connection is closed with this code so the FE distinguishes a forced
+    /// re-auth (old token/cookie now invalid) from a normal shutdown (1000)
+    /// or a transient drop. In the 4000–4999 application range.
+    pub const TOKEN_REVOKED: u16 = 4001;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -367,16 +374,25 @@ pub fn parse_subprotocol(header_value: &str) -> Option<ParsedSubprotocol> {
 
 #[derive(Clone)]
 struct WsState {
-    token: Arc<TokenString>,
+    /// Shared, runtime-mutable server token cell (ADR-0020 D18.3). The same
+    /// `Arc<RwLock<TokenString>>` is held by the http-api router state — boot
+    /// wires one cell into both — so a `POST /auth/rotate` write is visible to
+    /// the WS handshake the instant the write lock drops, with no second copy
+    /// to drift.
+    token: SharedToken,
     echo_protocol: HeaderValue,
     hub: Hub,
 }
 
 /// Build the WS sub-router.
-pub fn router(_config: &Config, token: &TokenString, hub: Hub) -> Router {
+///
+/// `token` is the *shared* server-token cell (ADR-0020 D18.3) — the WS state
+/// stores an `Arc::clone` of it (same underlying `RwLock`), so the http-api
+/// side and this side always read the same token even after a live rotation.
+pub fn router(_config: &Config, token: SharedToken, hub: Hub) -> Router {
     let echo_protocol = HeaderValue::from_static("gtmux.v1");
     let state = WsState {
-        token: Arc::new(token.clone()),
+        token,
         echo_protocol,
         hub,
     };
@@ -453,9 +469,16 @@ async fn ws_handler(
     };
 
     let bearer_token = parsed.bearer_token.as_deref();
-    let bearer_ok = bearer_token
-        .map(|t| gtmux_auth::verify_token(t, state.token.as_ref()))
-        .unwrap_or(false);
+    // Clone the current server token out under the read lock (ADR-0020 D18.3)
+    // before the constant-time compare — the lock is never held across
+    // `verify_token`, and a concurrent rotation that lands between this read
+    // and the compare simply means a fresh handshake reads the new value.
+    let bearer_ok = if let Some(t) = bearer_token {
+        let current = state.token.read().await.clone();
+        gtmux_auth::verify_token(t, &current)
+    } else {
+        false
+    };
 
     if !cookie_ok && !bearer_ok {
         if bearer_token.is_some() {
@@ -571,6 +594,10 @@ async fn handle_socket(
     let mut manipulation_rx = hub.subscribe_manipulation();
     let mut mount_cascade_rx = hub.subscribe_mount_cascade();
     let mut server_shutdown_rx = hub.subscribe_server_shutdown();
+    // ADR-0020 D18.3 / ADR-0003 D12: per-WS subscriber to the token-revoked
+    // channel. On `POST /auth/rotate` every live connection closes with code
+    // 4001 so the FE forces a fresh re-auth against the new server token.
+    let mut token_revoked_rx = hub.subscribe_token_revoked();
     // ADR-0021 D8 amend ② (0075/0076/0077): per-WS subscriber to the
     // rebind history replay channel. The arm below forwards only when
     // the envelope's `session` matches this connection's owner-scoped
@@ -1194,6 +1221,37 @@ async fn handle_socket(
                     }
                 }
             }
+            revoked = token_revoked_rx.recv() => {
+                match revoked {
+                    Ok(TokenRevokedEvent) => {
+                        // ADR-0020 D18.3 / ADR-0003 D12: the server token was
+                        // rotated and every cookie session revoked. Close with
+                        // 4001 so the FE distinguishes a forced re-auth from a
+                        // normal shutdown (1000) and re-authenticates with the
+                        // new token. No envelope precedes it — the close code
+                        // itself is the whole signal.
+                        let _ = send_bounded(
+                            &mut sink,
+                            Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: close_codes::TOKEN_REVOKED,
+                                reason: "token_revoked".into(),
+                            })),
+                            write_timeout,
+                        )
+                        .await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Capacity is 16 vs ~1 send per rotation — lagging
+                        // means we missed our only notification. Treat as
+                        // revoked and drop the connection.
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Hub dropped — other arms will hit Closed too.
+                    }
+                }
+            }
             list_change = terminal_list_change_rx.recv() => {
                 match list_change {
                     Ok(event) => {
@@ -1665,6 +1723,7 @@ where
 )]
 mod tests {
     use super::*;
+    use gtmux_auth::TokenString;
     use gtmux_pty_backend::PtyBackend;
 
     // ── Session-scoped input filter (0067 BE-3) ───────────────────────────
@@ -1957,7 +2016,7 @@ bind = "127.0.0.1"
         let cfg = test_config();
         let backend = PtyBackend::new();
         let hub = Hub::new(backend);
-        let app = router(&cfg, &token, hub.clone());
+        let app = router(&cfg, gtmux_auth::shared_token(token.clone()), hub.clone());
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .unwrap();
@@ -2191,6 +2250,38 @@ bind = "127.0.0.1"
         assert!(
             got_policy_close,
             "client-origin 0x87 must be policy-violation closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_revoked_closes_ws_with_4001() {
+        // ADR-0020 D18.3 / ADR-0003 D12: `hub.publish_token_revoked()` (called
+        // by `POST /auth/rotate`) closes every live WS with code 4001 so the
+        // FE forces a fresh re-auth.
+        let token = gtmux_auth::issue_token().unwrap();
+        let (addr, hub) = spawn_test_server(token.clone()).await;
+        let mut ws = connect_authed(addr, &token).await;
+        drain_initial(&mut ws, std::time::Duration::from_millis(50)).await;
+
+        hub.publish_token_revoked();
+
+        let mut got_revoked_close = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, ws.next()).await {
+                Ok(Some(Ok(TM::Close(Some(cf))))) => {
+                    assert_eq!(u16::from(cf.code), close_codes::TOKEN_REVOKED);
+                    got_revoked_close = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            }
+        }
+        assert!(
+            got_revoked_close,
+            "token rotation must close live WS with code 4001"
         );
     }
 
@@ -2485,7 +2576,7 @@ bind = "127.0.0.1"
         // so catch-up has actual PANE_OUT bytes to potentially replay.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let hub = Hub::new(backend);
-        let app = router(&cfg, &token, hub.clone());
+        let app = router(&cfg, gtmux_auth::shared_token(token.clone()), hub.clone());
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .unwrap();
@@ -3249,7 +3340,7 @@ bind = "127.0.0.1"
         let (disc_tx, mut disc_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         hub.set_disconnect_sink(disc_tx);
 
-        let app = router(&cfg, &token, hub.clone());
+        let app = router(&cfg, gtmux_auth::shared_token(token.clone()), hub.clone());
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .unwrap();
@@ -3325,7 +3416,7 @@ bind = "127.0.0.1"
         let (hb_tx, mut hb_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         hub.set_heartbeat_sink(hb_tx);
 
-        let app = router(&cfg, &token, hub.clone());
+        let app = router(&cfg, gtmux_auth::shared_token(token.clone()), hub.clone());
         let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
             .await
             .unwrap();

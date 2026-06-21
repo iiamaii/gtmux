@@ -39,6 +39,27 @@ const PERM_MASK: u32 = 0o777;
 #[derive(Clone, Debug)]
 pub struct TokenString(pub String);
 
+/// Shared, runtime-mutable server token cell (ADR-0020 D18.3).
+///
+/// The server token is read on *every* authenticated request (login, bearer
+/// middleware, WS handshake, step-up) and written only on `POST /auth/rotate`
+/// — a read-biased access pattern, so a `tokio::sync::RwLock` is the right
+/// primitive. Both the http-api router state and the ws-server router state
+/// hold a clone of the *same* `Arc<RwLock<…>>` (boot wires one cell into
+/// both), so a live token rotation is reflected across the whole process the
+/// instant the write lock is released — there is no second copy to drift.
+///
+/// Read sites clone the inner [`TokenString`] out under the read lock before
+/// calling [`verify_token`] (constant-time compare) so the lock is never held
+/// across the comparison.
+pub type SharedToken = std::sync::Arc<tokio::sync::RwLock<TokenString>>;
+
+/// Wrap an owned [`TokenString`] into a fresh [`SharedToken`] cell. Boot
+/// (`gtmux-cli`) calls this once and hands the result to both routers.
+pub fn shared_token(token: TokenString) -> SharedToken {
+    std::sync::Arc::new(tokio::sync::RwLock::new(token))
+}
+
 impl TokenString {
     /// Decode to raw bytes. Returns `BadEncoding` if the inner string is not
     /// valid base64url-no-pad or does not decode to exactly 32 bytes.

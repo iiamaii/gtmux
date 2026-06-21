@@ -135,6 +135,12 @@ const MOUNT_CASCADE_BROADCAST_CAPACITY: usize = 64;
 /// loop to drain even under heavy contention.
 const SERVER_SHUTDOWN_BROADCAST_CAPACITY: usize = 16;
 
+/// Capacity for the token-revoked channel (ADR-0020 D18.3 / ADR-0003 D12).
+/// Token rotation is a rare, operator-initiated event (`POST /auth/rotate`)
+/// — at most a handful per server lifetime — so 16 is generous headroom for
+/// every live WS handler to drain its single notification.
+const TOKEN_REVOKED_BROADCAST_CAPACITY: usize = 16;
+
 /// Capacity for the `SessionChange` channel (Slice next-2, ADR-0025
 /// D4). Cookie session changes are rare events (workspace switch, ~1
 /// per minute peak), so a small cap suffices. 64 leaves headroom for
@@ -230,6 +236,18 @@ pub struct ServerShutdownEvent {
     /// WS frame and surface a single toast.
     pub expected_exit_code: i32,
 }
+
+/// Payload of a `TokenRevoked` broadcast (ADR-0020 D18.3 / ADR-0003 D12).
+/// Emitted by `POST /auth/rotate` after the server token has been re-minted
+/// and every cookie session revoked. Server-wide — every connected webpage's
+/// WS handler turns one event into a `4001 token revoked` close frame and
+/// drops the connection so the FE re-authenticates with the new token.
+///
+/// Carries no data: the rotation itself is the whole signal, and the new
+/// token is delivered to the *initiating* caller via the HTTP rotate response,
+/// never broadcast over WS.
+#[derive(Clone, Debug)]
+pub struct TokenRevokedEvent;
 
 /// Payload of a `MountCascade` broadcast (Stage 5-D path P2).
 /// Emitted by `POST /api/sessions/:name/terminals` after the terminal
@@ -421,6 +439,12 @@ pub struct Hub {
     /// turns one event into a `0x89 SERVER_SHUTDOWN` envelope before
     /// the close frame (1000 normal) arrives.
     server_shutdown_events: broadcast::Sender<ServerShutdownEvent>,
+    /// Token-revoked broadcast (ADR-0020 D18.3 / ADR-0003 D12). Published
+    /// by `POST /auth/rotate` once the server token has been re-minted and
+    /// all cookie sessions revoked. Server-wide — every WS handler closes
+    /// its connection with code `4001 token revoked` so the FE forces a
+    /// fresh re-auth against the new token.
+    token_revoked_events: broadcast::Sender<TokenRevokedEvent>,
     /// Session-change broadcast (Slice next-2, ADR-0025 D4). Emitted
     /// by `set_session_for_owner` / `clear_session_for_owner` so WS
     /// handlers can refresh their per-connection PaneId filter set
@@ -458,6 +482,7 @@ impl Hub {
         let (manipulation_events, _) = broadcast::channel(MANIPULATION_BROADCAST_CAPACITY);
         let (mount_cascade_events, _) = broadcast::channel(MOUNT_CASCADE_BROADCAST_CAPACITY);
         let (server_shutdown_events, _) = broadcast::channel(SERVER_SHUTDOWN_BROADCAST_CAPACITY);
+        let (token_revoked_events, _) = broadcast::channel(TOKEN_REVOKED_BROADCAST_CAPACITY);
         let (session_change_events, _) = broadcast::channel(SESSION_CHANGE_BROADCAST_CAPACITY);
         let (attach_replay_events, _) = broadcast::channel(ATTACH_REPLAY_BROADCAST_CAPACITY);
 
@@ -484,6 +509,7 @@ impl Hub {
             cookie_validator: Arc::new(std::sync::Mutex::new(None)),
             terminal_uuid_provider: Arc::new(std::sync::Mutex::new(None)),
             server_shutdown_events,
+            token_revoked_events,
             session_change_events,
             session_pane_set_provider: Arc::new(std::sync::Mutex::new(None)),
             attach_replay_events,
@@ -778,6 +804,23 @@ impl Hub {
     /// then exits the connection loop so the close-handshake path runs.
     pub fn subscribe_server_shutdown(&self) -> broadcast::Receiver<ServerShutdownEvent> {
         self.server_shutdown_events.subscribe()
+    }
+
+    /// Broadcast a token-revoked notify (ADR-0020 D18.3 / ADR-0003 D12).
+    /// Called by `POST /auth/rotate` after the server token has been
+    /// re-minted and every cookie session revoked. Server-wide — every WS
+    /// handler closes its connection with code `4001 token revoked`. The
+    /// send is silent on "no subscribers" (no live WS clients), identical to
+    /// [`publish_server_shutdown`].
+    pub fn publish_token_revoked(&self) {
+        let _ = self.token_revoked_events.send(TokenRevokedEvent);
+    }
+
+    /// Subscribe to token-revoked notifications. Each WS handler pulls from
+    /// this channel and, on receipt, sends a `4001` close frame and exits the
+    /// connection loop.
+    pub fn subscribe_token_revoked(&self) -> broadcast::Receiver<TokenRevokedEvent> {
+        self.token_revoked_events.subscribe()
     }
 
     /// Subscribe to cookie session-change events (Slice next-2, ADR-0025
@@ -1079,6 +1122,26 @@ mod tests {
     async fn terminal_spawned_publish_silent_without_subscribers() {
         let hub = Hub::new(PtyBackend::new());
         hub.publish_terminal_spawned("uuid", 42);
+    }
+
+    #[tokio::test]
+    async fn token_revoked_publish_silent_without_subscribers() {
+        // ADR-0020 D18.3: publishing with no live WS must not panic/error.
+        let hub = Hub::new(PtyBackend::new());
+        hub.publish_token_revoked();
+    }
+
+    #[tokio::test]
+    async fn token_revoked_subscriber_receives_event() {
+        let hub = Hub::new(PtyBackend::new());
+        let mut rx = hub.subscribe_token_revoked();
+        hub.publish_token_revoked();
+        let got = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("recv");
+        // Unit-like payload — receipt is the whole signal.
+        let TokenRevokedEvent = got;
     }
 
     #[tokio::test]

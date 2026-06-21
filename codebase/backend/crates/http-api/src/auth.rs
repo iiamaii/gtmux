@@ -91,9 +91,17 @@ pub enum AuthMode {
 }
 
 impl AuthMode {
-    /// Parse from `config.auth.mode`. Unknown values fall back to `Token`
-    /// with a warning — fail-open here would silently disable the password
-    /// gate, so we *fail-closed* by defaulting to the safer token path.
+    /// Parse from `config.auth.mode`.
+    ///
+    /// **Deprecated for login (ADR-0020 D18.1).** Login is no longer
+    /// mode-exclusive — the token is always valid and the password is
+    /// additionally valid whenever a hash is loaded (see
+    /// [`auth_login_handler`]). This parser is retained only as a back-compat
+    /// reader of the now-ignored `config.auth.mode` field; it does **not**
+    /// gate any auth path. `AuthMode` itself still tags `SessionTable` entries
+    /// with the axis that minted them (diagnostics only).
+    ///
+    /// Unknown values fall back to `Token` with a warning.
     pub fn from_config_str(s: &str) -> Self {
         match s {
             "password" => Self::Password,
@@ -452,154 +460,513 @@ pub struct LoginBody {
     pub redirect: Option<String>,
 }
 
-/// `POST /auth/login` — accepts `{ token | password }` per the active
-/// `config.auth.mode`. Returns:
-///   * 200 + Set-Cookie + `{ redirect }` on success
-///   * 401 on bad credentials
-///   * 429 + `Retry-After` when the per-IP rate limit is exceeded
-///   * 400 when the body doesn't carry the credential the active mode
-///     expects (e.g. password mode but `{ token: "x" }`)
+/// `POST /auth/login` — unified `{ token } ∪ { password }` login (ADR-0020
+/// D18.1). The exclusive `config.auth.mode` branch is **gone**: the token is
+/// *always* a valid credential, and the password is *additionally* valid
+/// whenever a hash has been loaded (`password_hash.is_some()` — boot path or
+/// the runtime `POST /api/settings/password`, D18.2). A presented credential
+/// is accepted if it verifies on *either* axis.
+///
+/// Returns:
+///   * 200 + Set-Cookie + `{ redirect }` — `(token present && valid)
+///     || (password present && set && valid)`.
+///   * 401 — a credential was presented but neither axis verified (+ 429 once
+///     the per-IP rate limit trips).
+///   * 400 — neither `token` nor `password` present (missing credential).
 pub async fn auth_login_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
-    let mode = AuthMode::from_config_str(&state.config.auth.mode);
     let limiter = state.rate_limiter.clone();
     let limit = state.config.auth.rate_limit_per_5min;
     // Rate-limit key: prefer X-Forwarded-For (when behind a trusted proxy in
     // Cloud mode), fall back to a global "_local" bucket in Local mode where
     // ConnectInfo isn't plumbed through `into_make_service()`.
-    let key = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "_local".to_string());
+    let key = rate_limit_key(&headers);
 
-    match mode {
-        AuthMode::Token => {
-            let Some(token) = body.token.as_deref().filter(|t| !t.is_empty()) else {
-                return login_error(
-                    "token mode: missing `token` in request body",
-                    StatusCode::BAD_REQUEST,
-                );
-            };
-            if !verify_token(token, &state.token) {
-                state
-                    .auth_failure_counter
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if limiter.note_failure_and_check(&key, limit).await {
-                    return rate_limited_response();
-                }
-                return login_error("invalid token", StatusCode::UNAUTHORIZED);
-            }
-            limiter.reset(&key).await;
-            issue_cookie_response(&state, AuthMode::Token, body.redirect.as_deref()).await
+    let presented_token = body.token.as_deref().filter(|t| !t.is_empty());
+    let presented_password = body.password.as_deref().filter(|p| !p.is_empty());
+
+    // D18.1: missing *both* credentials is a 400 — there is nothing to verify.
+    if presented_token.is_none() && presented_password.is_none() {
+        return login_error(
+            "missing credential: provide `token` or `password`",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    // Token axis — always active (ADR-0020 D18.1: token always valid). Clone
+    // the current server token out under the read lock before the
+    // constant-time compare (D18.3 — never hold the lock across `verify_token`).
+    let token_ok = if let Some(token) = presented_token {
+        let current = state.token.read().await.clone();
+        verify_token(token, &current)
+    } else {
+        false
+    };
+
+    // Password axis — active only when a hash is loaded (D18.1/D18.2). Clone
+    // the stored hash out (releasing the lock) before the memory-hard Argon2
+    // verify so a tokio worker never stalls on the KDF (ADR-0020 perf).
+    let password_ok = if let Some(password) = presented_password {
+        let stored_hash = {
+            let guard = state.password_hash.read().await;
+            guard.as_deref().map(|h| h.to_string())
+        };
+        match stored_hash {
+            Some(hash) => verify_password_async(password.to_string(), hash).await,
+            // Password presented but none is set → this axis simply doesn't
+            // verify (token-only server). No 503 here — D18 drops the
+            // password-mode-but-unset error in favour of a plain 401/400.
+            None => false,
         }
-        AuthMode::Password => {
-            let Some(password) = body.password.as_deref().filter(|p| !p.is_empty()) else {
-                return login_error(
-                    "password mode: missing `password` in request body",
-                    StatusCode::BAD_REQUEST,
-                );
-            };
-            let hash = {
-                let guard = state.password_hash.read().await;
-                match guard.as_deref() {
-                    Some(h) => h.to_string(),
-                    None => {
-                        return login_error(
-                            "password mode is configured but no password is set; run `gtmux set-password`",
-                            StatusCode::SERVICE_UNAVAILABLE,
-                        );
-                    }
-                }
-            };
-            if !verify_password_async(password.to_string(), hash).await {
-                state
-                    .auth_failure_counter
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if limiter.note_failure_and_check(&key, limit).await {
-                    return rate_limited_response();
-                }
-                return login_error("invalid password", StatusCode::UNAUTHORIZED);
-            }
-            limiter.reset(&key).await;
-            issue_cookie_response(&state, AuthMode::Password, body.redirect.as_deref()).await
+    } else {
+        false
+    };
+
+    if token_ok || password_ok {
+        limiter.reset(&key).await;
+        // The cookie does not distinguish *how* the user logged in (D18.4 —
+        // it's a single session); carry the matched axis only as the
+        // SessionTable `mode` tag for diagnostics.
+        let mode = if token_ok {
+            AuthMode::Token
+        } else {
+            AuthMode::Password
+        };
+        return issue_cookie_response(&state, mode, body.redirect.as_deref()).await;
+    }
+
+    // A credential was presented but neither axis verified.
+    state
+        .auth_failure_counter
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if limiter.note_failure_and_check(&key, limit).await {
+        return rate_limited_response();
+    }
+    login_error("invalid credentials", StatusCode::UNAUTHORIZED)
+}
+
+/// `GET /auth/methods` — **unauthenticated** public probe (ADR-0020 D18.6).
+///
+/// The FE auth page renders *before* any cookie exists, so it cannot call the
+/// authed `GET /api/settings` to learn whether a password is set. This
+/// endpoint exposes the minimal shape it needs to decide whether to enable the
+/// password field:
+///
+/// ```json
+/// { "token": true, "password": <password_hash.is_some()> }
+/// ```
+///
+/// `token` is always `true` (the server always has a token). `password`
+/// reflects only the *presence* of a password hash — never its value or
+/// format. No rate limit (single-user local; cloud sits behind TLS — the
+/// information surface is a single boolean).
+pub async fn auth_methods_handler(State(state): State<AppState>) -> Response {
+    let password = state.password_hash.read().await.is_some();
+    let mut resp = Json(json!({ "token": true, "password": password })).into_response();
+    apply_security_headers(resp.headers_mut(), &state.config);
+    resp
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Step-up re-authentication (ADR-0020 D16) — mode-aware credential verify
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Body shape for a step-up-gated action (`POST /api/shutdown`,
+/// `POST /auth/rotate`). A single `credential` field holds either the
+/// password (password mode) or the server token (token mode) — the active
+/// mode is decided server-side by whether `state.password_hash` holds a
+/// hash (ADR-0020 D16.2). The FE picks which to send by reading
+/// `GET /api/settings`'s `auth.password_set`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct StepUpBody {
+    #[serde(default)]
+    pub credential: Option<String>,
+}
+
+/// Typed outcome of [`verify_step_up`] failure. Each gated handler maps this
+/// to the wire responses fixed by ADR-0020 D16.4 — identical for shutdown
+/// and rotate.
+#[derive(Debug)]
+pub(crate) enum StepUpRejection {
+    /// No `credential` in the body (absent, empty, or empty/missing body).
+    /// → `401 { "error": "credential_required" }`.
+    CredentialRequired,
+    /// `credential` present but didn't match (wrong password / token).
+    /// → `401 { "error": "invalid_credential" }`.
+    InvalidCredential,
+    /// Password-mode failures exceeded the per-IP rate limit (ADR-0020 D5).
+    /// → `429` + `Retry-After`.
+    RateLimited,
+}
+
+impl StepUpRejection {
+    /// Render this rejection as its fixed HTTP response. Centralised so
+    /// shutdown + rotate emit byte-identical errors (the FE consumes one
+    /// contract).
+    pub(crate) fn into_response(self) -> Response {
+        match self {
+            StepUpRejection::CredentialRequired => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "credential_required" })),
+            )
+                .into_response(),
+            StepUpRejection::InvalidCredential => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid_credential" })),
+            )
+                .into_response(),
+            StepUpRejection::RateLimited => rate_limited_response(),
         }
     }
 }
 
-/// `POST /auth/rotate` — ADR-0020 D14. Token-rotation action surfaced by the
-/// FE SettingsOverlay's [Rotate token] button. Authenticated by the caller's
-/// `gtmux_auth` cookie:
-///   * 200 + new Set-Cookie + `{ ok: true, revoked_count }` — caller's old
-///     cookie and every *other* session are dropped; the caller gets a fresh
-///     opaque session-id (same mode as before).
-///   * 401 — no cookie or invalid/expired cookie. No state change.
+/// Derive the per-IP rate-limit key from request headers exactly as
+/// [`auth_login_handler`] does (ADR-0020 D5): prefer the first
+/// `X-Forwarded-For` hop (trusted proxy in Cloud mode), else a single
+/// `_local` bucket (Local mode where `ConnectInfo` isn't plumbed). Shared so
+/// step-up failures land in the *same* bucket as login failures.
+pub(crate) fn rate_limit_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "_local".to_string())
+}
+
+/// Read a step-up action body into [`StepUpBody`], tolerating an empty or
+/// absent body. ADR-0020 D16.4 fixes a missing credential as
+/// `401 credential_required`, so this never surfaces a deserialize-level
+/// 400/500: an empty body becomes `StepUpBody { credential: None }` (which
+/// [`verify_step_up`] then maps to `credential_required`), and only genuinely
+/// malformed JSON (non-empty, non-object) returns a `400 invalid_json`.
+pub(crate) async fn parse_step_up_body(body: Body) -> Result<StepUpBody, Response> {
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "body_read_failed", "message": e.to_string() })),
+            )
+                .into_response());
+        }
+    };
+    if bytes.is_empty() {
+        return Ok(StepUpBody { credential: None });
+    }
+    match serde_json::from_slice::<StepUpBody>(&bytes) {
+        Ok(parsed) => Ok(parsed),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_json", "message": e.to_string() })),
+        )
+            .into_response()),
+    }
+}
+
+/// Mode-aware step-up credential verification shared by the shutdown and
+/// rotate handlers (ADR-0020 D16). Single source of truth so the two action
+/// endpoints can never drift in their re-auth semantics.
 ///
-/// Notes:
-///   * The *server* token (`state.token`, used by `?t=` / bearer paths)
-///     is **not** rotated here — that's a CLI-side operation (`gtmux
-///     rotate-token`). This endpoint rotates the in-memory cookie session
-///     only. ADR-0020 D14 §"거절된 대안" R1.
-///   * Sits outside `/api/*` so the SPA can fire it during the auth surface
-///     transition (e.g. immediately after sign-in), but every request still
-///     passes through the Host + Origin checks so CSRF surface is bounded.
+/// Decision tree (D16.2):
+///   * `state.password_hash` is `Some` (password mode) → verify `credential`
+///     as the password via Argon2id (`verify_password_async`, blocking pool).
+///     Repeated failures run through the per-IP [`RateLimiter`] (D5) keyed by
+///     [`rate_limit_key`]; over the limit → [`StepUpRejection::RateLimited`].
+///     A successful verify resets that bucket.
+///   * `state.password_hash` is `None` (token mode) → constant-time compare
+///     `credential` against the server token via [`verify_token`] (decodes +
+///     `ring::constant_time`, the same comparator login uses). Token failures
+///     are also funnelled through the limiter for uniformity (D16.4) but the
+///     constant-time path makes brute-force pointless.
+///
+/// Returns `Ok(())` on success; the caller then proceeds with the action.
+pub(crate) async fn verify_step_up(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &StepUpBody,
+) -> Result<(), StepUpRejection> {
+    // Missing / empty credential is *not* a deserialize error — D16.4 fixes
+    // it as 401 credential_required.
+    let Some(credential) = body.credential.as_deref().filter(|c| !c.is_empty()) else {
+        return Err(StepUpRejection::CredentialRequired);
+    };
+
+    let limiter = state.rate_limiter.clone();
+    let limit = state.config.auth.rate_limit_per_5min;
+    let key = rate_limit_key(headers);
+
+    // Clone the stored hash out (and release the read lock) *before* the
+    // memory-hard Argon2 verify — never hold the lock across the KDF, never
+    // stall a tokio worker (ADR-0020 perf, mirrors password_handler).
+    let stored_hash = {
+        let guard = state.password_hash.read().await;
+        guard.as_deref().map(|h| h.to_string())
+    };
+
+    let ok = match stored_hash {
+        // Password mode: Argon2id verify on the blocking pool.
+        Some(hash) => verify_password_async(credential.to_string(), hash).await,
+        // Token mode: constant-time compare against the server token. Clone
+        // the current token out under the read lock (ADR-0020 D18.3) — never
+        // hold the lock across the compare.
+        None => {
+            let current = state.token.read().await.clone();
+            verify_token(credential, &current)
+        }
+    };
+
+    if ok {
+        // Clear any accumulated failures so a previously-rate-limited
+        // operator isn't penalised after a correct credential.
+        limiter.reset(&key).await;
+        return Ok(());
+    }
+
+    state
+        .auth_failure_counter
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Run failures through the same limiter login uses (D16.4). Token-mode
+    // need not rate-limit but passing through is harmless and uniform.
+    if limiter.note_failure_and_check(&key, limit).await {
+        return Err(StepUpRejection::RateLimited);
+    }
+    Err(StepUpRejection::InvalidCredential)
+}
+
+/// **Union** step-up credential verification (ADR-0020 D19.2) — accepts the
+/// presented `credential` if it verifies as **either** the server token *or*
+/// the current password (when one is set). This is the D18.1 *login union*
+/// semantics applied to a step-up `{ credential }` body, and differs from
+/// [`verify_step_up`] (D16.2), which is **mode-aware** and picks a *single*
+/// axis based on `password_set`.
+///
+/// The union is load-bearing for password *removal*: the whole point of
+/// `DELETE /api/settings/password` is to recover when the password is *lost*,
+/// so a still-valid token must be accepted even while a password is set —
+/// `verify_step_up` would reject the token in that state (it would only try
+/// the password axis). Conversely a user who *remembers* the password can
+/// also use it. Both axes are tried; either match passes.
+///
+/// Error mapping mirrors [`verify_step_up`] exactly (one FE contract):
+///   * empty / missing credential → [`StepUpRejection::CredentialRequired`].
+///   * neither axis verifies → [`StepUpRejection::InvalidCredential`], after
+///     funnelling the failure through the per-IP [`RateLimiter`] (D5/D19.2 —
+///     password failures are rate-limited; the token axis is constant-time).
+///   * over the rate limit → [`StepUpRejection::RateLimited`].
+pub(crate) async fn verify_union_credential(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &StepUpBody,
+) -> Result<(), StepUpRejection> {
+    let Some(credential) = body.credential.as_deref().filter(|c| !c.is_empty()) else {
+        return Err(StepUpRejection::CredentialRequired);
+    };
+
+    let limiter = state.rate_limiter.clone();
+    let limit = state.config.auth.rate_limit_per_5min;
+    let key = rate_limit_key(headers);
+
+    // Token axis — always active (D18.1: token is always a valid credential).
+    // Clone the current server token out under the read lock before the
+    // constant-time compare (D18.3 — never hold the lock across `verify_token`).
+    let token_ok = {
+        let current = state.token.read().await.clone();
+        verify_token(credential, &current)
+    };
+
+    // Password axis — active only when a hash is loaded. Clone the stored hash
+    // out (releasing the lock) before the memory-hard Argon2 verify so a tokio
+    // worker never stalls on the KDF. Short-circuit: skip the KDF entirely if
+    // the token already matched.
+    let ok = if token_ok {
+        true
+    } else {
+        let stored_hash = {
+            let guard = state.password_hash.read().await;
+            guard.as_deref().map(|h| h.to_string())
+        };
+        match stored_hash {
+            Some(hash) => verify_password_async(credential.to_string(), hash).await,
+            None => false,
+        }
+    };
+
+    if ok {
+        limiter.reset(&key).await;
+        return Ok(());
+    }
+
+    state
+        .auth_failure_counter
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if limiter.note_failure_and_check(&key, limit).await {
+        return Err(StepUpRejection::RateLimited);
+    }
+    Err(StepUpRejection::InvalidCredential)
+}
+
+/// `POST /auth/rotate` — **server token reissue** (ADR-0020 D18.3, supersedes
+/// D14's cookie-only rotation). Surfaced by the FE SettingsOverlay's
+/// [Rotate token] button. Authenticated by the caller's `gtmux_auth` cookie
+/// *and* a step-up credential (D16 gate is retained):
+///
+///   * 200 + `{ ok: true, new_token, url }` + caller cookie cleared
+///     (`Max-Age=0`, **no** new cookie) — the server token is re-minted,
+///     persisted, every cookie session is revoked, and every live WS is
+///     closed 4001. The new token URL is returned for the operator to copy.
+///   * 401 — `session_cookie_required` / `invalid_session` (cookie gate) or
+///     `credential_required` / `invalid_credential` (step-up gate).
+///   * 429 — step-up password failures over the per-IP rate limit.
+///
+/// Effect (D18.3): old token URLs, bookmarks, bearer tokens and *all* cookies
+/// are immediately invalid → everyone re-authenticates. The password (if set)
+/// and its hash are untouched. The offline CLI `gtmux rotate-token` remains
+/// the equivalent path for a stopped server; this is its *live* sibling.
+///
+/// Sits outside `/api/*` so the SPA can fire it during the auth surface
+/// transition, but every request still passes the Host + Origin checks so the
+/// CSRF surface is bounded.
 pub async fn auth_rotate_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
-    let Some(old_cookie) = extract_session_cookie(req.headers()) else {
-        return (
+    // ADR-0020 D16/D18 check order: (1) cookie extract+validate, (2) step-up
+    // credential verify, (3) reissue. Headers are read before the body is
+    // consumed.
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+
+    let Some(old_cookie) = extract_session_cookie(&headers) else {
+        let mut resp = (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "session_cookie_required" })),
         )
             .into_response();
+        apply_security_headers(resp.headers_mut(), &state.config);
+        return resp;
     };
-    // Constant-time-equivalent validate against the session table — also
-    // returns the active `AuthMode` so the rotated cookie inherits it.
-    let Some(mode) = state.session_table.validate(&old_cookie).await else {
-        return (
+    // Validate the caller's cookie against the session table. We don't need
+    // the returned mode (the cookie is about to be revoked along with all
+    // others), only that it is currently a live session.
+    if state.session_table.validate(&old_cookie).await.is_none() {
+        let mut resp = (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid_session" })),
         )
             .into_response();
-    };
+        apply_security_headers(resp.headers_mut(), &state.config);
+        return resp;
+    }
 
-    // 1. Revoke every *other* session first, capture the count so the FE
-    //    can surface "logged out of N other devices".
-    let revoked_others = state.session_table.revoke_others(&old_cookie).await;
-    // 2. Revoke the caller's previous cookie so even an attacker who
-    //    captured it before rotation loses access.
-    state.session_table.revoke(&old_cookie).await;
-    // 3. Mint a fresh opaque cookie token (same mode).
-    let new_token = match state.session_table.issue(mode).await {
+    // ADR-0020 D16/D18.5: step-up re-auth (retained). Empty/absent body maps
+    // to `credential_required` (401) rather than a deserialize error.
+    let body = match parse_step_up_body(body).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    if let Err(rejection) = verify_step_up(&state, &headers, &body).await {
+        let mut resp = rejection.into_response();
+        apply_security_headers(resp.headers_mut(), &state.config);
+        return resp;
+    }
+
+    // ── D18.3 reissue sequence ──────────────────────────────────────────
+    // 1. Mint a fresh server token (256-bit CSPRNG, ADR-0003 D4).
+    let new = match gtmux_auth::issue_token() {
         Ok(t) => t,
         Err(e) => {
-            warn!(error = %e, "auth_rotate: failed to mint replacement cookie");
-            return (
+            warn!(error = %e, "auth_rotate: failed to mint server token");
+            let mut resp = (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "issue_failed" })),
             )
                 .into_response();
+            apply_security_headers(resp.headers_mut(), &state.config);
+            return resp;
         }
     };
-    let secure = state.config.tls_required();
-    let cookie_header = build_session_cookie(&new_token, state.session_table.max_age(), secure);
 
-    let revoked_count = revoked_others + 1;
+    // 2. Persist to the token file (0600) *before* swapping the in-memory
+    //    cell — if the disk write fails we abort with the old token still
+    //    authoritative (no half-rotated state where the running server
+    //    accepts a token the file doesn't hold).
+    if let Err(e) = gtmux_auth::save_token(&state.config.server.session, &new) {
+        warn!(error = %e, "auth_rotate: failed to persist new server token");
+        let mut resp = (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "persist_failed" })),
+        )
+            .into_response();
+        apply_security_headers(resp.headers_mut(), &state.config);
+        return resp;
+    }
+
+    // 3. Swap the shared in-memory token cell. ws-server holds the *same*
+    //    `Arc<RwLock<…>>` (boot wiring, T1) so its handshake path sees the
+    //    new token the instant this write lock drops.
+    *state.token.write().await = new.clone();
+
+    // 4. Revoke every cookie session (D18.4 — token rotate = 전원 무효화).
+    //    The caller's own cookie is included; it is also explicitly cleared
+    //    in the response below.
+    state.session_table.revoke_all().await;
+
+    // 5. Close every live WS connection with code 4001 (token revoked,
+    //    ADR-0003 D12 reused via the hub's token-revoked broadcast). Silent
+    //    when no hub is attached (unit-test AppState) or no WS clients exist.
+    if let Some(hub) = state.hub.as_ref() {
+        hub.publish_token_revoked();
+    }
+
+    // 6. Build the open URL the FE displays/copies. `?t=<token>` is the FE
+    //    AuthPage magic-link contract; scheme follows TLS, unspecified binds
+    //    map to a loopback host the operator can actually reach.
+    let url = build_open_url(&state.config, &new);
+
+    // 7. Respond — clear the caller's cookie (Max-Age=0, no replacement) so
+    //    the FE drops straight to /auth and re-authenticates with `new`.
+    let secure = state.config.tls_required();
+    let clear = clear_session_cookie(secure);
     let mut resp = (
         StatusCode::OK,
         Json(json!({
             "ok": true,
-            "revoked_count": revoked_count,
+            "new_token": new.0,
+            "url": url,
         })),
     )
         .into_response();
-    if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie_header) {
+    if let Ok(hv) = axum::http::HeaderValue::from_str(&clear) {
         resp.headers_mut().insert(header::SET_COOKIE, hv);
     }
     apply_security_headers(resp.headers_mut(), &state.config);
     resp
+}
+
+/// Assemble the operator-facing sign-in URL returned by `POST /auth/rotate`
+/// (ADR-0020 D18.3). `https` when TLS is required, else `http`. An
+/// unspecified bind (`0.0.0.0` / `::`) is rendered as `127.0.0.1` so the URL
+/// is reachable from the same host. The token rides the FE AuthPage
+/// magic-link query (`?t=`).
+fn build_open_url(config: &gtmux_config::Config, token: &TokenString) -> String {
+    let scheme = if config.tls_required() {
+        "https"
+    } else {
+        "http"
+    };
+    let bind = config.server.bind.as_str();
+    let host = if bind.is_empty()
+        || bind == "0.0.0.0"
+        || bind == "::"
+        || bind == "[::]"
+        || bind.starts_with("unix:")
+    {
+        "127.0.0.1"
+    } else {
+        bind
+    };
+    format!("{scheme}://{host}:{}/auth?t={}", config.server.port, token.0)
 }
 
 /// `POST /auth/logout` — revoke the cookie in the session table and emit a
@@ -726,7 +1093,10 @@ pub(crate) fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
 /// `/api/*` middleware. Returns `Ok(())` on success.
 pub(crate) async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
     if let Some(bearer) = extract_bearer(headers) {
-        if verify_token(&bearer, &state.token) {
+        // Clone the current server token out under the read lock (ADR-0020
+        // D18.3) before the constant-time compare.
+        let current = state.token.read().await.clone();
+        if verify_token(&bearer, &current) {
             return Ok(());
         }
         return Err(());

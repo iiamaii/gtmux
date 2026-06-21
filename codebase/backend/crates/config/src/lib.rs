@@ -178,7 +178,10 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// `"token"` 또는 `"password"`. Default: `"token"` (현 정책 유지, ADR-0020 D1).
+    /// **Deprecated (ADR-0020 D18) — 무시됨.** 과거 배타 `"token" | "password"`
+    /// 로그인 모드 선택자. D18 통합 인증 모델에서 로그인은 `{token} ∪ {password}`
+    /// 집합 일치로 판별하므로 본 필드는 더 이상 로그인 분기에 쓰이지 않는다. 기존
+    /// config 파일 호환(`deny_unknown_fields`)을 위해 필드는 유지하되 존재 시 무시.
     #[serde(default = "default_auth_mode")]
     pub mode: String,
     /// Cookie 의 max-age in days (ADR-0020 D2/D3). Default 7, range 1–30.
@@ -470,6 +473,28 @@ impl Default for ServerSeed {
     }
 }
 
+/// ADR-0003 D8 safe-filename charset for `server.session`. Equivalent to the
+/// regex `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$` (1..=63 ASCII bytes, leading
+/// char alphanumeric, remaining chars alphanumeric / `.` / `_` / `-`).
+/// Hand-rolled to avoid pulling in the `regex` crate for one boot-time check.
+fn is_safe_session_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    // Length: 1..=63 (regex = first char + up to 62 more).
+    if bytes.is_empty() || bytes.len() > 63 {
+        return false;
+    }
+    // First char must be strictly alphanumeric (no leading `.`/`_`/`-` — this
+    // is what blocks a leading `..` path component and hidden-dotfile names).
+    if !bytes[0].is_ascii_alphanumeric() {
+        return false;
+    }
+    // Remaining chars: alphanumeric or one of `.` `_` `-`. Crucially this
+    // excludes `/` and `\\` (path separators) and all control bytes.
+    bytes[1..]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// 자료형이 통과한 뒤 *값* 차원에서 다시 확인한다. 본 crate가 ADR-0003 §5
 /// 체크리스트 중 #1·#3·일부 #2를 담당.
 fn validate(cfg: &Config) -> Result<(), ConfigError> {
@@ -484,6 +509,22 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::Validation(
             "server.session must be non-empty".to_string(),
         ));
+    }
+
+    // server.session is used verbatim as the `<session>.token` filename key
+    // (auth::save_token / load_token write under the gtmux state dir), so a
+    // value like `../foo` or `a/b` would let a token write escape that dir.
+    // Enforce the ADR-0003 D8 safe-filename charset fail-closed at boot
+    // (plan-0022 S1-b / audit L1): regex `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`
+    // — leading alphanumeric, then alphanumeric / `.` / `_` / `-`, 1..=63
+    // bytes total. This rejects path separators, `..`, control chars, and
+    // any other byte that could traverse or confuse the filesystem layer.
+    if !is_safe_session_name(&cfg.server.session) {
+        return Err(ConfigError::Validation(format!(
+            "server.session {:?} must match ^[a-zA-Z0-9][a-zA-Z0-9._-]{{0,62}}$ \
+             (safe-filename charset, ADR-0003 D8)",
+            cfg.server.session
+        )));
     }
 
     // privileged port를 거부 — root 없이 bind 못 하는 영역을 silent로 시도하지
@@ -639,6 +680,73 @@ bind = "127.0.0.1"
             // path=None + 빌트인 디폴트의 session=""·port=0 이면 validate 실패.
             let err = load(None, "alpha").unwrap_err();
             assert!(matches!(err, ConfigError::Validation(_)));
+            Ok(())
+        });
+    }
+
+    // ── plan-0022 S1-b / audit L1 — server.session safe-filename charset ──
+
+    #[test]
+    fn session_rejects_traversal() {
+        // ADR-0003 D8: server.session is a `<session>.token` filename key, so
+        // path-traversal / separator / control-char values must be rejected
+        // fail-closed (these would otherwise let a token write escape the
+        // state dir). Pure-function coverage of `is_safe_session_name`.
+        for bad in [
+            "../x",       // parent-dir traversal
+            "..",         // bare parent ref
+            "a/b",        // forward-slash separator
+            "a\\b",       // backslash separator
+            ".hidden",    // leading dot (dotfile / not alphanumeric-leading)
+            "-leading",   // leading dash
+            "_leading",   // leading underscore
+            "a b",        // space
+            "a\tb",       // tab (control)
+            "a\nb",       // newline (control)
+            "a\0b",       // NUL
+            "héllo",      // non-ASCII
+            "a:b",        // colon
+            "",           // empty (also caught earlier, belt-and-braces)
+            &"a".repeat(64), // 64 bytes > 63 max
+        ] {
+            assert!(
+                !is_safe_session_name(bad),
+                "session {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn session_accepts_valid() {
+        for ok in [
+            "local",
+            "alpha",
+            "a",                  // single char
+            "Session_01",
+            "my.session-name",
+            "0",                  // leading digit
+            "z9._-",              // all allowed trailing chars
+            &"a".repeat(63),      // exactly 63 bytes (max)
+        ] {
+            assert!(
+                is_safe_session_name(ok),
+                "session {ok:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn session_traversal_fails_config_load() {
+        // End-to-end: a traversal session reaching `validate` (here via CLI
+        // override) must surface `ConfigError::Validation`, not load.
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file("gtmux.toml", minimal_toml())?;
+            let err = load(Some(Path::new("gtmux.toml")), "../escape").unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Validation(_)),
+                "traversal session must fail-closed at validate, got {err:?}"
+            );
             Ok(())
         });
     }
