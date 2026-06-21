@@ -982,6 +982,11 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
 /// send an `Origin` header (top-level navigation). Cross-origin fetches into
 /// `/api/*` would always send `Origin` per the Fetch spec, so the check fires
 /// where it matters.
+///
+/// Also enforces the `Sec-Fetch-Site` 2nd CSRF axis (ADR-0003 D6, 2026-06-22
+/// amend): an explicit `cross-site`/`cross-origin` value is rejected even when
+/// `Origin` is absent. Absent / `same-origin` / `same-site` / `none` pass —
+/// non-browser bearer clients send no `Sec-Fetch-*` headers.
 async fn origin_check_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -1000,6 +1005,20 @@ async fn origin_check_middleware(
     {
         return next.run(req).await;
     }
+    // 2nd CSRF axis (ADR-0003 D6, 2026-06-22 amend). Independent of the Origin
+    // check below — fires even when `Origin` is absent (the L2 gap). Non-browser
+    // clients (CLI/automation) don't send `Sec-Fetch-*`, so an *absent* header
+    // must pass (bearer is their gate); only an explicit cross-site/cross-origin
+    // value is rejected. Header lookup is case-insensitive via `HeaderMap`.
+    if let Some(sfs) = req.headers().get("sec-fetch-site") {
+        if let Ok(v) = sfs.to_str() {
+            if v == "cross-site" || v == "cross-origin" {
+                return HttpApiError::OriginForbidden.into_response();
+            }
+            // "same-origin" | "same-site" | "none" → allowed.
+        }
+    }
+    // absent → pass (non-browser bearer client; regression guard).
     if let Some(origin) = req.headers().get(header::ORIGIN) {
         // Reject Origin: null and any wildcard (R(rej)3). Exact match only.
         let origin_str = origin.to_str().unwrap_or("");
@@ -1342,6 +1361,155 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── ADR-0003 D6 (2026-06-22 amend) — `Sec-Fetch-Site` 2nd CSRF axis ──
+    //
+    // The axis is layered with the Origin check in `origin_check_middleware`
+    // and so covers the protected scope (`/api/*` + `/auth/rotate` etc.;
+    // entry-point allowlist exempt). It fires even when `Origin` is absent.
+    // An *absent* `Sec-Fetch-Site` must still pass — CLI/automation bearer
+    // clients send no `Sec-Fetch-*` headers, and rejecting them would be a
+    // regression. Only an explicit `cross-site`/`cross-origin` value is 403.
+
+    /// Read the `error` code from a JSON error body so a 403 from the
+    /// `Sec-Fetch-Site` axis (`origin_forbidden`) can be distinguished from a
+    /// host/auth 403.
+    async fn error_code(resp: Response) -> String {
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body.get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn sec_fetch_cross_site_rejected() {
+        // Protected route + valid auth + correct Host/Origin, but an explicit
+        // `Sec-Fetch-Site: cross-site` → 403 via the new axis (origin_forbidden).
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::ORIGIN, TEST_ORIGIN)
+                    .header("sec-fetch-site", "cross-site")
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            error_code(resp).await,
+            "origin_forbidden",
+            "cross-site must be rejected by the Sec-Fetch-Site axis, not host/auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn sec_fetch_same_origin_allowed() {
+        // `same-origin` + valid auth → passes the CSRF axes (reaches the
+        // handler; not a 403 origin rejection).
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::ORIGIN, TEST_ORIGIN)
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "same-origin must pass the Sec-Fetch-Site axis"
+        );
+    }
+
+    #[tokio::test]
+    async fn sec_fetch_absent_allowed() {
+        // KEY non-browser regression guard: no `Sec-Fetch-*` header at all +
+        // valid bearer → must pass (CLI/automation clients are gated by bearer,
+        // not by `Sec-Fetch-Site`). Must NOT be a 403.
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    // Deliberately NO Origin and NO Sec-Fetch-Site (bare CLI client).
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "an absent Sec-Fetch-Site must pass (non-browser bearer client)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sec_fetch_none_allowed() {
+        // `none` = top-level navigation (address bar / bookmark) → passes.
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::ORIGIN, TEST_ORIGIN)
+                    .header("sec-fetch-site", "none")
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "`none` (top-level nav) must pass the Sec-Fetch-Site axis"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_rotate_cross_site_rejected() {
+        // `/auth/rotate` is NOT in the entry-point allowlist, so it receives
+        // the 2nd CSRF axis too. A cross-site value → 403 (origin_forbidden)
+        // before the rotate handler/step-up logic runs.
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/rotate")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::ORIGIN, TEST_ORIGIN)
+                    .header("sec-fetch-site", "cross-site")
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            error_code(resp).await,
+            "origin_forbidden",
+            "/auth/rotate must receive the Sec-Fetch-Site axis"
+        );
     }
 
     // ── ADR-0020 + D13 — auth-page wiring ──
