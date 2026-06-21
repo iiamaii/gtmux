@@ -1,16 +1,16 @@
-// Auth API request / response types — aligned with BE Stage 2 actual contract.
+// Auth API request / response types — aligned with BE actual contract.
 //
 // 정본:
-// - ADR-0020 D1 (token + password — 서버 설정으로 모드 결정)
+// - ADR-0020 D18 (통합 인증 모델 — token ∪ password, live token rotation)
 // - ADR-0020 D2 (Cookie HttpOnly Secure SameSite=Strict, 7d rolling)
 // - ADR-0020 D5 (Argon2id 64MiB / iter 3 / parallel 4)
 // - ADR-0020 D8 (Rate limit 5 attempts / 5 min per IP — sliding window)
-// - codebase/backend/crates/http-api/src/auth.rs:436 LoginBody + 458 handler
+// - codebase/backend/crates/http-api/src/auth.rs LoginBody + handler
 //
-// ⚠️ 모드는 *서버 config.auth.mode* 가 결정 — 클라이언트가 선택하지 않는다.
-//    같은 `POST /auth/login` 으로 token 모드 / password 모드 둘 다 받지만,
-//    body 에 *해당 모드의 credential* 만 채워야 한다. 다른 field 가 채워지면
-//    BE 는 400 BAD_REQUEST.
+// ⚠️ D18: 유효 로그인 자격증명 = `{ token(항상) } ∪ { password(설정 시) }`.
+//    token 은 항상 활성, password 는 hash 존재 시 추가 활성 (동시 운용).
+//    배타 `config.auth.mode` 는 폐기. `POST /auth/login` body 는 제시한
+//    credential (`token` 또는 `password`) 만 채우고, BE 가 union 으로 검증한다.
 
 /* ────────────────────────────────────────────────────────────────────────── */
 /* POST /auth/login                                                            */
@@ -75,11 +75,40 @@ export interface LogoutResponse {
 }
 
 /* ────────────────────────────────────────────────────────────────────────── */
-/* POST /auth/rotate (token only) — BE Stage 2 에서 still ⏳ (skip noted).    */
+/* GET /auth/methods — public (unauthenticated) login-method discovery (D18.6) */
 /* ────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * BE shape (ADR-0020 D18.6): `{ token: true, password: <bool> }`. The auth page
+ * is rendered *before* authentication, so it cannot read `GET /api/settings`
+ * (authed). This public endpoint exposes only whether a password is set —
+ * `token` is always `true` (always a valid login credential). Used to decide
+ * which auth fields the login form offers.
+ */
+export interface AuthMethods {
+  /** Always `true` — token is always a valid login credential (D18.1). */
+  token: boolean;
+  /** `true` once a password hash exists (config/CLI or UI). */
+  password: boolean;
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* POST /auth/rotate — server-token reissue + step-up re-auth (ADR-0020 D18.3) */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * BE shape (ADR-0020 D18.3): `{ ok: true, new_token, url? }`. Rotation now
+ * *reissues the SERVER token* (not just the caller's cookie): the BE mints a
+ * fresh server token, swaps it live, revokes *all* sessions (`revoke_all`), and
+ * closes active WebSockets with close 4001. The caller's own cookie is cleared
+ * too — i.e. rotation signs everyone out, including you. The response carries
+ * the `new_token` and an `url` (open link) so the user can re-login with the
+ * fresh credential. `revoked_count` (the D14 cookie-rotation shape) is removed.
+ */
 export interface RotateTokenResponse {
-  kind: 'ok';
-  /** 새 token 값 (UI 표시용). cookie 는 server 가 자동 rotate. */
+  ok: boolean;
+  /** The freshly minted server token (the old token URL/bookmark is now dead). */
   new_token: string;
+  /** Ready-to-open login URL embedding the new token, when the BE provides it. */
+  url?: string;
 }

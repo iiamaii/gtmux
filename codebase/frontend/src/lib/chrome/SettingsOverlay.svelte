@@ -34,10 +34,23 @@
   import { shortcutOverrides, normalizeShortcutBinding } from '$lib/stores/shortcutOverrides.svelte';
   import { UnauthorizedError } from '$lib/http/sessions';
   import type { BehaviorSettings } from '$lib/http/settings';
+  import {
+    setPassword,
+    changePassword,
+    resetPassword,
+    PasswordError,
+  } from '$lib/http/settings';
   import { logout, rotateToken } from '$lib/http/auth';
+  import {
+    InvalidCredentialError,
+    CredentialRequiredError,
+    RateLimitedError,
+  } from '$lib/http/stepup';
   import brandLogoUrl from '$lib/assets/brand.png';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import ShutdownModal from './ShutdownModal.svelte';
+  import ReauthModal from './ReauthModal.svelte';
   import { sessionIODialog } from '$lib/stores/sessionIOdialog.svelte';
   import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
@@ -151,20 +164,47 @@
     window.location.href = '/auth';
   }
 
-  async function onRotateToken(): Promise<void> {
+  /* ── Rotate token (step-up re-auth, ADR-0020 D18.3 + D16) ────────── */
+
+  let rotateReauthOpen = $state(false);
+
+  function openRotateReauth(): void {
+    rotateReauthOpen = true;
+  }
+
+  /**
+   * Gated action — runs with the credential from ReauthModal. Step-up errors
+   * propagate so the ReauthModal stays open + shows them inline; everything
+   * else is handled here (redirect / toast).
+   *
+   * On success the rotation reissues the SERVER token and signs *everyone* out,
+   * including this caller (BE revoke_all + WS close 4001, ADR-0020 D18.3). So
+   * the session is already dead: copy the fresh login URL/token to the clipboard
+   * (best-effort — the toast still carries the value via text binding when the
+   * copy is blocked), then full-reload to `/auth` to re-login — the same
+   * window.location pattern as onLogout (ADR-0020 D9.1).
+   */
+  async function runRotate(credential: string): Promise<void> {
     try {
-      const res = await rotateToken();
-      try {
-        await navigator.clipboard.writeText(res.new_token);
-        toastStore.show({ message: 'Token rotated and copied to clipboard.', tone: 'success' });
-      } catch {
-        toastStore.show({
-          message: `Token rotated: ${res.new_token}`,
-          tone: 'success',
-          durationMs: 10_000,
-        });
-      }
+      const res = await rotateToken(credential);
+      const value = res.url ?? res.new_token;
+      const copy = await copyTextToSystemClipboard(value);
+      const copyNote = copy.ok
+        ? 'New link copied — re-login with it or your password.'
+        : `New link: ${value} — re-login with it or your password.`;
+      toastStore.show({
+        message: `Server token rotated. All sessions signed out. ${copyNote}`,
+        tone: 'success',
+        durationMs: 12_000,
+      });
     } catch (err) {
+      if (
+        err instanceof InvalidCredentialError ||
+        err instanceof CredentialRequiredError ||
+        err instanceof RateLimitedError
+      ) {
+        throw err; // ReauthModal branches + stays open for retry.
+      }
       if (err instanceof UnauthorizedError) {
         window.location.href = '/auth';
         return;
@@ -174,7 +214,163 @@
         tone: 'error',
         durationMs: 7_000,
       });
+      return;
     }
+    rotateReauthOpen = false;
+    // Session is dead (revoke_all) — full reload into /auth, like onLogout.
+    window.location.href = '/auth';
+  }
+
+  /* ── Password set / change (ADR-0020 D17) ────────────────────────── */
+
+  const passwordIsSet = $derived(settingsStore.auth?.password_set === true);
+
+  let pwCurrent = $state('');
+  let pwNew = $state('');
+  let pwConfirm = $state('');
+  let pwSubmitting = $state(false);
+  let pwError = $state<string | null>(null);
+
+  /**
+   * Lightweight client-side policy mirror (ADR-0020 D5 / D12: len ≥ 8 + letter
+   * + digit). The server is the authority — this only spares an obvious
+   * round-trip and guides the user. `weak_password` from the BE still wins.
+   */
+  function newPasswordPolicyError(pw: string): string | null {
+    if (pw.length === 0) return null;
+    if (pw.length < 8) return 'Use at least 8 characters.';
+    if (!/[A-Za-z]/.test(pw)) return 'Include at least one letter.';
+    if (!/[0-9]/.test(pw)) return 'Include at least one digit.';
+    return null;
+  }
+
+  const pwPolicyError = $derived(newPasswordPolicyError(pwNew));
+  const pwMismatch = $derived(
+    pwConfirm.length > 0 && pwNew !== pwConfirm,
+  );
+  const canSubmitPassword = $derived(
+    !pwSubmitting &&
+      pwNew.length > 0 &&
+      pwConfirm.length > 0 &&
+      pwPolicyError === null &&
+      !pwMismatch &&
+      (!passwordIsSet || pwCurrent.length > 0),
+  );
+
+  function resetPasswordForm(): void {
+    pwCurrent = '';
+    pwNew = '';
+    pwConfirm = '';
+    pwError = null;
+  }
+
+  async function submitPassword(): Promise<void> {
+    if (!canSubmitPassword) return;
+    pwSubmitting = true;
+    pwError = null;
+    try {
+      if (passwordIsSet) {
+        await changePassword(pwCurrent, pwNew);
+      } else {
+        await setPassword(pwNew);
+      }
+      // Refresh the snapshot so `password_set` (and the form mode) updates.
+      await settingsStore.load();
+      resetPasswordForm();
+      toastStore.show({
+        message: passwordIsSet ? 'Password changed.' : 'Password set.',
+        tone: 'success',
+      });
+    } catch (err) {
+      if (err instanceof PasswordError) {
+        pwError =
+          err.code === 'current_password_mismatch'
+            ? 'Current password is incorrect.'
+            : 'New password is too weak (8+ chars, a letter, and a digit).';
+        return;
+      }
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      pwError = err instanceof Error ? err.message : String(err);
+    } finally {
+      pwSubmitting = false;
+    }
+  }
+
+  /**
+   * Native `<form>` submit for the set/change password form. `preventDefault`
+   * stops the default GET navigation; `submitPassword` runs the real action.
+   * Wrapping the password inputs in a `<form>` silences Chrome's "[DOM]
+   * Password field is not contained in a form" warning and enables password-
+   * manager save/fill (S1-c). The per-input Enter handler is retained as a
+   * belt-and-suspenders fallback (and to allow `preventDefault` on Enter inside
+   * the multi-field form), but the form's onsubmit is the primary path.
+   */
+  function onPasswordFormSubmit(e: SubmitEvent): void {
+    e.preventDefault();
+    void submitPassword();
+  }
+
+  function onPasswordKeydown(e: KeyboardEvent): void {
+    if (e.key === 'Enter' && canSubmitPassword) {
+      e.preventDefault();
+      void submitPassword();
+    }
+  }
+
+  /* ── Delete password (union step-up reset, ADR-0020 D19) ─────────── */
+
+  let deletePwReauthOpen = $state(false);
+
+  function openDeletePwReauth(): void {
+    deletePwReauthOpen = true;
+  }
+
+  /**
+   * Gated action — runs with the credential from the union ReauthModal
+   * (`credentialKind="either"`). The credential is EITHER the current password
+   * OR the server token (D19.2), re-verified inline by the BE. Step-up errors
+   * propagate so the modal stays open + shows them inline; everything else is
+   * handled here.
+   *
+   * On success the BE deletes the password hash → `password_set` flips false.
+   * The cookie/session is unchanged (D19.3 — token still valid), so no redirect:
+   * we just refresh the snapshot (the set/change form switches to "Set
+   * password") and toast.
+   */
+  async function runDeletePassword(credential: string): Promise<void> {
+    try {
+      await resetPassword(credential);
+    } catch (err) {
+      if (
+        err instanceof InvalidCredentialError ||
+        err instanceof CredentialRequiredError ||
+        err instanceof RateLimitedError
+      ) {
+        throw err; // ReauthModal branches + stays open for retry.
+      }
+      if (err instanceof UnauthorizedError) {
+        window.location.href = '/auth';
+        return;
+      }
+      toastStore.show({
+        message: `Delete password failed: ${err instanceof Error ? err.message : String(err)}`,
+        tone: 'error',
+        durationMs: 7_000,
+      });
+      return;
+    }
+    deletePwReauthOpen = false;
+    // Refresh so `password_set` flips false → the form switches to "Set
+    // password" and the Status row updates.
+    await settingsStore.load();
+    resetPasswordForm();
+    toastStore.show({
+      message: 'Password deleted — token-only sign-in.',
+      tone: 'success',
+    });
   }
 
   /* ── Components section ─────────────────────────────────────────── */
@@ -364,6 +560,11 @@
     // (bubble phase) 에 있다. capture phase 인 이 리스너가 먼저 받으므로
     // 명시적으로 양보해야 Esc 가 confirm 만 닫고 settings 는 유지된다.
     if (shutdownDialog.open) return;
+    // Same yield for the step-up re-auth modals mounted by this overlay (rotate
+    // session, delete-password) — let their Modal primitive own Esc/Tab while
+    // open.
+    if (rotateReauthOpen) return;
+    if (deletePwReauthOpen) return;
     if (capturingActionId !== null) {
       const action = shortcutRegistry
         .listActions()
@@ -387,6 +588,11 @@
       // dialog state 를 함께 정리 — 안 하면 다음 open 때 confirm 이 곧바로
       // 다시 뜬다 (modal 은 {#if open} 안에 있어 unmount 만 된다).
       shutdownDialog.close();
+      // Tear down any step-up gate + clear the password form so a fresh open
+      // never shows stale credential input.
+      rotateReauthOpen = false;
+      deletePwReauthOpen = false;
+      resetPasswordForm();
       return;
     }
     window.addEventListener('keydown', onWindowKey, { capture: true });
@@ -491,9 +697,9 @@
     >
       <header class="settings-head">
         <span class="gear" aria-hidden="true">
-          <svg width="17" height="17" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="9" cy="9" r="2.4" />
-            <path d="M9 1.6v2M9 14.4v2M1.6 9h2M14.4 9h2M3.8 3.8l1.4 1.4M12.8 12.8l1.4 1.4M3.8 14.2l1.4-1.4M12.8 5.2l1.4-1.4" />
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
           </svg>
         </span>
         <div class="head-copy">
@@ -685,12 +891,148 @@
             <div class="srow">
               <div>
                 <div class="lbl">Rotate token</div>
-                <div class="dsc">Issue a new token when the backend endpoint is available.</div>
+                <div class="dsc">
+                  Reissue the server token and sign out every session, including
+                  this one. The old token link stops working; you get a fresh
+                  link to re-login. Requires re-entering your
+                  {passwordIsSet ? 'password' : 'token'}.
+                </div>
               </div>
               <div class="ctl">
-                <button type="button" class="btn" onclick={() => void onRotateToken()}>Rotate</button>
+                <button type="button" class="btn" onclick={openRotateReauth}>Rotate</button>
               </div>
             </div>
+
+            <div class="sgroup-head">Password</div>
+            <div class="srow pw-row">
+              <div>
+                <div class="lbl">{passwordIsSet ? 'Change password' : 'Set password'}</div>
+                <div class="dsc">
+                  {#if passwordIsSet}
+                    Update the password used to sign in and to confirm sensitive
+                    actions. Enter your current password to authorise the change.
+                  {:else}
+                    Set a password to sign in and to confirm sensitive actions.
+                    At least 8 characters with a letter and a digit.
+                  {/if}
+                </div>
+                <form class="pw-form" onsubmit={onPasswordFormSubmit}>
+                  <!--
+                    Hidden username field for password managers (Chrome [DOM]
+                    "Password forms should have (optionally hidden) username
+                    fields", https://goo.gl/9p2vKq). gtmux is single-user with no
+                    real username, so a constant gives a stable saved entry.
+                    display:none keeps it out of layout; tabindex=-1 + aria-hidden
+                    keep it out of the focus trap and a11y tree.
+                  -->
+                  <input
+                    type="text"
+                    name="username"
+                    autocomplete="username"
+                    value="gtmux"
+                    readonly
+                    tabindex="-1"
+                    aria-hidden="true"
+                    style="display:none"
+                  />
+                  {#if passwordIsSet}
+                    <label class="pw-field">
+                      <span class="pw-label">Current password</span>
+                      <input
+                        class="pw-input"
+                        type="password"
+                        bind:value={pwCurrent}
+                        placeholder="Current password"
+                        disabled={pwSubmitting}
+                        autocomplete="current-password"
+                        autocapitalize="off"
+                        autocorrect="off"
+                        spellcheck="false"
+                        onkeydown={onPasswordKeydown}
+                      />
+                    </label>
+                  {/if}
+                  <label class="pw-field" class:has-error={pwPolicyError !== null}>
+                    <span class="pw-label">New password</span>
+                    <input
+                      class="pw-input"
+                      type="password"
+                      bind:value={pwNew}
+                      placeholder="New password"
+                      disabled={pwSubmitting}
+                      autocomplete="new-password"
+                      autocapitalize="off"
+                      autocorrect="off"
+                      spellcheck="false"
+                      onkeydown={onPasswordKeydown}
+                    />
+                    {#if pwPolicyError !== null}
+                      <span class="pw-hint pw-hint-error" role="alert">{pwPolicyError}</span>
+                    {/if}
+                  </label>
+                  <label class="pw-field" class:has-error={pwMismatch}>
+                    <span class="pw-label">Confirm new password</span>
+                    <input
+                      class="pw-input"
+                      type="password"
+                      bind:value={pwConfirm}
+                      placeholder="Re-enter new password"
+                      disabled={pwSubmitting}
+                      autocomplete="new-password"
+                      autocapitalize="off"
+                      autocorrect="off"
+                      spellcheck="false"
+                      onkeydown={onPasswordKeydown}
+                    />
+                    {#if pwMismatch}
+                      <span class="pw-hint pw-hint-error" role="alert">Passwords do not match.</span>
+                    {/if}
+                  </label>
+                  {#if pwError !== null}
+                    <p class="pw-error" role="alert">{pwError}</p>
+                  {/if}
+                  <div class="pw-actions">
+                    <button
+                      type="submit"
+                      class="btn"
+                      disabled={!canSubmitPassword}
+                    >
+                      {#if pwSubmitting}
+                        Saving…
+                      {:else}
+                        {passwordIsSet ? 'Change password' : 'Set password'}
+                      {/if}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+
+            <div class="srow">
+              <div>
+                <div class="lbl">Delete password</div>
+                <div class="dsc">
+                  {#if passwordIsSet}
+                    Delete the saved password and revert to token-only sign-in.
+                    You'll confirm with your token or current password. You can
+                    set a new password again later.
+                  {:else}
+                    No password is set.
+                  {/if}
+                </div>
+              </div>
+              <div class="ctl">
+                <button
+                  type="button"
+                  class="btn danger"
+                  onclick={openDeletePwReauth}
+                  disabled={!passwordIsSet || pwSubmitting}
+                >
+                  Delete password
+                </button>
+              </div>
+            </div>
+
             {#if settingsStore.auth !== null}
               <div class="sgroup-head">Status</div>
               <div class="kv-row"><span>Token</span><strong>{settingsStore.auth.token_present ? 'Present' : 'Missing'}</strong></div>
@@ -894,6 +1236,27 @@
     open={shutdownDialog.open}
     sessionName={activeSessionName}
     onclose={() => shutdownDialog.close()}
+  />
+
+  <ReauthModal
+    open={rotateReauthOpen}
+    title="Confirm rotate"
+    description="Re-enter your credential to reissue the server token. This signs out every session, including this one."
+    confirmLabel="Rotate"
+    confirmVariant="primary"
+    onSubmit={runRotate}
+    onCancel={() => (rotateReauthOpen = false)}
+  />
+
+  <ReauthModal
+    open={deletePwReauthOpen}
+    title="Delete password"
+    description="Enter your token or current password to delete it. Sign-in reverts to token-only; you can set a new password later."
+    confirmLabel="Delete password"
+    confirmVariant="danger"
+    credentialKind="either"
+    onSubmit={runDeletePassword}
+    onCancel={() => (deletePwReauthOpen = false)}
   />
 {/if}
 
@@ -1361,6 +1724,95 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* ── Password set/change form (ADR-0020 D17) ─────────────────────── */
+
+  .pw-row {
+    align-items: start;
+  }
+
+  .pw-form {
+    display: grid;
+    gap: var(--space-10);
+    margin-top: var(--space-12);
+    max-width: 360px;
+  }
+
+  .pw-field {
+    display: grid;
+    gap: var(--space-6);
+    min-width: 0;
+  }
+
+  .pw-label {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--color-fg-muted);
+  }
+
+  .pw-input {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    height: 32px;
+    padding: 0 var(--space-12);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+    color: var(--color-fg);
+    font-family: inherit;
+    font-size: var(--text-base);
+    line-height: var(--leading-normal);
+    transition: border-color var(--motion-fast) var(--motion-easing);
+  }
+
+  .pw-input:hover:not(:disabled) {
+    border-color: var(--color-fg-subtle);
+  }
+
+  .pw-input:focus-visible {
+    outline: 2px solid var(--color-info);
+    outline-offset: 1px;
+    border-color: var(--color-info);
+  }
+
+  .pw-input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .pw-field.has-error .pw-input {
+    border-color: var(--color-danger);
+  }
+
+  .pw-hint {
+    font-size: var(--text-sm);
+    color: var(--color-fg-muted);
+  }
+
+  .pw-hint-error {
+    color: var(--color-danger);
+  }
+
+  .pw-error {
+    margin: 0;
+    padding: var(--space-8) var(--space-10);
+    border: 1px solid color-mix(in srgb, var(--color-danger) 34%, transparent);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--color-danger) 10%, transparent);
+    color: var(--color-danger);
+    font-size: var(--text-sm);
+  }
+
+  .pw-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-8);
+    justify-content: flex-start;
+    margin-top: var(--space-4);
   }
 
   .about-id {

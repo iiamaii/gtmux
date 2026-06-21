@@ -157,6 +157,7 @@ fn build_snapshot(
     state: &AppState,
     behavior: BehaviorSettings,
     password_set: bool,
+    token_present: bool,
 ) -> SettingsSnapshot {
     SettingsSnapshot {
         build: BuildInfo::current(),
@@ -168,7 +169,7 @@ fn build_snapshot(
         },
         behavior,
         auth: AuthInfo {
-            token_present: !state.token.0.is_empty(),
+            token_present,
             password_set,
             argon2: ArgonParams {
                 // Mirror the constants in `auth.rs`. Re-exposing them
@@ -187,12 +188,21 @@ async fn current_password_set(state: &AppState) -> bool {
     state.password_hash.read().await.is_some()
 }
 
+/// Whether a server token is currently issued (ADR-0020 D18.3 — the token is
+/// now a `SharedToken` `RwLock`, so we read-lock to inspect it). Always `true`
+/// in practice — the CLI mints one at boot and `POST /auth/rotate` only ever
+/// replaces it with another non-empty token.
+async fn current_token_present(state: &AppState) -> bool {
+    !state.token.read().await.0.is_empty()
+}
+
 /// `GET /api/settings` — returns the boot-immutable info + the current
 /// behavior snapshot.
 pub(crate) async fn get_handler(State(state): State<AppState>) -> Response {
     let behavior = *state.behavior_settings.read().await;
     let password_set = current_password_set(&state).await;
-    Json(build_snapshot(&state, behavior, password_set)).into_response()
+    let token_present = current_token_present(&state).await;
+    Json(build_snapshot(&state, behavior, password_set, token_present)).into_response()
 }
 
 /// `PATCH /api/settings` — accepts a partial JSON body. Only `behavior`
@@ -219,7 +229,8 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
     if body_bytes.is_empty() {
         let behavior = *state.behavior_settings.read().await;
         let password_set = current_password_set(&state).await;
-        return Json(build_snapshot(&state, behavior, password_set)).into_response();
+        let token_present = current_token_present(&state).await;
+        return Json(build_snapshot(&state, behavior, password_set, token_present)).into_response();
     }
 
     let parsed: Value = match serde_json::from_slice(&body_bytes) {
@@ -281,7 +292,8 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
         // as a no-op and return the current snapshot.
         let behavior = *state.behavior_settings.read().await;
         let password_set = current_password_set(&state).await;
-        return Json(build_snapshot(&state, behavior, password_set)).into_response();
+        let token_present = current_token_present(&state).await;
+        return Json(build_snapshot(&state, behavior, password_set, token_present)).into_response();
     };
 
     // Start from the *current* behavior so partial updates merge
@@ -360,7 +372,8 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
         *w = next;
     }
     let password_set = current_password_set(&state).await;
-    Json(build_snapshot(&state, next, password_set)).into_response()
+    let token_present = current_token_present(&state).await;
+    Json(build_snapshot(&state, next, password_set, token_present)).into_response()
 }
 
 // ─── Slice D-3: Auth Stage 7 (POST /api/settings/password) ────────────
@@ -368,9 +381,16 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
 /// Minimum length per ADR-0020 D5. zxcvbn is P2+.
 const MIN_PASSWORD_LENGTH: usize = 8;
 
+/// Body for `POST /api/settings/password`. `current_password` is required
+/// for a *change* (ADR-0020 D12 self-step-up) but absent for an *initial set*
+/// (ADR-0020 D17.1 — there is no existing password to verify). The
+/// discriminator is the live `state.password_hash`, not the body shape, so we
+/// accept `current_password` as optional and enforce its presence only in the
+/// change branch.
 #[derive(Debug, serde::Deserialize)]
 struct PasswordChangeRequest {
-    current_password: String,
+    #[serde(default)]
+    current_password: Option<String>,
     new_password: String,
 }
 
@@ -396,29 +416,34 @@ fn password_validates(new_password: &str) -> bool {
     has_letter && has_digit
 }
 
-/// `POST /api/settings/password` — ADR-0020 D4 password rotation.
+/// `POST /api/settings/password` — ADR-0020 D12 (change) + D17 (initial set).
 ///
-/// Body: `{ current_password, new_password }`.
+/// Body:
+///   * change (password already set): `{ current_password, new_password }`.
+///   * initial set (no password yet): `{ new_password }` — `current_password`
+///     omitted / ignored (ADR-0020 D17.1). The cookie session is sufficient
+///     authority; there is no existing password to step up against (D17.2).
+///
+/// The branch discriminator is the *live* `state.password_hash`, not the body.
 ///
 /// Outcomes:
-/// - 200 + `Set-Cookie: gtmux_auth=<new>` — verified, rehashed, persisted,
+/// - 200 + `Set-Cookie: gtmux_auth=<new>` — validated, hashed, persisted,
 ///   caller re-issued, **every other session revoked** (revoked_count
-///   echoed). The caller's old cookie is replaced by the new one in
-///   the response.
+///   echoed). After an initial set `password_set` flips to true.
 /// - 400 `weak_password` (min_length echoed) — new password failed validation.
-/// - 401 `current_password_mismatch` — Argon2 verify of `current_password`
-///   failed.
-/// - 503 `password_not_set` — server is in token mode or the password
-///   hash is missing; caller must set the password via the CLI first.
-/// - 500 `save_failed` — disk write failed.
+/// - 401 `current_password_mismatch` — change branch only: `current_password`
+///   absent or its Argon2 verify failed.
+/// - 500 `save_failed` / `hash_failed` / `issue_failed` — disk / KDF / mint
+///   failure.
 ///
 /// Side-effect ordering (atomic w.r.t. callers via the
 /// `AppState.password_hash` `RwLock`):
-/// 1. Read + verify current hash.
+/// 1. If a password is already set, verify `current_password`; otherwise
+///    (initial set) skip verification.
 /// 2. Validate new password.
 /// 3. Compute new Argon2id hash.
 /// 4. Atomically persist to disk (`save_password_hash` mode 0600).
-/// 5. Swap in-memory hash.
+/// 5. Swap in-memory hash (`password_set` becomes true on initial set).
 /// 6. Revoke all sessions *except* the caller, then re-issue the
 ///    caller's cookie under a fresh value so even the old cookie of
 ///    the caller is dead (any other tab that happened to share it loses
@@ -463,35 +488,42 @@ pub(crate) async fn password_handler(
         }
     };
 
-    // 1. Verify current. Clone the stored hash out and drop the read lock
-    // *before* the Argon2 verify, which runs on the blocking pool (the KDF is
-    // memory-hard — never hold the lock across it nor stall a tokio worker).
-    let current_hash = {
+    // 1. Branch on whether a password is already set (ADR-0020 D17.1).
+    //
+    //   * Set → *change*: verify `current_password` (D12 self-step-up).
+    //   * Not set → *initial set*: no current password to verify; the
+    //     authenticated cookie session is sufficient authority (D17.2). The
+    //     `503 password_not_set` branch no longer fires here — it's been
+    //     superseded by the initial-set path.
+    //
+    // Clone the stored hash out and drop the read lock *before* the Argon2
+    // verify, which runs on the blocking pool (the KDF is memory-hard —
+    // never hold the lock across it nor stall a tokio worker).
+    let existing_hash = {
         let guard = state.password_hash.read().await;
-        match guard.as_deref() {
-            Some(h) => h.to_string(),
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({
-                        "error": "password_not_set",
-                        "message": "server is in token mode or password is not yet set; \
-                                    run `gtmux set-password` first",
-                    })),
-                )
-                    .into_response();
-            }
-        }
+        guard.as_deref().map(|h| h.to_string())
     };
-    let current_ok =
-        crate::auth::verify_password_async(parsed.current_password.clone(), current_hash).await;
-    if !current_ok {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "current_password_mismatch" })),
-        )
-            .into_response();
+
+    if let Some(current_hash) = existing_hash {
+        // Change branch — `current_password` is mandatory and must verify.
+        let Some(current) = parsed.current_password.as_deref() else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "current_password_mismatch" })),
+            )
+                .into_response();
+        };
+        let current_ok =
+            crate::auth::verify_password_async(current.to_string(), current_hash).await;
+        if !current_ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "current_password_mismatch" })),
+            )
+                .into_response();
+        }
     }
+    // else: initial set — `current_password` is ignored entirely.
 
     // 2. Validate new.
     if !password_validates(&parsed.new_password) {
@@ -604,6 +636,85 @@ pub(crate) async fn logout_all_handler(
         revoked_count: revoked,
     })
     .into_response()
+}
+
+/// `DELETE /api/settings/password` — **password removal / reset** (ADR-0020
+/// D19). Disables password login and reverts the server to token-only.
+///
+/// Authorization is a **union step-up** (D19.2): the `{ credential }` body is
+/// accepted if it verifies as *either* the server token *or* the current
+/// password (via [`crate::auth::verify_union_credential`], the D18.1 login
+/// union applied to a step-up body). This is what makes the endpoint a
+/// recovery path — a user who *lost* the password can still authorize with the
+/// token, while one who *remembers* it can use the password. This differs from
+/// the mode-aware `verify_step_up` (D16) on purpose.
+///
+/// On success:
+///   1. Unlink the hash file at `password_hash_path` (if set and present;
+///      a not-found file is ignored — the in-memory clear is the source of
+///      truth and the disk delete is best-effort cleanup).
+///   2. `state.password_hash = None` → `password_set` flips to false, and
+///      `GET /auth/methods`'s `password` reads false immediately (D19.3).
+///   3. Return `200` + the full settings snapshot (mirrors GET/PATCH so the FE
+///      refreshes its Auth section without a second round-trip).
+///
+/// Cookies / sessions are **not** revoked (D19.3): removing a credential does
+/// not invalidate the caller's existing authenticated session — the token is
+/// still valid.
+///
+/// Idempotent (D19.1): if no password is currently set this is a 200 no-op —
+/// but the credential is still verified *first*, so an unauthenticated or
+/// invalid caller gets `401` regardless of whether a password exists (in the
+/// no-password state only the token axis can match, which is correct).
+///
+/// Errors (identical wire shape to the step-up endpoints):
+///   * `401 { "error": "credential_required" }` — empty / missing credential.
+///   * `401 { "error": "invalid_credential" }` — neither axis verified.
+///   * `429` + `Retry-After` — password failures over the per-IP rate limit.
+pub(crate) async fn reset_password_handler(
+    State(state): State<AppState>,
+    req: Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
+
+    // Parse `{ credential }` tolerantly — an empty/absent body becomes
+    // `credential: None`, which the union verify maps to `credential_required`
+    // (only genuinely malformed JSON yields a 400 `invalid_json`).
+    let parsed = match crate::auth::parse_step_up_body(body).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    // Union step-up authorization is the *first* precondition (D19.2) — runs
+    // even when no password is set, so an invalid caller always gets 401.
+    if let Err(rejection) = crate::auth::verify_union_credential(&state, &headers, &parsed).await {
+        return rejection.into_response();
+    }
+
+    // Authorized. Best-effort disk unlink first, then clear in-memory. A
+    // missing file is fine (idempotent no-op when already token-only); any
+    // other unlink error is logged but does not fail the request — the
+    // in-memory clear below is the authoritative state transition.
+    if let Some(path) = state.password_hash_path.as_ref() {
+        match std::fs::remove_file(path.as_ref()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "password reset: hash file unlink failed (clearing in-memory anyway)");
+            }
+        }
+    }
+
+    // Clear the in-memory hash → `password_set` is now false (D19.3). Idempotent
+    // when it was already None.
+    *state.password_hash.write().await = None;
+
+    // 200 + fresh snapshot (cookies untouched — D19.3, no Set-Cookie).
+    let behavior = *state.behavior_settings.read().await;
+    let token_present = current_token_present(&state).await;
+    let password_set = current_password_set(&state).await; // now false
+    Json(build_snapshot(&state, behavior, password_set, token_present)).into_response()
 }
 
 /// Convenience constructor for the `behavior_settings` field on
@@ -1132,16 +1243,35 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn password_change_without_password_set_returns_503() {
-        // No initial hash + no path → password_not_set.
+    /// Test state with **no** password set but a per-test on-disk path so an
+    /// *initial set* (ADR-0020 D17) can persist. Returns
+    /// `(state, tempdir, cookie)` — the cookie is a token-mode session
+    /// (matching the pre-set `password_set == false` world).
+    async fn unset_password_test_state() -> (AppState, tempfile::TempDir, String) {
         let (state, _token) = test_state();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("password.argon2");
+        let state = state.with_password_hash_path(path);
+        // No password hash set → `password_set == false`.
         let cookie = state
             .session_table
             .issue(crate::auth::AuthMode::Token)
             .await
-            .unwrap();
-        let app = router(state);
+            .expect("issue cookie");
+        (state, tmp, cookie)
+    }
+
+    #[tokio::test]
+    async fn password_initial_set_without_current() {
+        // ADR-0020 D17.1: password not set → `{ new_password }` alone is
+        // accepted (no `current_password`), and afterwards `password_set`
+        // flips to true.
+        let (state, _tmp, cookie) = unset_password_test_state().await;
+        assert!(
+            state.password_hash.read().await.is_none(),
+            "precondition: no password set"
+        );
+        let app = router(state.clone());
         let resp = app
             .oneshot(
                 HttpRequest::builder()
@@ -1150,17 +1280,105 @@ mod tests {
                     .header(header::HOST, TEST_HOST)
                     .header(header::COOKIE, format!("gtmux_auth={cookie}"))
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"current_password":"x","new_password":"newpw456"}"#,
-                    ))
+                    .body(Body::from(r#"{"new_password":"initpw123"}"#))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Success shape mirrors the change path: `{ ok, revoked_count }` +
+        // fresh Set-Cookie.
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("initial set re-issues the caller cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with("gtmux_auth="));
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"], "password_not_set");
+        assert_eq!(v["ok"], true);
+        assert!(v["revoked_count"].is_number());
+        // `password_set` is now true (in-memory + on disk).
+        let mem = state.password_hash.read().await.clone();
+        assert!(mem.is_some(), "password must now be set");
+        assert!(crate::auth::verify_password(
+            "initpw123",
+            mem.as_deref().unwrap()
+        ));
+        let disk_hash =
+            std::fs::read_to_string(state.password_hash_path.as_ref().unwrap().as_ref()).unwrap();
+        assert!(crate::auth::verify_password("initpw123", disk_hash.trim()));
+    }
+
+    #[tokio::test]
+    async fn password_initial_set_weak_rejected() {
+        // ADR-0020 D17.1: the initial-set path enforces the same D5 policy —
+        // a weak `new_password` returns the existing `400 weak_password`.
+        let (state, _tmp, cookie) = unset_password_test_state().await;
+        let app = router(state.clone());
+        for body in [
+            r#"{"new_password":"short1"}"#,   // too short
+            r#"{"new_password":"nodigits"}"#, // long enough, no digit
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri("/api/settings/password")
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body={body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["error"], "weak_password");
+            assert_eq!(v["min_length"], MIN_PASSWORD_LENGTH);
+        }
+        // A weak initial set must NOT have persisted anything.
+        assert!(
+            state.password_hash.read().await.is_none(),
+            "weak initial set must leave password unset"
+        );
+    }
+
+    #[tokio::test]
+    async fn password_change_still_requires_current() {
+        // ADR-0020 D17 regression guard: once a password IS set, the change
+        // path still demands `current_password` (D12). Both an absent and a
+        // wrong `current_password` → 401 `current_password_mismatch`.
+        let (state, _token, _tmp, cookie) = password_test_state("oldpw123").await;
+        let app = router(state);
+        for body in [
+            r#"{"new_password":"newpw456"}"#, // current omitted
+            r#"{"current_password":"wrong","new_password":"newpw456"}"#, // wrong current
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::POST)
+                        .uri("/api/settings/password")
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "body={body}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(v["error"], "current_password_mismatch");
+        }
     }
 
     #[tokio::test]
@@ -1261,5 +1479,226 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"], "session_cookie_required");
+    }
+
+    // ── ADR-0020 D19 — `DELETE /api/settings/password` union-step-up reset ──
+
+    /// Like [`password_test_state`] but also *persists* the hash to disk so a
+    /// reset's file-unlink path is exercised for real (the base helper only
+    /// sets the in-memory hash). Returns `(state, token, tempdir, cookie)`.
+    async fn reset_password_test_state(
+        initial_password: &str,
+    ) -> (AppState, TokenString, tempfile::TempDir, String) {
+        let (state, token, tmp, cookie) = password_test_state(initial_password).await;
+        let hash = state.password_hash.read().await.clone().unwrap();
+        crate::auth::save_password_hash(state.password_hash_path.as_ref().unwrap().as_ref(), &hash)
+            .expect("persist initial hash to disk");
+        assert!(
+            state.password_hash_path.as_ref().unwrap().as_ref().exists(),
+            "precondition: hash file on disk"
+        );
+        (state, token, tmp, cookie)
+    }
+
+    fn reset_request(cookie: &str, credential: Option<&str>) -> HttpRequest<Body> {
+        let body = match credential {
+            Some(c) => Body::from(serde_json::to_vec(&json!({ "credential": c })).unwrap()),
+            None => Body::empty(),
+        };
+        HttpRequest::builder()
+            .method(Method::DELETE)
+            .uri("/api/settings/password")
+            .header(header::HOST, TEST_HOST)
+            .header(header::COOKIE, format!("gtmux_auth={cookie}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    async fn login_status(app: &axum::Router, body: Value) -> StatusCode {
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/auth/login")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn auth_methods_password(app: &axum::Router) -> bool {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/methods")
+                    .header(header::HOST, TEST_HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        v["password"].as_bool().unwrap()
+    }
+
+    #[tokio::test]
+    async fn reset_disables_password_login() {
+        // D19 §검증: after reset → password login 401, token login 200,
+        // `/auth/methods` password=false, hash file gone.
+        let (state, token, _tmp, cookie) = reset_password_test_state("secretpw1").await;
+        let path = state.password_hash_path.as_ref().unwrap().clone();
+        let app = router(state);
+
+        // Precondition: password login currently works.
+        assert_eq!(
+            login_status(&app, json!({ "password": "secretpw1" })).await,
+            StatusCode::OK
+        );
+        assert!(auth_methods_password(&app).await, "precondition: password set");
+
+        // Reset using the password as the credential.
+        let resp = app.clone().oneshot(reset_request(&cookie, Some("secretpw1"))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let snap: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            snap["auth"]["password_set"],
+            serde_json::Value::Bool(false),
+            "snapshot must report password_set=false after reset"
+        );
+
+        // Post-reset: password login is gone, token login still works.
+        assert_eq!(
+            login_status(&app, json!({ "password": "secretpw1" })).await,
+            StatusCode::UNAUTHORIZED,
+            "password login must fail after reset"
+        );
+        assert_eq!(
+            login_status(&app, json!({ "token": token.0 })).await,
+            StatusCode::OK,
+            "token login must still work after reset"
+        );
+        assert!(
+            !auth_methods_password(&app).await,
+            "/auth/methods password must be false after reset"
+        );
+        assert!(!path.as_ref().exists(), "hash file must be unlinked");
+    }
+
+    #[tokio::test]
+    async fn reset_accepts_token_credential() {
+        // The lost-password recovery path: token credential authorizes removal
+        // even while a password is still set (union, not mode-aware).
+        let (state, token, _tmp, cookie) = reset_password_test_state("secretpw1").await;
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(reset_request(&cookie, Some(&token.0)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            state.password_hash.read().await.is_none(),
+            "password must be removed when authorized by token"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_accepts_password_credential() {
+        let (state, _token, _tmp, cookie) = reset_password_test_state("secretpw1").await;
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(reset_request(&cookie, Some("secretpw1")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            state.password_hash.read().await.is_none(),
+            "password must be removed when authorized by the password itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_rejects_wrong_credential() {
+        // Neither token nor password → 401, password still set (no removal).
+        let (state, _token, _tmp, cookie) = reset_password_test_state("secretpw1").await;
+        let path = state.password_hash_path.as_ref().unwrap().clone();
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(reset_request(&cookie, Some("totally-wrong")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "invalid_credential");
+        assert!(
+            state.password_hash.read().await.is_some(),
+            "password must remain set after a rejected reset"
+        );
+        assert!(path.as_ref().exists(), "hash file must remain after a rejected reset");
+    }
+
+    #[tokio::test]
+    async fn reset_missing_credential_returns_401() {
+        // Empty body → credential_required (the credential check is the first
+        // precondition, even though removal would be a no-op once authorized).
+        let (state, _token, _tmp, cookie) = reset_password_test_state("secretpw1").await;
+        let app = router(state.clone());
+        let resp = app.oneshot(reset_request(&cookie, None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "credential_required");
+        assert!(
+            state.password_hash.read().await.is_some(),
+            "password must remain set when no credential is presented"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_idempotent_when_no_password() {
+        // No password set → 200 no-op, but only with a valid credential. In the
+        // token-only state the token is the only credential that can match, so
+        // the union check still gates an unauthorized caller (covered by the
+        // 401 below) while a valid token yields a clean idempotent 200.
+        let (state, _tmp, cookie) = unset_password_test_state().await;
+        let token = state.token.read().await.clone();
+        let app = router(state.clone());
+
+        // Unauthorized caller still rejected even with no password to remove.
+        let bad = app
+            .clone()
+            .oneshot(reset_request(&cookie, Some("nope")))
+            .await
+            .unwrap();
+        assert_eq!(
+            bad.status(),
+            StatusCode::UNAUTHORIZED,
+            "invalid credential must 401 even when there is no password"
+        );
+
+        // Valid token → 200 no-op.
+        let resp = app
+            .oneshot(reset_request(&cookie, Some(&token.0)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "no-op reset must be 200");
+        let bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let snap: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            snap["auth"]["password_set"],
+            serde_json::Value::Bool(false)
+        );
+        assert!(
+            state.password_hash.read().await.is_none(),
+            "still no password after a no-op reset"
+        );
     }
 }

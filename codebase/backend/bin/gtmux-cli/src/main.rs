@@ -37,7 +37,10 @@ use std::process::ExitCode;
 use anyhow::{anyhow, Context};
 use axum::Router;
 use clap::{Parser, Subcommand};
-use gtmux_auth::{issue_token, load_token, rotate_token, save_token, AuthError, TokenString};
+use gtmux_auth::{
+    issue_token, load_token, rotate_token, save_token, shared_token, AuthError, SharedToken,
+    TokenString,
+};
 use gtmux_config::{derive_mode, load_with_overrides as load_config, Config, Mode};
 use gtmux_pty_backend::PtyBackend;
 use gtmux_ws_server::Hub;
@@ -495,31 +498,29 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         "server workspace (A) bound"
     );
 
-    // 6c) password hash — ADR-0020 D5. Loaded eagerly when `auth.mode =
-    //     "password"` so a missing file fails fast at boot rather than at
-    //     first login attempt. In token mode we leave it unset.
-    let password_hash: Option<String> = if config.auth.mode == "password" {
+    // 6c) password hash — ADR-0020 D5 + **D18.2**. Loaded eagerly whenever the
+    //     hash FILE EXISTS, regardless of the (now-deprecated, D18.1)
+    //     `config.auth.mode`. This is what makes a config/CLI-set password an
+    //     *active* login credential from boot (C3-A): the password axis of the
+    //     union login is enabled solely by `password_hash.is_some()`. A missing
+    //     file simply leaves the server token-only (no error — D18 has no
+    //     "password mode but unset" failure).
+    let password_hash: Option<String> = {
         let path =
             gtmux_http_api::default_password_hash_path().context("resolving password hash path")?;
         match gtmux_http_api::load_password_hash(&path) {
             Ok(h) => {
-                info!(path = %path.display(), "auth: loaded password hash");
+                info!(path = %path.display(), "auth: loaded password hash (password login active)");
                 Some(h)
             }
-            Err(gtmux_http_api::AuthError::HashFileMissing(p)) => {
-                warn!(
-                    path = %p.display(),
-                    "auth: password mode is configured but no hash file exists yet; \
-                     run `gtmux set-password` before any client tries to log in"
-                );
+            Err(gtmux_http_api::AuthError::HashFileMissing(_)) => {
+                // No password set — token-only login. Not an error (D18.2).
                 None
             }
             Err(e) => {
                 return Err(anyhow!("loading password hash: {e}"));
             }
         }
-    } else {
-        None
     };
 
     // 7+8+9) router — HTTP API (layout, bootstrap, healthz) + WebSocket (/ws).
@@ -539,9 +540,16 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     hub.set_disconnect_sink(disconnect_tx);
     hub.set_heartbeat_sink(heartbeat_tx);
 
+    // ADR-0020 D18.3 (T1): build ONE shared, runtime-mutable server-token cell
+    // and hand the *same* `Arc<RwLock<TokenString>>` to both the http-api
+    // AppState and the ws-server router. `POST /auth/rotate` then swaps the
+    // token in this single cell and both routers observe the new value — there
+    // is no second copy for ws-server to drift on.
+    let shared = shared_token(token.clone());
+
     let app_state = build_app_state(
         &config,
-        &token,
+        shared.clone(),
         hub.clone(),
         workspace.clone(),
         server_workspace.clone(),
@@ -610,7 +618,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         }
     });
 
-    let app = build_router(app_state, &config, &token, hub.clone());
+    let app = build_router(app_state, &config, shared.clone(), hub.clone());
 
     // 10) bind — TCP only for now (unix socket variant lives behind
     //    `bind = "unix:/..."` and is a planned alt-path; surface a friendly
@@ -701,7 +709,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
 
 fn build_app_state(
     config: &Config,
-    token: &TokenString,
+    token: SharedToken,
     hub: Hub,
     workspace: gtmux_http_api::WorkspaceManager,
     server_workspace: PathBuf,
@@ -718,9 +726,9 @@ fn build_app_state(
     //
     // Legacy `/api/layout` v1 + `LayoutStore` were removed in the Stage 6
     // cleanup (handover §5.3.3); v2 is the only `/layout` surface.
-    let mut app_state = gtmux_http_api::AppState::with_hub_and_workspace(
+    let mut app_state = gtmux_http_api::AppState::with_hub_and_workspace_shared(
         config.clone(),
-        token.clone(),
+        token,
         hub,
         workspace,
     )
@@ -742,7 +750,7 @@ fn build_app_state(
 fn build_router(
     app_state: gtmux_http_api::AppState,
     config: &Config,
-    token: &TokenString,
+    token: SharedToken,
     hub: Hub,
 ) -> Router {
     let frontend_dist = app_state
@@ -751,6 +759,8 @@ fn build_router(
         .as_deref()
         .map(|p| p.to_path_buf());
     let http = gtmux_http_api::router_with_app_state(app_state, frontend_dist.as_deref());
+    // ADR-0020 D18.3 (T1): the ws-server router stores an `Arc::clone` of the
+    // *same* shared token cell the http-api AppState holds.
     let ws = gtmux_ws_server::router(config, token, hub);
     http.merge(ws)
 }

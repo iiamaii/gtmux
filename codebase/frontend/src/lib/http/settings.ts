@@ -9,6 +9,7 @@
 // 만 노출하고 consumer 추가는 후속.
 
 import { UnauthorizedError } from './sessions';
+import { stepUpErrorFor } from './stepup';
 
 export interface BehaviorSettings {
   /** ADR-0021 G25.1.b — panel close 시 modal 우회 + terminal SIGTERM. */
@@ -95,5 +96,127 @@ export async function patchBehavior(
   });
   if (res.status === 401) throw new UnauthorizedError();
   if (!res.ok) throw new Error(`PATCH /api/settings returned ${res.status}`);
+  return json<SettingsSnapshot>(res);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* POST /api/settings/password — password initial-set / change (ADR-0020 D17) */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/** Distinct error codes the password endpoint can return (D5 / D12 / D17). */
+export type PasswordErrorCode =
+  | 'weak_password' // 400 — new password fails len ≥ 8 + letter + digit.
+  | 'current_password_mismatch'; // 401 — wrong current (change path only).
+
+/** Thrown by `setPassword` / `changePassword` on a recognised 400/401. */
+export class PasswordError extends Error {
+  readonly code: PasswordErrorCode;
+  constructor(code: PasswordErrorCode, message?: string) {
+    super(message ?? code);
+    this.name = 'PasswordError';
+    this.code = code;
+  }
+}
+
+async function postPassword(body: Record<string, string>): Promise<void> {
+  const res = await fetch('/api/settings/password', {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    credentials: 'include',
+    body: JSON.stringify(body),
+  });
+
+  if (res.ok) return;
+
+  if (res.status === 400 || res.status === 401) {
+    const parsed = await res
+      .json()
+      .catch(() => ({}) as { error?: string; message?: string });
+    const code = (parsed as { error?: string }).error;
+    const message = (parsed as { message?: string }).message;
+    if (code === 'weak_password') throw new PasswordError('weak_password', message);
+    if (code === 'current_password_mismatch') {
+      throw new PasswordError('current_password_mismatch', message);
+    }
+  }
+
+  if (res.status === 401) throw new UnauthorizedError();
+  throw new Error(`POST /api/settings/password returned ${res.status}`);
+}
+
+/**
+ * Initial password set (ADR-0020 D17.1, `password_set === false`). Body carries
+ * only `{ new_password }` — there is no existing password to verify. The cookie
+ * session is sufficient authority (D17.2), so no step-up credential is required.
+ *
+ * @throws {PasswordError} `weak_password` — caller surfaces inline.
+ */
+export async function setPassword(newPassword: string): Promise<void> {
+  await postPassword({ new_password: newPassword });
+}
+
+/**
+ * Password change (ADR-0020 D12, `password_set === true`). Verifying the current
+ * password is the self-step-up, so this path is *not* additionally gated by the
+ * ReauthModal (D16.1).
+ *
+ * @throws {PasswordError} `current_password_mismatch` (wrong current) or
+ *   `weak_password` (new fails policy) — caller surfaces inline.
+ */
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  await postPassword({
+    current_password: currentPassword,
+    new_password: newPassword,
+  });
+}
+
+/* ────────────────────────────────────────────────────────────────────────── */
+/* DELETE /api/settings/password — remove password / token-only reset (D19)   */
+/* ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Remove the account password (ADR-0020 D19) → token-only sign-in. Authorised
+ * by a **union step-up** (D19.2): `credential` may be EITHER the current
+ * password OR the server token — whichever the user has. Lost-password recovery
+ * uses the token; a remembered password also works.
+ *
+ * On success the BE unlinks the hash file + clears `state.password_hash`, so
+ * `password_set` (and `GET /auth/methods`) flips false. The cookie/session is
+ * unchanged (the token is still valid), so no redirect happens here. The 200
+ * snapshot is returned so the caller can refresh the form mode.
+ *
+ * Reuses the shared shutdown/rotate step-up error mapping (`stepUpErrorFor`):
+ * a 401 `invalid_credential` / `credential_required` or 429 surfaces as a
+ * step-up error and keeps the ReauthModal open; a 401 *without* a step-up code
+ * is a genuine session expiry → `UnauthorizedError` (redirect).
+ *
+ * @throws {InvalidCredentialError} wrong credential — retry in the modal.
+ * @throws {CredentialRequiredError} empty / missing credential.
+ * @throws {RateLimitedError} 429 (password mode rate limit).
+ * @throws {UnauthorizedError} genuine session expiry — redirect to /auth.
+ */
+export async function resetPassword(
+  credential: string,
+): Promise<SettingsSnapshot> {
+  const res = await fetch('/api/settings/password', {
+    method: 'DELETE',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    credentials: 'include',
+    body: JSON.stringify({ credential }),
+  });
+
+  const stepUp = await stepUpErrorFor(res);
+  if (stepUp !== null) throw stepUp;
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`DELETE /api/settings/password returned ${res.status}`);
   return json<SettingsSnapshot>(res);
 }
