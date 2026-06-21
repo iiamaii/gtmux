@@ -303,10 +303,14 @@
         if (ok) {
           stripTokenFromUrl();
         } else {
-          // BE-rendered /auth/bootstrap 가 token 재시도 / password fallback 을
-          // 일관 처리. URL 의 token 은 유지 (사용자 복구 경로 보존).
-          window.location.href =
-            `/auth/bootstrap?token=${encodeURIComponent(tokenFromUrl)}`;
+          // 보안감사 I1 (ADR-0003 R(rej)2) — 실패 경로에서 평문 token 을 다시
+          // URL(`/auth/bootstrap?token=…`)에 실으면 access-log/Referer/history
+          // 표면이 재생긴다. 토큰은 이미 sessionStorage(TOKEN_STORAGE_KEY, 위)
+          // 에 WS bearer 복구용으로 보존돼 있고, M1 적용 후 /auth/bootstrap 는
+          // 무효 토큰을 401 로 거부하므로 재전송은 무의미. URL 을 정리한 뒤
+          // 토큰 없는 /auth FE 페이지로 보내 token/password 폼 재인증을 받는다.
+          stripTokenFromUrl();
+          window.location.href = '/auth';
           return;
         }
       }
