@@ -19,7 +19,8 @@
 
   import { onMount, untrack } from 'svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
-  import { login } from '$lib/http/auth';
+  import { authMethods, login } from '$lib/http/auth';
+  import type { AuthMethods } from '$lib/types/auth';
   import brandLogoUrl from '$lib/assets/brand.png';
 
   // ADR-0020 D13 — 본 컴포넌트가 `/auth` page 의 *단일 source*. BE 는
@@ -27,11 +28,14 @@
   // AuthPage mount. `/auth-preview` 는 디자인 demo alias (동일 컴포넌트).
   // 시안 ref/frontend-design/auth.html — 동일 디자인 + 실제 login 동작.
   //
-  // Mode 는 *서버 config.auth.mode* 가 결정 — 클라이언트가 선택하지 않는다.
-  // 두 mode UI 모두 노출 — 활성 모드의 credential 만 BE 에 보냄. 실제 submit
-  // 은 활성 모드의 credential 만 BE 에 보낸다.
+  // ADR-0020 D18 — token·password 둘 다 유효 (union). token 은 항상 활성;
+  // password 칸은 `GET /auth/methods` 의 `password === true` 일 때만 가용성
+  // 결정. 활성 모드의 credential 만 BE 에 보내고, BE 가 union 으로 검증한다.
   type LocalMode = 'token' | 'password';
   let mode = $state<LocalMode>('token');
+  // D18.6 — auth page 는 인증 전이라 /api/settings (authed) 를 못 부른다.
+  // 공개 /auth/methods 로 password 가용성만 판별. 실패 시 token-only fallback.
+  let methods = $state<AuthMethods>({ token: true, password: false });
   let tokenValue = $state('');
   let passwordValue = $state('');
   let showSecret = $state(false);
@@ -46,11 +50,16 @@
 
   onMount(() => {
     themeStore.apply();
+    // ADR-0020 D18.3 — magic-link `?t=<token>` 진입은 token 자동 처리이며,
+    // methods 기반 default (아래) 보다 *우선*. 본 플래그로 자동 토큰 진입 시
+    // password default 전환을 막는다.
+    let magicLinkToken = false;
     // ADR-0020 D4 — URL `?t=<token>` 자동 처리. 한 번만 실행.
     try {
       const params = new URLSearchParams(window.location.search);
       const t = params.get('t');
       if (t && t.length > 0) {
+        magicLinkToken = true;
         untrack(() => {
           mode = 'token';
           tokenValue = t;
@@ -61,12 +70,21 @@
     } catch (e) {
       console.debug('[gtmux] auth query read failed', e);
     }
+    // ADR-0020 D18.6 — password 가용성 판별. magic-link 진입이 아니면 password
+    // 가용 시 password 를 기본 노출 (D18: password 우선, token 도 항상 유효).
+    void authMethods().then((m) => {
+      methods = m;
+      if (!magicLinkToken && m.password) mode = 'password';
+      else if (!m.password && mode === 'password') mode = 'token';
+    });
     return () => {
       if (countdownInterval !== null) clearInterval(countdownInterval);
     };
   });
 
   function selectMode(next: LocalMode): void {
+    // D18.6 — password 미설정이면 password 탭 선택 불가 (token-only).
+    if (next === 'password' && !methods.password) return;
     mode = next;
     errorMessage = null;
     // 다음 mode 의 input 으로 focus 이동
@@ -152,7 +170,11 @@
       <h1 class="heading" id="auth-title">gtmux</h1>
     </div>
     <p class="deck">
-      Authenticate with a token or password. Your session persists on this device.
+      {#if methods.password}
+        Authenticate with a token or password. Your session persists on this device.
+      {:else}
+        Authenticate with your access token. Your session persists on this device.
+      {/if}
     </p>
 
     <div class="tabs" role="tablist" aria-label="Authentication method">
@@ -170,13 +192,17 @@
         role="tab"
         class="tab"
         aria-selected={mode === 'password'}
+        disabled={!methods.password}
+        title={methods.password
+          ? undefined
+          : 'No password is set. Set one in Settings → Auth after signing in.'}
         onclick={() => selectMode('password')}
       >
         Password
       </button>
     </div>
 
-    {#if mode === 'token'}
+    {#if mode === 'token' || !methods.password}
       <div class="panel" role="tabpanel">
         <form onsubmit={submit} autocomplete="off">
           <div class="field">
@@ -218,6 +244,24 @@
     {:else}
       <div class="panel" role="tabpanel">
         <form onsubmit={submit} autocomplete="off">
+          <!--
+            Hidden username field so password managers associate the credential
+            with an account (Chrome [DOM] "Password forms should have (optionally
+            hidden) username fields", https://goo.gl/9p2vKq). gtmux is single-user
+            with no real username, so a constant gives a stable saved entry.
+            display:none + tabindex=-1 + aria-hidden keep it out of layout, the
+            tab order, and the a11y tree.
+          -->
+          <input
+            type="text"
+            name="username"
+            autocomplete="username"
+            value="gtmux"
+            readonly
+            tabindex="-1"
+            aria-hidden="true"
+            style="display:none"
+          />
           <div class="field">
             <div class="label">
               <span>Password</span>
@@ -350,6 +394,11 @@
     background: var(--color-surface);
     color: var(--color-fg);
     box-shadow: var(--shadow-sm);
+  }
+
+  .tab:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   :global(:root.dark) .tab[aria-selected='true'] {
