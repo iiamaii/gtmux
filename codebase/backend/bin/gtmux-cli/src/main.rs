@@ -547,6 +547,28 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     // is no second copy for ws-server to drift on.
     let shared = shared_token(token.clone());
 
+    // ADR-0003 D12 / SSoT §1.11: parse the trusted-proxy CIDR allowlist once,
+    // here, so a malformed entry is a *hard boot error* (fail-closed) rather
+    // than a silently-empty allowlist that keeps trusting forged
+    // `X-Forwarded-For`. Local mode / absent `[cloud]` yields an empty list.
+    let trusted_proxy_nets = gtmux_http_api::parse_trusted_proxy_nets(&config)
+        .context("parsing [cloud].trusted_proxy_ips")?;
+    // SSoT §5 item 8: cloud + required + empty list → warn (XFF ignored) and
+    // proceed. NOT an exit. Local mode ignores `[cloud]` entirely.
+    if mode == Mode::Cloud {
+        if let Some(cloud) = config.cloud.as_ref() {
+            if cloud.trusted_proxy_ips_required && cloud.trusted_proxy_ips.is_empty() {
+                eprintln!(
+                    "gtmux start: warning — cloud mode with empty [cloud].trusted_proxy_ips; \
+                     X-Forwarded-For ignored, rate-limit keys on the proxy socket IP \
+                     (every client behind the proxy shares one bucket). Set \
+                     trusted_proxy_ips to your reverse-proxy IP(s) for per-client limits, \
+                     or set trusted_proxy_ips_required = false to silence this."
+                );
+            }
+        }
+    }
+
     let app_state = build_app_state(
         &config,
         shared.clone(),
@@ -554,6 +576,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         workspace.clone(),
         server_workspace.clone(),
         password_hash,
+        trusted_proxy_nets,
     );
 
     // Stage 5 D10 α: register the cookie validator so the WS handshake
@@ -677,9 +700,20 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     let shutdown_signal = wait_for_shutdown();
 
     // 13) serve.
-    let serve_result = axum::serve(listener, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal)
-        .await;
+    //    `into_make_service_with_connect_info::<SocketAddr>()` inserts the peer
+    //    socket address into each request's extensions so the rate limiter can
+    //    key on a *verified* client IP and gate `X-Forwarded-For` to trusted
+    //    proxies (ADR-0003 D12). This is TCP-only — the `unix:` bind path is
+    //    rejected at step 10 above, so there is no peerless TCP request here.
+    //    When a unix-socket bind is eventually wired it will have no peer IP;
+    //    `peer_from_parts` returns `None` there and the rate-limit key falls
+    //    back to XFF-ignore (single bucket), which is the fail-closed default.
+    let serve_result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal)
+    .await;
 
     // Post-shutdown — drop the PtyBackend so its `Drop` impl runs the
     // ADR-0014 D7 teardown step 1 (SIGTERM → grace → SIGKILL fan-out
@@ -707,6 +741,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     serve_result.context("axum::serve")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_app_state(
     config: &Config,
     token: SharedToken,
@@ -714,6 +749,7 @@ fn build_app_state(
     workspace: gtmux_http_api::WorkspaceManager,
     server_workspace: PathBuf,
     password_hash: Option<String>,
+    trusted_proxy_nets: Vec<ipnet::IpNet>,
 ) -> gtmux_http_api::AppState {
     // AppState wires three side-channels into the HTTP router:
     //  * `hub` so session-scoped `PUT /api/sessions/:name/layout` and the
@@ -732,7 +768,9 @@ fn build_app_state(
         hub,
         workspace,
     )
-    .with_server_workspace(server_workspace);
+    .with_server_workspace(server_workspace)
+    // ADR-0003 D12: inject the boot-validated trusted-proxy CIDR allowlist.
+    .with_trusted_proxy_nets(trusted_proxy_nets);
     if let Some(h) = password_hash {
         app_state = app_state.with_password_hash(h);
     }

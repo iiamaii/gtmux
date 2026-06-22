@@ -59,3 +59,9 @@ max_size_bytes = 104857600
 [cloud]
 tls_required                        = false
 rate_limit_auth_failures_per_minute = 10
+# 신뢰 프록시 IP allowlist (CIDR) — reverse proxy 뒤에서 X-Forwarded-For 의
+# 클라이언트 IP 를 *이 IP 에서 온 요청에 한해* rate-limit key 로 신뢰한다
+# (ADR-0003 D12). 미설정/빈 목록이면 XFF 무시 → 프록시 socket IP 단일 버킷
+# (모든 클라이언트가 한 버킷 공유) + boot 경고. 프록시 IP 를 넣어야 per-client 동작.
+# trusted_proxy_ips          = ["127.0.0.1/32"]
+# trusted_proxy_ips_required = true   # false 로 두면 빈 목록 경고를 끈다

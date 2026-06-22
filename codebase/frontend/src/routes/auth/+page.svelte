@@ -66,6 +66,20 @@
         });
         // Token 채운 직후 자동 submit — 사용자 click 없이 통과 (Magic link UX).
         void submit();
+        // 보안감사 I1 (ADR-0003 R(rej)2) — 평문 `?t=<token>` 가 주소창/history
+        // 에 남으면 access-log/Referer/shoulder-surf 표면이 된다. 캡처·자동
+        // submit 직후 (성공/실패 무관) URL 에서 token 을 제거. `redirect` 도
+        // 함께 제거하고, 그 외 쿼리는 보존. replaceState 실패는 무해.
+        try {
+          params.delete('t');
+          params.delete('redirect');
+          const qs = params.toString();
+          const cleanUrl =
+            window.location.pathname + (qs.length > 0 ? `?${qs}` : '');
+          window.history.replaceState({}, '', cleanUrl);
+        } catch (e) {
+          console.debug('[gtmux] auth URL clean failed', e);
+        }
       }
     } catch (e) {
       console.debug('[gtmux] auth query read failed', e);

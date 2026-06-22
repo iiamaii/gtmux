@@ -22,6 +22,9 @@ gtmux-http-api = { path = "../../crates/http-api" }
 gtmux-config = { path = "../../crates/config" }
 gtmux-auth = { path = "../../crates/auth" }
 thiserror = { workspace = true }
+# CIDR matching for the trusted-proxy X-Forwarded-For allowlist (ADR-0003 D12).
+# The parsed `Vec<IpNet>` is threaded from boot into the http-api AppState.
+ipnet = { workspace = true }
 # Offline `gtmux session ls|export|import` (ADR-0044 D-C2) reads/wraps/validates
 # session layout + export-envelope JSON directly against the workspace dir.
 serde_json = { workspace = true }

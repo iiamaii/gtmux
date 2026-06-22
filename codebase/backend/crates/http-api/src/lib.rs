@@ -66,8 +66,8 @@ mod workspace;
 
 pub use auth::{
     default_password_hash_path, default_rate_limiter, default_session_table, hash_password,
-    load_password_hash, save_password_hash, verify_password, AuthError, AuthMode, RateLimiter,
-    SessionTable,
+    load_password_hash, parse_trusted_proxy_nets, save_password_hash, verify_password, AuthError,
+    AuthMode, RateLimiter, SessionTable,
 };
 pub use file_open::{
     default_allowlist_path, default_audit_dir, Allowlist, AllowlistEntry, AllowlistMatch, AuditLog,
@@ -178,6 +178,14 @@ pub struct AppState {
     pub session_table: Arc<SessionTable>,
     /// Per-IP rate limiter for `POST /auth/login` (ADR-0020 D5).
     pub rate_limiter: Arc<RateLimiter>,
+    /// Parsed `[cloud].trusted_proxy_ips` CIDR allowlist (ADR-0003 D12,
+    /// SSoT §1.11). Reverse-proxy IPs whose `X-Forwarded-For` is honoured by
+    /// the per-IP rate-limit key (cloud mode only). Parsed **once at boot** via
+    /// [`crate::parse_trusted_proxy_nets`]; empty in Local mode, or in cloud
+    /// mode when the operator left it unset (XFF then ignored — every client
+    /// behind the proxy shares the proxy-socket bucket). Read on the rate-limit
+    /// hot path by [`crate::rate_limit_key`].
+    pub trusted_proxy_nets: Arc<Vec<ipnet::IpNet>>,
     /// PHC-encoded Argon2id hash for password-mode auth (ADR-0020 D5).
     /// `None` (inside the lock) in token mode or when the password file
     /// doesn't exist yet (login then 503s with a hint to run
@@ -270,9 +278,24 @@ impl AppState {
     /// both readers at once (ADR-0020 D18.3).
     pub fn new_shared(config: Config, token: SharedToken) -> Self {
         let session_table = default_session_table(config.auth.cookie_max_age_days);
+        // Parse the trusted-proxy CIDR allowlist once here. This constructor is
+        // infallible (tests + single-router callers lean on it), so a malformed
+        // entry degrades to an empty list + a warning rather than a panic. The
+        // CLI boot path calls [`parse_trusted_proxy_nets`] directly and `?`-es
+        // its error so production *does* fail-closed on bad CIDR
+        // (ADR-0003 D12); it then injects the parsed value via
+        // [`AppState::with_trusted_proxy_nets`].
+        let trusted_proxy_nets = match parse_trusted_proxy_nets(&config) {
+            Ok(nets) => Arc::new(nets),
+            Err(e) => {
+                tracing::warn!(error = %e, "trusted_proxy_ips: ignoring malformed allowlist");
+                Arc::new(Vec::new())
+            }
+        };
         Self {
             session_table,
             rate_limiter: default_rate_limiter(),
+            trusted_proxy_nets,
             password_hash: Arc::new(RwLock::new(None)),
             password_hash_path: None,
             server_id: Arc::from(fresh_server_id()),
@@ -331,6 +354,16 @@ impl AppState {
     /// D-3 rotation handler can re-save without re-resolving XDG.
     pub fn with_password_hash_path(mut self, path: std::path::PathBuf) -> Self {
         self.password_hash_path = Some(Arc::new(path));
+        self
+    }
+
+    /// Inject the boot-parsed `[cloud].trusted_proxy_ips` CIDR allowlist
+    /// (ADR-0003 D12). The CLI parses it with [`parse_trusted_proxy_nets`]
+    /// *before* serving so a malformed entry is a hard boot error (fail-closed),
+    /// then hands the validated list here. Overrides the lenient parse done in
+    /// [`AppState::new_shared`].
+    pub fn with_trusted_proxy_nets(mut self, nets: Vec<ipnet::IpNet>) -> Self {
+        self.trusted_proxy_nets = Arc::new(nets);
         self
     }
 
@@ -1297,6 +1330,8 @@ mod tests {
                 tls_cert: std::path::PathBuf::from("/dev/null"),
                 tls_key: std::path::PathBuf::from("/dev/null"),
                 rate_limit_auth_failures_per_minute: 10,
+                trusted_proxy_ips: Vec::new(),
+                trusted_proxy_ips_required: true,
             }),
             ..test_config()
         }
@@ -8323,5 +8358,169 @@ mod tests {
             layout["workspace_root"],
             proj_canonical.to_string_lossy().as_ref()
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Trusted-proxy X-Forwarded-For (ADR-0003 D12) — config parse + handler
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A cloud config whose `[cloud].trusted_proxy_ips` carries `cidrs`.
+    fn cloud_config_with_trusted(cidrs: &[&str]) -> Config {
+        Config {
+            server: ServerConfig {
+                bind: "0.0.0.0".to_string(),
+                ..test_config().server
+            },
+            cloud: Some(CloudConfig {
+                tls_required: false,
+                tls_cert: std::path::PathBuf::new(),
+                tls_key: std::path::PathBuf::new(),
+                rate_limit_auth_failures_per_minute: 10,
+                trusted_proxy_ips: cidrs.iter().map(|s| s.to_string()).collect(),
+                trusted_proxy_ips_required: true,
+            }),
+            ..test_config()
+        }
+    }
+
+    /// Valid CIDR list parses into the expected number of nets (ADR-0003 D12).
+    #[test]
+    fn trusted_proxy_ips_parses() {
+        let cfg = cloud_config_with_trusted(&["203.0.113.5/32", "10.0.0.0/8", "2001:db8::/32"]);
+        let nets = parse_trusted_proxy_nets(&cfg).expect("valid CIDRs parse");
+        assert_eq!(nets.len(), 3);
+        // A bare IP without a prefix is accepted as a host route.
+        let cfg_bare = cloud_config_with_trusted(&["192.0.2.10"]);
+        let nets_bare = parse_trusted_proxy_nets(&cfg_bare).expect("bare IP parses");
+        assert_eq!(nets_bare.len(), 1);
+        assert!(nets_bare[0].contains(&"192.0.2.10".parse::<std::net::IpAddr>().unwrap()));
+        // Local config (no [cloud]) → empty.
+        assert!(parse_trusted_proxy_nets(&test_config())
+            .expect("local parses")
+            .is_empty());
+    }
+
+    /// A malformed CIDR is a hard error so boot can fail-closed (ADR-0003 D12).
+    #[test]
+    fn invalid_cidr_fails_boot() {
+        let cfg = cloud_config_with_trusted(&["not-an-ip"]);
+        let err = parse_trusted_proxy_nets(&cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("not-an-ip"),
+            "error names the bad entry: {err}"
+        );
+        // A typo'd prefix is also rejected.
+        assert!(parse_trusted_proxy_nets(&cloud_config_with_trusted(&["10.0.0.0/99"])).is_err());
+    }
+
+    /// cloud + required + empty list → the warn predicate fires; setting the
+    /// list (or clearing `required`) silences it. SSoT §5 item 8 — the CLI
+    /// emits a stderr warning and proceeds (this asserts the *condition*).
+    #[test]
+    fn cloud_required_empty_warns() {
+        let empty = cloud_config_with_trusted(&[]);
+        let cloud = empty.cloud.as_ref().unwrap();
+        assert!(
+            cloud.trusted_proxy_ips_required && cloud.trusted_proxy_ips.is_empty(),
+            "empty+required is the warn condition"
+        );
+        // Non-empty list → no warn.
+        let set = cloud_config_with_trusted(&["203.0.113.5/32"]);
+        let cloud_set = set.cloud.as_ref().unwrap();
+        assert!(!cloud_set.trusted_proxy_ips.is_empty());
+        // Parse still succeeds (warn ≠ error).
+        assert!(parse_trusted_proxy_nets(&empty).expect("empty parses").is_empty());
+    }
+
+    /// Build a cloud router with a single trusted-proxy /32 and drive the login
+    /// rate limiter from a *trusted* peer with two different X-Forwarded-For
+    /// hops: they land in two distinct buckets, so exhausting one leaves the
+    /// other still at 401 (key = the forwarded client, not the proxy socket).
+    #[tokio::test]
+    async fn xff_trusted_peer_uses_forwarded_hop_handler() {
+        use axum::extract::ConnectInfo;
+        use std::net::SocketAddr;
+
+        let token = issue_token().expect("token");
+        let cfg = cloud_config_with_trusted(&["203.0.113.5/32"]);
+        let limit = cfg.auth.rate_limit_per_5min;
+        let state = AppState::new(cfg, token.clone());
+        let app = router_with_state(state);
+        let proxy: SocketAddr = "203.0.113.5:4444".parse().unwrap();
+
+        // Hammer client A past the limit.
+        for _ in 0..=limit {
+            let _ = login_attempt(&app, "client-A", Some(proxy)).await;
+        }
+        let a_status = login_attempt(&app, "client-A", Some(proxy)).await;
+        assert_eq!(
+            a_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "client-A (trusted proxy hop) must rate-limit"
+        );
+
+        // Client B (same trusted proxy, different forwarded hop) is a separate
+        // bucket → still 401, not 429.
+        let b_status = login_attempt(&app, "client-B", Some(proxy)).await;
+        assert_eq!(
+            b_status,
+            StatusCode::UNAUTHORIZED,
+            "client-B keys on its own forwarded hop, not the shared proxy socket"
+        );
+        let _ = (ConnectInfo::<SocketAddr>(proxy),); // type-use marker
+    }
+
+    /// An *untrusted* peer's forged X-Forwarded-For is ignored: two different
+    /// XFF values collapse into the single peer-socket bucket, so once the
+    /// limit is hit a *new* forged hop also gets 429.
+    #[tokio::test]
+    async fn xff_untrusted_peer_ignores_forwarded_handler() {
+        use std::net::SocketAddr;
+
+        let token = issue_token().expect("token");
+        // Trusted set is a different /32; the request peer is NOT in it.
+        let cfg = cloud_config_with_trusted(&["203.0.113.5/32"]);
+        let limit = cfg.auth.rate_limit_per_5min;
+        let state = AppState::new(cfg, token.clone());
+        let app = router_with_state(state);
+        let attacker: SocketAddr = "198.51.100.9:5555".parse().unwrap();
+
+        // Exhaust the bucket via forged hop X.
+        for _ in 0..=limit {
+            let _ = login_attempt(&app, "forged-X", Some(attacker)).await;
+        }
+        // A *different* forged hop from the same untrusted peer is the SAME
+        // bucket (peer IP) → also 429.
+        let status = login_attempt(&app, "forged-Y", Some(attacker)).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "untrusted peer's forged XFF cannot escape its socket bucket"
+        );
+    }
+
+    /// Helper: POST a wrong-token login with an injected peer `ConnectInfo` and
+    /// the given X-Forwarded-For, returning the status. Wrong token → 401
+    /// unless the rate limiter has tripped (→ 429).
+    async fn login_attempt(
+        app: &Router,
+        xff: &str,
+        peer: Option<std::net::SocketAddr>,
+    ) -> StatusCode {
+        use axum::extract::ConnectInfo;
+        let body = serde_json::to_vec(&json!({ "token": "definitely-wrong-token" })).unwrap();
+        let mut req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/auth/login")
+            .header(header::HOST, TEST_HOST)
+            .header(header::ORIGIN, TEST_ORIGIN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-forwarded-for", xff)
+            .body(Body::from(body))
+            .unwrap();
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ConnectInfo(addr));
+        }
+        app.clone().oneshot(req).await.unwrap().status()
     }
 }

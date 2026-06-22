@@ -676,6 +676,7 @@ pub(crate) async fn reset_password_handler(
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
+    let peer = crate::auth::peer_from_parts(&parts);
     let headers = parts.headers;
 
     // Parse `{ credential }` tolerantly — an empty/absent body becomes
@@ -688,7 +689,9 @@ pub(crate) async fn reset_password_handler(
 
     // Union step-up authorization is the *first* precondition (D19.2) — runs
     // even when no password is set, so an invalid caller always gets 401.
-    if let Err(rejection) = crate::auth::verify_union_credential(&state, &headers, &parsed).await {
+    if let Err(rejection) =
+        crate::auth::verify_union_credential(&state, &headers, peer, &parsed).await
+    {
         return rejection.into_response();
     }
 

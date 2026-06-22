@@ -24,6 +24,7 @@ argon2 = { workspace = true }
 base64 = { workspace = true }
 fs2 = { workspace = true }
 async-trait = { workspace = true }
+ipnet = { workspace = true }
 gtmux-auth = { path = "../auth" }
 gtmux-config = { path = "../config" }
 gtmux-pty-backend = { path = "../pty-backend" }
