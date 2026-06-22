@@ -1419,7 +1419,12 @@ fn set_password_cmd() -> ExitCode {
     }
     println!();
     println!("gtmux password saved at {} (mode 0600).", path.display());
-    println!("Switch `[auth] mode = \"password\"` in your config and restart `gtmux start`.");
+    // ADR-0020 D18: login is the union {token} ∪ {password}. A password set here
+    // becomes valid from the next `gtmux start` (the hash is loaded at boot); no
+    // `[auth] mode` switch exists anymore. To enable it on a running server with
+    // no restart, set it from the UI (Settings → Auth) instead.
+    println!("It is active as an additional login credential from the next `gtmux start`.");
+    println!("Token login stays valid too — there is no `[auth] mode` to change.");
     println!();
     ExitCode::SUCCESS
 }
