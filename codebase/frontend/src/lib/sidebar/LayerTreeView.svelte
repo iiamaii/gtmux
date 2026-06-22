@@ -1299,7 +1299,6 @@
                 type="button"
                 class="sticky-row"
                 tabindex="-1"
-                style:height={`${rowHeight}px`}
                 style:padding-left={`${sr.node.depth * 16 + 4}px`}
                 title={groupDisplayLabel(sg)}
                 onclick={() => scrollRowToTop(sr.index)}
@@ -1684,6 +1683,7 @@
     align-items: center;
     gap: var(--space-4);
     width: 100%;
+    height: 24px;
     padding-right: var(--space-8);
     border: 0;
     background: var(--color-surface); /* match Files token (was --color-bg) */
