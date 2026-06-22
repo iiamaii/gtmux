@@ -425,7 +425,10 @@
     padding: 0 var(--space-6);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-sm);
-    background: var(--color-glass-2);
+    /* Match the inspector button-group container (ItemInfoView .segmented-control
+     * / .align-group / .state-row): surface-2 fill + border + radius. Theme-aware
+     * via the shared token. */
+    background: var(--color-surface-2);
     transition: border-color var(--motion-fast) var(--motion-easing);
   }
 
@@ -485,7 +488,9 @@
   }
 
   .footer-search-clear:hover {
-    background: var(--color-glass-2);
+    /* Inner-button hover mirrors the inspector group buttons (.seg-btn / .align-btn
+     * hover = glass-1), staying visible against the surface-2 search field. */
+    background: var(--color-glass-1);
     color: var(--color-fg);
   }
 
