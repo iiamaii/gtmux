@@ -253,9 +253,28 @@ pub struct CloudConfig {
     /// 분당 인증 실패 허용 횟수 (SSoT §1.10). 기본 10 — code-server 대비
     /// 약간 관대하나 grill D22에서 명시 키로 두기로 결정.
     pub rate_limit_auth_failures_per_minute: u32,
+    /// CIDR allowlist of reverse-proxy IPs whose `X-Forwarded-For` is trusted
+    /// (ADR-0003 D12, SSoT §1.11). Empty → XFF ignored (fail-closed): the
+    /// per-IP rate limiter keys on the proxy socket IP, collapsing every
+    /// client behind the proxy into one bucket. cloud-mode only — Local mode
+    /// ignores `[cloud]`. Each entry is a CIDR string (e.g. `"192.0.2.10/32"`,
+    /// `"10.0.0.0/8"`); a bare IP without a prefix is also accepted (parsed as
+    /// `/32` or `/128`). Invalid CIDR → boot error (http-api parses once).
+    #[serde(default)]
+    pub trusted_proxy_ips: Vec<String>,
+    /// When `true` (default) and `trusted_proxy_ips` is empty in cloud mode,
+    /// boot emits a stderr warning that XFF is ignored and proceeds (it does
+    /// *not* exit). SSoT §1.11 / §5 item 8. Set `false` to silence the warning
+    /// when keying on the proxy socket IP is intentional.
+    #[serde(default = "default_true")]
+    pub trusted_proxy_ips_required: bool,
 }
 
 fn default_tls_required() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -856,6 +875,65 @@ rate_limit_auth_failures_per_minute = 10
             let cloud = cfg.cloud.expect("cloud section present");
             assert!(cloud.tls_required);
             assert_eq!(cloud.rate_limit_auth_failures_per_minute, 10);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn trusted_proxy_ips_parses() {
+        // ADR-0003 D12 / SSoT §1.11: the two new `[cloud]` fields parse from
+        // TOML, and when omitted default to `[]` + required=true (existing
+        // cloud configs absorb them with no schema_version bump).
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "gtmux.toml",
+                r#"schema_version = 1
+[server]
+session = "alpha"
+port = 9001
+bind = "0.0.0.0"
+[cloud]
+tls_required = false
+rate_limit_auth_failures_per_minute = 10
+trusted_proxy_ips = ["192.0.2.10/32", "10.0.0.0/8"]
+trusted_proxy_ips_required = false
+"#,
+            )?;
+            let cfg = load(Some(Path::new("gtmux.toml")), "").unwrap();
+            let cloud = cfg.cloud.expect("cloud section present");
+            assert_eq!(
+                cloud.trusted_proxy_ips,
+                vec!["192.0.2.10/32".to_string(), "10.0.0.0/8".to_string()]
+            );
+            assert!(!cloud.trusted_proxy_ips_required);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn trusted_proxy_ips_default_when_omitted() {
+        // Omitting both new keys yields the SSoT defaults: empty list +
+        // required=true. A pre-existing cloud config (no XFF keys) absorbs
+        // them naturally — this is the schema_version-stable migration path.
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.create_file(
+                "gtmux.toml",
+                r#"schema_version = 1
+[server]
+session = "alpha"
+port = 9001
+bind = "0.0.0.0"
+[cloud]
+tls_required = false
+rate_limit_auth_failures_per_minute = 10
+"#,
+            )?;
+            let cfg = load(Some(Path::new("gtmux.toml")), "").unwrap();
+            let cloud = cfg.cloud.expect("cloud section present");
+            assert!(cloud.trusted_proxy_ips.is_empty());
+            assert!(cloud.trusted_proxy_ips_required);
             Ok(())
         });
     }

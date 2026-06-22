@@ -61,12 +61,13 @@ pub async fn shutdown_handler(State(state): State<AppState>, req: Request<Body>)
     // Read the body manually (empty / absent body → `credential_required`,
     // never a deserialize 400/500).
     let (parts, body) = req.into_parts();
+    let peer = crate::auth::peer_from_parts(&parts);
     let headers = parts.headers;
     let body = match parse_step_up_body(body).await {
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    if let Err(rejection) = verify_step_up(&state, &headers, &body).await {
+    if let Err(rejection) = verify_step_up(&state, &headers, peer, &body).await {
         let mut resp = rejection.into_response();
         apply_security_headers(resp.headers_mut(), &state.config);
         return resp;

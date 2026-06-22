@@ -27,6 +27,7 @@
 #![allow(missing_docs)]
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,12 +36,14 @@ use argon2::password_hash::SaltString;
 use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
 use gtmux_auth::{verify_token, TokenString};
+use gtmux_config::{derive_mode, Mode};
+use ipnet::IpNet;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
 use serde_json::json;
@@ -475,15 +478,20 @@ pub struct LoginBody {
 ///   * 400 — neither `token` nor `password` present (missing credential).
 pub async fn auth_login_handler(
     State(state): State<AppState>,
+    // Infallible peer extractor — `None` on test / non-TCP paths where the peer
+    // socket isn't plumbed. `FromRequestParts`, so it precedes `Json` (the body
+    // consumer). `Option<ConnectInfo<…>>` is *not* a valid axum 0.8 extractor,
+    // hence the custom `OptionalPeer`.
+    OptionalPeer(peer): OptionalPeer,
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Response {
     let limiter = state.rate_limiter.clone();
     let limit = state.config.auth.rate_limit_per_5min;
-    // Rate-limit key: prefer X-Forwarded-For (when behind a trusted proxy in
-    // Cloud mode), fall back to a global "_local" bucket in Local mode where
-    // ConnectInfo isn't plumbed through `into_make_service()`.
-    let key = rate_limit_key(&headers);
+    // Rate-limit key (ADR-0003 D12): Local → "_local"; Cloud → the trusted
+    // proxy's forwarded client IP when the peer is in `trusted_proxy_ips`, else
+    // the raw socket peer (forged X-Forwarded-For cannot move the bucket).
+    let key = rate_limit_key_for_state(&state, &headers, peer);
 
     let presented_token = body.token.as_deref().filter(|t| !t.is_empty());
     let presented_password = body.password.as_deref().filter(|p| !p.is_empty());
@@ -623,18 +631,111 @@ impl StepUpRejection {
     }
 }
 
-/// Derive the per-IP rate-limit key from request headers exactly as
-/// [`auth_login_handler`] does (ADR-0020 D5): prefer the first
-/// `X-Forwarded-For` hop (trusted proxy in Cloud mode), else a single
-/// `_local` bucket (Local mode where `ConnectInfo` isn't plumbed). Shared so
-/// step-up failures land in the *same* bucket as login failures.
-pub(crate) fn rate_limit_key(headers: &HeaderMap) -> String {
+/// Parse the configured `[cloud].trusted_proxy_ips` CIDR allowlist into
+/// [`IpNet`] values **once at boot** (ADR-0003 D12, SSoT §1.11). Each string
+/// is a CIDR (`"192.0.2.10/32"`, `"10.0.0.0/8"`, `"2001:db8::/32"`); a bare IP
+/// without a prefix is also accepted and treated as a host route (`/32` for
+/// IPv4, `/128` for IPv6). Any malformed entry is a hard error so boot can
+/// fail-closed rather than silently trusting nothing (an attacker could
+/// otherwise rely on a typo'd allowlist to keep forging `X-Forwarded-For`).
+///
+/// Returns an empty `Vec` when the section is absent or the list is empty
+/// (Local mode, or cloud-with-no-proxy) — the caller then keys on the socket
+/// peer (XFF ignored). The returned `Vec` is wrapped in an `Arc` by the
+/// caller and stored on [`crate::AppState`] for the request hot path.
+pub fn parse_trusted_proxy_nets(config: &gtmux_config::Config) -> Result<Vec<IpNet>, AuthError> {
+    let Some(cloud) = config.cloud.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut nets = Vec::with_capacity(cloud.trusted_proxy_ips.len());
+    for raw in &cloud.trusted_proxy_ips {
+        let trimmed = raw.trim();
+        // Accept a CIDR (`a.b.c.d/n`) directly; fall back to parsing a bare IP
+        // as a host route so operators can write `"192.0.2.10"` without `/32`.
+        let net = trimmed
+            .parse::<IpNet>()
+            .or_else(|_| trimmed.parse::<IpAddr>().map(IpNet::from))
+            .map_err(|_| {
+                AuthError::Rand(format!(
+                    "[cloud].trusted_proxy_ips: {raw:?} is not a valid CIDR or IP address"
+                ))
+            })?;
+        nets.push(net);
+    }
+    Ok(nets)
+}
+
+/// Extract the first `X-Forwarded-For` hop (left-most = original client),
+/// trimmed. `None` when the header is absent or empty. Only `-For` is read —
+/// `-Proto`/`-Host` are not consumed anywhere in the codebase (ADR-0003 D12
+/// amend), so only `-For` is gated here.
+fn forwarded_first_hop(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.split(',').next())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "_local".to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Derive the per-IP rate-limit key, mode- and peer-aware (ADR-0003 D12 amend
+/// 2026-06-22, SSoT §1.11). Shared by login + both step-up paths so all three
+/// rate-limit call sites land failures in the *same* bucket.
+///
+/// Rules:
+///   * **Local mode** (`derive_mode(bind)` → `Local`) → `"_local"` — a single
+///     global bucket. There is no reverse proxy in front of a loopback bind,
+///     so XFF and the peer socket are both irrelevant. Unchanged from the
+///     pre-amend behaviour; existing Local-config tests stay green.
+///   * **Cloud mode**, `peer` ∈ `trusted_nets` (CIDR match) → the first
+///     `X-Forwarded-For` hop, i.e. the real client behind the trusted proxy.
+///     Falls back to `peer.to_string()` if the trusted proxy forwarded no XFF.
+///   * **Cloud mode**, `peer` ∉ `trusted_nets` / `peer` absent / `trusted_nets`
+///     empty → `peer.to_string()` — XFF is **ignored** so a client that isn't a
+///     trusted proxy cannot forge a header to escape its own bucket. `peer`
+///     absent (no `ConnectInfo`, e.g. a future unix-socket bind or a unit-test
+///     path) collapses to a single `"_peerless"` bucket — fail-closed: never
+///     trust XFF without a verified peer.
+pub(crate) fn rate_limit_key(
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+    mode: Mode,
+    trusted_nets: &[IpNet],
+) -> String {
+    if mode == Mode::Local {
+        return "_local".to_string();
+    }
+    // Cloud mode.
+    let peer = match peer {
+        Some(p) => p,
+        // No verified peer IP (no ConnectInfo plumbed, e.g. unix-socket bind or
+        // a test path). Fail-closed: ignore XFF, collapse into one bucket.
+        None => return "_peerless".to_string(),
+    };
+    let peer_trusted = trusted_nets.iter().any(|net| net.contains(&peer));
+    if peer_trusted {
+        // The peer is a trusted reverse proxy — honour its forwarded client IP.
+        if let Some(hop) = forwarded_first_hop(headers) {
+            return hop;
+        }
+    }
+    // Untrusted peer, or trusted peer that forwarded no XFF → key on the socket
+    // peer itself (forged XFF cannot move the bucket).
+    peer.to_string()
+}
+
+/// Convenience over [`rate_limit_key`] that reads `mode` + `trusted_nets` off
+/// the [`AppState`], so each of the three rate-limit call sites (login,
+/// step-up, union) only has to supply the request `headers` and the peer
+/// `IpAddr` extracted from `ConnectInfo`. Mode is derived from the bound
+/// address (`derive_mode(&state.config.server.bind)`).
+pub(crate) fn rate_limit_key_for_state(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+) -> String {
+    let mode = derive_mode(&state.config.server.bind);
+    rate_limit_key(headers, peer, mode, &state.trusted_proxy_nets)
 }
 
 /// Read a step-up action body into [`StepUpBody`], tolerating an empty or
@@ -687,6 +788,7 @@ pub(crate) async fn parse_step_up_body(body: Body) -> Result<StepUpBody, Respons
 pub(crate) async fn verify_step_up(
     state: &AppState,
     headers: &HeaderMap,
+    peer: Option<IpAddr>,
     body: &StepUpBody,
 ) -> Result<(), StepUpRejection> {
     // Missing / empty credential is *not* a deserialize error — D16.4 fixes
@@ -697,7 +799,7 @@ pub(crate) async fn verify_step_up(
 
     let limiter = state.rate_limiter.clone();
     let limit = state.config.auth.rate_limit_per_5min;
-    let key = rate_limit_key(headers);
+    let key = rate_limit_key_for_state(state, headers, peer);
 
     // Clone the stored hash out (and release the read lock) *before* the
     // memory-hard Argon2 verify — never hold the lock across the KDF, never
@@ -760,6 +862,7 @@ pub(crate) async fn verify_step_up(
 pub(crate) async fn verify_union_credential(
     state: &AppState,
     headers: &HeaderMap,
+    peer: Option<IpAddr>,
     body: &StepUpBody,
 ) -> Result<(), StepUpRejection> {
     let Some(credential) = body.credential.as_deref().filter(|c| !c.is_empty()) else {
@@ -768,7 +871,7 @@ pub(crate) async fn verify_union_credential(
 
     let limiter = state.rate_limiter.clone();
     let limit = state.config.auth.rate_limit_per_5min;
-    let key = rate_limit_key(headers);
+    let key = rate_limit_key_for_state(state, headers, peer);
 
     // Token axis — always active (D18.1: token is always a valid credential).
     // Clone the current server token out under the read lock before the
@@ -835,6 +938,7 @@ pub async fn auth_rotate_handler(State(state): State<AppState>, req: Request<Bod
     // credential verify, (3) reissue. Headers are read before the body is
     // consumed.
     let (parts, body) = req.into_parts();
+    let peer = peer_from_parts(&parts);
     let headers = parts.headers;
 
     let Some(old_cookie) = extract_session_cookie(&headers) else {
@@ -865,7 +969,7 @@ pub async fn auth_rotate_handler(State(state): State<AppState>, req: Request<Bod
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    if let Err(rejection) = verify_step_up(&state, &headers, &body).await {
+    if let Err(rejection) = verify_step_up(&state, &headers, peer, &body).await {
         let mut resp = rejection.into_response();
         apply_security_headers(resp.headers_mut(), &state.config);
         return resp;
@@ -1089,6 +1193,44 @@ pub(crate) fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
     extract_cookie_value(headers, COOKIE_NAME)
 }
 
+/// Pull the peer socket `IpAddr` out of request `parts` for the `Request<Body>`
+/// handlers (`/api/shutdown`, `/auth/rotate`, `/api/settings/password` reset)
+/// that read the body manually and so can't use the `ConnectInfo` extractor in
+/// their signature. `axum::serve(.., into_make_service_with_connect_info::<
+/// SocketAddr>())` inserts a `ConnectInfo<SocketAddr>` into the extensions on
+/// every TCP request; `None` when it's absent — a unit-test path, or a future
+/// `unix:` bind (no peer IP → XFF-ignore, fail-closed) (ADR-0003 D12).
+pub(crate) fn peer_from_parts(parts: &axum::http::request::Parts) -> Option<IpAddr> {
+    parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+}
+
+/// Infallible `FromRequestParts` extractor for the peer socket `IpAddr`. Reads
+/// the `ConnectInfo<SocketAddr>` extension that
+/// `into_make_service_with_connect_info::<SocketAddr>()` installs on each TCP
+/// request, returning `OptionalPeer(None)` when it's absent (unit-test
+/// `oneshot` paths, or a future `unix:` bind). Used instead of
+/// `Option<ConnectInfo<SocketAddr>>`, which is **not** a valid extractor in
+/// axum 0.8 (no blanket `Option` impl for `ConnectInfo`). Never rejects, so it
+/// can sit before the body-consuming `Json` extractor in `auth_login_handler`.
+pub(crate) struct OptionalPeer(pub Option<IpAddr>);
+
+impl<S> axum::extract::FromRequestParts<S> for OptionalPeer
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(OptionalPeer(peer_from_parts(parts)))
+    }
+}
+
 /// Convenience: per-AppState cookie-or-bearer check used by the
 /// `/api/*` middleware. Returns `Ok(())` on success.
 pub(crate) async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<(), ()> {
@@ -1289,5 +1431,154 @@ mod tests {
         assert_eq!(normalise_redirect_target(Some("https://evil")), "/");
         assert_eq!(normalise_redirect_target(Some("/canvas")), "/canvas");
         assert_eq!(normalise_redirect_target(Some("/x\r\nSet-Cookie: ev")), "/");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Trusted-proxy X-Forwarded-For rate-limit keying (ADR-0003 D12)
+    // ─────────────────────────────────────────────────────────────────────
+
+    fn xff_headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    fn net(cidr: &str) -> IpNet {
+        cidr.parse().unwrap()
+    }
+
+    fn ip(addr: &str) -> IpAddr {
+        addr.parse().unwrap()
+    }
+
+    /// Local mode → always the single `_local` bucket, regardless of peer / XFF
+    /// / trusted list. Guards the existing loopback rate-limit tests.
+    #[test]
+    fn local_mode_keys_local_bucket() {
+        let trusted = vec![net("203.0.113.5/32")];
+        // Even with a matching peer and a forged XFF, Local stays `_local`.
+        assert_eq!(
+            rate_limit_key(
+                &xff_headers("1.2.3.4"),
+                Some(ip("203.0.113.5")),
+                Mode::Local,
+                &trusted,
+            ),
+            "_local"
+        );
+        // And with no peer / no XFF at all.
+        assert_eq!(
+            rate_limit_key(&HeaderMap::new(), None, Mode::Local, &[]),
+            "_local"
+        );
+    }
+
+    /// Cloud + peer ∈ trusted (CIDR match) → key = the first X-Forwarded-For
+    /// hop (the real client behind the trusted reverse proxy).
+    #[test]
+    fn xff_trusted_peer_uses_forwarded_hop() {
+        // IPv4 /32 exact match.
+        let trusted = vec![net("203.0.113.5/32")];
+        assert_eq!(
+            rate_limit_key(
+                &xff_headers("198.51.100.7, 203.0.113.5"),
+                Some(ip("203.0.113.5")),
+                Mode::Cloud,
+                &trusted,
+            ),
+            "198.51.100.7",
+            "trusted peer's forwarded first hop is the client"
+        );
+
+        // IPv4 /24 range match — peer .77 inside 203.0.113.0/24.
+        let trusted_24 = vec![net("203.0.113.0/24")];
+        assert_eq!(
+            rate_limit_key(
+                &xff_headers("198.51.100.7"),
+                Some(ip("203.0.113.77")),
+                Mode::Cloud,
+                &trusted_24,
+            ),
+            "198.51.100.7"
+        );
+
+        // IPv6 trusted proxy.
+        let trusted_v6 = vec![net("2001:db8::/32")];
+        assert_eq!(
+            rate_limit_key(
+                &xff_headers("198.51.100.7"),
+                Some(ip("2001:db8::1")),
+                Mode::Cloud,
+                &trusted_v6,
+            ),
+            "198.51.100.7"
+        );
+    }
+
+    /// Cloud + peer ∉ trusted → XFF ignored, key = the raw socket peer. A
+    /// forged X-Forwarded-For cannot move the attacker out of their own bucket.
+    #[test]
+    fn xff_untrusted_peer_ignores_forwarded() {
+        let trusted = vec![net("203.0.113.5/32")];
+        // Peer .6 is NOT in the /32 trusted set → key on the peer, not the XFF.
+        assert_eq!(
+            rate_limit_key(
+                &xff_headers("198.51.100.7"),
+                Some(ip("203.0.113.6")),
+                Mode::Cloud,
+                &trusted,
+            ),
+            "203.0.113.6",
+            "untrusted peer's forged XFF must be ignored"
+        );
+
+        // Peer just outside a /24 trusted block.
+        let trusted_24 = vec![net("203.0.113.0/24")];
+        assert_eq!(
+            rate_limit_key(
+                &xff_headers("198.51.100.7"),
+                Some(ip("203.0.114.1")),
+                Mode::Cloud,
+                &trusted_24,
+            ),
+            "203.0.114.1"
+        );
+    }
+
+    /// Cloud + empty trusted list → every peer is untrusted → always key on the
+    /// socket peer (the operator-unset case: single proxy-IP bucket).
+    #[test]
+    fn xff_empty_trusted_keys_on_peer() {
+        assert_eq!(
+            rate_limit_key(
+                &xff_headers("198.51.100.7"),
+                Some(ip("203.0.113.5")),
+                Mode::Cloud,
+                &[],
+            ),
+            "203.0.113.5"
+        );
+    }
+
+    /// Cloud + trusted peer but no XFF header → fall back to the peer IP (a
+    /// trusted proxy that simply didn't forward a client header).
+    #[test]
+    fn xff_trusted_peer_without_header_keys_on_peer() {
+        let trusted = vec![net("203.0.113.5/32")];
+        assert_eq!(
+            rate_limit_key(&HeaderMap::new(), Some(ip("203.0.113.5")), Mode::Cloud, &trusted),
+            "203.0.113.5"
+        );
+    }
+
+    /// Cloud + peer absent (no ConnectInfo / future unix bind) → fail-closed
+    /// single `_peerless` bucket; XFF is never trusted without a verified peer.
+    #[test]
+    fn xff_peerless_cloud_collapses_to_single_bucket() {
+        let trusted = vec![net("203.0.113.5/32")];
+        assert_eq!(
+            rate_limit_key(&xff_headers("198.51.100.7"), None, Mode::Cloud, &trusted),
+            "_peerless"
+        );
     }
 }
