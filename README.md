@@ -152,6 +152,11 @@ gtmux is single-user software. It is intended for:
   proxy. Do not expose plaintext HTTP with tokens and cookies to the
   public internet.
 
+When running behind a reverse proxy, set `[cloud].trusted_proxy_ips` to
+the proxy's IP/CIDR so the auth rate limiter keys on each real client IP
+instead of lumping everyone into one bucket — see
+[QUICKSTART.md](QUICKSTART.md) §3.
+
 See [QUICKSTART.md](QUICKSTART.md) for the local/cloud setup flow.
 
 ---
