@@ -73,25 +73,28 @@ sudo install -m 755 backend/target/release/gtmux /usr/local/bin/gtmux
 ## 2) 실행 모드 A — Local (`bind = 127.0.0.1`, config 없음)
 
 이 머신에서만 접속한다면 config 파일을 만들 필요가 없다. 빌트인 디폴트
-(`bind = "127.0.0.1"`, `port = 9001`, `mode = token`) 가 이미 Local
-모드다.
+(`bind = "127.0.0.1"`, `port = 9001`) 가 이미 Local 모드다. port·로그를
+조정하고 싶을 때만 쓰는 템플릿이 `codebase/config.local.sample.toml` 에
+준비돼 있다.
 
 ```bash
 cd codebase
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-gtmux start --session local
+gtmux start --name local
 ```
 
 기동 시 stdout 에 1회 banner 가 출력된다.
 
 ```text
-gtmux local ready
+gtmux local ready (instance)
   Mode:         Local
   Bind:         127.0.0.1:9001
   Open URL:     http://127.0.0.1:9001/auth/bootstrap?token=<hex>
   Token path:   ~/.local/state/gtmux/local.token (0600)
-  Backend:      PtyBackend (supervisor pid=<n>)
+  Workspace(A): /Users/you
+  Store(C):     ~/.local/state/gtmux/store/local
+  Backend:      PtyBackend (ADR-0013, supervisor pid=<n>)
 ```
 
 Local 모드의 특징:
@@ -100,7 +103,7 @@ Local 모드의 특징:
 |---|---|
 | `bind` | `127.0.0.1` |
 | Mode | Local |
-| Auth | token bootstrap |
+| Auth | token bootstrap (선택적 password 추가 — §4 참조) |
 | TLS | 불필요 |
 | `[cloud]` 블록 | 불필요 |
 | 외부 기기 접속 | 불가 |
@@ -110,7 +113,7 @@ Local 모드의 특징:
 다른 터미널에서 종료:
 
 ```bash
-gtmux stop --session local
+gtmux stop --name local
 ```
 
 ---
@@ -122,15 +125,15 @@ gtmux stop --session local
 
 ### 3.1 Config 파일 작성
 
-`codebase/config.sample.toml` 을 그대로 복사한 뒤 두 군데의
-`PUBLIC_IP` 자리만 본인 서버 IP 또는 도메인으로 교체 (포트를
-9001 외로 바꾸면 그 값도 함께 갱신).
+`codebase/config.cloud.sample.toml` 을 그대로 복사한 뒤 `PUBLIC_HOST`
+자리만 본인 서버 IP 또는 도메인으로 교체 (포트를 9001 외로 바꾸면 그
+값도 함께 갱신).
 
 ```bash
 mkdir -p ~/.config/gtmux
 mkdir -p ~/.local/state/gtmux && chmod 700 ~/.local/state/gtmux
 
-cp codebase/config.sample.toml ~/.config/gtmux/prod.config.toml
+cp codebase/config.cloud.sample.toml ~/.config/gtmux/prod.config.toml
 $EDITOR    ~/.config/gtmux/prod.config.toml
 ```
 
@@ -138,15 +141,21 @@ $EDITOR    ~/.config/gtmux/prod.config.toml
 
 | 키 | 값 | 의미 |
 |---|---|---|
-| `[server].session` | `"prod"` | `--session` 인자와 일치 |
+| `[server].session` | `"prod"` | Server Instance 이름 — `--name` 인자와 일치해야 함 |
 | `[server].port` | `9001` | listen port |
 | `[server].bind` | `"0.0.0.0"` | 모든 인터페이스 listen → cloud mode 자동 발동 |
-| `[security].cors_origins` | `["http://PUBLIC_IP:9001"]` | 정확 일치, wildcard 금지 |
-| `[security].host_allowlist` | `["PUBLIC_IP:9001"]` | DNS rebind 방어 |
-| `[auth].mode` | `"token"` | `gtmux start` 가 매번 새 bootstrap URL 발행 (기본 검증 경로) |
-| `[cloud].tls_required` | `false` | 신뢰 네트워크 평문 HTTP 검증 경로. HTTPS reverse proxy 운영 시 `true` |
-| `[cloud].trusted_proxy_ips` | `["127.0.0.1/32"]` | `X-Forwarded-For` 를 신뢰할 reverse proxy IP/CIDR. per-client rate limit 용. 아래 주석 참조 |
-| `[assets].max_size_bytes` | `104857600` | 업로드 asset 1개당 최대 크기 (이 sample 은 100 MiB) |
+| `[security].cors_origins` | `["https://PUBLIC_HOST"]` | 정확 일치, wildcard 금지 |
+| `[security].host_allowlist` | `["PUBLIC_HOST"]` | DNS rebind 방어 |
+| `[cloud].rate_limit_auth_failures_per_minute` | `10` | `[cloud]` 필수 키 — 기본값 없음. 분당 인증 실패 허용 횟수 |
+| `[cloud].tls_required` | `true` | 기본값. gtmux 가 TLS 직접 종단 (`tls_cert`/`tls_key` 지정). reverse proxy 가 HTTPS 를 종단하는 신뢰 네트워크 검증 경로에서만 `false` |
+| `[cloud].trusted_proxy_ips` | `["10.0.0.2/32"]` | `X-Forwarded-For` 를 신뢰할 reverse proxy IP/CIDR. per-client rate limit 용 (proxy 형태). 아래 주석 참조 |
+| `[assets].max_size_bytes` | `52428800` | 업로드 asset 1개당 최대 크기 (이 sample 은 50 MiB) |
+
+> **Server Instance vs. session.** **Server Instance** 는 `--name` (TOML
+> 에서는 `[server].session` — 키 이름은 그대로지만 `--name` 과 일치해야
+> 함) 으로 식별되는 실행 중인 gtmux server 1개다. **session** 은 UI 안에서
+> 전환하는, 저장된 workspace/layout 레코드다. 둘은 서로 다른 개념 — 하나의
+> Server Instance 가 여러 session 을 담는다.
 
 모든 키의 인라인 설명은 sample 파일에 그대로 들어있다.
 
@@ -167,16 +176,16 @@ cd codebase
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
 gtmux start \
-  --session prod \
+  --name prod \
   --config ~/.config/gtmux/prod.config.toml
 ```
 
 방화벽이 있다면 `9001/tcp` 를 미리 연다 (`sudo ufw allow 9001/tcp`
 등). Banner 의 `Open URL` 은 여전히 `http://127.0.0.1:9001/...` 형식이라
-외부 브라우저에서는 host 부분을 `PUBLIC_IP` 로 교체해서 연다:
+외부 브라우저에서는 host 부분을 `PUBLIC_HOST` 로 교체해서 연다:
 
 ```text
-http://PUBLIC_IP:9001/auth/bootstrap?token=<hex>
+http://PUBLIC_HOST:9001/auth/bootstrap?token=<hex>
 ```
 
 ---
@@ -185,37 +194,50 @@ http://PUBLIC_IP:9001/auth/bootstrap?token=<hex>
 
 두 모드 모두 흐름은 같다.
 
-1. Banner 의 **bootstrap URL** 을 브라우저로 한 번 연다.
-2. 서버가 토큰을 검증하고 `HttpOnly` + `SameSite=Strict` session
-   쿠키 (7일 rolling renewal) 를 발급하면서 URL 에서 토큰을 지운다.
+1. Banner 의 **bootstrap URL** (magic link) 을 브라우저로 한 번 연다.
+2. 서버가 토큰을 검증하고 `gtmux_auth` 쿠키 (`HttpOnly` +
+   `SameSite=Strict` + `Path=/`, Cloud/HTTPS 에선 `Secure`, 7일 rolling
+   renewal) 를 발급한다.
 3. 이후로는 path-only URL 을 북마크한다 — Local 은
-   `http://127.0.0.1:9001/`, Cloud 는 `http://PUBLIC_IP:9001/`. 쿠키가
-   만료되거나 logout 하기 전까지 그대로 로그인 상태.
+   `http://127.0.0.1:9001/`, Cloud 는 `http://PUBLIC_HOST:9001/`. 쿠키가
+   만료되거나 sign out 하기 전까지 그대로 로그인 상태.
 
-### Password 모드로 전환 (선택)
+### Password 추가 (선택)
 
-기본값인 token 모드는 `gtmux start` 마다 새 bootstrap URL 을 발행한다.
-대신 안정적인 비밀번호 로그인을 쓰고 싶다면:
+**token** 은 항상 유효하다 — 위 magic link 는 매 `gtmux start` 마다
+동작한다. 여기에 **password** 를 **추가로** 설정할 수 있고, 둘 다 동시에
+유효하므로 아무거나로 로그인하면 된다. **선택할 auth "mode" 는 없다** —
+`[auth].mode` 는 deprecated·무시되며, password 추가에 **config 편집도
+재시작도 필요 없다**.
+
+password 설정은 둘 중 하나:
 
 ```bash
 gtmux set-password           # 2회 입력. Argon2id hash 저장
                               # → ~/.local/state/gtmux/password.argon2 (0600)
+                              # 다음 `gtmux start` 부터 활성
 ```
 
-Config 의 `[auth].mode = "password"` 로 바꾼 뒤 재시작. 로그인 페이지가
-토큰 자동 소비 대신 비밀번호 입력 폼으로 바뀐다 (5회 / 5분 throttle).
+또는 UI **Settings → Auth** — 실행 중 즉시 활성, 재시작 불요
+(password 로그인 폼은 5회 / 5분 throttle).
 
-비밀번호 분실 시 회전:
+**Password 제거** (token-only 로 복귀 — 비밀번호 분실 시 복구 경로):
 
 ```bash
-gtmux reset-password
+gtmux reset-password         # hash 파일 삭제 → token-only 로그인
 ```
 
-토큰 유출 시 회전 (cloud 모드 한정 — local 모드는 매 start 마다 자동
-재발급):
+또는 UI **Settings → Auth → "Delete password"** (token 또는 현재 password
+로 재인증 후 → token-only).
+
+**유출 token 회전.** UI **Settings → Auth → "Rotate token"** 은 서버
+token 을 재발급하고 **모든** session 을 sign out 시키며 (활성 탭 전부
+연결 해제) 새 로그인 링크를 보여준다. 먼저 현재 credential 재입력을
+요구한다. password 는 그대로 유지된다. CLI 등가 (정지된 서버용):
 
 ```bash
-gtmux rotate-token --session prod
+gtmux rotate-token --name prod   # offline 재발급. local 모드는 어차피
+                                 # 매 start 마다 재발급
 ```
 
 ---
@@ -261,7 +283,7 @@ cd codebase
 mkdir -p ~/.local/state/gtmux
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-nohup gtmux start --session local \
+nohup gtmux start --name local \
   > ~/.local/state/gtmux/local.log 2>&1 &
 
 tail -f ~/.local/state/gtmux/local.log   # bootstrap URL 확인
@@ -277,8 +299,8 @@ Cloud 도 동일 — `--config ~/.config/gtmux/prod.config.toml` 만 추가.
 어떤 방식으로 띄웠든 종료는 항상 다음 명령을 쓴다:
 
 ```bash
-gtmux stop --session <name>            # SIGTERM, 5초 대기
-gtmux stop --session <name> --force    # 이어서 SIGKILL
+gtmux stop --name <name>            # SIGTERM, 5초 대기
+gtmux stop --name <name> --force    # 이어서 SIGKILL
 ```
 
 이게 pidfile 을 존중하면서 모든 child shell 까지 reap 한다. Shell job
@@ -289,15 +311,18 @@ gtmux stop --session <name> --force    # 이어서 SIGKILL
 ## 7) Lifecycle 명령 reference
 
 ```bash
-gtmux status                            # 알려진 session + liveness
-gtmux status   --session prod           # 단일 session
-gtmux stop     --session prod [--force] # graceful / 강제
-gtmux teardown --session prod --force   # 5단계 청소
-                                        # (token / layout / pidfile / socket / config)
+gtmux status                            # 알려진 instance + liveness
+gtmux status   --name prod              # 단일 Server Instance
+gtmux stop     --name prod [--force]    # graceful / 강제
+gtmux teardown --name prod --force      # 5단계 청소
+                                        # (socket / token / layout / pidfile / config)
                                         # 부분 보존: --keep-state / --keep-config
-gtmux set-password / reset-password     # password 모드 credential
-gtmux rotate-token --session prod       # cloud 모드 token 회전
+gtmux set-password / reset-password     # 선택적 password credential 추가 / 제거
+gtmux rotate-token --name prod          # 서버 token 재발급 (cloud / offline)
 ```
+
+(`--session` 은 `--name` 의 deprecated alias 로 여전히 동작하나 deprecation
+경고를 출력한다.)
 
 전체 flag 는 `gtmux <subcommand> --help`.
 
@@ -312,8 +337,8 @@ gtmux rotate-token --session prod       # cloud 모드 token 회전
 | 브라우저에 `Forbidden` | `cors_origins` / `host_allowlist` 불일치 | scheme + host + port 가 모두 정확 일치해야 한다 |
 | `/` 가 `{"error":"not_found"}` | `GTMUX_FRONTEND_DIST` 없이 기동 | env var 지정 또는 번들 설치 |
 | `cannot find type Group / Panel in api.d.ts` | `make codegen` 누락 | 재실행 후 rebuild |
-| `Address already in use (os error 48)` | port 충돌 | `gtmux status` → `gtmux stop --session <name>` |
-| `pidfile exists but process is gone` | 이전 실행 crash | `gtmux teardown --session <name> --force --keep-state` |
+| `Address already in use (os error 48)` | port 충돌 | `gtmux status` → `gtmux stop --name <name>` |
+| `pidfile exists but process is gone` | 이전 실행 crash | `gtmux teardown --name <name> --force --keep-state` |
 | 재방문 시 `Forbidden` | 쿠키 만료 / 삭제 | 가장 최근 `gtmux start` 의 banner URL 다시 열기 |
 | `gtmux` 가 기동 거부 | root (`EUID == 0`) 실행 | 일반 유저로 |
 

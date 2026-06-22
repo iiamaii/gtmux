@@ -2,8 +2,8 @@
 
 > [English] · [한국어](USAGE.ko.md)
 >
-> What every part of the canvas does once you're past the auth dialog
-> and looking at the workspace. Companion to [`QUICKSTART.md`](QUICKSTART.md)
+> What every part of the canvas does once you've signed in and picked a
+> workspace session. Companion to [`QUICKSTART.md`](QUICKSTART.md)
 > (install / config / first sign-in).
 
 ---
@@ -23,18 +23,25 @@ Appendix:
 
 ## 1) Session management
 
-A **session** is one named persistent workspace: one Canvas layout file
-+ the Terminals you've spawned inside it + the visual items (notes,
-shapes, documents, …) you've placed on the canvas. One gtmux server
-hosts as many sessions as you want, but only **one is active per
-browser tab**.
+A **session** here is one named persistent workspace: one Canvas layout
+file + the Terminals you've spawned inside it + the visual items (notes,
+shapes, documents, …) you've placed on the canvas. One gtmux **Server
+Instance** (one running server, named by `--name`) hosts as many sessions
+as you want, but only **one is active per browser tab**.
 
-### 1.1 Where session state lives
+> Terminology: a **Server Instance** is one running gtmux server process
+> (started with `gtmux start --name <instance>`). A **session** is a saved
+> workspace/layout record you pick inside the UI. They are different
+> concepts — don't conflate them. (See also **Pane** = the real tmux/PTY
+> unit vs. **Panel** = the canvas visual object, §2.4.)
+
+### 1.1 Where state lives
 
 | Artifact | Path |
 |---|---|
-| Canvas layout (per session) | `${XDG_STATE_HOME:-~/.local/state}/gtmux/<session>.json` (schema v2: `groups[]` + `items[]` + `viewport`) |
-| Auth token | `${XDG_STATE_HOME}/gtmux/<session>.token` (mode 0600) |
+| Canvas layout (per session) | `${XDG_DATA_HOME:-~/.local/share}/gtmux/store/<instance>/<session>.json` (session record, schema v2: `groups[]` + `items[]` + `viewport`) |
+| Server token | `${XDG_STATE_HOME}/gtmux/<session>.token` (mode 0600) |
+| Password hash (when set) | `${XDG_STATE_HOME}/gtmux/password.argon2` (mode 0600; Argon2id PHC, per Server Instance — **not** per session) |
 | Pidfile | `${XDG_STATE_HOME}/gtmux/<session>.pid` |
 | Asset uploads | `<workspace>/.assets/<sha256>` (content-addressed) |
 | Server config | `${XDG_CONFIG_HOME:-~/.config}/gtmux/<session>.config.toml` |
@@ -43,46 +50,91 @@ The layout file is rewritten on every meaningful mutation (drag-commit,
 inspector edit, paste, …) with a 300 ms debounce. Terminal output is
 not persisted — only the panel positioning and metadata.
 
-### 1.2 The Auth dialog (first thing you see)
+### 1.2 Signing in (the `/auth` page)
 
-Triggered when the server has no active session bound to your browser
-tab yet — typically the very first sign-in, after `Switch session`, or
-after the server was restarted with a new identity.
+Sign-in itself happens on the `/auth` page, **before** the workspace
+loads. gtmux uses a single union sign-in: you always have a one-time
+**token** link, and you may additionally set a **password** — both are
+valid at once, so you can log in with either. There is no auth "mode".
+The `/auth` page shows both a token field and a password field; the
+password field is only active when a password is set (the page gates it
+via `GET /auth/methods`). A magic-link `?t=<token>` URL auto-submits and
+then strips the token from the address bar. See
+[`QUICKSTART.md`](QUICKSTART.md) for the full sign-in walkthrough.
 
-Choices in the dialog:
+### 1.3 The session picker (first thing after sign-in)
 
-- **[Existing session]** — pick from the list. Selecting prompts an
-  *Attach confirm modal* if the layout has a recent edit conflict.
-- **[New session]** — name → server creates the layout file and you
-  drop into an empty canvas.
+Once you're signed in, the **session picker** (`AuthDialog`, titled
+*"Choose a workspace session"*) appears whenever no session is bound to
+your browser tab yet — the first time in, after **Switch session…**, or
+after the server restarted with a new identity. It is a simple
+switchboard with two choices:
 
-### 1.3 Active session dropdown (toolbar, top-left)
+- **New session** — *"Start with an empty canvas."* Opens
+  `NewSessionModal`; name it → the server creates the layout file and
+  you drop into an empty canvas.
+- **Open existing** — *"Pick from saved workspaces."* Opens
+  `SessionListModal`; pick from the saved sessions.
+
+When no session is active the picker is non-dismissable (no Esc /
+backdrop / Cancel) — you must choose New or Open to proceed.
+
+### 1.4 Active session dropdown (toolbar, top-left)
 
 The button next to the toolbar's tool groups shows the active session
 name. Click it to open `SessionListModal` directly — pick another
-session and the canvas hot-swaps without a page reload (terminals from
-the old session are detached but kept alive in the server's terminal
-pool, so re-attaching later restores their live state).
+session and the canvas hot-swaps to it. By default the swap happens
+**without a page reload** (terminals from the old session are detached
+but kept alive in the server's terminal pool, so re-attaching later
+restores their live state). If you turn on **Settings → Behavior →
+Reload page on session switch**, the switch instead does a full page
+reload to reset caches, WS state, and attach state.
 
-### 1.4 Session menu (titlebar kebab)
+### 1.5 Session menu (titlebar kebab)
 
-The kebab `⋮` button in the titlebar opens `SessionMenu`. Items:
+The kebab `⋮` button in the titlebar opens `SessionMenu`. It has exactly
+**four items** — everything auth/lifecycle-related lives in Settings (see
+§1.6), not here:
 
 | Item | Effect |
 |---|---|
-| **New session** | Open `NewSessionModal`, name + create. |
-| **Session list** | Open `SessionListModal` (same as toolbar dropdown). |
-| **Import session** | Open `ImportSessionModal` — pick a `.json` file. Server validates schema and writes a new session file. Name conflict → 409, you can rename and retry. |
-| **Export session** | Open `ExportSessionModal` — downloads the current session as a JSON file. Includes layout (positions, labels, notes, references) but **not** terminal output and **not** the uploaded asset bytes. |
-| **Rotate token** | Token mode only. Issues a new token, reissues the cookie. |
-| **Settings** | Open `SettingsOverlay`. Tabs cover behavior, auth, keyboard shortcuts, assets storage. |
-| **Shutdown** | Confirm modal → server kills every PTY in this session, writes the layout, exits with code 0. |
-| **Logout** | Three-step flow: clear local reconnect hint → `POST /auth/logout` → full reload to `/auth`. Cookie is revoked server-side. |
+| **Switch session…** | Open the session picker (`SessionListModal`) to attach a different session. |
+| **Import layout** | Open `ImportSessionModal` — pick a `.json` file. The server validates the schema and writes a new session file. Name conflict → 409; rename and retry. |
+| **Export layout** | Open `ExportSessionModal` — downloads the current session as a JSON file. Includes layout (positions, labels, notes, references) but **not** terminal output and **not** the uploaded asset bytes. (Disabled when no session is active.) |
+| **Settings…** | Open `SettingsOverlay`. |
 
-Destructive actions (Delete session, Shutdown, Close panel, Delete
-group with children) always show a confirm modal.
+Destructive actions (Shutdown, Close panel, Delete group with children)
+always show a confirm modal; Shutdown and Rotate token additionally
+require a step-up re-auth (§1.6).
 
-### 1.5 Import / Export — what's in and what's out
+### 1.6 Settings → Auth & lifecycle
+
+`SettingsOverlay` is reached from the kebab's **Settings…**. Its
+left-rail sections are **Storage · Behavior · Appearance · Components ·
+Keyboard · Auth · About**. The auth/account and lifecycle actions —
+which used to be guessed at as kebab items — actually live here:
+
+**Settings → Auth** (account + credentials):
+
+| Action | Effect |
+|---|---|
+| **Sign out** | Clears the auth cookie and returns to `/auth`. Flow: clear the local reconnect hint → `POST /auth/logout` → navigate to `/auth`. |
+| **Rotate token** | Reissues the **server token** and signs out **every** session, including this one (BE `revoke_all` + active WebSockets closed with close code 4001). The old token link stops working; you get a fresh login link (copied to clipboard, also shown in the toast). Requires re-entering your current credential first (step-up: password if one is set, else token). Your password is unchanged. |
+| **Set / Change password** | Set a password (≥ 8 chars, a letter, and a digit) to sign in with, or change the existing one (enter the current password to authorise). Password sign-in becomes active immediately — no restart, and the token still works too. |
+| **Delete password** | Reverts to token-only sign-in. Confirmed with a union step-up — your **token OR** current **password** (lost-password recovery path). The cookie/session is unchanged; you can set a new password later. |
+| **Status** | Read-out rows: **Token** (Present / Missing) and **Password** (Set / Not set). |
+
+**Settings → About → Danger zone**:
+
+| Action | Effect |
+|---|---|
+| **Shutdown server** | Confirm modal → step-up re-auth → the server reaps every live pane, preserves the canvas layout on disk, emits a `SERVER_SHUTDOWN` frame over WS, and exits with **code 6**. Re-enter with `gtmux start --name <instance>`. |
+
+Step-up re-auth (ADR-0020 D16): both **Rotate token** and **Shutdown**
+open a re-auth modal that re-collects your current credential (password
+if set, else token) and verifies it inline before the action runs.
+
+### 1.7 Import / Export — what's in and what's out
 
 `Export` writes a single session `.json`:
 
@@ -103,7 +155,7 @@ This is fine for layout backup, sharing a canvas template, or moving a
 session between machines that share an asset store. It is not a full
 workspace archive.
 
-### 1.6 Attach recovery & reconnect
+### 1.8 Attach recovery & reconnect
 
 When the WebSocket drops (laptop sleep, server restart, network blip):
 
@@ -136,7 +188,7 @@ the browser tab.
               │
  ┌────────────▼───────────┐
  │  gtmux server          │  Rust (axum 0.8 + tokio). One process per
- │  · http-api crate      │  --session/--port pair.
+ │  · http-api crate      │  --name/--port pair (Server Instance).
  │  · ws-server crate     │  Origin / Host / CSRF middleware. Auth.
  │  · auth crate          │  Layout persistence (HTTP PUT, 300 ms debounce).
  │  · config crate        │
@@ -154,17 +206,20 @@ the browser tab.
 
 ### 2.1 gtmux server — what it owns
 
-- One **session binding**, set by `--session` and immutable for the
-  process lifetime.
-- HTTP API: `GET/PUT /api/layout`, `GET /api/sessions`, `POST
-  /api/sessions/import`, asset upload (`POST /api/assets/upload`),
-  file picker stat endpoint (`GET /api/files/stat`),
-  auth (`POST /auth/login`, `POST /auth/logout`).
+- One **Server Instance** identity, set by `--name` and immutable for
+  the process lifetime.
+- HTTP API: layout GET/PUT, `GET /api/sessions`, `POST
+  /api/sessions/import`, terminal pool (`GET /api/terminals`, `POST
+  /api/terminals/<id>/{kill,respawn}`), asset upload (`POST
+  /api/assets/upload`), file picker stat endpoint (`GET
+  /api/files/stat`), auth (`POST /auth/login`, `POST /auth/logout`,
+  `POST /auth/rotate`).
 - WebSocket: bidirectional control + data frames. Multiplexes
-  per-terminal output and notification frames.
+  per-terminal output and notification frames, and is the channel a new
+  terminal is spawned over (see §2.4).
 - Cookie auth gate on every HTTP and WS handshake.
-- Per-session canvas layout persistence to
-  `${XDG_STATE_HOME}/gtmux/<session>.json`.
+- Per-session canvas layout persistence to the session record
+  `${XDG_DATA_HOME:-~/.local/share}/gtmux/store/<instance>/<session>.json`.
 
 ### 2.2 Terminal server (`pty-backend` crate) — what it owns
 
@@ -195,7 +250,8 @@ Everything **visual** and **layout-related**:
 - Selection model: **M** (manipulation selection — items you're about
   to act on) is orthogonal to **I** (input target — the one Terminal
   panel that receives keystrokes).
-- Sidebars (left: layer tree + terminal list; right: inspector).
+- Sidebars (left: Layers / Terminals / Files tabs + a unified search
+  footer; right: inspector).
 - Toolbar, viewport controls, command palette, context menu.
 - Local FE clipboard (page lifetime), undo/redo stack (50 entries,
   in-memory).
@@ -211,7 +267,7 @@ This separation is load-bearing:
 | Identifier | `terminal_id` (UUID, server-issued) | item `id` (UUID, FE-issued) + reference to a `terminal_id` |
 | Owner | gtmux server (`pty-backend`) | Canvas layout (`items[]`) |
 | Cardinality | 1 process at a time | N panels can reference the *same* terminal |
-| Lifecycle | Spawned on `POST /api/pane/new`. Killed only by explicit close (or supervisor reap on crash). Survives WS disconnect, browser reload, session switch. | Spawned by the Terminal tool (or paste / duplicate). Disappears on panel close (which by default also closes the terminal). |
+| Lifecycle | Spawned over the WebSocket control channel (the server fans out a `pane-spawned` frame to subscribers); managed afterward via `GET /api/terminals` and `POST /api/terminals/<id>/{kill,respawn}`. Killed only by explicit close (or supervisor reap on crash). Survives WS disconnect, browser reload, session switch. | Spawned by the Terminal tool (or paste / duplicate). Disappears on panel close (which by default also closes the terminal). |
 | Persisted? | Live in-memory only. Not in layout JSON. Server restart = terminal gone. | Yes, position + label + the referenced `terminal_id` are written to the layout JSON. |
 | Output stream | One `tokio::broadcast` channel per terminal | Each panel is one subscriber on the channel |
 | Input stream | One master fd writer | Whichever panel is the input target (I) writes |
@@ -224,11 +280,12 @@ output in both, input from either reaches the same shell. This is
 useful when you want the same long-running process visible across
 multiple groups or sessions on the same server.
 
-To create a mirror today: copy a Terminal panel with **Cmd/Ctrl+C** and
-paste as mirror via the context menu (`Paste as mirror`, when
-available). Plain paste (Cmd/Ctrl+V) **clones** — a fresh terminal is
-spawned. The default keeps newcomers from accidentally creating
-multi-input panels.
+To point a panel at an existing terminal today: right-click a Terminal
+panel and choose **Change terminal…** (`changeTerminalDialog`) to attach
+it to another live `terminal_id` — two panels on the same `terminal_id`
+are mirrors. Plain copy/paste (Cmd/Ctrl+C / Cmd/Ctrl+V) **clones** — a
+fresh terminal is spawned for the pasted panel. Cloning by default keeps
+you from accidentally creating multi-input panels.
 
 #### What survives what
 
@@ -242,7 +299,7 @@ multi-input panels.
   survive. Layout JSON is replayed on next attach but
   every panel becomes *dangling*; double-click to spawn a fresh shell
   into the same panel slot.
-- **`gtmux teardown --session X`**: layout file + token + state all
+- **`gtmux teardown --name X`**: layout file + token + state all
   removed.
 
 ---
@@ -287,8 +344,12 @@ the icons are disabled.
 
 #### Terminal (T)
 - Click on the canvas to spawn a Terminal panel.
-- Backend: `POST /api/pane/new` opens a PTY pair, spawns the user's
-  `$SHELL` as the child, returns a fresh `terminal_id`.
+- Backend: the spawn request goes over the WebSocket control channel —
+  the server opens a PTY pair, spawns the user's `$SHELL` as the child,
+  and broadcasts a `pane-spawned` frame (carrying the fresh
+  `terminal_id`) to subscribers. (There is no `POST /api/pane/new`
+  endpoint; terminal-pool HTTP is `GET /api/terminals` and `POST
+  /api/terminals/<id>/{kill,respawn}`.)
 - Frontend: a panel mounts at the click position with default size
   (~640 × 360), attaches to the broadcast channel, and grabs the input
   target.
@@ -404,7 +465,7 @@ release.
 
 ### 3.7 Customising shortcuts
 
-`SettingsOverlay → Shortcuts` lets you reassign single-key bindings.
+`SettingsOverlay → Keyboard` lets you reassign single-key bindings.
 Overrides are saved to `localStorage`, scoped to your browser. Default
 bindings:
 
@@ -431,7 +492,7 @@ ordered list of children. Groups do
 **not** carry geometry of their own: the group's visual bounds are
 derived from its children every render.
 
-### 4.1 Data model (in `<session>.json`)
+### 4.1 Data model (in the session record `<session>.json`)
 
 ```
 groups[ {id, parent_id, label, color, visibility, locked, order} ]
@@ -464,7 +525,9 @@ children. Tree depth has no explicit cap; the schema is recursive.
 
 ### 4.4 Layer tree sidebar
 
-The left sidebar's **Layer tree** is the canonical Group manager.
+The left sidebar has **three tabs — Layers, Terminals, Files — plus a
+unified search footer** pinned at the bottom. The **Layers** tab is the
+canonical Group manager.
 
 - **Tree mode** (default): nested Groups and Panels, drag to reparent
   or reorder. Per-row icons: visibility toggle, lock toggle, type icon
@@ -474,10 +537,11 @@ The left sidebar's **Layer tree** is the canonical Group manager.
   badge. Use this to debug "what's in front?" or to spot accidentally
   buried items.
 
-The sibling sidebar tab — **Terminal list view** — flattens out all
-Terminal items in the active session (regardless of which group they
-sit in) for quick selection, label rename, and the *Connect to existing
-terminal* flow (`ChangeTerminalModal`).
+The **Terminals** tab flattens out all Terminal items in the active
+session (regardless of which group they sit in) for quick selection,
+label rename, and the *Change terminal* flow (`ChangeTerminalModal`).
+The **Files** tab browses the workspace file tree. The search footer
+filters whichever tab is active.
 
 ### 4.5 Z-index and Groups
 
@@ -515,10 +579,10 @@ The FE clipboard (page-lifetime, in-memory) understands Groups:
   preserved.
 - **Duplicate** = paste without touching the clipboard.
 
-Terminal item paste defaults to **Clone** (a fresh terminal is spawned
-for each pasted panel). The context menu offers **Paste as mirror**
-when the source terminal still exists in the pool — the pasted panel
-shares the *same* `terminal_id` as the original.
+Terminal item paste **clones** (a fresh terminal is spawned for each
+pasted panel). To make a panel mirror an existing terminal instead, use
+the panel's right-click **Change terminal…** action to attach it to a
+live `terminal_id` — two panels on the same `terminal_id` are mirrors.
 
 ### 4.7 Multi-select and bulk operations
 
@@ -612,7 +676,7 @@ text area).
 | `0` | Reset zoom to 100% |
 | Shift + `1` | Fit all items in viewport |
 
-All single-key bindings are reassignable in **Settings → Shortcuts**.
+All single-key bindings are reassignable in **Settings → Keyboard**.
 
 ---
 
@@ -620,14 +684,20 @@ All single-key bindings are reassignable in **Settings → Shortcuts**.
 
 ### Titlebar (44 px, top)
 
-- Left: Session menu (kebab `⋮`).
-- Centre: `gtmux · <session> · <host>:<port> · <auth-mode>`.
-- Right: Theme toggle (light / dark), Focus mode toggle (P1+).
+- Left: Session menu (kebab `⋮`) + brand mark + "gtmux".
+- Centre: `<host>:<port> · Local` — the page host (from
+  `window.location.host`) and the run mode, currently always the literal
+  `Local`. No `<auth-mode>`, no session name, no `gtmux ·` prefix.
+- Right: a single **Refresh page** button (full reload). Theme lives in
+  **Settings → Appearance**, not the titlebar.
 
 ### Left sidebar (248 px, dockable)
 
-- Tab 1: **Layer tree** (Groups + Items, tree mode / z mode).
-- Tab 2: **Terminal list view** (flat per-session list of Terminal items).
+- Three tabs: **Layers** (Groups + Items, tree mode / z mode),
+  **Terminals** (flat per-session list of Terminal items), and **Files**
+  (workspace file tree).
+- A unified **search footer** pinned at the bottom filters the active
+  tab.
 
 ### Right panel — Inspector
 
@@ -656,8 +726,8 @@ Adapts to whether you clicked an item, a group, or the canvas:
   forward / Send backward, Lock / Unlock, Show / Hide,
   Minimize / Maximize.
 - **Group**: above + Change color, Rename, Ungroup.
-- **Terminal panel**: above + Connect to existing terminal (`Change
-  terminal`).
+- **Terminal panel**: above + **Change terminal…** (attach the panel to
+  another live terminal).
 
 ### Reconnect banner (32 px, conditional)
 
