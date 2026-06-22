@@ -154,6 +154,10 @@ gtmux는 단일 사용자 앱입니다. 권장 운영 범위는 다음과 같습
 - **Public internet 노출**: gtmux를 직접 HTTP로 노출하지 말고 HTTPS reverse
   proxy 뒤에 둡니다. 토큰과 쿠키가 평문으로 나가는 구성을 피해야 합니다.
 
+reverse proxy 뒤에서 운영할 땐 `[cloud].trusted_proxy_ips` 에 proxy 의
+IP/CIDR 를 지정해, auth rate limit 이 모두를 한 버킷에 묶지 않고 실제
+client IP 별로 동작하게 하세요 — [QUICKSTART.ko.md](QUICKSTART.ko.md) §3 참조.
+
 자세한 local/cloud 설정은 [QUICKSTART.ko.md](QUICKSTART.ko.md)를 보세요.
 
 ---

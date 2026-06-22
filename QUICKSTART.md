@@ -149,9 +149,21 @@ Key fields:
 | `[security].host_allowlist` | `["PUBLIC_IP:9001"]` | DNS-rebind defence |
 | `[auth].mode` | `"token"` | Bootstrap URL per `gtmux start` (default validated path) |
 | `[cloud].tls_required` | `false` | Plaintext HTTP for trusted-network validation. Set `true` once you front the server with HTTPS. |
+| `[cloud].trusted_proxy_ips` | `["127.0.0.1/32"]` | Reverse-proxy IP/CIDR whose `X-Forwarded-For` is trusted for per-client rate limiting. See note below. |
 | `[assets].max_size_bytes` | `104857600` | 100 MiB per uploaded asset (image / document) |
 
 Every key is documented inline in the sample.
+
+> **Trusted proxy / `X-Forwarded-For`.** When gtmux sits behind a reverse
+> proxy, set `[cloud].trusted_proxy_ips` to the proxy's IP/CIDR so the
+> auth rate limiter keys on the real client IP. gtmux trusts `X-Forwarded-For`
+> **only** when the request's socket peer IP matches that list (spoofed
+> XFF is ignored). If it is unset/empty, XFF is ignored entirely and every
+> client behind the proxy shares **one** rate-limit bucket (one user's
+> failed logins can throttle everyone) — gtmux prints a stderr warning at
+> boot unless you set `trusted_proxy_ips_required = false`. Only
+> `X-Forwarded-For` is consulted (`-Proto`/`-Host` are not). Local mode is
+> unaffected. Full detail: `docs/deploy.md` §3.6.3.
 
 ### 3.2 Start the server
 

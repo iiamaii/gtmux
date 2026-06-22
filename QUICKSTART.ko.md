@@ -145,9 +145,20 @@ $EDITOR    ~/.config/gtmux/prod.config.toml
 | `[security].host_allowlist` | `["PUBLIC_IP:9001"]` | DNS rebind 방어 |
 | `[auth].mode` | `"token"` | `gtmux start` 가 매번 새 bootstrap URL 발행 (기본 검증 경로) |
 | `[cloud].tls_required` | `false` | 신뢰 네트워크 평문 HTTP 검증 경로. HTTPS reverse proxy 운영 시 `true` |
+| `[cloud].trusted_proxy_ips` | `["127.0.0.1/32"]` | `X-Forwarded-For` 를 신뢰할 reverse proxy IP/CIDR. per-client rate limit 용. 아래 주석 참조 |
 | `[assets].max_size_bytes` | `104857600` | 업로드 asset 1개당 최대 크기 (이 sample 은 100 MiB) |
 
 모든 키의 인라인 설명은 sample 파일에 그대로 들어있다.
+
+> **Trusted proxy / `X-Forwarded-For`.** gtmux 를 reverse proxy 뒤에 둘
+> 땐 `[cloud].trusted_proxy_ips` 에 proxy 의 IP/CIDR 를 명시해야 auth
+> rate limit 이 실제 client IP 별로 동작한다. gtmux 는 요청의 socket peer
+> IP 가 이 목록과 매치될 때**만** `X-Forwarded-For` 를 신뢰한다 (위조 XFF
+> 는 무시). 미설정/빈 목록이면 XFF 가 전부 무시되고 proxy 뒤 모든 client
+> 가 **하나의** rate-limit 버킷을 공유한다 (한 사람의 로그인 실패가 전원을
+> throttle). 이 경우 boot 시 stderr 경고가 뜨며, `trusted_proxy_ips_required
+> = false` 로 끌 수 있다. `X-Forwarded-For` 만 본다 (`-Proto`/`-Host` 미사용).
+> Local 모드는 무관. 상세: `docs/deploy.md` §3.6.3.
 
 ### 3.2 서버 기동
 
