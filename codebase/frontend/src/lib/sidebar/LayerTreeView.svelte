@@ -1650,13 +1650,16 @@
    * viewport's top edge. Above rows, below the context menu; clickable. */
   .sticky-stack {
     position: absolute;
+    top: 0;
     left: 0;
     right: 0;
     z-index: 2;
-    pointer-events: auto;
+    pointer-events: none; /* container ignores events; rows opt back in below. */
     display: flex;
     flex-direction: column;
-    box-shadow: 0 2px 4px color-mix(in srgb, var(--color-shadow, #000) 18%, transparent);
+    background: var(--color-surface); /* opaque base occludes scrolling rows, incl. on hover (matches Files) */
+    border-bottom: 1px solid var(--color-border);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.12);
   }
 
   .sticky-row {
@@ -1666,12 +1669,13 @@
     width: 100%;
     padding-right: var(--space-8);
     border: 0;
-    background: var(--color-bg);
+    background: var(--color-surface); /* match Files token (was --color-bg) */
     color: var(--color-fg-muted);
     text-align: left;
     cursor: pointer;
     font: inherit;
     font-size: var(--text-md);
+    pointer-events: auto; /* clickable even though the container opted out. */
   }
 
   .sticky-row:hover {
