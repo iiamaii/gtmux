@@ -757,6 +757,7 @@
    * tree has no reliable hierarchy to pin). */
   const MAX_STICKY = 6;
   const STICKY_ROW_HEIGHT_FALLBACK = 28;
+  const STICKY_STACK_BORDER = 1; // .sticky-stack border-bottom (px)
 
   let treeScrollEl = $state<HTMLUListElement | null>(null);
   let scrollTop = $state(0);
@@ -832,11 +833,19 @@
     return out;
   });
 
-  /** Click a sticky header → scroll that ancestor row to the top of the view. */
-  function scrollRowToTop(index: number): void {
+  /**
+   * Click a sticky header → reveal that ancestor row just BELOW the sticky
+   * ancestors that stay pinned for it (ADR-0052 D7), not at content-top where its
+   * own pinned ancestors would cover it. `btn.offsetTop` within the absolutely-
+   * positioned `.sticky-stack` is exactly the cumulative height of the ancestors
+   * above the clicked row — the strip that will remain occluded after the jump.
+   */
+  function scrollRowToTop(index: number, btn?: HTMLElement): void {
     const el = treeScrollEl;
     if (el === null) return;
-    el.scrollTop = index * rowHeight;
+    const stickyOffset =
+      btn && btn.offsetTop > 0 ? btn.offsetTop + STICKY_STACK_BORDER : 0;
+    el.scrollTop = Math.max(0, index * rowHeight - stickyOffset);
   }
 
   // Panel 행이 dead pane 인지 — 회색/취소선 표시 트리거.
@@ -1301,7 +1310,7 @@
                 tabindex="-1"
                 style:padding-left={`${sr.node.depth * 16 + 4}px`}
                 title={groupDisplayLabel(sg)}
-                onclick={() => scrollRowToTop(sr.index)}
+                onclick={(e) => scrollRowToTop(sr.index, e.currentTarget as HTMLElement)}
               >
                 <span class="type-icon group-type-icon" aria-hidden="true">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
