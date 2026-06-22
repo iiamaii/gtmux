@@ -108,6 +108,7 @@
   const MAX_FILE_TREE_EXPANSIONS = 200;
   // ADR-0052 D7 — sticky parent header stack depth cap.
   const MAX_STICKY = 6;
+  const STICKY_STACK_BORDER = 1; // .sticky-stack border-bottom (px)
   // Fallback row height when the live `.row` offsetHeight cannot be measured yet
   // (≈ icon row + 2px row gap; matches the CSS in this file). Replaced by the
   // measured value on first render — ADR-0052 D7.
@@ -437,11 +438,16 @@
     return true;
   }
 
-  function onStickyClick(index: number): void {
+  function onStickyClick(index: number, btn?: HTMLElement): void {
     const el = treeScrollEl;
     if (!el) return;
-    // Scroll the clicked ancestor row to the top of the viewport (D7).
-    el.scrollTop = index * effectiveRowHeight();
+    // Reveal the clicked ancestor just BELOW the sticky ancestors that stay
+    // pinned for it (ADR-0052 D7), not at content-top where they would cover it.
+    // `btn.offsetTop` within the absolutely-positioned `.sticky-stack` = the
+    // cumulative height of those pinned ancestors (the strip that stays occluded).
+    const stickyOffset =
+      btn && btn.offsetTop > 0 ? btn.offsetTop + STICKY_STACK_BORDER : 0;
+    el.scrollTop = Math.max(0, index * effectiveRowHeight() - stickyOffset);
     recomputeSticky();
   }
 
@@ -1805,7 +1811,7 @@
                 title={stickyRow.path}
                 onclick={(e: MouseEvent) => {
                   e.stopPropagation();
-                  onStickyClick(stickyIndex);
+                  onStickyClick(stickyIndex, e.currentTarget as HTMLElement);
                 }}
               >
                 {@render fileIconSvg(stickyRow)}
