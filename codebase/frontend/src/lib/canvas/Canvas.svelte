@@ -1222,6 +1222,10 @@
       clearCanvasDrillAndSelection();
       return;
     }
+    // Drag multi-select is a canvas selection like a single click — return to
+    // the Layers tab when in Files (parity with onCanvasPointerDown / onnodeclick).
+    // The empty-canvas / zero-hit branches above stay in Files (deselect only).
+    returnToLayerTabForCanvasSelection();
     sessionStore.setM(ids);
     suppressNextPaneClick();
   }
