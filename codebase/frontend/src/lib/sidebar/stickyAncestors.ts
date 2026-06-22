@@ -55,3 +55,58 @@ export function ancestorIndices(
   capped.reverse();
   return capped;
 }
+
+/**
+ * VSCode-style "push-out" offset (px) for the BOTTOM sticky header (ADR-0052 D7
+ * amend ④, push-out-only). When the next row that ends the deepest sticky
+ * ancestor's subtree (the first row after `topIndex` whose depth ≤ that
+ * ancestor's depth — its next sibling / uncle) rises into the sticky band, the
+ * bottom sticky header is pushed up by their overlap, clamped to one sticky-row
+ * height so only the bottom row slides before the set recomputes.
+ *
+ * Returns 0 when there is no sticky stack, no pushing row exists yet, or the row
+ * has not entered the band. Pure arithmetic — no DOM. The caller applies the
+ * result as `transform: translateY(-offset)` on the last sticky row only
+ * (compositor-only; keeps the overlay base pinned per amend ③).
+ *
+ * @param rows           flattened DFS rows carrying `depth`
+ * @param stickyIndices  current sticky ancestor indices (top-down) of the top row
+ * @param topIndex       floor(scrollTop / rowHeight) — the topmost visible row
+ * @param scrollTop      live scroll position (px)
+ * @param rowHeight      tree row pitch (px)
+ * @param stickyHeight   one sticky header row height (px)
+ */
+export function bottomPushOffset(
+  rows: ReadonlyArray<{ depth: number }>,
+  stickyIndices: ReadonlyArray<number>,
+  topIndex: number,
+  scrollTop: number,
+  rowHeight: number,
+  stickyHeight: number,
+): number {
+  const k = stickyIndices.length;
+  if (k === 0 || rowHeight <= 0 || stickyHeight <= 0) return 0;
+
+  const lastIdx = stickyIndices[k - 1];
+  if (lastIdx === undefined) return 0;
+  const last = rows[lastIdx];
+  if (last === undefined) return 0;
+  const deepestDepth = last.depth;
+
+  // First row after the top row that is NOT inside the bottom ancestor's subtree
+  // (depth ≤ its depth). That row is what pushes the bottom header up.
+  let nb = -1;
+  for (let i = Math.max(topIndex, lastIdx) + 1; i < rows.length; i += 1) {
+    const r = rows[i];
+    if (r !== undefined && r.depth <= deepestDepth) {
+      nb = i;
+      break;
+    }
+  }
+  if (nb < 0) return 0;
+
+  const nbTop = nb * rowHeight - scrollTop; // viewport-y of the pushing row
+  const overlap = k * stickyHeight - nbTop; // > 0 once it enters the band
+  if (overlap <= 0) return 0;
+  return Math.min(overlap, stickyHeight);
+}
