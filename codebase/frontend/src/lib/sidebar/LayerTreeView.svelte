@@ -1281,21 +1281,16 @@
       description="No group or panel label matches the search."
     />
   {:else}
-    <ul
-      class="tree"
-      role="tree"
-      aria-label="Canvas layer tree"
-      bind:this={treeScrollEl}
-      onscroll={onTreeScroll}
-    >
+    <div class="tree-viewport">
+      <!-- ADR-0052 D7 (clarify amend ③) — sticky ancestor overlay lives OUTSIDE
+           the scrolling <ul>, as a sibling pinned at CSS top:0 in this
+           non-scrolling relative wrapper. No per-scroll JS positioning → it
+           rides the compositor with the rows instead of chasing scrollTop a
+           frame behind (the prior jitter). Mirrors FileTreeView. -->
       {#if stickyRows.length > 0}
-        <!-- Sticky ancestor stack (ADR-0052 D7). Absolutely pinned to the top of
-             the scroll container; pointer-events active, above rows / below the
-             context menu. Hidden while searching. -->
         <div
           class="sticky-stack"
           aria-hidden="true"
-          style:top={`${scrollTop}px`}
         >
           {#each stickyRows as sr (sr.node.id)}
             {#if sr.node.kind === 'group'}
@@ -1325,6 +1320,13 @@
           {/each}
         </div>
       {/if}
+      <ul
+        class="tree"
+        role="tree"
+        aria-label="Canvas layer tree"
+        bind:this={treeScrollEl}
+        onscroll={onTreeScroll}
+      >
       {#each visibleTree as node (node.kind + ':' + node.id)}
         {#if node.kind === 'group'}
         {@const g = node.group}
@@ -1608,7 +1610,8 @@
         </li>
         {/if}
       {/each}
-    </ul>
+      </ul>
+    </div>
   {/if}
 </div>
 
@@ -1635,6 +1638,20 @@
     border-radius: 2px;
   }
 
+  /* ── Tree viewport (sticky overlay anchor) (ADR-0052 D7 clarify ③) ──
+   * Non-scrolling relative wrapper that fills the available height. The inner
+   * <ul.tree> scrolls; the .sticky-stack overlay is pinned to this wrapper's
+   * top edge (top:0), so it no longer chases scrollTop per-frame. Mirrors
+   * FileTreeView's .tree-viewport. */
+  .tree-viewport {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
   .tree {
     flex: 1 1 auto;
     overflow-y: auto;
@@ -1642,12 +1659,12 @@
     list-style: none;
     margin: 0;
     padding: var(--space-4) 0;
-    position: relative;
   }
 
-  /* Sticky parent header stack (ADR-0052 D7). Absolutely positioned inside the
-   * scroll container; `top` tracks scrollTop so the stack stays pinned to the
-   * viewport's top edge. Above rows, below the context menu; clickable. */
+  /* Sticky parent header stack (ADR-0052 D7 clarify ③). Sibling overlay OUTSIDE
+   * the scrolling <ul>, absolutely pinned to the non-scrolling .tree-viewport's
+   * top edge (top:0, no per-scroll JS). Above rows, below the context menu;
+   * rows are clickable. Mirrors FileTreeView. */
   .sticky-stack {
     position: absolute;
     top: 0;
