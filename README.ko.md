@@ -75,6 +75,11 @@ panel을 의미 있는 위치에 두고, 주변에 note와 snippet을 붙이고,
   session layout JSON을 export/import할 수 있습니다. live terminal output과
   업로드 asset byte는 export에 포함되지 않습니다.
 
+- **간단한 로그인**  
+  서버가 출력하는 일회용 token 링크로 접속합니다. 추가로 password를 설정하면
+  둘 중 아무 쪽으로나 로그인할 수 있습니다. 자세한 내용은
+  [QUICKSTART.ko.md](QUICKSTART.ko.md)를 참조하세요.
+
 ---
 
 ## 편의성 및 기대 효과
@@ -98,7 +103,7 @@ gtmux는 shell을 대체하려는 도구가 아니라, shell 작업에 공간과
 
 ### Backend
 
-- **Rust 1.85**
+- **Rust 1.85+ (MSRV)**
 - **axum 0.8**, **tower/tower-http** — HTTP API, static serving,
   middleware, CORS, Host validation
 - **tokio 1.52** — async runtime, process, IO, signal, timer
@@ -106,7 +111,7 @@ gtmux는 shell을 대체하려는 도구가 아니라, shell 작업에 공간과
 - **portable-pty** — cross-platform PTY 기반 child shell
 - **serde / serde_json** — layout 및 API 데이터
 - **figment + TOML** — 설정 파일
-- **argon2** — password mode credential 저장
+- **argon2** — 선택적 password 로그인 credential(Argon2id) 저장
 - **utoipa + openapi-typescript** — OpenAPI 기반 frontend type 생성
 
 ### Frontend
@@ -116,6 +121,7 @@ gtmux는 shell을 대체하려는 도구가 아니라, shell 작업에 공간과
 - **xterm.js 6** + fit / Unicode 11 addon — terminal rendering
 - **marked + DOMPurify** — markdown document rendering 및 sanitization
 - **lucide-svelte** — UI icon
+- **openapi-fetch** — backend 계약 기반 typed HTTP 클라이언트
 - Backend OpenAPI 계약에서 생성되는 TypeScript API 타입
 
 ---
@@ -134,7 +140,7 @@ make codegen
 ( cd backend  && cargo build --workspace --release )
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-./backend/target/release/gtmux start --session demo
+./backend/target/release/gtmux start --name demo
 ```
 
 서버 stdout에 출력되는
@@ -169,7 +175,7 @@ client IP 별로 동작하게 하세요 — [QUICKSTART.ko.md](QUICKSTART.ko.md)
 
 ---
 
-## Repository layout
+## Repository Layout
 
 ```
 codebase/
@@ -196,3 +202,5 @@ group, snippet, document, asset, import/export, auth, reconnect, local/cloud
 ## License
 
 Rust workspace metadata와 동일하게 **MIT OR Apache-2.0** 듀얼 라이선스입니다.
+[codebase/backend/LICENSE-MIT](codebase/backend/LICENSE-MIT) 와
+[codebase/backend/LICENSE-APACHE](codebase/backend/LICENSE-APACHE) 를 참조하세요.

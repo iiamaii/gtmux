@@ -76,25 +76,28 @@ short form `gtmux` is used.
 ## 2) Run mode A — Local (`bind = 127.0.0.1`, no config file)
 
 If only this machine will connect, skip the config file entirely. The
-built-in defaults (`bind = "127.0.0.1"`, `port = 9001`, `mode = token`)
-are already the Local mode.
+built-in defaults (`bind = "127.0.0.1"`, `port = 9001`) are already the
+Local mode. A ready-made template — only needed if you want to tune the
+port / logging — lives at `codebase/config.local.sample.toml`.
 
 ```bash
 cd codebase
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-gtmux start --session local
+gtmux start --name local
 ```
 
 Startup banner (printed once on stdout):
 
 ```text
-gtmux local ready
+gtmux local ready (instance)
   Mode:         Local
   Bind:         127.0.0.1:9001
   Open URL:     http://127.0.0.1:9001/auth/bootstrap?token=<hex>
   Token path:   ~/.local/state/gtmux/local.token (0600)
-  Backend:      PtyBackend (supervisor pid=<n>)
+  Workspace(A): /Users/you
+  Store(C):     ~/.local/state/gtmux/store/local
+  Backend:      PtyBackend (ADR-0013, supervisor pid=<n>)
 ```
 
 Local-mode characteristics:
@@ -103,7 +106,7 @@ Local-mode characteristics:
 |---|---|
 | `bind` | `127.0.0.1` |
 | Mode | Local |
-| Auth | token bootstrap |
+| Auth | token bootstrap (add an optional password — see §4) |
 | TLS | not required |
 | `[cloud]` block | not required |
 | External access | not possible |
@@ -114,7 +117,7 @@ reaped).
 Stop from another terminal:
 
 ```bash
-gtmux stop --session local
+gtmux stop --name local
 ```
 
 ---
@@ -126,15 +129,15 @@ network needs to reach the server.
 
 ### 3.1 Write a config file
 
-A ready-made template lives at `codebase/config.sample.toml`. Copy it
-and replace the two `PUBLIC_IP` placeholders with your server's IP or
+A ready-made template lives at `codebase/config.cloud.sample.toml`. Copy
+it and replace the `PUBLIC_HOST` placeholders with your server's IP or
 domain (also swap `9001` if you change the port).
 
 ```bash
 mkdir -p ~/.config/gtmux
 mkdir -p ~/.local/state/gtmux && chmod 700 ~/.local/state/gtmux
 
-cp codebase/config.sample.toml ~/.config/gtmux/prod.config.toml
+cp codebase/config.cloud.sample.toml ~/.config/gtmux/prod.config.toml
 $EDITOR    ~/.config/gtmux/prod.config.toml
 ```
 
@@ -142,15 +145,21 @@ Key fields:
 
 | Key | Value | Why |
 |---|---|---|
-| `[server].session` | `"prod"` | Must match `--session` |
+| `[server].session` | `"prod"` | Server Instance name — must match `--name` |
 | `[server].port` | `9001` | Listen port |
 | `[server].bind` | `"0.0.0.0"` | Listen on every interface → cloud mode auto-enables |
-| `[security].cors_origins` | `["http://PUBLIC_IP:9001"]` | Exact match, no wildcards |
-| `[security].host_allowlist` | `["PUBLIC_IP:9001"]` | DNS-rebind defence |
-| `[auth].mode` | `"token"` | Bootstrap URL per `gtmux start` (default validated path) |
-| `[cloud].tls_required` | `false` | Plaintext HTTP for trusted-network validation. Set `true` once you front the server with HTTPS. |
-| `[cloud].trusted_proxy_ips` | `["127.0.0.1/32"]` | Reverse-proxy IP/CIDR whose `X-Forwarded-For` is trusted for per-client rate limiting. See note below. |
-| `[assets].max_size_bytes` | `104857600` | 100 MiB per uploaded asset (image / document) |
+| `[security].cors_origins` | `["https://PUBLIC_HOST"]` | Exact match, no wildcards |
+| `[security].host_allowlist` | `["PUBLIC_HOST"]` | DNS-rebind defence |
+| `[cloud].rate_limit_auth_failures_per_minute` | `10` | Required `[cloud]` key — no default; per-minute auth-failure ceiling |
+| `[cloud].tls_required` | `true` | Default. gtmux terminates TLS (supply `tls_cert`/`tls_key`). Set `false` only when a reverse proxy fronts HTTPS for trusted-network validation. |
+| `[cloud].trusted_proxy_ips` | `["10.0.0.2/32"]` | Reverse-proxy IP/CIDR whose `X-Forwarded-For` is trusted for per-client rate limiting (proxy mode). See note below. |
+| `[assets].max_size_bytes` | `52428800` | 50 MiB per uploaded asset (image / document) |
+
+> **Server Instance vs. session.** A **Server Instance** is one running
+> gtmux server, named by `--name` (and `[server].session` in the TOML —
+> the key keeps its old name but must match `--name`). A **session** is a
+> saved workspace/layout record you switch between inside the UI. They are
+> different concepts — one Server Instance holds many sessions.
 
 Every key is documented inline in the sample.
 
@@ -172,17 +181,17 @@ cd codebase
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
 gtmux start \
-  --session prod \
+  --name prod \
   --config ~/.config/gtmux/prod.config.toml
 ```
 
 Open the host firewall if any (`sudo ufw allow 9001/tcp`, etc.). The
 banner still shows `http://127.0.0.1:9001/auth/bootstrap?token=...` —
-replace the host part with your `PUBLIC_IP` to open it from another
+replace the host part with your `PUBLIC_HOST` to open it from another
 device:
 
 ```text
-http://PUBLIC_IP:9001/auth/bootstrap?token=<hex>
+http://PUBLIC_HOST:9001/auth/bootstrap?token=<hex>
 ```
 
 ---
@@ -191,39 +200,53 @@ http://PUBLIC_IP:9001/auth/bootstrap?token=<hex>
 
 Both modes use the same flow.
 
-1. Open the **bootstrap URL** from the banner once in your browser.
-2. The server validates the token, sets an `HttpOnly` + `SameSite=Strict`
-   session cookie (7-day rolling renewal), and strips the token from the
-   URL.
+1. Open the **bootstrap URL** (the magic link) from the banner once in
+   your browser.
+2. The server validates the token and issues the `gtmux_auth` cookie
+   (`HttpOnly` + `SameSite=Strict` + `Path=/`, `Secure` on Cloud/HTTPS,
+   7-day rolling renewal).
 3. After that, bookmark the path-only URL — `http://127.0.0.1:9001/` in
-   Local mode, `http://PUBLIC_IP:9001/` in Cloud mode. The cookie keeps
-   you signed in until you log out or it expires.
+   Local mode, `http://PUBLIC_HOST:9001/` in Cloud mode. The cookie keeps
+   you signed in until you sign out or it expires.
 
-### Switching to password mode (optional)
+### Adding a password (optional)
 
-Token mode is the default and reissues a new bootstrap URL on every
-`gtmux start`. If you want a stable password instead:
+The **token** is always valid — the magic link above works on every
+`gtmux start`. You may **additionally** set a **password**; both
+credentials stay valid at once, so you can log in with either. There is
+**no auth "mode" to choose** — `[auth].mode` is deprecated and ignored,
+and adding a password needs **no config edit and no restart**.
+
+Set a password either way:
 
 ```bash
-gtmux set-password           # prompts twice, writes Argon2id hash
+gtmux set-password           # prompts twice, writes an Argon2id hash
                               # → ~/.local/state/gtmux/password.argon2 (0600)
+                              # active from the next `gtmux start`
 ```
 
-Then set `[auth].mode = "password"` in the config and restart. The
-login page will ask for the password instead of consuming a token (5
-attempts / 5 minutes throttle).
+or in the UI — **Settings → Auth** — which applies it live, no restart
+(5 attempts / 5 minutes throttle on the password login form).
 
-To rotate a forgotten password:
+**Remove the password** (back to token-only — this is the lost-password
+recovery path):
 
 ```bash
-gtmux reset-password
+gtmux reset-password         # deletes the hash file → token-only login
 ```
 
-To rotate a leaked token (cloud only — local mode rotates on every
-start):
+or **Settings → Auth → "Delete password"** (re-authenticate with the
+token or the current password first → token-only).
+
+**Rotate a leaked token.** **Settings → Auth → "Rotate token"** reissues
+the server token, signs out **every** session (all active tabs
+disconnect), and shows a fresh login link; it asks you to re-enter your
+current credential first. The password is left unchanged. The CLI
+equivalent (for a stopped server) is:
 
 ```bash
-gtmux rotate-token --session prod
+gtmux rotate-token --name prod   # offline reissue; local mode reissues
+                                 # on every start anyway
 ```
 
 ---
@@ -270,7 +293,7 @@ cd codebase
 mkdir -p ~/.local/state/gtmux
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-nohup gtmux start --session local \
+nohup gtmux start --name local \
   > ~/.local/state/gtmux/local.log 2>&1 &
 
 tail -f ~/.local/state/gtmux/local.log   # read the bootstrap URL
@@ -287,8 +310,8 @@ long-lived deployments.
 Regardless of how you launched it, always stop the server with:
 
 ```bash
-gtmux stop --session <name>            # SIGTERM, 5 s grace
-gtmux stop --session <name> --force    # then SIGKILL
+gtmux stop --name <name>            # SIGTERM, 5 s grace
+gtmux stop --name <name> --force    # then SIGKILL
 ```
 
 This honours the pidfile and reaps every child shell. Killing the shell
@@ -299,15 +322,18 @@ job directly leaves orphaned PTYs.
 ## 7) Lifecycle reference
 
 ```bash
-gtmux status                            # all known sessions + liveness
-gtmux status   --session prod           # one session
-gtmux stop     --session prod [--force] # graceful / forced shutdown
-gtmux teardown --session prod --force   # 5-step cleanup
-                                        # (token / layout / pidfile / socket / config)
+gtmux status                            # all known instances + liveness
+gtmux status   --name prod              # one Server Instance
+gtmux stop     --name prod [--force]    # graceful / forced shutdown
+gtmux teardown --name prod --force      # 5-step cleanup
+                                        # (socket / token / layout / pidfile / config)
                                         # opt-out parts with --keep-state / --keep-config
-gtmux set-password / reset-password     # password-mode credential
-gtmux rotate-token --session prod       # cloud-mode token rotation
+gtmux set-password / reset-password     # add / remove the optional password credential
+gtmux rotate-token --name prod          # reissue the server token (cloud / offline)
 ```
+
+(`--session` is still accepted as a deprecated alias for `--name`; it
+prints a deprecation warning.)
 
 `gtmux <subcommand> --help` for the complete flag list.
 
@@ -322,8 +348,8 @@ gtmux rotate-token --session prod       # cloud-mode token rotation
 | Browser shows `Forbidden` | `cors_origins` / `host_allowlist` mismatch | Origin must match exactly — scheme + host + port |
 | `/` returns `{"error":"not_found"}` | Started server without `GTMUX_FRONTEND_DIST` | Set the env var or install the bundle |
 | `cannot find type Group / Panel in api.d.ts` | Skipped `make codegen` | Run `make codegen`, rebuild |
-| `Address already in use (os error 48)` | Port taken | `gtmux status` → `gtmux stop --session <name>` |
-| `pidfile exists but process is gone` | Previous crash | `gtmux teardown --session <name> --force --keep-state` |
+| `Address already in use (os error 48)` | Port taken | `gtmux status` → `gtmux stop --name <name>` |
+| `pidfile exists but process is gone` | Previous crash | `gtmux teardown --name <name> --force --keep-state` |
 | Bootstrap URL says “Forbidden” on re-open | Cookie expired / cleared | Re-open the most recent banner URL |
 | `gtmux` refuses to start | Running as root (`EUID == 0`) | Switch to a regular user |
 

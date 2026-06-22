@@ -67,6 +67,9 @@ and return later to the same layout.
 - **Move layouts around.** Import/export session JSON for backups or
   templates. Live terminal output and uploaded asset bytes are not
   bundled in exports.
+- **Sign in simply.** Open the one-time token link the server prints;
+  you can additionally set a password and then log in with either. See
+  [QUICKSTART.md](QUICKSTART.md) for details.
 
 ---
 
@@ -94,7 +97,7 @@ workspace.
 
 ### Backend
 
-- **Rust 1.85**
+- **Rust 1.85+ (MSRV)**
 - **axum 0.8** and **tower/tower-http** for HTTP, static serving,
   middleware, CORS, Host validation, and API routing
 - **tokio 1.52** for async runtime, process handling, IO, signals, and
@@ -103,7 +106,7 @@ workspace.
 - **portable-pty** for cross-platform PTY-backed child shells
 - **serde / serde_json** for layout and API data
 - **figment + TOML** for configuration
-- **argon2** for password-mode credential storage
+- **argon2** for the optional password-login credential (Argon2id)
 - **utoipa + openapi-typescript** for OpenAPI-driven frontend types
 
 ### Frontend
@@ -113,6 +116,7 @@ workspace.
 - **xterm.js 6** with fit and Unicode 11 addons for terminal rendering
 - **marked + DOMPurify** for sanitized markdown document rendering
 - **lucide-svelte** for UI icons
+- **openapi-fetch** for the typed HTTP client over the backend contract
 - OpenAPI-generated API types shared from the backend contract
 
 ---
@@ -131,7 +135,7 @@ make codegen
 ( cd backend  && cargo build --workspace --release )
 
 GTMUX_FRONTEND_DIST="$PWD/frontend/dist" \
-./backend/target/release/gtmux start --session demo
+./backend/target/release/gtmux start --name demo
 ```
 
 Open the `Open URL: .../auth/bootstrap?token=...` line printed by the
@@ -196,4 +200,6 @@ software rather than a stable production platform.
 ## License
 
 Dual-licensed under **MIT OR Apache-2.0**, matching the Rust workspace
-metadata.
+metadata. See
+[codebase/backend/LICENSE-MIT](codebase/backend/LICENSE-MIT) and
+[codebase/backend/LICENSE-APACHE](codebase/backend/LICENSE-APACHE).
