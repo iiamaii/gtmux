@@ -1,0 +1,68 @@
+# gtmux Sample Config — Cloud 모드 (외부 노출, 보안 정책 강제)
+#
+# 언제 쓰나: 본인 머신 밖(LAN / VPN / Tailscale / 공인 IP)에서 접속. bind 가 loopback 이
+# 아니면 Cloud 모드가 자동 발동하고 [cloud] 섹션이 *필수*가 된다(없으면 부팅 거부).
+# Cloud 모드는 per-IP rate limit · strict origin/Host · (기본)TLS/HSTS 를 강제한다.
+#
+# 사용법:
+#   1) 본 파일을 `~/.config/gtmux/<name>.config.toml` 로 복사
+#   2) PUBLIC_HOST(공인 IP 또는 도메인) 와 port 를 본인 환경으로 교체
+#   3) 아래 [cloud] 에서 배포 형태 A(직접 TLS) / B(reverse proxy) 중 하나 선택
+#   4) `gtmux start --name <name> --config ~/.config/gtmux/<name>.config.toml`
+#
+# 인증(ADR-0020 D18): token 은 부팅 시 발급되며 cloud 에서는 영속(명시 회전 전까지 유지).
+#   password 를 추가하려면 `gtmux set-password`(다음 start 부터) 또는 UI Settings → Auth
+#   (즉시 활성). token·password 동시 유효. 누출 token 즉시 차단 = UI [Rotate token]
+#   (서버 token 재발급 + 전원 로그아웃 + 활성 WS 종료) 또는 CLI `gtmux rotate-token --name <name>`.
+#
+# 상세: codebase/QUICKSTART.ko.md, docs/deploy.md
+
+schema_version = 1
+
+[server]
+session = "prod"
+port    = 9001
+# 비-loopback bind → Cloud 모드 자동 추론. "0.0.0.0"(모든 인터페이스) 또는 특정 외부 IP.
+bind    = "0.0.0.0"
+
+[runtime]
+log_level  = "info"
+log_format = "auto"    # systemd journal 로 보낼 땐 "json"
+
+[security]
+# 브라우저가 보낼 Origin 의 정확-일치 화이트리스트. wildcard 금지. scheme+host(+port)
+# 형식으로, 브라우저가 *실제 접속하는* origin 그대로 적는다(reverse proxy 면 프록시의
+# 공개 origin). 여러 호스트(IP + 도메인)는 모두 나열.
+cors_origins   = ["https://PUBLIC_HOST"]
+# Host 헤더 화이트리스트 — DNS rebinding 방어. cors_origins 와 host 부분 일치.
+host_allowlist = ["PUBLIC_HOST"]
+
+[auth]
+cookie_max_age_days = 7
+rate_limit_per_5min = 5
+
+[assets]
+max_size_bytes = 52428800   # 50 MiB
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [cloud] — Cloud 모드 필수 섹션. 아래 형태 A / B 중 하나를 택한다.
+# ─────────────────────────────────────────────────────────────────────────────
+[cloud]
+# 분당 인증 실패 허용 횟수. [cloud] 의 *필수* 키(기본값 없음 — 생략하면 부팅 거부).
+rate_limit_auth_failures_per_minute = 10
+
+# ── 형태 A (권장·기본): gtmux 가 TLS 를 직접 종단 ──
+#   tls_required = true 가 기본값. cert/key 를 지정해야 부팅을 통과한다(둘 다 PEM, 0600).
+tls_required = true
+tls_cert = "/etc/gtmux/cert.pem"
+tls_key  = "/etc/gtmux/key.pem"
+
+# ── 형태 B (reverse proxy 가 TLS 종단): 위 A 의 3줄을 지우고 아래 주석을 해제 ──
+#   nginx / Caddy 등이 HTTPS 를 종단하고 gtmux 로 평문 HTTP 를 전달하는 경우.
+# tls_required = false                  # 신뢰 네트워크 평문 HTTP 허용(escape hatch)
+# trusted_proxy_ips = ["10.0.0.2/32"]   # 프록시 IP/CIDR. 이 IP 에서 온 요청에 한해
+#                                       # X-Forwarded-For 의 client IP 를 rate-limit key 로
+#                                       # 신뢰한다(ADR-0003 D12). 미설정/빈 목록이면 XFF 무시
+#                                       # → 프록시 socket IP 단일 버킷(전 클라이언트 공유) +
+#                                       # 부팅 시 stderr 경고. 프록시 IP 를 넣어야 per-client.
+# trusted_proxy_ips_required = true     # false 로 두면 위 빈 목록 경고를 끈다

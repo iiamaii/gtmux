@@ -1,0 +1,51 @@
+# gtmux Sample Config — Local 모드 (loopback, 단일 머신)
+#
+# 언제 쓰나: 본인 컴퓨터에서만 접속(127.0.0.1). 외부 노출 없음, TLS 불요.
+# 사실 Local 모드는 config 파일 없이도 동작한다 — built-in default(bind=127.0.0.1,
+# port=9001)가 곧 Local 모드다. 본 파일은 port·로그·디바운스 등을 조정하고 싶을 때만 쓴다.
+#
+# 사용법:
+#   1) 본 파일을 `~/.config/gtmux/<name>.config.toml` 로 복사
+#   2) `<name>` 을 본인 instance 이름으로 교체(아래 [server].session 과 일치)
+#   3) `gtmux start --name <name> --config ~/.config/gtmux/<name>.config.toml`
+#
+# 인증(ADR-0020 D18): token 은 매 `gtmux start` 마다 자동 발급(배너의 Open URL 한 번
+#   열면 쿠키 발급). password 를 추가로 쓰려면 `gtmux set-password`(다음 start 부터 활성)
+#   또는 UI Settings → Auth(실행 중 즉시 활성, 재시작 불요). token·password 는 동시에
+#   유효하다(둘 중 아무거나로 로그인). config 에 배타적 auth mode 선택지는 없다.
+#
+# 상세: codebase/QUICKSTART.ko.md
+
+schema_version = 1
+
+[server]
+# instance 이름. `--name <name>` 과 일치해야 함. safe-filename charset
+# (^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$). 부팅 immutable.
+session = "local"
+# listen port. 1024–65535 (privileged port < 1024 는 거부).
+port    = 9001
+# loopback bind → Local 모드 자동 추론. "127.0.0.1" | "::1" | "localhost" |
+# "unix:/path/to.sock" 모두 Local. 외부 노출은 config.cloud.sample.toml 참조.
+bind    = "127.0.0.1"
+
+# ── 이하 섹션은 전부 선택 — 생략 시 안전한 기본값이 적용된다. ──
+
+[runtime]
+log_level  = "info"   # trace|debug|info|warn|error|off
+log_format = "auto"   # auto(tty=text / pipe=json) | text | json
+# ring_buffer_size_kb     = 128   # pane 당 스크롤백 ring buffer (KB)
+# layout_debounce_ms      = 300   # Canvas Layout HTTP PUT debounce (ms)
+# panel_state_debounce_ms = 300   # Panel streaming-state 토글 debounce (ms)
+
+[auth]
+# Cookie 수명(일). 1–30, rolling renewal(사용 중이면 자동 연장).
+cookie_max_age_days = 7
+# password 로그인 실패 brute-force 방어: N 시도 / 5분 / IP.
+rate_limit_per_5min = 5
+
+[assets]
+# 업로드 asset 1개당 최대 저장 크기(byte). 기본 50 MiB.
+max_size_bytes = 52428800
+
+# Local 모드는 [security](cors_origins / host_allowlist)를 생략하면 loopback alias
+# (127.0.0.1 / localhost / [::1])로 자동 합성한다. [cloud] 섹션은 Local 에서 무시된다.
