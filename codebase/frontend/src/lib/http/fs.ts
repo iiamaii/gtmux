@@ -499,6 +499,27 @@ export function fsFileUrl(path: string): string {
   return `/api/fs/file?${qs}`;
 }
 
+// Attachment variant of `fsFileUrl` — `?disposition=attachment` opts the BE into
+// serving `Content-Disposition: attachment` so the browser saves rather than
+// renders inline (ADR-0047 D12.4). Keep `fsFileUrl` for inline preview render.
+export function fsDownloadUrl(path: string): string {
+  const qs = new URLSearchParams({ path, disposition: 'attachment' });
+  return `/api/fs/file?${qs}`;
+}
+
+// Programmatic single-file download: create a temp `<a download>`, click it,
+// then remove it — saves without navigating away. Same-origin cookie GET (the
+// preview `<img>` already authenticates this way), so no extra auth handling.
+export function downloadWorkspaceFile(path: string, name: string): void {
+  if (typeof document === 'undefined') return;
+  const a = document.createElement('a');
+  a.href = fsDownloadUrl(path);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
 export async function uploadFs(
   dir: string,
   files: readonly File[],

@@ -41,6 +41,7 @@
     FsPayloadTooLargeError,
     FsUnsupportedMimeError,
     copyFs,
+    downloadWorkspaceFile,
     listDir,
     mkdirFs,
     moveFs,
@@ -2021,6 +2022,16 @@
 	        </button>
         <button type="button" role="menuitem" onclick={() => copyRowsToWorkspaceClipboard([row])}>
           Copy
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            downloadWorkspaceFile(row.path, row.entry.name);
+            closeContextMenu();
+          }}
+        >
+          Download
         </button>
 	        <button type="button" role="menuitem" onclick={() => openRename(row)}>
 	          Rename

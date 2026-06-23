@@ -5,7 +5,7 @@
 
   import { filePreviewStore } from '$lib/stores/filePreview.svelte';
   import { chromeStore } from '$lib/stores/chrome.svelte';
-  import { fsFileUrl } from '$lib/http/fs';
+  import { fsFileUrl, fsDownloadUrl } from '$lib/http/fs';
   import { UnauthorizedError } from '$lib/http/sessions';
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -528,7 +528,7 @@
         <span class="file-name" title={selection.path}>{basename(selection.path)}</span>
         <span class="actions">
           {#if previewUrl.length > 0}
-            <a class="icon-btn" href={previewUrl} download title="Download" aria-label="Download">
+            <a class="icon-btn" href={fsDownloadUrl(selection.path)} download={basename(selection.path)} title="Download" aria-label="Download">
               <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
                 <path d="M8 3v8M5 8l3 3 3-3M3 13h10"/>
               </svg>
@@ -636,7 +636,7 @@
         <div class="preview-max-actions">
           {#if !isMultiSelection && selection !== null}
             {#if previewUrl.length > 0}
-              <a class="icon-btn" href={previewUrl} download title="Download" aria-label="Download">
+              <a class="icon-btn" href={fsDownloadUrl(selection.path)} download={basename(selection.path)} title="Download" aria-label="Download">
                 <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
                   <path d="M8 3v8M5 8l3 3 3-3M3 13h10"/>
                 </svg>
