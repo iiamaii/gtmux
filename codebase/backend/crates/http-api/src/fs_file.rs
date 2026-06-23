@@ -41,6 +41,11 @@ pub struct FsFileQuery {
     /// Absolute path of the file to serve. Must resolve inside A and outside
     /// the denylist.
     pub path: String,
+    /// ADR-0047 D12.1 — opt-in attachment download. Only the value
+    /// `"attachment"` activates a `Content-Disposition: attachment` header;
+    /// anything else / absent serves inline (unchanged D3 preview behaviour).
+    #[serde(default)]
+    pub disposition: Option<String>,
 }
 
 /// `GET /api/fs/file?path=<abs>` — ADR-0047 D3. Streams a workspace file's
@@ -120,6 +125,19 @@ pub async fn fs_file_serve_handler(
         .header(header::CONTENT_LENGTH, bytes.len())
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::ETAG, &etag);
+    // ADR-0047 D12.1 — opt-in attachment download. Only `disposition=attachment`
+    // attaches a `Content-Disposition` header; the inline (default) response is
+    // byte-and-header identical to D3 so `<img>`/PdfViewer preview never regresses.
+    if q.disposition.as_deref() == Some("attachment") {
+        let basename = canonical
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("download");
+        builder = builder.header(
+            header::CONTENT_DISPOSITION,
+            attachment_disposition(basename),
+        );
+    }
     if mime == "image/svg+xml" {
         // Direct navigation to an SVG renders it as a top-level document where
         // inline scripts execute — stamp the same hardening CSP the asset
@@ -408,6 +426,78 @@ fn sanitize_filename(raw: &str) -> Option<String> {
     Some(base.to_string())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Content-Disposition (ADR-0047 D12.1) — RFC 6266 attachment with an
+//  RFC 5987-encoded UTF-8 filename plus an ASCII fallback.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build the `Content-Disposition` value for an attachment download:
+///   `attachment; filename="<ascii-fallback>"; filename*=UTF-8''<pct-encoded>`
+///
+/// `filename*` carries the exact UTF-8 basename (RFC 5987 percent-encoded, so
+/// Korean / other non-ASCII names round-trip); `filename` is a lossy ASCII
+/// approximation for legacy clients. Both are sanitized so no CR/LF/`"`/`\`
+/// can leak into the header value (header-injection safety).
+fn attachment_disposition(basename: &str) -> String {
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        ascii_fallback_filename(basename),
+        rfc5987_encode(basename),
+    )
+}
+
+/// Lossy ASCII approximation of a filename for the `filename="…"` parameter.
+/// Every non-ASCII byte, ASCII control, `"`, `\`, CR or LF is replaced with
+/// `_`; an empty result falls back to `download`. The replacement also makes
+/// header injection impossible (no CR/LF/`"` survive).
+fn ascii_fallback_filename(basename: &str) -> String {
+    let mut out = String::with_capacity(basename.len());
+    for ch in basename.chars() {
+        // ASCII printable except the quoting/escaping chars passes through.
+        if ch.is_ascii_graphic() && ch != '"' && ch != '\\' {
+            out.push(ch);
+        } else if ch == ' ' {
+            out.push(' ');
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        "download".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// RFC 5987 percent-encoding of `value`'s UTF-8 bytes for the `filename*`
+/// parameter: every byte outside the `attr-char` set is `%HH`-escaped. This is
+/// a tiny hand-rolled encoder so we don't pull in a new dependency just for one
+/// header (the `percent-encoding` crate is only transitively present).
+///
+/// `attr-char` (RFC 5987 §3.2.1): ALPHA / DIGIT and
+/// `! # $ & + - . ^ _ ` | ~`. Everything else (incl. CR/LF/`"`) is encoded,
+/// which also guarantees header-injection safety for this parameter.
+fn rfc5987_encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        let is_attr_char = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            );
+        if is_attr_char {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 fn error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(json!({ "error": code }))).into_response()
 }
@@ -475,6 +565,53 @@ mod tests {
         // Nothing from the batch was written (fresh.txt must not exist).
         assert!(!d.join("fresh.txt").exists());
         assert_eq!(std::fs::read(d.join("dup.txt")).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn rfc5987_encode_passes_attr_chars_and_escapes_the_rest() {
+        // attr-char set survives untouched.
+        assert_eq!(rfc5987_encode("aZ09-._~"), "aZ09-._~");
+        // Space, quote, and path separators are percent-encoded.
+        assert_eq!(rfc5987_encode("a b"), "a%20b");
+        assert_eq!(rfc5987_encode("a\"b"), "a%22b");
+        assert_eq!(rfc5987_encode("a/b"), "a%2Fb");
+        // Non-ASCII (Korean) → its UTF-8 bytes, percent-encoded uppercase hex.
+        // "한" = U+D55C = ED 95 9C in UTF-8.
+        assert_eq!(rfc5987_encode("한"), "%ED%95%9C");
+        // CR/LF cannot survive (header-injection safety).
+        assert_eq!(rfc5987_encode("a\r\nb"), "a%0D%0Ab");
+    }
+
+    #[test]
+    fn ascii_fallback_filename_replaces_unsafe_and_non_ascii() {
+        assert_eq!(ascii_fallback_filename("report.pdf"), "report.pdf");
+        assert_eq!(ascii_fallback_filename("with space.txt"), "with space.txt");
+        // Non-ASCII basename collapses to underscores but keeps the extension.
+        assert_eq!(ascii_fallback_filename("한글.png"), "__.png");
+        // Quote / backslash / control / CR / LF → `_` (no injection).
+        assert_eq!(ascii_fallback_filename("a\"b\\c\td.bin"), "a_b_c_d.bin");
+        // CR and LF each become `_` (two chars → two underscores).
+        assert_eq!(ascii_fallback_filename("a\r\nb"), "a__b");
+        // Wholly non-ASCII still yields a non-empty (underscore) approximation —
+        // only a truly empty result falls back to `download`.
+        assert_eq!(ascii_fallback_filename("한글"), "__");
+        assert_eq!(ascii_fallback_filename(""), "download");
+        // All-whitespace trims to empty → `download`.
+        assert_eq!(ascii_fallback_filename("   "), "download");
+    }
+
+    #[test]
+    fn attachment_disposition_format() {
+        // ASCII filename.
+        assert_eq!(
+            attachment_disposition("report.pdf"),
+            "attachment; filename=\"report.pdf\"; filename*=UTF-8''report.pdf"
+        );
+        // Korean filename: ASCII fallback is lossy, filename* round-trips bytes.
+        assert_eq!(
+            attachment_disposition("보고서.pdf"),
+            "attachment; filename=\"___.pdf\"; filename*=UTF-8''%EB%B3%B4%EA%B3%A0%EC%84%9C.pdf"
+        );
     }
 
     #[test]
