@@ -28,7 +28,7 @@
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
   import { matchNamePath } from '$lib/sidebar/treeMatch';
-  import { ancestorIndices } from '$lib/sidebar/stickyAncestors';
+  import { ancestorIndices, bottomPushOffset } from '$lib/sidebar/stickyAncestors';
 
   // ADR-0052 D2 — the single unified search bar now lives in LeftPanel's footer.
   // This component no longer renders its own input; it receives the active tab's
@@ -758,6 +758,7 @@
   const MAX_STICKY = 6;
   const STICKY_ROW_HEIGHT_FALLBACK = 28;
   const STICKY_STACK_BORDER = 1; // .sticky-stack border-bottom (px)
+  const STICKY_ROW_HEIGHT = 24; // .sticky-row height (px) — mirrors the CSS
 
   let treeScrollEl = $state<HTMLUListElement | null>(null);
   let scrollTop = $state(0);
@@ -831,6 +832,23 @@
       if (node !== undefined) out.push({ index: idx, node });
     }
     return out;
+  });
+
+  // Push-out offset (px) for the bottom sticky row (ADR-0052 D7 amend ④). As the
+  // next sibling section rises into the band it slides the deepest ancestor up.
+  // Only the bottom row translates (transform → compositor; overlay base stays
+  // pinned, amend ③). Recomputes on scroll via the reactive `scrollTop`.
+  const stickyBottomPush = $derived.by<number>(() => {
+    if (searching || stickyRows.length === 0) return 0;
+    const indices = stickyRows.map((r) => r.index);
+    return bottomPushOffset(
+      visibleTree,
+      indices,
+      stickyTopIndex,
+      scrollTop,
+      rowHeight,
+      STICKY_ROW_HEIGHT,
+    );
   });
 
   /**
@@ -1301,17 +1319,32 @@
           class="sticky-stack"
           aria-hidden="true"
         >
-          {#each stickyRows as sr (sr.node.id)}
+          {#each stickyRows as sr, i (sr.node.id)}
             {#if sr.node.kind === 'group'}
               {@const sg = sr.node.group}
+              {@const isLast = i === stickyRows.length - 1}
               <button
                 type="button"
                 class="sticky-row"
                 tabindex="-1"
                 style:padding-left={`${sr.node.depth * 16 + 4}px`}
+                style:z-index={stickyRows.length - i}
+                style:transform={isLast ? `translateY(-${stickyBottomPush}px)` : null}
                 title={groupDisplayLabel(sg)}
                 onclick={(e) => scrollRowToTop(sr.index, e.currentTarget as HTMLElement)}
               >
+                <!-- Fold caret (ADR-0052 D7 amend ④): a sticky row is an *expanded*
+                     ancestor, so it always shows ▾; clicking collapses it. -->
+                <span
+                  class="caret"
+                  role="presentation"
+                  onclick={(e: MouseEvent) => {
+                    e.stopPropagation();
+                    selectNode(sr.node.id);
+                    toggleExpand(sr.node.id);
+                  }}
+                  onkeydown={() => {}}
+                >▾</span>
                 <span class="type-icon group-type-icon" aria-hidden="true">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M4 8V5a1 1 0 0 1 1-1h3"/>
@@ -1688,6 +1721,9 @@
   }
 
   .sticky-row {
+    /* position + z-index let the push-out (ADR-0052 D7 amend ④) slide the bottom
+     * row BEHIND the ancestors above it (z-index set inline, descending). */
+    position: relative;
     display: flex;
     align-items: center;
     gap: var(--space-4);

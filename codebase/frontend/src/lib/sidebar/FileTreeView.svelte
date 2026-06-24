@@ -41,6 +41,7 @@
     FsPayloadTooLargeError,
     FsUnsupportedMimeError,
     copyFs,
+    downloadWorkspaceFile,
     listDir,
     mkdirFs,
     moveFs,
@@ -74,7 +75,7 @@
   import { shortcutRegistry, type ShortcutDescriptor } from '$lib/keyboard/shortcutRegistry.svelte';
   import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
   import { matchNamePath } from './treeMatch';
-  import { ancestorIndices } from './stickyAncestors';
+  import { ancestorIndices, bottomPushOffset } from './stickyAncestors';
   import { debounce } from '$lib/common/debounce';
 
   // ADR-0052 D2 — the search input now lives in the LeftPanel footer (one
@@ -109,6 +110,7 @@
   // ADR-0052 D7 — sticky parent header stack depth cap.
   const MAX_STICKY = 6;
   const STICKY_STACK_BORDER = 1; // .sticky-stack border-bottom (px)
+  const STICKY_ROW_HEIGHT = 24; // .sticky-row height (px) — mirrors the CSS
   // Fallback row height when the live `.row` offsetHeight cannot be measured yet
   // (≈ icon row + 2px row gap; matches the CSS in this file). Replaced by the
   // measured value on first render — ADR-0052 D7.
@@ -165,6 +167,9 @@
 
   // ── Sticky parent headers (ADR-0052 D7) ──
   let stickyIndices = $state<number[]>([]);
+  // Push-out offset (px) for the bottom sticky row (ADR-0052 D7 amend ④); updated
+  // every scroll in recomputeSticky. Only the bottom row translates (compositor).
+  let stickyPush = $state(0);
   let measuredRowHeight = $state(0);
   const searching = $derived(query.trim().length > 0);
 
@@ -418,11 +423,13 @@
     // Sticky is hierarchy-only; the flat search list has no ancestors (D7).
     if (searching) {
       if (stickyIndices.length > 0) stickyIndices = [];
+      if (stickyPush !== 0) stickyPush = 0;
       return;
     }
     const el = treeScrollEl;
     if (!el || rows.length === 0) {
       if (stickyIndices.length > 0) stickyIndices = [];
+      if (stickyPush !== 0) stickyPush = 0;
       return;
     }
     if (measuredRowHeight === 0) measureRowHeight();
@@ -430,6 +437,9 @@
     const topIndex = Math.floor(el.scrollTop / rowHeight);
     const next = ancestorIndices(rows, topIndex, MAX_STICKY);
     if (!sameIndices(next, stickyIndices)) stickyIndices = next;
+    // Push-out for the bottom sticky row (ADR-0052 D7 amend ④).
+    const push = bottomPushOffset(rows, next, topIndex, el.scrollTop, rowHeight, STICKY_ROW_HEIGHT);
+    if (push !== stickyPush) stickyPush = push;
   }
 
   function sameIndices(a: number[], b: number[]): boolean {
@@ -1801,19 +1811,34 @@
            searching). Pinned at the top of the scroll viewport, above normal rows. -->
       {#if stickyIndices.length > 0}
         <div class="sticky-stack">
-          {#each stickyIndices as stickyIndex (stickyIndex)}
+          {#each stickyIndices as stickyIndex, i (stickyIndex)}
             {@const stickyRow = rows[stickyIndex]}
             {#if stickyRow !== undefined}
+              {@const isLast = i === stickyIndices.length - 1}
               <button
                 type="button"
                 class="sticky-row"
                 style:padding-left={`${stickyRow.depth * 16 + 4}px`}
+                style:z-index={stickyIndices.length - i}
+                style:transform={isLast ? `translateY(-${stickyPush}px)` : null}
                 title={stickyRow.path}
                 onclick={(e: MouseEvent) => {
                   e.stopPropagation();
                   onStickyClick(stickyIndex, e.currentTarget as HTMLElement);
                 }}
               >
+                <!-- Fold caret (ADR-0052 D7 amend ④): a sticky row is an *expanded*
+                     directory, so it always shows ▾; clicking collapses it. -->
+                <span
+                  class="caret"
+                  role="presentation"
+                  onclick={(e: MouseEvent) => {
+                    e.stopPropagation();
+                    applyRowSelection([stickyRow], stickyRow.path, stickyRow.path);
+                    toggleDirectory(stickyRow.path);
+                  }}
+                  onkeydown={() => {}}
+                >▾</span>
                 {@render fileIconSvg(stickyRow)}
                 <span class="label">{stickyRow.entry.name}</span>
               </button>
@@ -1997,6 +2022,16 @@
 	        </button>
         <button type="button" role="menuitem" onclick={() => copyRowsToWorkspaceClipboard([row])}>
           Copy
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            downloadWorkspaceFile(row.path, row.entry.name);
+            closeContextMenu();
+          }}
+        >
+          Download
         </button>
 	        <button type="button" role="menuitem" onclick={() => openRename(row)}>
 	          Rename
@@ -2404,6 +2439,9 @@
   }
 
   .sticky-row {
+    /* position + z-index let the push-out (ADR-0052 D7 amend ④) slide the bottom
+     * row BEHIND the ancestors above it (z-index set inline, descending). */
+    position: relative;
     display: flex;
     align-items: center;
     gap: var(--space-4);

@@ -6906,6 +6906,133 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// `GET /api/fs/file?path=<abs>&disposition=<d>` request (ADR-0047 D12).
+    fn fs_file_download_request(
+        token: &TokenString,
+        abs_path: &str,
+        disposition: &str,
+    ) -> HttpRequest<Body> {
+        let mut q = String::new();
+        for b in abs_path.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                    q.push(b as char)
+                }
+                _ => q.push_str(&format!("%{b:02X}")),
+            }
+        }
+        HttpRequest::builder()
+            .uri(format!("/api/fs/file?path={q}&disposition={disposition}"))
+            .header(header::HOST, TEST_HOST)
+            .header(header::AUTHORIZATION, bearer(token))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Percent-decode an RFC 5987 `filename*` value back to its UTF-8 string,
+    /// so a test can assert a non-ASCII basename round-trips.
+    fn pct_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16).unwrap();
+                let lo = (bytes[i + 2] as char).to_digit(16).unwrap();
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    /// ADR-0047 D12.1 — `?disposition=attachment` → 200 with a
+    /// `Content-Disposition: attachment` header whose `filename*` round-trips a
+    /// non-ASCII (Korean) basename; the bytes are still served unchanged.
+    #[tokio::test]
+    async fn fs_file_attachment_sets_content_disposition() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let png = fixture_png_1x1();
+        let basename = "한글 사진.png";
+        let file = dir.path().join(basename);
+        std::fs::write(&file, &png).unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        let abs = canonical.to_str().unwrap();
+
+        let resp = app
+            .oneshot(fs_file_download_request(&token, abs, "attachment"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cd = resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .expect("Content-Disposition present for attachment")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(cd.starts_with("attachment;"), "got: {cd}");
+        assert!(cd.contains("filename*=UTF-8''"), "got: {cd}");
+        // The filename* value round-trips the exact on-disk basename.
+        let star = cd.split("filename*=UTF-8''").nth(1).unwrap();
+        assert_eq!(pct_decode(star), basename);
+        // No CR/LF leaked into the header value (injection guard).
+        assert!(!cd.contains('\r') && !cd.contains('\n'));
+        // Bytes are still the file bytes.
+        let got = to_bytes(resp.into_body(), 64 * 1024).await.unwrap().to_vec();
+        assert_eq!(got, png);
+    }
+
+    /// ADR-0047 D12.1 — default (no `disposition`) response carries NO
+    /// `Content-Disposition` header (inline-preview regression guard).
+    #[tokio::test]
+    async fn fs_file_default_has_no_content_disposition() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let file = dir.path().join("logo.png");
+        std::fs::write(&file, fixture_png_1x1()).unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+
+        let resp = app
+            .oneshot(fs_file_request(&token, abs.to_str().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .is_none());
+    }
+
+    /// ADR-0047 D12.1 — any `disposition` value other than `attachment`
+    /// (e.g. `inline`) is ignored → still no `Content-Disposition` header.
+    #[tokio::test]
+    async fn fs_file_attachment_unknown_value_is_inline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let file = dir.path().join("logo.png");
+        std::fs::write(&file, fixture_png_1x1()).unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+
+        let resp = app
+            .oneshot(fs_file_download_request(
+                &token,
+                abs.to_str().unwrap(),
+                "inline",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .is_none());
+    }
+
     /// ADR-0047 D2 — upload a PNG into a workspace dir → 201, file on disk,
     /// response carries absolute path + sniffed MIME + size.
     #[tokio::test]
