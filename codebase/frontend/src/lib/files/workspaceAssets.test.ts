@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  formatPathsForTerminalInput,
   materializationTypeForPath,
   parseWorkspaceFileDragPayload,
+  posixQuotePath,
   previewMetaForPath,
   resolveWorkspacePath,
   shikiLangForPath,
@@ -77,5 +79,44 @@ describe('workspaceAssets', () => {
     expect(directory?.files[0]?.kind).toBe('directory');
     expect(parseWorkspaceFileDragPayload('{')).toBeNull();
     expect(parseWorkspaceFileDragPayload(JSON.stringify({ files: [{ path: 1 }] }))).toBeNull();
+  });
+});
+
+describe('posixQuotePath (ADR-0047 D4 amend — terminal path injection)', () => {
+  it('passes plain paths through unquoted', () => {
+    expect(posixQuotePath('/srv/project/src/main.rs')).toBe('/srv/project/src/main.rs');
+    expect(posixQuotePath('/srv/project/docs')).toBe('/srv/project/docs');
+  });
+
+  it('single-quotes paths containing a space', () => {
+    expect(posixQuotePath('/srv/project/My Notes.md')).toBe("'/srv/project/My Notes.md'");
+  });
+
+  it('escapes an embedded single quote as \'\\\'\'', () => {
+    expect(posixQuotePath("/srv/project/it's a file.txt")).toBe(
+      "'/srv/project/it'\\''s a file.txt'",
+    );
+  });
+
+  it('quotes other shell-special characters', () => {
+    expect(posixQuotePath('/srv/project/$(whoami).log')).toBe("'/srv/project/$(whoami).log'");
+    expect(posixQuotePath('/srv/project/file*.txt')).toBe("'/srv/project/file*.txt'");
+    expect(posixQuotePath('')).toBe("''");
+  });
+});
+
+describe('formatPathsForTerminalInput', () => {
+  it('joins with a single space and appends one trailing space, no newline', () => {
+    expect(
+      formatPathsForTerminalInput(['/srv/project/a.txt', '/srv/project/b c.txt']),
+    ).toBe("/srv/project/a.txt '/srv/project/b c.txt' ");
+  });
+
+  it('returns empty string for no paths', () => {
+    expect(formatPathsForTerminalInput([])).toBe('');
+  });
+
+  it('appends a trailing space to a single plain path', () => {
+    expect(formatPathsForTerminalInput(['/srv/project/a.txt'])).toBe('/srv/project/a.txt ');
   });
 });

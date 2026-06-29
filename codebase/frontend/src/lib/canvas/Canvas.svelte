@@ -13,7 +13,7 @@
   // - 캔버스 dot grid 는 token-driven (--canvas-bg, --canvas-grid).
   // - panOnDrag = [1, 2] — middle/right 마우스 버튼만 pan (left는 selection/drag용).
 
-  import { onDestroy, onMount, untrack } from 'svelte';
+  import { getContext, onDestroy, onMount, untrack } from 'svelte';
   import { SvelteFlow, Background, BackgroundVariant, useSvelteFlow } from '@xyflow/svelte';
   import type { Node, Viewport } from '@xyflow/svelte';
   import '@xyflow/svelte/dist/style.css';
@@ -41,8 +41,11 @@
     DOCUMENT_EXTENSIONS,
     IMAGE_EXTENSIONS,
     WORKSPACE_FILE_DRAG_MIME,
+    formatPathsForTerminalInput,
     parseWorkspaceFileDragPayload,
   } from '$lib/files/workspaceAssets';
+  import { encodePaneIn, FRAME_TYPE } from '$lib/ws/decode';
+  import type { WsClient } from '$lib/ws/client';
   import PanelNode from './PanelNode.svelte';
   import TextNode from './TextNode.svelte';
   import NoteNode from './NoteNode.svelte';
@@ -123,6 +126,13 @@
   // useSvelteFlow 는 SvelteFlowProvider 컨텍스트가 있어야 동작 (+page.svelte 에서 마운트됨).
   const { screenToFlowPosition, setViewport, getViewport } = useSvelteFlow();
   let applyingStoreViewport = false;
+
+  // WS PANE_IN 송신 채널 — `+page.svelte` 의 setContext('wsClient', holder) 가 단일
+  // 진실 (XtermHost 와 동일 holder). Files drag → terminal pane drop 시 dragged
+  // path 를 그 pane 의 PTY 에 텍스트 입력으로 전송 (ADR-0047 D4 amend 2026-06-30).
+  // 미설정(테스트/SSR) 환경에서는 holder 가 null → 송신 skip.
+  interface WsClientHolder { current: WsClient | null }
+  const wsClientHolder = getContext<WsClientHolder | undefined>('wsClient') ?? null;
 
   /** Drag-to-create state — rect/ellipse/line + free_draw. */
   type DragShape = 'rect' | 'ellipse' | 'line' | 'free_draw';
@@ -2492,11 +2502,69 @@
     e.dataTransfer.dropEffect = 'copy';
   }
 
+  /**
+   * ADR-0047 D4 amend (2026-06-30) — resolve a drop point to a *live* terminal
+   * pane's numeric PaneId, or `null` when the drop did not land on a connected
+   * terminal pane (→ fall through to the canvas materialize behaviour).
+   *
+   * The hit-test mirrors `nodeIdAtPoint`: the topmost `.svelte-flow__node` under
+   * the cursor exposes its canvas item id via `data-id`. A PanelNode's node id
+   * *is* the terminal item id (PanelNode `data.id`), so we look that up in
+   * `sessionStore.items`, require `type === 'terminal'`, and resolve the running
+   * pane via `terminalPool.paneIdFor` (the same UUID→PaneId binding XtermHost
+   * uses). `undefined` (spawn handshake pending / dangling) → no target.
+   */
+  function terminalPaneIdAtPoint(clientX: number, clientY: number): number | null {
+    const nodeId = nodeIdAtPoint(clientX, clientY);
+    if (nodeId === null) return null;
+    const item = sessionStore.items.get(nodeId);
+    if (item === undefined || item.type !== 'terminal') return null;
+    const paneId = terminalPool.paneIdFor(nodeId);
+    if (paneId === undefined || !Number.isInteger(paneId) || paneId <= 0) return null;
+    return paneId;
+  }
+
+  /**
+   * ADR-0047 D4 amend (2026-06-30) — send dragged file path(s) as terminal
+   * *input* (text only, never executed — no Enter) to the pane under the drop.
+   * Returns `true` when the input was dispatched (caller must NOT materialize).
+   * The frame is the exact channel xterm keystrokes use: `PANE_IN` (0x03) via
+   * the shared WsClient (`encodePaneIn(paneId, utf8 bytes)`).
+   */
+  function sendPathsToTerminalPane(paneId: number, paths: readonly string[]): boolean {
+    const client = wsClientHolder?.current ?? null;
+    if (client === null) return false;
+    const text = formatPathsForTerminalInput(paths);
+    if (text.length === 0) return false;
+    const bytes = new TextEncoder().encode(text);
+    client.sendFrame(FRAME_TYPE.PANE_IN, encodePaneIn(paneId, bytes));
+    return true;
+  }
+
   async function onCanvasDrop(e: DragEvent): Promise<void> {
     const raw = e.dataTransfer?.getData(WORKSPACE_FILE_DRAG_MIME) ?? '';
     const payload = raw.length > 0 ? parseWorkspaceFileDragPayload(raw) : null;
     if (payload === null || payload.files.length === 0) return;
     e.preventDefault();
+
+    // ADR-0047 D4 amend (2026-06-30) — Files drag onto a terminal pane types the
+    // path(s) into that pane's PTY instead of materializing a canvas item
+    // (macOS Terminal "drag file into terminal" parity). Branch on the drop
+    // target: a live terminal pane under the cursor → PTY input; otherwise the
+    // existing materialize path below.
+    const targetPaneId = terminalPaneIdAtPoint(e.clientX, e.clientY);
+    if (targetPaneId !== null) {
+      const paths = payload.files.map((file) => file.path);
+      const sent = sendPathsToTerminalPane(targetPaneId, paths);
+      if (sent) {
+        toastStore.show({
+          message: `Inserted ${paths.length === 1 ? 'path' : `${paths.length} paths`} into terminal.`,
+          tone: 'success',
+        });
+      }
+      return;
+    }
+
     const origin = screenToFlowPosition({ x: e.clientX, y: e.clientY });
     let created = 0;
     for (const [index, file] of payload.files.entries()) {
