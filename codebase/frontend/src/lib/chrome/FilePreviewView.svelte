@@ -275,30 +275,39 @@
     if (e.key === 'Escape') closeContentMenu();
   }
 
-  // ADR-0046 D6 amend ⑩ — Cmd/Ctrl+C in the active Preview = Copy path (with
-  // selection location), mirroring the right-click "Copy path". Handled in
-  // CAPTURE phase so it runs before the global bubble keydown handlers
-  // (shortcutRegistry / canvas) and before the native copy event, guaranteeing
-  // the path-copy wins when the Preview is the active surface with a selected
-  // file. The gate returns false everywhere else, so normal Cmd/Ctrl+C and the
-  // right-click menu's Copy (raw text) / Copy path are unaffected.
+  // ADR-0046 D6 amend ⑬ (supersedes ⑩) — in the active Preview:
+  //   Cmd/Ctrl+C        = copy the SELECTED TEXT (only when a real selection lies
+  //                       in the preview surface; otherwise native copy passes).
+  //   Cmd/Ctrl+Shift+C  = Copy path (+ selection location), the old ⑩ behavior.
+  // Handled in CAPTURE phase so it wins over the global bubble keydown handlers
+  // (shortcutRegistry / canvas) and the native copy event when the Preview is the
+  // active surface with a single selected file. The gate returns false everywhere
+  // else; the right-click menu's Copy / Copy path (amend ⑥) are unchanged.
   function onWindowKeydownCapture(e: KeyboardEvent): void {
-    if (
-      (e.metaKey || e.ctrlKey) &&
-      !e.shiftKey &&
-      !e.altKey &&
-      (e.key === 'c' || e.key === 'C')
-    ) {
-      if (!canKeyboardCopyPath()) return;
+    const isCopyChord =
+      (e.metaKey || e.ctrlKey) && !e.altKey && (e.key === 'c' || e.key === 'C');
+    if (!isCopyChord) return;
+    if (!canKeyboardCopy()) return;
+    if (e.shiftKey) {
+      // Cmd/Ctrl+Shift+C → Copy path (amend ⑬.3).
       e.preventDefault();
       e.stopImmediatePropagation();
       void copyPathViaShortcut();
+      return;
+    }
+    // Cmd/Ctrl+C → copy selected text, but only hijack when there IS a selection
+    // in the preview surface; with no selection, let native copy pass (no-op).
+    const root = previewSurfaceEl;
+    if (root !== undefined && selectedTextWithin(root).length > 0) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      void copySelectedTextViaShortcut();
     }
   }
 
-  /** Gate for the amend ⑩ keyboard copy-path: Preview active + single file +
-   *  focus not in an editable field / xterm (so normal field copy still works). */
-  function canKeyboardCopyPath(): boolean {
+  /** Gate for the amend ⑬ keyboard copy: Preview active + single file + focus not
+   *  in an editable field / xterm (so normal field copy still works). */
+  function canKeyboardCopy(): boolean {
     if (chromeStore.state.rightPanelTab !== 'preview') return false;
     if (selection === null || isMultiSelection) return false;
     const el = document.activeElement as HTMLElement | null;
@@ -326,6 +335,19 @@
     const result = await copyTextToSystemClipboard(value);
     toastStore.show({
       message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
+  }
+
+  /** Cmd/Ctrl+C (amend ⑬.2) — copy the live text selection within the preview. */
+  async function copySelectedTextViaShortcut(): Promise<void> {
+    const root = previewSurfaceEl;
+    if (root === undefined) return;
+    const text = selectedTextWithin(root);
+    if (text.length === 0) return;
+    const result = await copyTextToSystemClipboard(text);
+    toastStore.show({
+      message: result.ok ? 'Copied selection.' : (result.reason ?? 'Copy failed.'),
       tone: result.ok ? 'success' : 'error',
     });
   }
@@ -837,6 +859,10 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    /* ADR-0046 D6 amend ⑬.1 — Preview content must be drag-selectable; override
+     * the right-panel chrome's `user-select: none` (RightPanel) so highlight works. */
+    user-select: text;
+    -webkit-user-select: text;
     --code-viewer-font-size: calc(10.5px * var(--preview-content-scale, 1));
     --code-viewer-line-height: 1.6;
     --code-viewer-gutter-width: 28px;
