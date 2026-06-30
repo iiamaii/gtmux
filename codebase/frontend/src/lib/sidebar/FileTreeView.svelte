@@ -20,7 +20,7 @@
    * model (filesystem vs canvas layout).
    */
 
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { chromeStore } from '$lib/stores/chrome.svelte';
   import { fileClipboardStore } from '$lib/stores/fileClipboard.svelte';
   import { filePreviewStore } from '$lib/stores/filePreview.svelte';
@@ -505,9 +505,64 @@
   let wasSearching = false;
   $effect(() => {
     const now = searching;
-    if (wasSearching && !now) scrollRestored = false;
+    const was = wasSearching;
     wasSearching = now;
+    // Search cleared → the tree `{#if}` branch re-renders. Defer the follow-up to
+    // a microtask so its store/tree reads are NOT tracked as effect deps.
+    if (was && !now) queueMicrotask(() => void onSearchCleared());
   });
+
+  // On clearing the search: if a Files selection persists (amend ⑪), reveal it in
+  // the tree (ADR-0046 D6 amend ⑭); otherwise restore the pre-search scroll offset.
+  async function onSearchCleared(): Promise<void> {
+    if (filePreviewStore.selectedPaths.size > 0) {
+      await revealSelectedPaths();
+    } else {
+      scrollRestored = false;
+    }
+  }
+
+  // Expand the ancestor dirs of every selected path (lazy-load) so the persisted
+  // selection becomes visible + highlighted, then scroll the first into view. The
+  // selection store itself already survived the query clear (amend ⑪); this only
+  // re-reveals it. ADR-0046 D6 amend ⑭.
+  async function revealSelectedPaths(): Promise<void> {
+    const root = rootPath || targetRoot;
+    if (root.length === 0) return;
+    const selected = [...filePreviewStore.selectedPaths];
+    if (selected.length === 0) return;
+
+    const next = new Set(expandedDirs);
+    let added = false;
+    for (const path of selected) {
+      let dir = parentDir(path);
+      while (dir !== root && isSameOrChild(dir, root)) {
+        if (!next.has(dir)) {
+          next.add(dir);
+          added = true;
+        }
+        const up = parentDir(dir);
+        if (up === dir) break;
+        dir = up;
+      }
+    }
+    if (added) {
+      expandedDirs = next;
+      await hydrateExpandedDirs(next, root);
+    }
+    await tick();
+    scrollRowIntoView(selected[0]);
+  }
+
+  function scrollRowIntoView(path: string | undefined): void {
+    if (path === undefined || treeScrollEl === undefined) return;
+    for (const el of treeScrollEl.querySelectorAll('.row')) {
+      if ((el as HTMLElement).dataset.path === path) {
+        el.scrollIntoView({ block: 'nearest' });
+        return;
+      }
+    }
+  }
 
   // ── Search Phase 2 (ADR-0052 D4) — debounced recursive server search ──
   // `runServerSearch` issues the request; the debounced wrapper coalesces rapid
@@ -1860,6 +1915,7 @@
           class:selected
           class:drop-inside={dropTargetDir === row.path}
           class:dragging={fileDragState !== null && fileDragState.sourcePaths.includes(row.path)}
+          data-path={row.path}
           role="treeitem"
           aria-selected={selected}
           aria-expanded={row.entry.kind === 'directory' ? row.expanded : undefined}
