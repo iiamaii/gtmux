@@ -309,6 +309,40 @@ export function isSafeWorkspaceRelativePath(path: string): boolean {
   );
 }
 
+/**
+ * Characters that make a path unsafe to paste raw into a POSIX shell — a space
+ * or any shell-special glob/quoting/expansion metacharacter (ADR-0047 D4 amend
+ * 2026-06-30). When a path contains any of these we wrap it in single quotes so
+ * the terminal receives one inert word (no word-splitting / glob / expansion).
+ * Includes whitespace (space, tab, newline) plus the shell metacharacter set.
+ */
+// eslint-disable-next-line no-control-regex
+const SHELL_SPECIAL_RE = /[\s'"\\$(){}\[\]*?;&|<>`!~# ]/;
+
+/**
+ * Quote a single path for safe insertion as terminal *input* (text only — never
+ * executed by us). Plain paths pass through unchanged; paths containing a space
+ * or any shell-special character are wrapped in POSIX single quotes with the
+ * standard `'\''` escape for embedded single quotes. Mirrors macOS Terminal's
+ * "drag file into terminal" behaviour (ADR-0047 D4 amend 2026-06-30).
+ */
+export function posixQuotePath(path: string): string {
+  if (path.length === 0) return "''";
+  if (!SHELL_SPECIAL_RE.test(path)) return path;
+  return `'${path.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Format one or more dragged file paths into the text to inject into a
+ * terminal's PTY: each path quoted per `posixQuotePath`, joined by a single
+ * space, with one trailing space appended (and NO trailing newline — the user
+ * reviews before running). ADR-0047 D4 amend 2026-06-30.
+ */
+export function formatPathsForTerminalInput(paths: readonly string[]): string {
+  if (paths.length === 0) return '';
+  return `${paths.map(posixQuotePath).join(' ')} `;
+}
+
 export function encodeWorkspaceFileDragPayload(
   files: readonly WorkspaceDraggedFile[],
 ): string {

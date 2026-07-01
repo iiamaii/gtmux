@@ -41,6 +41,7 @@
   import { bindGroupShortcuts } from '$lib/keyboard/groupShortcuts.svelte';
   import { bindClipboardShortcuts } from '$lib/keyboard/clipboardShortcuts.svelte';
   import { bindGlobalTerminalCopyShortcut } from '$lib/keyboard/terminalCopyShortcut';
+  import { bindGlobalFindShortcut } from '$lib/keyboard/findShortcut.svelte';
   import { bindEditingShortcuts } from '$lib/keyboard/editingShortcuts.svelte';
   import { bindToolShortcuts } from '$lib/keyboard/toolShortcuts.svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
@@ -145,6 +146,7 @@
   let unbindGroupShortcuts: (() => void) | null = null;
   let unbindClipboardShortcuts: (() => void) | null = null;
   let unbindGlobalTerminalCopyShortcut: (() => void) | null = null;
+  let unbindGlobalFindShortcut: (() => void) | null = null;
   let unbindEditingShortcuts: (() => void) | null = null;
   let unbindToolShortcuts: (() => void) | null = null;
   let unbindSystemTheme: (() => void) | null = null;
@@ -273,6 +275,9 @@
     // Terminal copy shortcut (Cmd/Ctrl+Shift+C) — capture-phase ownership to
     // block browser DevTools inspect while preserving xterm selection copy.
     unbindGlobalTerminalCopyShortcut = bindGlobalTerminalCopyShortcut();
+    // Find shortcut (Cmd/Ctrl+F) — overrides browser Find to open the left-panel
+    // search (ADR-0052 D2, 2026-06-30 amend).
+    unbindGlobalFindShortcut = bindGlobalFindShortcut();
     // Editing shortcuts (Cmd+A select-all) — ADR-0017 D6 amend ⑤ (a) / amend ⑦.
     unbindEditingShortcuts = bindEditingShortcuts();
     // Tool shortcuts (V/H/R/O/L/P/T/N/S/D/I/F) — ADR-0017 D6 amend ⑫.
@@ -434,6 +439,10 @@
     if (unbindGlobalTerminalCopyShortcut !== null) {
       unbindGlobalTerminalCopyShortcut();
       unbindGlobalTerminalCopyShortcut = null;
+    }
+    if (unbindGlobalFindShortcut !== null) {
+      unbindGlobalFindShortcut();
+      unbindGlobalFindShortcut = null;
     }
     if (unbindEditingShortcuts !== null) {
       unbindEditingShortcuts();

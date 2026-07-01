@@ -17,9 +17,10 @@
    *     expands the panel AND switches to that tab (chromeStore.setLeftPanelTab).
    */
 
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { chromeStore, type LeftPanelTab } from '$lib/stores/chrome.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { registerLeftPanelSearchController } from './leftPanelSearchController';
   import LayerTreeView from './LayerTreeView.svelte';
   import TerminalListView from './TerminalListView.svelte';
   import FileTreeView from './FileTreeView.svelte';
@@ -74,6 +75,22 @@
   function selectTab(tab: LeftPanelTab): void {
     chromeStore.setLeftPanelTab(tab);
   }
+
+  // Expose the footer search bar to global shortcuts (Cmd/Ctrl+F, ADR-0052 D2)
+  // via the single-controller registry. `activeTab` is a $derived, so reading it
+  // in `currentTab` always reflects the live active tab at call time.
+  onMount(() =>
+    registerLeftPanelSearchController({
+      setQuery: (tab, q) => {
+        searchByTab[tab] = q;
+      },
+      focusSearch: ({ selectAll } = {}) => {
+        searchInputEl?.focus();
+        if (selectAll) searchInputEl?.select();
+      },
+      currentTab: () => activeTab,
+    }),
+  );
 
   function expandAndSelect(tab: LeftPanelTab): void {
     chromeStore.setLeftPanelTab(tab); // also flips sidebarCollapsed → false

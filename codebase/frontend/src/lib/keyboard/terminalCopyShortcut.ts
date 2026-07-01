@@ -41,6 +41,18 @@ function providerWithSelection(): TerminalCopyProvider | null {
   return null;
 }
 
+/**
+ * Current terminal drag-selection text across all registered terminals, or
+ * `''` when nothing is selected. Reuses the same provider set + selection
+ * lookup as the copy shortcut so the two stay consistent.
+ *
+ * Used by the Cmd/Ctrl+F find shortcut (ADR-0052 D2) to route a live
+ * terminal selection into the Files search.
+ */
+export function currentTerminalSelection(): string {
+  return providerWithSelection()?.getSelection() ?? '';
+}
+
 export function bindGlobalTerminalCopyShortcut(): () => void {
   if (typeof window === 'undefined') return () => {};
   const shortcutUnsubs = [
