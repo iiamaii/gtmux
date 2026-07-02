@@ -17,29 +17,6 @@ export function canUseAsyncClipboard(): boolean {
   );
 }
 
-/**
- * Read text from the system clipboard via the async Clipboard API only.
- *
- * Returns `''` on any failure: unavailable API, insecure context,
- * permission-denied, or an empty clipboard. There is intentionally no
- * `execCommand` fallback — legacy `paste` is not reliably scriptable and
- * the only caller (Cmd/Ctrl+F autofill, ADR-0052 D2) treats `''` as "no
- * clipboard text", which degrades gracefully to focus-only.
- */
-export async function readTextFromSystemClipboard(): Promise<string> {
-  if (
-    typeof navigator === 'undefined' ||
-    typeof navigator.clipboard?.readText !== 'function'
-  ) {
-    return '';
-  }
-  try {
-    return await navigator.clipboard.readText();
-  } catch {
-    return '';
-  }
-}
-
 export async function copyTextToSystemClipboard(text: string): Promise<TextClipboardResult> {
   if (canUseAsyncClipboard()) {
     try {

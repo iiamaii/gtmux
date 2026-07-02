@@ -1,5 +1,5 @@
 import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
-import { OSC52_FALLBACK_TTL_MS, takeRecentOsc52 } from '$lib/xterm/osc52';
+import { OSC52_FALLBACK_TTL_MS, peekRecentOsc52, takeRecentOsc52 } from '$lib/xterm/osc52';
 import { resolveTerminalCopyText } from './terminalCopyResolve';
 import { shortcutRegistry } from './shortcutRegistry.svelte';
 
@@ -42,15 +42,22 @@ function providerWithSelection(): TerminalCopyProvider | null {
 }
 
 /**
- * Current terminal drag-selection text across all registered terminals, or
- * `''` when nothing is selected. Reuses the same provider set + selection
- * lookup as the copy shortcut so the two stay consistent.
+ * Terminal "current highlight" text for the Cmd/Ctrl+F find shortcut
+ * (ADR-0052 D2), or `''` when there is none. Mirrors the copy shortcut's source
+ * resolution so find and copy agree on what is "selected":
+ *   1. a native xterm drag-selection (a normal shell drag), else
+ *   2. the gated OSC 52 fallback buffer — a mouse-mode TUI (claude) whose drag
+ *      makes no xterm selection but writes its highlight via OSC 52.
  *
- * Used by the Cmd/Ctrl+F find shortcut (ADR-0052 D2) to route a live
- * terminal selection into the Files search.
+ * The OSC 52 buffer is only ever filled past the consent gate (ADR-0049 D3:
+ * setting ON + secure context), so this is automatically settings-gated — no
+ * extra check. Unlike copy, find PEEKS (non-draining): a search must not consume
+ * the one-shot buffer a following Cmd+C copy relies on.
  */
 export function currentTerminalSelection(): string {
-  return providerWithSelection()?.getSelection() ?? '';
+  const native = providerWithSelection()?.getSelection() ?? '';
+  if (native.length > 0) return native;
+  return peekRecentOsc52(OSC52_FALLBACK_TTL_MS, performance.now()) ?? '';
 }
 
 export function bindGlobalTerminalCopyShortcut(): () => void {
