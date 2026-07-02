@@ -5,6 +5,7 @@ import {
   makeOsc52Handler,
   OSC52_FALLBACK_TTL_MS,
   OSC52_MAX_BYTES,
+  peekRecentOsc52,
   rememberOsc52,
   runOnce,
   takeRecentOsc52,
@@ -250,6 +251,32 @@ describe('rememberOsc52 + takeRecentOsc52 (D7)', () => {
     expect(takeRecentOsc52(undefined, OSC52_FALLBACK_TTL_MS)).toBe('def');
     rememberOsc52('def2', 0);
     expect(takeRecentOsc52(undefined, OSC52_FALLBACK_TTL_MS + 1)).toBeNull();
+  });
+});
+
+describe('peekRecentOsc52 (non-draining, D7 / find)', () => {
+  it('returns the buffered text within the TTL without clearing it', () => {
+    rememberOsc52('highlight', 1_000);
+    expect(peekRecentOsc52(10_000, 5_000)).toBe('highlight');
+    // Non-draining: a second peek still sees it, AND a later copy take works.
+    expect(peekRecentOsc52(10_000, 5_000)).toBe('highlight');
+    expect(takeRecentOsc52(10_000, 5_000)).toBe('highlight');
+  });
+
+  it('returns null once the TTL has elapsed', () => {
+    rememberOsc52('old', 0);
+    expect(peekRecentOsc52(10_000, 10_001)).toBeNull();
+  });
+
+  it('returns null when the buffer was never filled', () => {
+    expect(peekRecentOsc52(10_000, 0)).toBeNull();
+  });
+
+  it('leaves a stale buffer in place for take to clear (peek is read-only)', () => {
+    rememberOsc52('stale', 0);
+    expect(peekRecentOsc52(10_000, 99_999)).toBeNull(); // stale → null, but NOT cleared
+    // A take at a fresh nowMs still observes it → peek did not mutate the buffer.
+    expect(takeRecentOsc52(10_000, 0)).toBe('stale');
   });
 });
 

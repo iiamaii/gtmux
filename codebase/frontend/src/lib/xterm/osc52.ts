@@ -83,6 +83,27 @@ export function takeRecentOsc52(
   return buf.text;
 }
 
+/**
+ * Like {@link takeRecentOsc52} but NON-draining: return the buffered OSC 52 text
+ * if fresh (within `ttlMs` of `nowMs`), else `null`, WITHOUT clearing the buffer
+ * or mutating any state.
+ *
+ * Used by the find shortcut (Cmd/Ctrl+F, ADR-0052 D2) to route a mouse-mode TUI
+ * highlight into the search. Reading the highlight for search must NOT consume
+ * the one-shot buffer a following Cmd+C copy relies on (ADR-0049 D7), so find
+ * peeks while copy takes. A stale buffer is left in place (read-only) — the next
+ * `takeRecentOsc52` clears it. `nowMs` is injected, same as `takeRecentOsc52`.
+ */
+export function peekRecentOsc52(
+  ttlMs: number = OSC52_FALLBACK_TTL_MS,
+  nowMs: number = 0,
+): string | null {
+  const buf = osc52Buffer;
+  if (buf === null) return null;
+  if (nowMs - buf.at > ttlMs) return null; // stale — but leave it (peek is read-only).
+  return buf.text;
+}
+
 /** Test-only: clear the fallback buffer so cases don't bleed into each other. */
 export function __resetOsc52Buffer(): void {
   osc52Buffer = null;

@@ -1824,7 +1824,24 @@
           {#each searchResults as result (result.path)}
             {@const selected = filePreviewStore.selectedPaths.has(result.path)}
             {@const contextDir = resultContextDir(result)}
-            <li class="search-result" class:selected role="presentation">
+            {@const resultRow = resultIconRow(result)}
+            <!-- ADR-0052 D4 amend (2026-07-02): a search result is treated like a
+                 tree row for single-item interactions — right-click menu + drag
+                 (→ canvas / terminal path). The tree-row handlers are reused via
+                 the `resultRow` adapter; the drag payload is identical, so canvas
+                 and terminal drop consumers need no change. Click stays single
+                 select + preview (`onSearchResultClick`). -->
+            <li
+              class="search-result"
+              class:selected
+              class:dragging={fileDragState !== null && fileDragState.sourcePaths.includes(result.path)}
+              data-path={result.path}
+              role="presentation"
+              draggable={true}
+              ondragstart={(e: DragEvent) => onFileDragStart(resultRow, e)}
+              ondragend={clearFileDragState}
+              oncontextmenu={(e: MouseEvent) => onRowContextMenu(resultRow, e)}
+            >
               <button
                 type="button"
                 class="search-result-button"
@@ -1836,7 +1853,7 @@
                   onSearchResultClick(result);
                 }}
               >
-                {@render fileIconSvg(resultIconRow(result))}
+                {@render fileIconSvg(resultRow)}
                 <span class="search-result-name">
                   {@render highlightedName(result.entry.name, result.ranges)}
                 </span>
@@ -2434,6 +2451,11 @@
 
   .search-result.selected .type-icon {
     color: var(--color-accent);
+  }
+
+  /* ADR-0052 D4 amend (2026-07-02): dragging feedback, mirrors `.row.dragging`. */
+  .search-result.dragging {
+    opacity: 0.45;
   }
 
   .search-result-button {
