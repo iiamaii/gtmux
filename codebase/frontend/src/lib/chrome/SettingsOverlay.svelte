@@ -1080,12 +1080,14 @@
                 <div class="lbl">Allow terminal clipboard copy (OSC 52)</div>
                 <div class="dsc">
                   Lets terminal apps (e.g. claude) copy to your clipboard via OSC 52.
-                  Requires HTTPS or localhost; over plain HTTP it stays inactive.
+                  On HTTPS or localhost this copies automatically; over plain HTTP,
+                  press Cmd/Ctrl+C to copy the selection via a legacy fallback.
                 </div>
                 {#if !isSecureContext}
                   <div class="dsc-warn" role="note">
-                    This page is not a secure context, so this setting won't take
-                    effect until you reach gtmux over HTTPS or localhost.
+                    This page is not a secure context, so automatic copy is limited —
+                    but Cmd/Ctrl+C still copies via a legacy fallback. Use HTTPS or
+                    localhost for seamless auto-copy.
                   </div>
                 {/if}
               </div>

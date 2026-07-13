@@ -1684,6 +1684,14 @@
     if (item.type === 'path') {
       classes.push('path-node-wrapper');
     }
+    // ADR-0004 amend ④ (2026-07-13) — hidden TERMINAL panels stay MOUNTED so their
+    // xterm scrollback survives; the SvelteFlow node wrapper is display:none'd via
+    // this class (which also suppresses the selection/hover ring that lives on the
+    // wrapper). Only terminals need retain; other item types keep their own
+    // `{#if isVisible}` unmount, so they are not given this class.
+    if (item.type === 'terminal' && !visible) {
+      classes.push('node-hidden');
+    }
     const common = {
       id: item.id,
       position: { x: item.x, y: item.y },
@@ -3513,6 +3521,14 @@
     background: transparent !important;
     box-shadow: none;
     transition: box-shadow 120ms ease;
+  }
+
+  /* ADR-0004 amend ④ (2026-07-13) — a hidden terminal panel keeps its xterm MOUNTED
+     (buffer survives) but its node wrapper is fully hidden here. display:none removes
+     the wrapper from render entirely, so the selection/hover ring (which lives on the
+     wrapper) is suppressed too — no floating ring over a hidden-but-selected panel. */
+  .canvas-root :global(.svelte-flow__node.node-hidden) {
+    display: none;
   }
 
   .canvas-root :global(.svelte-flow__node:hover) {

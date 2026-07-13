@@ -9,9 +9,11 @@ export const SECURE_XTERM_OPTIONS: ITerminalOptions = {
   fontSize: 13,
   cursorBlink: true,
   allowProposedApi: true,
-  // xterm's FitAddon subtracts overviewRuler.width from the fitted column
-  // area, and xterm also uses it as the vertical scrollbar width. Keep this
-  // explicit so the rightmost glyphs do not render under the scrollbar.
-  overviewRuler: { width: 18 },
+  // NOTE (ADR-0004 D8, 2026-07-12): do NOT set `overviewRuler` here. Setting its
+  // width renders a `z-index:8` overlay canvas (`.xterm-decoration-overview-ruler`,
+  // right:0) OVER the text grid — it covered the rightmost column. gtmux registers
+  // no decorations, so the ruler is pure overlay. Without it, FitAddon reserves its
+  // default 14px for the native `.xterm-viewport` scrollbar (pinned to 8px in
+  // XtermHost's CSS) — enough clearance, and no on-top overlay over the glyphs.
   // 보안 옵션은 P0 구현 시 R2 F6 따라 채움.
 };
