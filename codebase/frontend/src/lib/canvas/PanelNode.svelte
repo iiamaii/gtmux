@@ -14,7 +14,8 @@
   //       multi 시 multi-drag affordance 강조.
   // - resize : NodeResizer (corner + edge handles). onResizeEnd 시 sessionStore
   //   + PUT /api/sessions/<name>/layout 으로 영속화.
-  // - visibility=false → 렌더 X.
+  // - visibility=false → node wrapper 를 display:none (Canvas `node-hidden` class).
+  //   터미널 widget 은 mounted 유지 → xterm 버퍼 보존 (ADR-0004 amend ④).
 
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import PanelDanglingOverlay from './PanelDanglingOverlay.svelte';
@@ -86,10 +87,11 @@
   } = $props();
 
   const { updateNode } = useSvelteFlow();
-  const isVisible = $derived(data.visibility !== false);
-  // Keep XtermHost mounted while minimized. Recreating xterm on restore drops
-  // its screen buffer and leaves the panel blank until new output arrives.
-  const shouldMountTerminal = $derived(isVisible);
+  // ADR-0004 amend ④ (2026-07-13): the terminal is ALWAYS mounted — its xterm
+  // scrollback must survive hide/show and minimize. Visibility is enforced by a
+  // `node-hidden` class on the SvelteFlow node wrapper (Canvas.svelte::itemToNode)
+  // that display:none's the whole panel; the widget stays mounted, so no output is
+  // lost and no re-attach/replay is needed on show. Hence no `isVisible` render gate.
   // Label source = persisted layout item.label (ADR-0050 D1/D3, per-panel).
   //   1) layout item.label (persisted on disk per (session, panel)) — blank
   //      treated as unset.
@@ -396,7 +398,6 @@
   }
 </script>
 
-{#if isVisible}
   <div
     class="panel"
     class:m-single={isSingleM}
@@ -539,7 +540,6 @@
       </div>
     </header>
     <div class="panel-body">
-      {#if shouldMountTerminal}
         {#if terminalPaneId !== undefined}
           <!-- xterm-portal-host: MaximizedItemModal 이 maximize 시 본 div 의
                XtermHost DOM (containerEl) 을 modal 의 slot 으로 reparent.
@@ -554,11 +554,9 @@
             <div class="pending-hint">Waiting for spawn handshake.</div>
           </div>
         {/if}
-      {/if}
       <PanelDanglingOverlay terminalId={data.id} />
     </div>
   </div>
-{/if}
 
 <PanelCloseConfirmModal
   open={confirmOpen}

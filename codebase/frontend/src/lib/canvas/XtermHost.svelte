@@ -31,9 +31,10 @@
   // 4. $effect cleanup: dispatcher unregister + term.dispose (R2 F11 — 모든 리스너·
   //    DOM·내부 버퍼 해제) + resize/input debounce timer 해제.
   //
-  // D16 Panel Streaming State amend: visibility=false 면 PanelNode 가 본 컴포넌트를
-  // 마운트하지 않는다. minimized=true 는 xterm 인스턴스를 유지하고 chrome 만 접는다.
-  // 그래야 restore 시 xterm 의 screen/scrollback buffer 가 보존된다.
+  // D16 Panel Streaming State: visibility=false / minimized=true 둘 다 xterm 인스턴스를
+  // **유지**하고 CSS(display:none)로만 숨긴다 (visibility=hidden 은 ADR-0004 amend ④ —
+  // Canvas node-hidden class; minimized 는 .panel-body display:none). 그래야 restore 시
+  // xterm 의 screen/scrollback buffer 가 보존된다 (unmount 하면 버퍼 소실 → block-out).
   //
   // WsClient 주입 경로: `+page.svelte` 가 `setContext('wsClient', wsClient)` 로 단일
   // 인스턴스를 등록. 본 컴포넌트는 `getContext` 로 꺼내 사용 — PanelNode 가 prop 으로
@@ -58,15 +59,16 @@
   import { settingsStore } from '$lib/stores/settings.svelte';
   import type { WsClient } from '$lib/ws/client';
 
-  // ADR-0049 D3 dual gate: OSC 52 clipboard write is performed only when BOTH
-  // (a) the consent setting is on AND (b) the page is a secure context. Missing
-  // / undefined setting (BE not yet wired) falls back to false → off.
+  // ADR-0049 D3-b amend (2026-07-12): consent is the SOLE gate. Secure context is
+  // no longer required. In a non-secure context (plain-HTTP cloud, tls_required=
+  // false) the write degrades to the ADR-0039 `execCommand` path under the user's
+  // Cmd+C gesture — the D7 buffer fills here, then terminalCopyShortcut copies it
+  // in the keydown gesture. This mirrors snippet/selection copy so OSC 52 (claude)
+  // copy works over plain HTTP too. The immediate (gesture-less) auto-write still
+  // no-ops in a non-secure context; consent stays default-off. Missing/undefined
+  // setting → false (off).
   function osc52WriteAllowed(): boolean {
-    return (
-      settingsStore.behavior.osc52_clipboard_write_enabled === true &&
-      typeof window !== 'undefined' &&
-      window.isSecureContext === true
-    );
+    return settingsStore.behavior.osc52_clipboard_write_enabled === true;
   }
 
   // paneId 는 항상 numeric (legacy `%N` 의 N 또는 0x88 binding 으로 얻은 PaneId).
@@ -133,11 +135,14 @@
     (e.target as Element | null)?.dispatchEvent(synth);
   }
 
-  // R2 F8 resize debounce — fit() 폭주 방지 (DOM 측정 → reflow 비용).
-  // NodeResizer 드래그 중에는 컨테이너만 커지고 xterm 내부 .xterm-screen 의
-  // cell-정수배수 inline-px height 는 fit() 호출 후에만 갱신. 그동안 갭이
-  // 노출되므로 debounce 짧게 — 50ms 면 인지 X + fit() 폭주 회피 모두 충족.
-  const RESIZE_DEBOUNCE_MS = 50;
+  // ADR-0004 D5 amend ② (2026-07-13): resize fit strategy — two cases.
+  //  - Already-visible resize (drag): fit immediately, coalesced to ≤1 per frame via
+  //    requestAnimationFrame, so the visible grid tracks the container with no lag.
+  //  - Re-show after hide (minimize → panel-body display:none): DEFER the fit via a
+  //    short timeout. After un-hiding, xterm must re-measure its char size before a
+  //    fit/refresh will paint; fitting on the next frame paints BLANK ("block out").
+  //    The timeout lets xterm's measurement settle first (proven pre-② timing).
+  const REFIT_ON_SHOW_MS = 50;
   // FE-2 송신 debounce — fit() 직후의 미세 rebound 흡수. lastSent dedup 과 함께 작동.
   const RESIZE_SEND_DEBOUNCE_MS = 100;
 
@@ -251,7 +256,9 @@
     // lastSent dedup 가 1차 필터, send debounce 가 2차 필터. 두 단계는 직렬.
     let lastSentCols: number | null = null;
     let lastSentRows: number | null = null;
+    let fitRaf: number | null = null;
     let fitTimer: ReturnType<typeof setTimeout> | null = null;
+    let wasHidden = false;
     let sendTimer: ReturnType<typeof setTimeout> | null = null;
     let pendingCols: number | null = null;
     let pendingRows: number | null = null;
@@ -283,6 +290,33 @@
       client.sendFrame(FRAME_TYPE.PANE_RESIZE, encodePaneResize(paneIdNumLocal, cols, rows));
     }
 
+    function runFit(): void {
+      // Never fit at a degenerate size — a 0-width/height container makes FitAddon
+      // propose a tiny grid, collapsing cols/rows and blanking the buffer. The
+      // container can be hidden between an RO tick and a deferred fit callback.
+      const rect = containerEl?.getBoundingClientRect();
+      if (rect === undefined || rect.width <= 0 || rect.height <= 0) return;
+      debugCount('xterm.fit');
+      try {
+        fitAddon.fit();
+        term.refresh(0, Math.max(0, term.rows - 1));
+      } catch (e) {
+        console.debug('[gtmux] xterm fit on resize failed', e);
+        return;
+      }
+      const cols = term.cols;
+      const rows = term.rows;
+      // dedup 1차: 직전 송신값과 동일하면 send debounce 도 arm 하지 않음.
+      if (cols === lastSentCols && rows === lastSentRows) return;
+      pendingCols = cols;
+      pendingRows = rows;
+      if (sendTimer) clearTimeout(sendTimer);
+      sendTimer = setTimeout(() => {
+        sendTimer = null;
+        flushResize();
+      }, RESIZE_SEND_DEBOUNCE_MS);
+    }
+
     const ro = new ResizeObserver((entries) => {
       // P1-D entry-level dedup — 직전 px 와 동일하면 fit() 진입 자체 skip.
       // SvelteFlow 의 nodeInternals update 가 동일 width/height 재측정을 트리거할
@@ -291,10 +325,19 @@
       if (last !== undefined) {
         const w = Math.round(last.contentRect.width);
         const h = Math.round(last.contentRect.height);
-        // Minimized panels keep XtermHost mounted under display:none so the
-        // xterm buffer survives. Ignore hidden 0x0 measurements and force the
-        // next visible measurement to refit even if it matches the old size.
+        // Minimized panels keep XtermHost mounted under display:none so the xterm
+        // buffer survives. Drop any pending fit so it can't run at a degenerate
+        // size, mark a re-show, and force the next visible measurement to refit.
         if (w <= 0 || h <= 0) {
+          if (fitRaf !== null) {
+            cancelAnimationFrame(fitRaf);
+            fitRaf = null;
+          }
+          if (fitTimer !== null) {
+            clearTimeout(fitTimer);
+            fitTimer = null;
+          }
+          wasHidden = true;
           lastObservedW = -1;
           lastObservedH = -1;
           return;
@@ -303,34 +346,38 @@
         lastObservedW = w;
         lastObservedH = h;
       }
-      if (fitTimer) clearTimeout(fitTimer);
-      fitTimer = setTimeout(() => {
-        fitTimer = null;
-        debugCount('xterm.fit');
-        try {
-          fitAddon.fit();
-          term.refresh(0, Math.max(0, term.rows - 1));
-        } catch (e) {
-          console.debug('[gtmux] xterm fit on resize failed', e);
-          return;
+      if (wasHidden) {
+        // Re-show after display:none — defer the fit so xterm re-measures its char
+        // size first. A next-frame fit paints blank ("block out"); ADR-0004 D5 amend ②.
+        wasHidden = false;
+        if (fitRaf !== null) {
+          cancelAnimationFrame(fitRaf);
+          fitRaf = null;
         }
-        const cols = term.cols;
-        const rows = term.rows;
-        // dedup 1차: 직전 송신값과 동일하면 send debounce 도 arm 하지 않음.
-        if (cols === lastSentCols && rows === lastSentRows) return;
-        pendingCols = cols;
-        pendingRows = rows;
-        if (sendTimer) clearTimeout(sendTimer);
-        sendTimer = setTimeout(() => {
-          sendTimer = null;
-          flushResize();
-        }, RESIZE_SEND_DEBOUNCE_MS);
-      }, RESIZE_DEBOUNCE_MS);
+        if (fitTimer !== null) clearTimeout(fitTimer);
+        fitTimer = setTimeout(() => {
+          fitTimer = null;
+          runFit();
+        }, REFIT_ON_SHOW_MS);
+        return;
+      }
+      // ② already-visible resize: fit immediately, coalesced to ≤1 per frame (rAF)
+      // so the visible grid matches the container without a debounce-window lag.
+      // Deferring out of the RO callback via rAF also avoids the "RO loop" warning.
+      if (fitRaf !== null) return;
+      fitRaf = requestAnimationFrame(() => {
+        fitRaf = null;
+        runFit();
+      });
     });
     ro.observe(containerEl);
 
     return () => {
-      if (fitTimer) {
+      if (fitRaf !== null) {
+        cancelAnimationFrame(fitRaf);
+        fitRaf = null;
+      }
+      if (fitTimer !== null) {
         clearTimeout(fitTimer);
         fitTimer = null;
       }
@@ -399,5 +446,15 @@
   .xterm-host :global(.xterm-viewport),
   .xterm-host :global(.xterm-screen) {
     height: 100%;
+  }
+  /* ADR-0004 D8 (2026-07-12): pin the native viewport scrollbar to a known narrow
+     width so FitAddon's default 14px column reservation reliably clears it. This
+     replaces the `overviewRuler.width` hack (removed in options.ts) that rendered a
+     z-index:8 overlay canvas over the rightmost glyphs. */
+  .xterm-host :global(.xterm-viewport) {
+    scrollbar-width: thin;
+  }
+  .xterm-host :global(.xterm-viewport)::-webkit-scrollbar {
+    width: 8px;
   }
 </style>
