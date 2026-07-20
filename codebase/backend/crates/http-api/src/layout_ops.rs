@@ -38,9 +38,10 @@ pub struct LayoutOpsRequest {
 }
 
 /// One layout op (ADR-0053 D5). Wire tag is `op`, snake_case (`raise_top`,
-/// `group_create`, …). Terminal lifecycle ops (`spawn`/`mount`) are Batch B
-/// (ADR-0053 D11) and intentionally absent — an unknown `op` value is a serde
-/// error mapped to 400 `bad_request` by the handler.
+/// `group_create`, …). Terminal lifecycle ops (`spawn`/`mount` — ADR-0053
+/// D11) mutate the layout here; their side effects (PTY spawn, alive-pool
+/// pre-flight) live in the handler. An unknown `op` value is a serde error
+/// mapped to 400 `bad_request` by the handler.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LayoutOp {
@@ -136,6 +137,28 @@ pub enum LayoutOp {
         #[serde(default)]
         force: bool,
     },
+    Spawn {
+        /// Placement overrides — same default rule as `create` (ADR-0053
+        /// D11 / 잔여 확인 3: stored-viewport center + terminal default
+        /// size). The terminal UUID (= item id) is server-issued and
+        /// returned via `created_ids`; the handler PTY-spawns it after the
+        /// layout commit (headless-complete — no browser required).
+        x: Option<f64>,
+        y: Option<f64>,
+        w: Option<f64>,
+        h: Option<f64>,
+    },
+    Mount {
+        /// UUID of an *alive pool terminal* (handler pre-flights against
+        /// the terminal map — dead/unknown → 400 `terminal_not_alive`).
+        /// Adds a TerminalItem referencing it, no spawn (ADR-0053 D11 —
+        /// web `attachToCanvas` parity).
+        uuid: String,
+        x: Option<f64>,
+        y: Option<f64>,
+        w: Option<f64>,
+        h: Option<f64>,
+    },
     GroupCreate {
         ids: Vec<String>,
         label: Option<String>,
@@ -195,6 +218,10 @@ pub struct ApplyOutcome {
     /// Terminal UUIDs whose items were deleted with `kill_terminal: true`.
     /// The handler SIGTERMs + forgets these after the layout commit.
     pub kill_terminal_uuids: Vec<String>,
+    /// Fresh terminal UUIDs minted by `spawn` ops (ADR-0053 D11). Also
+    /// present in `created_ids`; the handler PTY-spawns these (with D4 env
+    /// injection) after the layout commit.
+    pub spawned_terminal_uuids: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +243,10 @@ const LINE_HIT_PADDING: f64 = 8.0;
 /// FE `itemFactory.ts` path default second endpoint delta.
 const PATH_DEFAULT_DX: f64 = 240.0;
 const PATH_DEFAULT_DY: f64 = 80.0;
+/// FE `itemFactory.ts` `DEFAULT_TERMINAL_SIZE` — spawn/mount default panel
+/// size (ADR-0053 D11, placement rule = create's).
+const TERMINAL_DEFAULT_W: f64 = 480.0;
+const TERMINAL_DEFAULT_H: f64 = 320.0;
 /// FE `itemFactory.ts` free-draw bbox padding.
 const FREE_DRAW_PADDING: f64 = 8.0;
 
@@ -1045,6 +1076,102 @@ fn default_payload(item_type: &str, x: f64, y: f64) -> Map<String, Value> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Terminal lifecycle ops (ADR-0053 D11 — Batch B)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the panel geometry for `spawn`/`mount` — the `create` default
+/// rule (ADR-0053 D11 / 잔여 확인 3): explicit values win, otherwise the
+/// stored-viewport center with the FE terminal default size.
+fn terminal_placement(
+    layout: &Layout,
+    x: Option<f64>,
+    y: Option<f64>,
+    w: Option<f64>,
+    h: Option<f64>,
+) -> Result<(f64, f64, f64, f64), OpError> {
+    let w = w.unwrap_or(TERMINAL_DEFAULT_W);
+    let h = h.unwrap_or(TERMINAL_DEFAULT_H);
+    if !(w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
+        return Err(OpError::new(
+            "bad_geometry",
+            "w/h must be positive finite numbers",
+        ));
+    }
+    let (cx, cy) = viewport_center(&layout.viewport);
+    let x = x.unwrap_or(cx - w / 2.0);
+    let y = y.unwrap_or(cy - h / 2.0);
+    check_finite(&[("x", x), ("y", y)])?;
+    Ok((x, y, w, h))
+}
+
+/// Append a TerminalItem with the given id at top z (ADR-0018 D7 parity
+/// with `create`).
+fn push_terminal_item(layout: &mut Layout, id: &str, x: f64, y: f64, w: f64, h: f64) {
+    let max_z = layout
+        .items
+        .iter()
+        .map(|it| it.common().z)
+        .max()
+        .unwrap_or(0);
+    layout.items.push(Item::Terminal {
+        common: crate::schema::ItemCommon {
+            id: id.to_string(),
+            parent_id: None,
+            x,
+            y,
+            w,
+            h,
+            z: max_z.saturating_add(1),
+            visibility: Visibility::Visible,
+            locked: false,
+            label: String::new(),
+            description: String::new(),
+            minimized: false,
+        },
+    });
+}
+
+/// `spawn` — mint a fresh terminal UUID (the canonical terminal-id mint,
+/// ADR-0018 D2 global namespace) and persist its TerminalItem. The PTY
+/// spawn itself is a handler side effect after the layout commit.
+fn op_spawn(
+    layout: &mut Layout,
+    x: Option<f64>,
+    y: Option<f64>,
+    w: Option<f64>,
+    h: Option<f64>,
+) -> Result<String, OpError> {
+    let (x, y, w, h) = terminal_placement(layout, x, y, w, h)?;
+    let id = crate::terminal_map::fresh_terminal_uuid();
+    push_terminal_item(layout, &id, x, y, w, h);
+    Ok(id)
+}
+
+/// `mount` — add a TerminalItem referencing an existing pool terminal
+/// (no spawn). Aliveness is pre-flighted by the handler; the pure core
+/// rejects only the structural duplicate (same UUID already mounted in
+/// this session layout — ADR-0053 D11, explicit code ahead of the
+/// pipeline's id-uniqueness validate).
+fn op_mount(
+    layout: &mut Layout,
+    uuid: &str,
+    x: Option<f64>,
+    y: Option<f64>,
+    w: Option<f64>,
+    h: Option<f64>,
+) -> Result<(), OpError> {
+    if item_idx(layout, uuid).is_some() {
+        return Err(OpError::new(
+            "already_mounted",
+            format!("terminal {uuid:?} already has an item in this session layout"),
+        ));
+    }
+    let (x, y, w, h) = terminal_placement(layout, x, y, w, h)?;
+    push_terminal_item(layout, uuid, x, y, w, h);
+    Ok(())
+}
+
 fn op_delete(
     layout: &mut Layout,
     id: &str,
@@ -1360,6 +1487,11 @@ pub fn apply_ops(layout: &mut Layout, ops: &[LayoutOp]) -> Result<ApplyOutcome, 
                 fields,
             } => op_create(layout, item_type, *x, *y, *w, *h, fields.as_ref())
                 .map(|id| outcome.created_ids.push(id)),
+            LayoutOp::Spawn { x, y, w, h } => op_spawn(layout, *x, *y, *w, *h).map(|id| {
+                outcome.created_ids.push(id.clone());
+                outcome.spawned_terminal_uuids.push(id);
+            }),
+            LayoutOp::Mount { uuid, x, y, w, h } => op_mount(layout, uuid, *x, *y, *w, *h),
             LayoutOp::Delete {
                 id,
                 kill_terminal,
@@ -1716,6 +1848,68 @@ mod tests {
             other => panic!("unexpected variant {other:?}"),
         }
         assert!(schema::validate(&l).is_ok());
+    }
+
+    #[test]
+    fn spawn_defaults_center_top_z_and_reports_uuid() {
+        let mut l = layout_with(vec![rect(A, 3)]);
+        let ops = vec![LayoutOp::Spawn {
+            x: None,
+            y: None,
+            w: None,
+            h: None,
+        }];
+        let outcome = apply_ops(&mut l, &ops).unwrap();
+        assert_eq!(outcome.created_ids.len(), 1);
+        assert_eq!(outcome.spawned_terminal_uuids, outcome.created_ids);
+        let id = &outcome.created_ids[0];
+        assert_eq!(id.len(), 36, "spawn id is a server-issued UUID");
+        let idx = item_idx(&l, id).unwrap();
+        match &l.items[idx] {
+            Item::Terminal { common } => {
+                // Default viewport (0,0,zoom 1) → nominal center (960, 540);
+                // terminal default 480x320 → top-left (720, 380).
+                assert_eq!(common.w, TERMINAL_DEFAULT_W);
+                assert_eq!(common.h, TERMINAL_DEFAULT_H);
+                assert_eq!(common.x, 960.0 - TERMINAL_DEFAULT_W / 2.0);
+                assert_eq!(common.y, 540.0 - TERMINAL_DEFAULT_H / 2.0);
+                assert_eq!(common.z, 4);
+                assert_eq!(common.parent_id, None);
+            }
+            other => panic!("unexpected variant {other:?}"),
+        }
+        assert!(schema::validate(&l).is_ok());
+    }
+
+    #[test]
+    fn mount_adds_item_and_rejects_duplicate() {
+        let uuid = "11111111-2222-4333-8444-5555555555ee";
+        let mut l = Layout::empty();
+        op_mount(&mut l, uuid, Some(10.0), Some(20.0), None, None).unwrap();
+        let idx = item_idx(&l, uuid).unwrap();
+        match &l.items[idx] {
+            Item::Terminal { common } => {
+                assert_eq!(common.x, 10.0);
+                assert_eq!(common.y, 20.0);
+                assert_eq!(common.w, TERMINAL_DEFAULT_W);
+                assert_eq!(common.h, TERMINAL_DEFAULT_H);
+            }
+            other => panic!("unexpected variant {other:?}"),
+        }
+        assert!(schema::validate(&l).is_ok());
+        // Same UUID mounted twice in one session layout → explicit reject.
+        let err = op_mount(&mut l, uuid, None, None, None, None).unwrap_err();
+        assert_eq!(err.code, "already_mounted");
+    }
+
+    #[test]
+    fn spawn_rejects_bad_geometry() {
+        let mut l = Layout::empty();
+        let err = op_spawn(&mut l, None, None, Some(-5.0), None).unwrap_err();
+        assert_eq!(err.code, "bad_geometry");
+        let err = op_spawn(&mut l, Some(f64::NAN), None, None, None).unwrap_err();
+        assert_eq!(err.code, "bad_geometry");
+        assert!(l.items.is_empty());
     }
 
     #[test]

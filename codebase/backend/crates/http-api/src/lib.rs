@@ -454,6 +454,11 @@ impl AppState {
     /// Spawn a fresh Terminal in the PTY backend and bind it to `uuid` in
     /// the [`TerminalMap`] (Stage 4-A / ADR-0018 D6 *fresh spawn* arm).
     ///
+    /// `canvas_session` is the canvas session name the spawn is scoped to
+    /// (ADR-0053 D4 — injected as `GTMUX_CANVAS_SESSION`; `None` for
+    /// session-less paths like an orphan respawn, which then omits the
+    /// variable).
+    ///
     /// Idempotent on the UUID axis: if `uuid` is already mapped to an alive
     /// PaneId the existing binding is returned with no side effect. Two
     /// concurrent calls for the same UUID will at worst spawn one extra
@@ -467,6 +472,7 @@ impl AppState {
         &self,
         uuid: String,
         cwd: Option<std::path::PathBuf>,
+        canvas_session: Option<&str>,
     ) -> Result<gtmux_pty_backend::PaneId, SpawnTerminalError> {
         if let Some(existing) = self.terminal_map.lookup_pane(&uuid).await {
             return Ok(existing);
@@ -478,8 +484,12 @@ impl AppState {
         // ADR-0046 D2 — default cwd = the session's effective workspace(B).
         // `None` keeps the pty-backend default ($HOME → process cwd); a
         // per-terminal template cwd override would win here in the future.
+        // ADR-0053 D4 — every spawn path injects the terminal's canvas
+        // identity into the child env (self-identification for in-terminal
+        // agents).
         let pane = hub.backend().spawn(gtmux_pty_backend::SpawnSpec {
             cwd,
+            env: terminal_identity_env(&uuid, canvas_session),
             ..gtmux_pty_backend::SpawnSpec::default_shell()
         })?;
         match self.terminal_map.register(uuid.clone(), pane).await {
@@ -626,6 +636,24 @@ impl AppState {
     ) -> Self {
         Self::with_hub_shared(config, token, hub).with_workspace(workspace)
     }
+}
+
+/// Canvas-identity env for a terminal child process (ADR-0053 D4):
+/// `GTMUX_TERMINAL_ID` = the terminal UUID (= canvas item id, ADR-0018 D2),
+/// `GTMUX_CANVAS_SESSION` = the canvas session name when the spawn is
+/// session-scoped. Deliberately distinct from `GTMUX_SESSION` /
+/// `GTMUX_SERVER_INSTANCE` (server instance markers injected by the pty
+/// backend). Values can go stale (session rename, unmount) — consumers
+/// validate by hitting the HTTP API and treating 404 as stale (D4).
+pub(crate) fn terminal_identity_env(
+    uuid: &str,
+    canvas_session: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = vec![("GTMUX_TERMINAL_ID".to_string(), uuid.to_string())];
+    if let Some(name) = canvas_session {
+        env.push(("GTMUX_CANVAS_SESSION".to_string(), name.to_string()));
+    }
+    env
 }
 
 /// Errors from [`AppState::spawn_terminal_with_uuid`]. Distinct from
@@ -2647,7 +2675,7 @@ mod tests {
 
         // POST /api/sessions { name: "demo" } → 201
         let create_body = serde_json::to_vec(
-            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let resp = app
@@ -2820,7 +2848,7 @@ mod tests {
         let (app, token, _) = make_app_with_workspace(&dir);
         let body = || {
             serde_json::to_vec(
-                &json!({ "name": "twin", "workspace_root": dir.path().to_str().unwrap() }),
+                &json!({ "name": "twin", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
             )
             .unwrap()
         };
@@ -2845,7 +2873,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
         for bad in ["", "../etc", "a/b", "has space"] {
-            let body = serde_json::to_vec(&json!({ "name": bad })).unwrap();
+            let body = serde_json::to_vec(&json!({ "name": bad, "confirm": true })).unwrap();
             let resp = app
                 .clone()
                 .oneshot(
@@ -2911,7 +2939,7 @@ mod tests {
         let (app, token, _wd) = make_app_with_workspace(&dir);
         // Seed by creating the same name first.
         let create_body = serde_json::to_vec(
-            &json!({ "name": "dup", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "dup", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let r1 = app
@@ -3327,7 +3355,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
         let create_body = serde_json::to_vec(
-            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         app.clone()
@@ -3426,7 +3454,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
         let create_body = serde_json::to_vec(
-            &json!({ "name": "be4", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "be4", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         app.clone()
@@ -3601,7 +3629,7 @@ mod tests {
         workspace_root: &std::path::Path,
     ) {
         let create_body = serde_json::to_vec(
-            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap() }),
+            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let resp = app
@@ -3878,7 +3906,7 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .method(Method::DELETE)
-                    .uri("/api/sessions/alpha")
+                    .uri("/api/sessions/alpha?confirm=true")
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(&token))
                     .body(Body::empty())
@@ -3901,7 +3929,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
         let create_body = serde_json::to_vec(
-            &json!({ "name": "doomed", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "doomed", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         app.clone()
@@ -3924,7 +3952,7 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .method(Method::DELETE)
-                    .uri("/api/sessions/doomed")
+                    .uri("/api/sessions/doomed?confirm=true")
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(&token))
                     .body(Body::empty())
@@ -3948,6 +3976,245 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── ADR-0053 D6/D12 (Batch B): session lifecycle extra-auth gate ──
+
+    /// Local mode, no password, bearer-only (non-browser): create without
+    /// the explicit confirm flag → 400 `confirm_required`; with it → 201.
+    /// Delete mirrors via `?confirm=true`.
+    #[tokio::test]
+    async fn session_lifecycle_gate_local_requires_confirm_for_bearer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({ "name": "gated", "workspace_root": dir.path().to_str().unwrap() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "confirm_required");
+
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({
+                "name": "gated",
+                "workspace_root": dir.path().to_str().unwrap(),
+                "confirm": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // DELETE without confirm → 400; with → 204.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/gated")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/gated?confirm=true")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Browser flow non-regression (ADR-0053 D6): a request authenticated
+    /// by a valid `gtmux_auth` session cookie keeps the pre-gate rules —
+    /// no confirm flag, no password header.
+    #[tokio::test]
+    async fn session_lifecycle_gate_cookie_browser_flow_bypasses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, _token, _store, state) = make_app_with_workspace_and_state(&dir);
+        let cookie = state
+            .session_table
+            .issue(auth::AuthMode::Token)
+            .await
+            .expect("issue cookie");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("{COOKIE_NAME_STR}={cookie}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": "webflow",
+                            "workspace_root": dir.path().to_str().unwrap(),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "cookie-authenticated (browser) create must not need confirm"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/webflow")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("{COOKIE_NAME_STR}={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "cookie-authenticated (browser) delete must not need confirm"
+        );
+    }
+
+    /// Password set (mode-independent): bearer callers must re-present the
+    /// password via `X-Gtmux-Password` — missing → 401 credential_required,
+    /// wrong → 401 invalid_credential, correct → 201. The confirm flag does
+    /// not substitute.
+    #[tokio::test]
+    async fn session_lifecycle_gate_password_mode_requires_header() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store, state) = make_app_with_workspace_and_state(&dir);
+        let hash = hash_password("hunter2 correct horse").expect("hash");
+        *state.password_hash.write().await = Some(hash);
+
+        let create_body = json!({
+            "name": "pwgated",
+            "workspace_root": dir.path().to_str().unwrap(),
+            "confirm": true,
+        });
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(create_body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "credential_required");
+
+        let post_with_pw = |pw: &'static str| {
+            let app = app.clone();
+            let token = token.clone();
+            let body = create_body.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        HttpRequest::builder()
+                            .method(Method::POST)
+                            .uri("/api/sessions")
+                            .header(header::HOST, TEST_HOST)
+                            .header(header::AUTHORIZATION, bearer(&token))
+                            .header("x-gtmux-password", pw)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let body: Value = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                (status, body)
+            }
+        };
+
+        let (status, body) = post_with_pw("wrong password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "invalid_credential");
+
+        let (status, _) = post_with_pw("hunter2 correct horse").await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Delete also honours the password header (no confirm needed).
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/pwgated")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header("x-gtmux-password", "hunter2 correct horse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Cloud mode without a configured password: non-browser session
+    /// lifecycle is refused outright (403 `password_required`) — cloud
+    /// presumes the password flow (ADR-0053 잔여 확인 1).
+    #[tokio::test]
+    async fn session_lifecycle_gate_cloud_without_password_403() {
+        let token = issue_token().expect("token");
+        let state = AppState::new(cloud_test_config(false), token.clone());
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(
+                            &json!({ "name": "c", "workspace_root": "/tmp", "confirm": true }),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "password_required");
     }
 
     #[tokio::test]
@@ -5283,6 +5550,168 @@ mod tests {
         assert_eq!(body["code"], "create_terminal_not_allowed");
     }
 
+    // ── ADR-0053 D11 (Batch B): spawn / mount ops ──
+
+    /// `spawn` is headless-complete (ADR-0053 D11): with no browser or
+    /// attach anywhere, one ops call persists the TerminalItem (default
+    /// create placement) *and* leaves an alive PTY bound to the new UUID,
+    /// with the 0x88 TERMINAL_SPAWNED binding published.
+    #[tokio::test]
+    async fn layout_ops_spawn_headless_persists_item_and_spawns_pty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], vec![])).unwrap(),
+        )
+        .unwrap();
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let mut spawned_rx = hub.subscribe_terminal_spawned();
+        let app = router_with_state(state.clone());
+
+        let (status, body) = post_ops(&app, &token, "demo", json!([{ "op": "spawn" }])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["spawn_failures"], json!([]));
+        let uuid = body["created_ids"][0].as_str().unwrap().to_string();
+        assert_eq!(uuid.len(), 36, "spawn id must be a server-issued UUID");
+
+        // Layout persisted with the create-rule default placement
+        // (viewport (0,0,1) → center (960,540); terminal 480x320).
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        let item = ops_find_item(&layout, &uuid);
+        assert_eq!(item["type"], "terminal");
+        assert_eq!(item["x"], 720.0);
+        assert_eq!(item["y"], 380.0);
+        assert_eq!(item["w"], 480.0);
+        assert_eq!(item["h"], 320.0);
+
+        // PTY alive + 0x88 binding published + attach_index membership.
+        let pane = state
+            .terminal_map
+            .lookup_pane(&uuid)
+            .await
+            .expect("spawn op must leave an alive PTY binding");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), spawned_rx.recv())
+            .await
+            .expect("0x88 must be published")
+            .expect("recv");
+        assert_eq!(&*event.terminal_id, uuid.as_str());
+        assert_eq!(event.pane_id, pane.0);
+        assert_eq!(
+            state.attach_index.read_attached_sessions(&uuid),
+            vec!["demo".to_string()],
+        );
+
+        // Cleanup — SIGTERM the real child shell.
+        let _ = hub.backend().kill(pane);
+    }
+
+    /// Atomicity across the spawn side effect: a failing op in the same
+    /// batch rejects everything — no layout change *and no PTY spawn*.
+    #[tokio::test]
+    async fn layout_ops_spawn_atomic_with_failing_op_spawns_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state.clone());
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([
+                { "op": "spawn" },
+                { "op": "move", "id": "00000000-0000-4000-8000-00000000dead", "x": 1.0, "y": 1.0 },
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "item_not_found");
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        assert!(layout["items"].as_array().unwrap().is_empty());
+        assert!(
+            state.terminal_map.is_empty().await,
+            "rejected batch must not spawn any PTY"
+        );
+    }
+
+    /// `mount` adds an item for an alive pool terminal without spawning;
+    /// a dead/unknown UUID is rejected up front, and a second mount of the
+    /// same UUID into the same session is an explicit 400 (ADR-0053 D11).
+    #[tokio::test]
+    async fn layout_ops_mount_alive_validation_and_duplicate_reject() {
+        use gtmux_pty_backend::PaneId;
+        let uuid = "11111111-2222-4333-8444-5555555555bb";
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state.clone());
+
+        // Unknown UUID → 400 terminal_not_alive, nothing written.
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "mount", "uuid": "00000000-0000-4000-8000-00000000beef" }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "terminal_not_alive");
+        assert_eq!(body["failed_index"], 0);
+
+        // Alive pool terminal → mounted with explicit coordinates, no
+        // fresh spawn (the pool binding is untouched).
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(9))
+            .await
+            .unwrap();
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "mount", "uuid": uuid, "x": 5.0, "y": 6.0 }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["created_ids"],
+            json!([]),
+            "mount reuses a caller-supplied id — nothing is server-issued"
+        );
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        let item = ops_find_item(&layout, uuid);
+        assert_eq!(item["type"], "terminal");
+        assert_eq!(item["x"], 5.0);
+        assert_eq!(item["y"], 6.0);
+        assert_eq!(item["w"], 480.0);
+        assert_eq!(item["h"], 320.0);
+        assert_eq!(state.terminal_map.lookup_pane(uuid).await, Some(PaneId(9)));
+        assert_eq!(
+            state.attach_index.read_attached_sessions(uuid),
+            vec!["demo".to_string()],
+        );
+
+        // Duplicate mount into the same session layout → explicit reject.
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "mount", "uuid": uuid }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "already_mounted");
+    }
+
     #[tokio::test]
     async fn terminal_kill_404_when_not_in_pool() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5351,7 +5780,7 @@ mod tests {
         workspace_root: &std::path::Path,
     ) {
         let body = serde_json::to_vec(
-            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap() }),
+            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let resp = app
@@ -5622,7 +6051,7 @@ mod tests {
 
         // Create the session (no attach yet) with workspace_root = project dir.
         let create = serde_json::to_vec(
-            &json!({ "name": "demo", "workspace_root": project.to_str().unwrap() }),
+            &json!({ "name": "demo", "workspace_root": project.to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let resp = app
@@ -6531,7 +6960,7 @@ mod tests {
         let uuid = "11111111-2222-4333-8444-66666666666e";
         let mut rx = hub.subscribe_terminal_spawned();
         let pane = state
-            .spawn_terminal_with_uuid(uuid.to_string(), None)
+            .spawn_terminal_with_uuid(uuid.to_string(), None, None)
             .await
             .expect("spawn");
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
@@ -6553,7 +6982,7 @@ mod tests {
         let uuid = "11111111-2222-4333-8444-66666666666f";
         let mut rx = hub.subscribe_terminal_spawned();
         let _first = state
-            .spawn_terminal_with_uuid(uuid.to_string(), None)
+            .spawn_terminal_with_uuid(uuid.to_string(), None, None)
             .await
             .expect("spawn 1");
         let _drain = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
@@ -6562,13 +6991,36 @@ mod tests {
             .expect("recv");
         // Re-spawn the same UUID — fast-path lookup, no fresh broadcast.
         let _second = state
-            .spawn_terminal_with_uuid(uuid.to_string(), None)
+            .spawn_terminal_with_uuid(uuid.to_string(), None, None)
             .await
             .expect("spawn 2");
         let racy = tokio::time::timeout(std::time::Duration::from_millis(80), rx.recv()).await;
         assert!(
             racy.is_err(),
             "idempotent re-spawn must not publish a second binding, got: {racy:?}"
+        );
+    }
+
+    /// ADR-0053 D4 — canvas identity env injected into every spawn:
+    /// `GTMUX_TERMINAL_ID` always, `GTMUX_CANVAS_SESSION` only for
+    /// session-scoped spawns. (Runtime propagation into the child shell is
+    /// the pty backend's existing `SpawnSpec.env` contract; the end-to-end
+    /// echo check is a Batch E 실측 item.)
+    #[test]
+    fn terminal_identity_env_maps_uuid_and_session() {
+        let uuid = "11111111-2222-4333-8444-666666666601";
+        let env = terminal_identity_env(uuid, Some("demo"));
+        assert_eq!(
+            env,
+            vec![
+                ("GTMUX_TERMINAL_ID".to_string(), uuid.to_string()),
+                ("GTMUX_CANVAS_SESSION".to_string(), "demo".to_string()),
+            ]
+        );
+        let env = terminal_identity_env(uuid, None);
+        assert_eq!(
+            env,
+            vec![("GTMUX_TERMINAL_ID".to_string(), uuid.to_string())]
         );
     }
 
@@ -8872,7 +9324,7 @@ mod tests {
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "needs-ws" })),
+            Some(json!({ "name": "needs-ws", "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -8889,7 +9341,7 @@ mod tests {
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "escape", "workspace_root": "/etc" })),
+            Some(json!({ "name": "escape", "workspace_root": "/etc", "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -8911,7 +9363,7 @@ mod tests {
                 &token,
                 Method::POST,
                 "/api/sessions",
-                Some(json!({ "name": name, "workspace_root": proj.to_string_lossy() })),
+                Some(json!({ "name": name, "workspace_root": proj.to_string_lossy(), "confirm": true })),
             )
             .await;
             assert_eq!(
@@ -8985,7 +9437,7 @@ mod tests {
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "movable", "workspace_root": proj1.to_string_lossy() })),
+            Some(json!({ "name": "movable", "workspace_root": proj1.to_string_lossy(), "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
@@ -9055,7 +9507,7 @@ mod tests {
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "orig", "workspace_root": proj.to_string_lossy() })),
+            Some(json!({ "name": "orig", "workspace_root": proj.to_string_lossy(), "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);

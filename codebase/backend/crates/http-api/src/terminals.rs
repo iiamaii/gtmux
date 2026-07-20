@@ -342,8 +342,16 @@ pub async fn respawn_handler(
     crate::sessions::kill_and_unregister_terminal(&state, &id).await;
     // ADR-0046 D2 — respawn in the effective Workspace(B) of a session that
     // references this terminal (best-effort; falls back to the pty default).
-    let cwd = crate::sessions::terminal_respawn_cwd(&state, &id).await;
-    match state.spawn_terminal_with_uuid(id.clone(), cwd).await {
+    // The same session name rides along as the canvas identity env
+    // (ADR-0053 D4); an orphan UUID spawns without it.
+    let (cwd, session) = match crate::sessions::terminal_respawn_cwd(&state, &id).await {
+        Some((cwd, session)) => (Some(cwd), Some(session)),
+        None => (None, None),
+    };
+    match state
+        .spawn_terminal_with_uuid(id.clone(), cwd, session.as_deref())
+        .await
+    {
         Ok(_) => (StatusCode::OK, Json(json!({ "id": id, "reused": false }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
