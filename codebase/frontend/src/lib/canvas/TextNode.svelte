@@ -18,6 +18,7 @@
     constrainResizeAspectIfShift,
     scheduleLiveAspectResize,
   } from './resizeConstraint';
+  import { holdLayoutRefetch, releaseLayoutRefetch } from '$lib/ws/layoutRefetch.svelte';
   import { strokeDashArray } from './strokeDash';
   // 텍스트 정렬 UI 는 ToolbarSubbar (lib/toolbar/ToolbarSubbar.svelte) 로 이전.
   // 본 컴포넌트는 더 이상 alignment toolbar 를 그리지 않는다.
@@ -186,7 +187,14 @@
     if (result.ok) editing = false;
   }
 
+  // ADR-0053 D7 — resize gesture 동안 외부발 0x80 refetch defer (node drag 와
+  // 동일 가드). NodeResizer 는 d3-drag 기반 — start/end 는 항상 짝으로 발화.
+  function onResizeStart(): void {
+    holdLayoutRefetch();
+  }
+
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
+    releaseLayoutRefetch();
     const constrained = constrainResizeAspectIfShift(
       event,
       params,
@@ -237,6 +245,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResizeStart}
       {onResize}
       {onResizeEnd}
     />

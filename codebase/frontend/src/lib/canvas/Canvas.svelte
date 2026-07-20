@@ -45,6 +45,7 @@
     parseWorkspaceFileDragPayload,
   } from '$lib/files/workspaceAssets';
   import { encodePaneIn, FRAME_TYPE } from '$lib/ws/decode';
+  import { holdLayoutRefetch, releaseLayoutRefetch } from '$lib/ws/layoutRefetch.svelte';
   import type { WsClient } from '$lib/ws/client';
   import PanelNode from './PanelNode.svelte';
   import TextNode from './TextNode.svelte';
@@ -2938,6 +2939,9 @@
     if (movedById.size === 0) return;
     if (nodeDragPriorSnapshot === null) {
       nodeDragPriorSnapshot = sessionStore.layoutSnapshot();
+      // ADR-0053 D7 — drag 진행 중 외부발 0x80 refetch defer. release 는
+      // onnodedragstop 이 snapshot 소거와 짝지어 정확히 1회 수행.
+      holdLayoutRefetch();
     }
     // Live store update keeps derived group bboxes in sync while dragging.
     for (const [id, next] of movedById) {
@@ -2967,13 +2971,18 @@
   function onnodedragstop({
     nodes,
   }: { targetNode: Node | null; nodes: Node[] }) {
+    // ADR-0053 D7 — hold 는 onnodedrag 첫 tick (snapshot 생성) 과 짝.
+    // gesture 종료가 어느 분기로 빠지든 snapshot 소거와 함께 정확히 1회
+    // release — 미짝 release 는 외부발 0x80 refetch 를 영구 defer 시킨다.
+    const heldSnapshot = nodeDragPriorSnapshot;
+    nodeDragPriorSnapshot = null;
+    if (heldSnapshot !== null) releaseLayoutRefetch();
     if (nodes.length === 0) return;
     if (sessionStore.active === null) return;
 
     // id → moved item map. 단일 drag 시 nodes.length === 1.
     const movedById = movedItemsFromNodes(nodes);
     if (movedById.size === 0) {
-      nodeDragPriorSnapshot = null;
       resetDockState();
       return;
     }
@@ -3004,8 +3013,7 @@
     // PRE-state snapshot — optimistic update 직전에 잡아 history capture 의
     // 입력으로 명시 (ADR-0028 D7). 그렇지 않으면 layoutSnapshot() 이 이미
     // 새 position 으로 갱신된 후 호출되어 PRE === POST → Cmd+Z 가 no-op.
-    const priorSnapshot = nodeDragPriorSnapshot ?? sessionStore.layoutSnapshot();
-    nodeDragPriorSnapshot = null;
+    const priorSnapshot = heldSnapshot ?? sessionStore.layoutSnapshot();
     // Optimistic store update — bind:nodes 양방향 sync 의 idempotent 결과.
     for (const [id, next] of movedById) {
       sessionStore.items.set(id, next);

@@ -34,6 +34,7 @@
     constrainResizeAspectIfShift,
     scheduleLiveAspectResize,
   } from './resizeConstraint';
+  import { holdLayoutRefetch, releaseLayoutRefetch } from '$lib/ws/layoutRefetch.svelte';
   import {
     MINIMIZED_TERMINAL_PANEL_HEIGHT,
     type CanvasItem,
@@ -147,6 +148,12 @@
     );
   }
 
+  // ADR-0053 D7 — resize gesture 동안 외부발 0x80 refetch defer (node drag 와
+  // 동일 가드). NodeResizer 는 d3-drag 기반 — start/end 는 항상 짝으로 발화.
+  function onResizeStart(): void {
+    holdLayoutRefetch();
+  }
+
   // NodeResizer onResizeEnd — { event, params: { x, y, width, height } }.
   // Resize 도중에는 SvelteFlow 가 controlled width/height 를 자체 업데이트
   // 하므로 본 핸들러는 *최종 값만* store + disk 로 commit (drag 와 동일 패턴).
@@ -156,6 +163,7 @@
   // + 큰 h 로 인한 빈 contents* 회귀가 source 차원에서 차단됨. 사용자가
   // resize 하려면 minimize 먼저 toggle 풀어야 함 (명료한 mental model).
   function onResizeEnd(event: unknown, params: ResizeParams) {
+    releaseLayoutRefetch();
     const current = currentResizeBounds(params);
     const constrained = constrainResizeAspectIfShift(
       event,
@@ -417,6 +425,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResizeStart}
       {onResize}
       {onResizeEnd}
     />

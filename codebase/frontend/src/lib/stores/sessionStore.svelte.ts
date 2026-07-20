@@ -32,6 +32,7 @@ import {
   UnauthorizedError,
 } from '$lib/http/sessions';
 import { killTerminal } from '$lib/http/terminals';
+import { layoutEtag } from '$lib/stores/layoutEtag';
 import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
 import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
 import { historyStore } from '$lib/stores/historyStore.svelte';
@@ -333,6 +334,8 @@ class SessionStore {
       if (!res.ok) return false;
       const { layout, workspace_root } = parseLayoutBody(await res.json());
       if (workspace_root !== undefined) this.setActiveWorkspaceRoot(workspace_root);
+      // ADR-0053 D7 — refetch 로 확인한 etag 기록 (다음 0x80 echo 판별 기준).
+      layoutEtag.note((res.headers.get('ETag') ?? '').replace(/^"|"$/g, ''));
       this.loadLayout(layout);
       return true;
     } catch {
@@ -395,6 +398,9 @@ class SessionStore {
     this.suppressedTextEditDblClick = null;
     sessionStorageHint.clear();
     historyStore.setActive(null);
+    // ADR-0053 D7 — 이전 session 의 etag 가 새 session 의 0x80 판별을 오염하지
+    // 않도록 초기화.
+    layoutEtag.clear();
   }
 
   /**
@@ -1110,6 +1116,8 @@ class SessionStore {
       const { layout, workspace_root } = parseLayoutBody(await layoutRes.json());
       const effectiveWorkspaceRoot = workspace_root ?? attachBody.workspace_root;
       this.setActiveSession({ name, effectiveWorkspaceRoot });
+      // ADR-0053 D7 — attach 시점의 etag 기록 (0x80 echo 판별 기준).
+      layoutEtag.note((layoutRes.headers.get('ETag') ?? '').replace(/^"|"$/g, ''));
       this.loadLayout(layout);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

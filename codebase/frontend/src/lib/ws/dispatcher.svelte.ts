@@ -4,9 +4,9 @@
 // - WsClient 가 디코드한 envelope 을 frame type 별로 fan-out:
 //     * 0x02 PANE_OUT  → registered per-pane handler (xterm.write)
 //     * 0x07 NOTIFY_MIRROR → connection / panel state hints (e.g. pane-died zombie)
-//     * 0x80 LAYOUT_CHANGED → multi-session 에서는 mutateLayout 의 응답이 진실
-//       (legacy v1 refetch 는 0044 dual-source 제거 시 폐기). 본 핸들러는 외부
-//       hook 만 호출하고 자체 store mutation 은 안 함.
+//     * 0x80 LAYOUT_CHANGED → ADR-0053 D7: etag 비교 후 외부발 변경이면
+//       debounce + drag/resize defer 가드를 거쳐 reloadActiveLayout()
+//       (`layoutRefetch.svelte.ts`). 자기 발신 echo 는 etag 일치로 no-op.
 //     * 0x81 M_CHANGED       → sessionStore.M (active session 매칭 시)
 //     * 0x82 I_CHANGED       → sessionStore.I (active session 매칭 시)
 //     * 0x83 VIEWPORT_CHANGED → sessionStore.viewport (active session 매칭 시)
@@ -48,6 +48,8 @@ import {
   type Envelope,
 } from './decode';
 import { resolveCtrl, type CtrlResponse } from './ctrl-registry';
+import { etagBytesToHex } from './layoutRefetchGate';
+import { notifyLayoutChanged } from './layoutRefetch.svelte';
 import { WsClient, computeWsUrl, type ConnectionState, type WsClientOptions } from './client';
 
 // ── PANE_OUT handler 레지스트리 ────────────────────────────────────────────
@@ -354,11 +356,15 @@ function handleLayoutChanged(payload: Uint8Array): void {
     console.warn('[ws] 0x80 LAYOUT_CHANGED decode failed');
     return;
   }
-  // Multi-session: mutateLayout() 호출의 응답이 진실 — 본 broadcast 는 같은
-  // session 의 *다른 webpage* 가 변경했을 때 의미가 있는데 single-attach lock
-  // 으로 그 경로가 닫혀 있어 현재로서는 informational. Phase 2 (cross-tab
-  // multi-attach) 가 land 하면 `/api/sessions/<name>/layout` refetch 추가.
-  console.debug('[ws] 0x80 LAYOUT_CHANGED received (multi-session no-op)');
+  // ADR-0053 D7 — 0x80 재활성. CLI `/layout/ops` 등 *외부발* layout 변경의
+  // 실시간 반영 채널. FE 자기 발신 PUT 의 echo 는 etag 비교로 걸러진다
+  // (`layoutRefetch` 의 gate — HTTP 응답 경로가 `layoutEtag` 를 갱신).
+  // node drag / panel resize 진행 중이면 defer 후 gesture 종료 시 flush —
+  // 드래그 중 `items.clear()` (loadLayout) 는 절대 일어나지 않는다.
+  // 외부발 반영은 history 미기록 (reloadActiveLayout → loadLayout 은
+  // historyStore.capture 를 경유하지 않음 — 0x86 전례와 동일 정책).
+  if (sessionStore.active === null) return;
+  notifyLayoutChanged(etagBytesToHex(decoded.etag));
 }
 
 /**
