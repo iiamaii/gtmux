@@ -2284,6 +2284,293 @@ pub async fn layout_put_handler(
         .expect("static headers")
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  POST /api/sessions/:name/layout/ops (ADR-0053 D5/D6/D10/D13)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Map a per-op failure to the wire shape: 409 for `locked` (ADR-0053 D6),
+/// 400 for everything else. `failed_index` is `null` when the failure came
+/// from the batch-level pipeline (degrade→recompute→validate) rather than a
+/// specific op.
+fn ops_failure_response(failed_index: Option<usize>, e: crate::layout_ops::OpError) -> Response {
+    let status = if e.locked {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(json!({
+            "error": e.code,
+            "code": e.code,
+            "failed_index": failed_index,
+            "message": e.message,
+        })),
+    )
+        .into_response()
+}
+
+/// Pre-flight for `create image|document` ops (ADR-0053 D10 amend ② a/b):
+/// stat the workspace-relative `path` against the session's effective
+/// Workspace(B) — a broken reference fails the batch up front — and, for
+/// images, derive `mime` / `original_w` / `original_h` from the file bytes
+/// when the caller left them unset. Runs *before* the session write lock
+/// (fs I/O off the lock; the stat is a best-effort guard, the hard
+/// A+denylist boundary stays at serve time — `GET /api/fs/file`).
+async fn prepare_create_ops(
+    state: &crate::AppState,
+    wm: &Arc<WorkspaceManager>,
+    name: &str,
+    ops: &mut [crate::layout_ops::LayoutOp],
+) -> Result<(), (Option<usize>, crate::layout_ops::OpError)> {
+    use crate::layout_ops::{LayoutOp, OpError};
+
+    // Resolve the effective Workspace(B) once — ops cannot change it
+    // (workspace mutation is a dedicated endpoint, ADR-0053 D12).
+    let mut b_root: Option<std::path::PathBuf> = None;
+
+    for (index, op) in ops.iter_mut().enumerate() {
+        let LayoutOp::Create {
+            item_type, fields, ..
+        } = op
+        else {
+            continue;
+        };
+        if item_type != "image" && item_type != "document" {
+            continue;
+        }
+        let Some(Value::Object(map)) = fields.as_mut() else {
+            continue; // no fields → validate() reports the missing source.
+        };
+        let Some(rel) = map.get("path").and_then(Value::as_str).map(str::to_owned) else {
+            continue; // content / asset_id origins carry no fs reference.
+        };
+        let fail = |code: &'static str, message: String| {
+            Err((
+                Some(index),
+                OpError {
+                    code,
+                    message,
+                    locked: false,
+                },
+            ))
+        };
+        if !schema::is_clean_relative_workspace_path(&rel) {
+            return fail(
+                "workspace_path_invalid",
+                format!("path {rel:?} is not a clean workspace-relative path"),
+            );
+        }
+        let root = match &b_root {
+            Some(r) => r.clone(),
+            None => {
+                let r = session_effective_workspace(state, wm, name).await;
+                b_root = Some(r.clone());
+                r
+            }
+        };
+        let abs = root.join(&rel);
+        let canonical = match abs.canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                return fail(
+                    "path_not_found",
+                    format!("workspace file {rel:?} does not exist"),
+                );
+            }
+        };
+        if !fs_guard::is_path_allowed(&canonical, &state.server_workspace, &state.fs_denylist) {
+            return fail(
+                "path_not_allowed",
+                format!("workspace file {rel:?} resolves outside the allowed workspace"),
+            );
+        }
+        if !canonical.is_file() {
+            return fail("path_not_found", format!("{rel:?} is not a regular file"));
+        }
+        // Image meta derivation (D10 amend ② b) — only when the caller left
+        // the fields unset.
+        if item_type == "image" {
+            let needs_mime = !matches!(map.get("mime"), Some(v) if !v.is_null());
+            let needs_dims = !matches!(map.get("original_w"), Some(v) if !v.is_null())
+                || !matches!(map.get("original_h"), Some(v) if !v.is_null());
+            if needs_mime || needs_dims {
+                let read_path = canonical.clone();
+                let bytes = match tokio::task::spawn_blocking(move || std::fs::read(&read_path))
+                    .await
+                {
+                    Ok(Ok(b)) => b,
+                    _ => {
+                        return fail(
+                            "path_not_found",
+                            format!("workspace file {rel:?} could not be read"),
+                        );
+                    }
+                };
+                if needs_mime {
+                    map.insert("mime".into(), json!(crate::assets::sniff_any(&bytes)));
+                }
+                if needs_dims {
+                    if let Some((w, h)) = crate::layout_ops::image_dimensions(&bytes) {
+                        map.entry("original_w").or_insert(json!(w));
+                        map.entry("original_h").or_insert(json!(h));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `POST /api/sessions/:name/layout/ops` — server-side batch layout ops
+/// (ADR-0053 D5). Atomic: every op applies, or the batch is rejected with
+/// `{failed_index, code}` and nothing changes. The successful path runs the
+/// same pipeline as the full-layout PUT (degrade dangling path endpoints →
+/// recompute path bboxes → validate), writes disk-first under the
+/// per-session write lock, then publishes the new ETag on the WS hub (0x80).
+///
+/// **Authorization (ADR-0053 D6)**: bearer middleware only — deliberately
+/// *no* `owner_holds_session` attach gate. The CLI client never attaches
+/// (attaching would steal the browser's single-attach lock); a local token
+/// holder is the user by threat model (ADR-0003 D6).
+pub async fn layout_ops_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(name): AxumPath<String>,
+    req: Request<Body>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    if let Err(e) = validate_session_name(&name) {
+        return SessionError::Workspace(e).into_response();
+    }
+
+    let body_bytes = match read_bounded_body(req, SESSION_PUT_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(BodyReadError::TooLarge) => return SessionError::PayloadTooLarge.into_response(),
+        Err(BodyReadError::Io(msg)) => return SessionError::BadJson(msg).into_response(),
+    };
+    let mut request: crate::layout_ops::LayoutOpsRequest =
+        match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => return SessionError::BadJson(e.to_string()).into_response(),
+        };
+    if request.ops.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "empty_ops",
+                "message": "ops must contain at least one op",
+            })),
+        )
+            .into_response();
+    }
+
+    // Create pre-flight (fs stat + image meta) — outside the write lock.
+    if let Err((index, e)) = prepare_create_ops(&state, wm, &name, &mut request.ops).await {
+        return ops_failure_response(index, e);
+    }
+
+    let arc = match state.session_cache.get_or_load(wm, &name).await {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let mut snap = arc.write().await;
+
+    // Apply against a clone — the cached snapshot stays untouched until the
+    // disk write lands (all-or-nothing, ADR-0053 D5).
+    let mut layout = snap.layout.clone();
+    let outcome = match crate::layout_ops::apply_ops(&mut layout, &request.ops) {
+        Ok(o) => o,
+        Err((index, e)) => return ops_failure_response(Some(index), e),
+    };
+
+    // Pipeline — identical order to `layout_put_handler` (ADR-0053 D5):
+    // degrade dangling path endpoints → recompute path bbox caches →
+    // validate. A validation failure rejects the whole batch.
+    schema::degrade_dangling_path_endpoints(&mut layout);
+    schema::recompute_path_bboxes(&mut layout);
+    if let Err(e) = schema::validate(&layout) {
+        return ops_failure_response(
+            None,
+            crate::layout_ops::OpError {
+                code: e.code(),
+                message: e.to_string(),
+                locked: false,
+            },
+        );
+    }
+
+    // Disk-first atomic write under the held write lock (ADR-0006 D13),
+    // mirroring the PUT path (serialize once, fsync/rename on the blocking
+    // pool).
+    let bytes = canonical_bytes(&layout);
+    let new_snap = SessionLayout::new_with_bytes(layout, &bytes);
+    let path = match wm.session_path(&name) {
+        Ok(p) => p,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    let write_path = path.clone();
+    let write_bytes = bytes;
+    match tokio::task::spawn_blocking(move || atomic_write_session(&write_path, &write_bytes)).await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return SessionError::Workspace(e).into_response(),
+        Err(join_err) => {
+            tracing::error!(
+                error = %join_err,
+                "layout_ops: atomic_write_session spawn_blocking panicked"
+            );
+            return service_unavailable("write_failed");
+        }
+    }
+
+    // attach_index diff while the write lock is held (ADR-0021 D7 amend ③ —
+    // same ordering rationale as the PUT path). `create` cannot add
+    // terminals in Batch A, but `delete` removes them.
+    let old_uuids = crate::attach_index::terminal_uuids_in(&snap.layout);
+    let new_uuids = crate::attach_index::terminal_uuids_in(&new_snap.layout);
+    let (removed, added) = diff_terminal_uuids(&old_uuids, &new_uuids);
+    let etag_raw = new_snap.etag;
+    let etag_hex = new_snap.etag_hex.clone();
+    *snap = new_snap;
+    drop(snap);
+    state.attach_index.apply_diff(&name, &removed, &added);
+
+    // `delete` with kill_terminal=true — SIGTERM + unregister + forget, the
+    // same post-commit sequence as `delete_item_handler` (ADR-0021 D9.2).
+    for uuid in &outcome.kill_terminal_uuids {
+        tracing::info!(
+            session = %name,
+            uuid = %uuid,
+            "layout_ops: delete kill_terminal=true → SIGTERM + forget metadata"
+        );
+        kill_and_unregister_terminal(&state, uuid).await;
+        state.terminal_meta.forget(uuid).await;
+    }
+
+    // ADR-0053 D5/D7 — broadcast the new ETag so live FE subscribers
+    // re-hydrate (0x80 LAYOUT_CHANGED).
+    if let Some(hub) = state.hub.as_ref() {
+        hub.publish_layout_changed(etag_raw);
+    }
+
+    let etag_quoted = format!("\"{etag_hex}\"");
+    let mut resp = (
+        StatusCode::OK,
+        Json(json!({
+            "etag": etag_hex,
+            "applied": request.ops.len(),
+            "created_ids": outcome.created_ids,
+        })),
+    )
+        .into_response();
+    if let Ok(val) = HeaderValue::from_str(&etag_quoted) {
+        resp.headers_mut().insert(header::ETAG, val);
+    }
+    resp
+}
+
 /// Compute `(removed, added)` between two terminal UUID lists drawn from
 /// the prior and new layout of one session. Used by the attach_index
 /// hook in [`layout_put_handler`] to derive the per-session diff.

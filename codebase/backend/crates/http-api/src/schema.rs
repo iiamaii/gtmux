@@ -753,6 +753,12 @@ pub enum ValidationError {
     DanglingItemParent { parent: String },
     #[error("group parent_id {parent:?} does not refer to a known group id")]
     DanglingGroupParent { parent: String },
+    /// ADR-0010 R5 / ADR-0053 D5 — the group parent chain contains a cycle
+    /// (a group is its own ancestor). FE mutation paths never build one
+    /// structurally, but an arbitrary `reparent` op (ADR-0053 D13) can —
+    /// this check is the server-side guarantee.
+    #[error("group parent chain contains a cycle through group {group:?}")]
+    GroupCycle { group: String },
     #[error("duplicate group id: {0:?}")]
     DuplicateGroupId(String),
     #[error("duplicate item id: {0:?}")]
@@ -848,6 +854,7 @@ impl ValidationError {
             Self::BadGroupId(_) => "bad_group_id",
             Self::DanglingItemParent { .. } => "dangling_item_parent",
             Self::DanglingGroupParent { .. } => "dangling_group_parent",
+            Self::GroupCycle { .. } => "group_cycle",
             Self::DuplicateGroupId(_) => "duplicate_group_id",
             Self::DuplicateItemId(_) => "duplicate_item_id",
             Self::LabelTooLong => "label_too_long",
@@ -889,7 +896,7 @@ impl ValidationError {
 /// requiring every component to be `Normal` rejects absolute paths and all
 /// traversal in one pass. (A leading dot in a *filename*, e.g. `.config`, is
 /// a `Normal` component and is allowed.)
-fn is_clean_relative_workspace_path(p: &str) -> bool {
+pub(crate) fn is_clean_relative_workspace_path(p: &str) -> bool {
     if p.is_empty() || p.contains('\0') {
         return false;
     }
@@ -980,6 +987,42 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                     parent: parent.clone(),
                 });
             }
+        }
+    }
+    // Groups: parent-chain acyclicity (ADR-0010 R5, wired for ADR-0053 D5).
+    // Each group has a single parent pointer, so cycle detection is a walk up
+    // the chain per group with a shared `safe` memo: any id reached from an
+    // already-cleared chain is cleared without re-walking, keeping the whole
+    // pass O(groups).
+    {
+        let parent_of: std::collections::HashMap<&str, Option<&str>> = layout
+            .groups
+            .iter()
+            .map(|g| (g.id.as_str(), g.parent_id.as_deref()))
+            .collect();
+        let mut safe: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for g in &layout.groups {
+            if safe.contains(g.id.as_str()) {
+                continue;
+            }
+            let mut on_path: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut path: Vec<&str> = Vec::new();
+            let mut cur: Option<&str> = Some(g.id.as_str());
+            while let Some(id) = cur {
+                if safe.contains(id) {
+                    break;
+                }
+                if !on_path.insert(id) {
+                    return Err(ValidationError::GroupCycle {
+                        group: id.to_string(),
+                    });
+                }
+                path.push(id);
+                // Dangling parents were rejected above, so a miss here can
+                // only be `None` (root) — flatten accordingly.
+                cur = parent_of.get(id).copied().flatten();
+            }
+            safe.extend(path);
         }
     }
 
@@ -3305,6 +3348,59 @@ mod tests {
         });
         let err = validate(&l).unwrap_err();
         assert_eq!(err.code(), "bad_snippet_entry_id");
+    }
+
+    // ── ADR-0010 R5 / ADR-0053 D5 — group parent-chain cycle detection ──
+
+    fn group(id: &str, parent_id: Option<&str>) -> Group {
+        Group {
+            id: id.to_string(),
+            parent_id: parent_id.map(|s| s.to_string()),
+            label: "g".to_string(),
+            color: None,
+            visibility: Visibility::Visible,
+            locked: false,
+            order: 0,
+        }
+    }
+
+    const UUID_G2: &str = "0d990000-0000-4111-8222-000000000004";
+    const UUID_G3: &str = "0d990000-0000-4111-8222-000000000005";
+
+    #[test]
+    fn group_cycle_self_parent_rejected() {
+        let mut l = Layout::empty();
+        l.groups.push(group(UUID_G, Some(UUID_G)));
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "group_cycle");
+    }
+
+    #[test]
+    fn group_cycle_two_node_rejected() {
+        let mut l = Layout::empty();
+        l.groups.push(group(UUID_G, Some(UUID_G2)));
+        l.groups.push(group(UUID_G2, Some(UUID_G)));
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "group_cycle");
+    }
+
+    #[test]
+    fn group_cycle_three_node_rejected() {
+        let mut l = Layout::empty();
+        l.groups.push(group(UUID_G, Some(UUID_G2)));
+        l.groups.push(group(UUID_G2, Some(UUID_G3)));
+        l.groups.push(group(UUID_G3, Some(UUID_G)));
+        let err = validate(&l).unwrap_err();
+        assert_eq!(err.code(), "group_cycle");
+    }
+
+    #[test]
+    fn group_acyclic_chain_validates() {
+        let mut l = Layout::empty();
+        l.groups.push(group(UUID_G, None));
+        l.groups.push(group(UUID_G2, Some(UUID_G)));
+        l.groups.push(group(UUID_G3, Some(UUID_G2)));
+        assert!(validate(&l).is_ok());
     }
 
     /// ADR-0042 cross-language drift guard. The OpenAPI codegen chain now
