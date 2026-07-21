@@ -31,6 +31,7 @@ mod ansi;
 mod http;
 mod process_audit;
 mod remote;
+mod skill;
 mod state_files;
 
 use std::io::IsTerminal;
@@ -203,6 +204,11 @@ enum Cmd {
         #[command(subcommand)]
         command: remote::FsCmd,
     },
+    /// Read or install the embedded gtmux CLI Agent Skill (ADR-0055 D2).
+    /// Offline — no server connection. `gtmux skill` prints the whole
+    /// embedded SKILL.md; `--section <n>` prints one section; `install`
+    /// writes it into user-level skill directories so agents pick it up.
+    Skill(skill::SkillArgs),
     /// Set or replace the password used by ADR-0020 password-mode auth.
     /// Prompts twice on the TTY (or reads from stdin in non-interactive
     /// environments) and writes an Argon2id PHC hash to
@@ -379,6 +385,7 @@ fn main() -> ExitCode {
         Cmd::Terminal { command } => remote::run_terminal(command),
         Cmd::Workspace { command } => remote::run_workspace(command),
         Cmd::Fs { command } => remote::run_fs(command),
+        Cmd::Skill(args) => skill::run(args),
         Cmd::SetPassword => set_password_cmd(),
         Cmd::ResetPassword => reset_password_cmd(),
     }
@@ -2402,6 +2409,47 @@ mod tests {
                 assert_eq!(name_as.as_deref(), Some("copy"));
             }
             other => panic!("expected Session::Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_subcommands_parse() {
+        // Bare `gtmux skill` → whole document (no section, no subcommand).
+        let cli = Cli::parse_from(["gtmux", "skill"]);
+        match cli.command {
+            Cmd::Skill(skill::SkillArgs { section, command }) => {
+                assert!(section.is_none());
+                assert!(command.is_none());
+            }
+            other => panic!("expected Skill, got {other:?}"),
+        }
+        // `--section 2`.
+        let cli = Cli::parse_from(["gtmux", "skill", "--section", "2"]);
+        match cli.command {
+            Cmd::Skill(skill::SkillArgs { section, command }) => {
+                assert_eq!(section.as_deref(), Some("2"));
+                assert!(command.is_none());
+            }
+            other => panic!("expected Skill, got {other:?}"),
+        }
+        // `install --claude --force`.
+        let cli = Cli::parse_from(["gtmux", "skill", "install", "--claude", "--force"]);
+        match cli.command {
+            Cmd::Skill(skill::SkillArgs {
+                section,
+                command:
+                    Some(skill::SkillCmd::Install {
+                        claude,
+                        codex,
+                        force,
+                    }),
+            }) => {
+                assert!(section.is_none());
+                assert!(claude);
+                assert!(!codex);
+                assert!(force);
+            }
+            other => panic!("expected Skill::Install, got {other:?}"),
         }
     }
 
