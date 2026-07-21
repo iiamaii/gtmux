@@ -71,20 +71,26 @@ async fn session_effective_workspace(
     )
 }
 
-/// Resolve the cwd for a *respawn* (keyed by terminal UUID, no session in the
-/// request). A terminal can be mirrored across sessions (N:N); we pick any
-/// session that currently references the UUID (via `attach_index`) and reuse
-/// its effective Workspace(B). Returns `None` when there is no workspace
-/// configured or no referencing session — the spawn then falls back to the
-/// pty-backend default (`$HOME`), matching pre-ADR-0046 behaviour for orphans.
+/// Resolve the cwd + canvas session name for a *respawn* (keyed by terminal
+/// UUID, no session in the request). A terminal can be mirrored across
+/// sessions (N:N); we pick any session that currently references the UUID
+/// (via `attach_index`) and reuse its effective Workspace(B). The session
+/// name doubles as the `GTMUX_CANVAS_SESSION` env identity (ADR-0053 D4).
+/// Returns `None` when there is no workspace configured or no referencing
+/// session — the spawn then falls back to the pty-backend default (`$HOME`)
+/// with no canvas-session marker, matching pre-ADR-0046 behaviour for
+/// orphans.
 pub(crate) async fn terminal_respawn_cwd(
     state: &crate::AppState,
     uuid: &str,
-) -> Option<std::path::PathBuf> {
+) -> Option<(std::path::PathBuf, String)> {
     let wm = state.workspace.as_ref()?;
     let sessions = state.attach_index.read_attached_sessions(uuid);
     let name = sessions.first()?;
-    Some(session_effective_workspace(state, wm, name.as_str()).await)
+    Some((
+        session_effective_workspace(state, wm, name.as_str()).await,
+        name.as_str().to_string(),
+    ))
 }
 
 const WEBPAGE_ID_HEADER: &str = "x-gtmux-webpage-id";
@@ -99,6 +105,11 @@ const WEBPAGE_ID_HEADER: &str = "x-gtmux-webpage-id";
 /// `DefaultBodyLimit::max(SESSION_PUT_MAX_BYTES)` on the import route to lift
 /// axum's default 2 MB ceiling.
 pub(crate) const SESSION_PUT_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Body cap for `POST /api/sessions` (a small JSON: name + workspace_root +
+/// confirm). The handler reads the body manually (ADR-0053 D6 gate needs the
+/// headers alongside), so axum's default limit does not apply.
+pub(crate) const CREATE_BODY_MAX_BYTES: usize = 64 * 1024;
 
 fn session_cookie(headers: &HeaderMap) -> String {
     crate::auth::extract_session_cookie(headers).unwrap_or_else(|| "_unknown".to_string())
@@ -792,27 +803,8 @@ pub async fn attach_confirm_handler(
     // ADR-0046 D2 — every fresh spawn inherits the session's effective
     // Workspace(B) as its cwd.
     let cwd = session_effective_workspace(&state, wm, &name).await;
-    let mut spawned: Vec<String> = Vec::new();
-    let mut already_present: Vec<String> = Vec::new();
-    let mut failed: Vec<Value> = Vec::new();
-    for uuid in uuids {
-        if state.terminal_map.lookup_pane(&uuid).await.is_some() {
-            already_present.push(uuid);
-            continue;
-        }
-        match state
-            .spawn_terminal_with_uuid(uuid.clone(), Some(cwd.clone()))
-            .await
-        {
-            Ok(_) => spawned.push(uuid),
-            Err(e) => {
-                failed.push(json!({
-                    "id": uuid,
-                    "error": e.to_string(),
-                }));
-            }
-        }
-    }
+    let (spawned, already_present, failed) =
+        spawn_session_terminals(&state, &name, cwd, &uuids).await;
 
     // Stage 5-D path P1: hint other sessions' webpages that the alive pool
     // has grown. The trigger session itself is skipped at the WS
@@ -836,6 +828,41 @@ pub async fn attach_confirm_handler(
         })),
     )
         .into_response()
+}
+
+/// Spawn PTYs for every UUID in `uuids` with the session's cwd and canvas
+/// identity env (ADR-0053 D4/D11). Shared by [`attach_confirm_handler`] and
+/// the layout-ops `spawn` op so the two spawn paths cannot drift. Returns
+/// `(spawned, already_present, failed)`; `failed` entries are
+/// `{ id, error }` JSON objects.
+pub(crate) async fn spawn_session_terminals(
+    state: &crate::AppState,
+    name: &str,
+    cwd: std::path::PathBuf,
+    uuids: &[String],
+) -> (Vec<String>, Vec<String>, Vec<Value>) {
+    let mut spawned: Vec<String> = Vec::new();
+    let mut already_present: Vec<String> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    for uuid in uuids {
+        if state.terminal_map.lookup_pane(uuid).await.is_some() {
+            already_present.push(uuid.clone());
+            continue;
+        }
+        match state
+            .spawn_terminal_with_uuid(uuid.clone(), Some(cwd.clone()), Some(name))
+            .await
+        {
+            Ok(_) => spawned.push(uuid.clone()),
+            Err(e) => {
+                failed.push(json!({
+                    "id": uuid,
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+    (spawned, already_present, failed)
 }
 
 /// `POST /api/sessions/:name/terminals` — Stage 5-D path P2. Create a
@@ -894,7 +921,7 @@ pub async fn create_terminal_handler(
     let cwd = session_effective_workspace(&state, wm, &name).await;
     let uuid = crate::terminal_map::fresh_terminal_uuid();
     let pane = match state
-        .spawn_terminal_with_uuid(uuid.clone(), Some(cwd))
+        .spawn_terminal_with_uuid(uuid.clone(), Some(cwd), Some(&name))
         .await
     {
         Ok(p) => p,
@@ -1194,6 +1221,11 @@ pub struct CreateSessionBody {
     /// exists. No uniqueness check (N:1 — sessions may share one dir).
     #[serde(default)]
     pub workspace_root: Option<String>,
+    /// ADR-0053 D6 explicit-confirmation flag (CLI `--yes`) — required for
+    /// *non-browser* callers in Local mode when no password is set. Ignored
+    /// for cookie-authenticated (browser) callers and in password mode.
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 /// Body of `PUT /api/sessions/{name}/workspace` — re-point a session's
@@ -1505,16 +1537,115 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     (year, m, d, hour, minute, second)
 }
 
-/// `POST /api/sessions { name, workspace_root }` — create an empty v2 record
-/// bound to a project Workspace(B). Both fields are mandatory (ADR-0046 D5).
-/// `workspace_root` is validated A-internal + denylist + dir + exists; **no
-/// uniqueness check** (N:1, ADR-0045 D4). Outcomes: `201 { name }` /
-/// `400 invalid_session_name` / `400 invalid_workspace` (+ reason) /
+/// Password re-presentation header for the session-lifecycle gate
+/// (ADR-0053 D6/D12 — CLI `--password`). Header (not body) so both the
+/// JSON-body create and the body-less DELETE share one channel.
+pub(crate) const SESSION_PASSWORD_HEADER: &str = "x-gtmux-password";
+
+/// ADR-0053 D6/D12 — extra authentication gate for session lifecycle
+/// (create/delete). The bearer token alone is insufficient here: an
+/// in-canvas terminal AI can read the token file, so these destructive /
+/// scope-changing actions demand a second factor the AI cannot auto-acquire.
+///
+/// Decision tree:
+///   * **Browser flow bypass** — a request authenticated by a valid
+///     `gtmux_auth` session cookie keeps the existing FE rules (no extra
+///     gate): the cookie proves the caller completed the interactive
+///     `/auth/login` flow, and gating it would regress the shipped web UX.
+///     Bearer-only (non-browser) callers fall through to the gate.
+///   * **Password set** (any mode) — the password must be re-presented via
+///     the `X-Gtmux-Password` header; verified with the shared ADR-0020
+///     Argon2id step-up path (missing → 401 `credential_required`, wrong →
+///     401 `invalid_credential`, brute-force → 429).
+///   * **No password + Local** — an explicit `confirm` (body `confirm:true`
+///     / query `confirm=true`; CLI `--yes`) is required → else 400
+///     `confirm_required`. This is a footgun guard, not a security boundary
+///     (ADR-0053 잔여 확인 1).
+///   * **No password + Cloud** — 403 `password_required` (cloud presumes
+///     the password flow).
+pub(crate) async fn session_lifecycle_gate(
+    state: &crate::AppState,
+    headers: &HeaderMap,
+    peer: Option<std::net::IpAddr>,
+    confirm: bool,
+) -> Result<(), Response> {
+    if let Some(cookie) = crate::auth::extract_session_cookie(headers) {
+        if state.session_table.validate(&cookie).await.is_some() {
+            return Ok(());
+        }
+    }
+    let password_set = state.password_hash.read().await.is_some();
+    if password_set {
+        let credential = headers
+            .get(SESSION_PASSWORD_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = crate::auth::StepUpBody { credential };
+        return crate::auth::verify_step_up(state, headers, peer, &body)
+            .await
+            .map_err(|rejection| rejection.into_response());
+    }
+    match state.config.mode() {
+        gtmux_config::Mode::Local => {
+            if confirm {
+                Ok(())
+            } else {
+                Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "confirm_required",
+                        "message": "session create/delete from a non-browser client requires \
+                                    explicit confirmation (confirm=true / --yes, ADR-0053 D6)",
+                    })),
+                )
+                    .into_response())
+            }
+        }
+        gtmux_config::Mode::Cloud => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "password_required",
+                "message": "session create/delete in cloud mode requires a configured \
+                            password (ADR-0053 D6)",
+            })),
+        )
+            .into_response()),
+    }
+}
+
+/// `true` when the raw query string contains `confirm=true` (ADR-0053 D6 —
+/// the body-less DELETE's confirmation channel).
+fn confirm_from_query(query: Option<&str>) -> bool {
+    query.is_some_and(|q| q.split('&').any(|pair| pair == "confirm=true"))
+}
+
+/// `POST /api/sessions { name, workspace_root, confirm? }` — create an empty
+/// v2 record bound to a project Workspace(B). `name`/`workspace_root` are
+/// mandatory (ADR-0046 D5). `workspace_root` is validated A-internal +
+/// denylist + dir + exists; **no uniqueness check** (N:1, ADR-0045 D4).
+/// Gated by [`session_lifecycle_gate`] (ADR-0053 D6/D12) for non-browser
+/// callers. Outcomes: `201 { name }` / `400 invalid_session_name` /
+/// `400 invalid_workspace` (+ reason) / `400 confirm_required` /
+/// `401 credential_required|invalid_credential` / `403 password_required` /
 /// `409 session_already_exists` / `503`.
-pub async fn create_handler(
-    State(state): State<crate::AppState>,
-    Json(body): Json<CreateSessionBody>,
-) -> Response {
+pub async fn create_handler(State(state): State<crate::AppState>, req: Request<Body>) -> Response {
+    // Manual body read: the gate needs the headers + peer alongside the
+    // parsed body (axum's `Json` extractor consumes the request).
+    let (parts, raw_body) = req.into_parts();
+    let peer = crate::auth::peer_from_parts(&parts);
+    let headers = parts.headers;
+    let bytes = match read_bounded_body_bytes(raw_body, CREATE_BODY_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(BodyReadError::TooLarge) => return SessionError::PayloadTooLarge.into_response(),
+        Err(BodyReadError::Io(msg)) => return SessionError::BadJson(msg).into_response(),
+    };
+    let body: CreateSessionBody = match serde_json::from_slice(&bytes) {
+        Ok(b) => b,
+        Err(e) => return SessionError::BadJson(e.to_string()).into_response(),
+    };
+    if let Err(resp) = session_lifecycle_gate(&state, &headers, peer, body.confirm).await {
+        return resp;
+    }
     let Some(wm) = state.workspace.as_ref() else {
         return service_unavailable("workspace_not_configured");
     };
@@ -1569,13 +1700,25 @@ pub async fn create_handler(
     resp.into_response()
 }
 
-/// `DELETE /api/sessions/:name` — unlink the record from disk and evict the
-/// cache. ADR-0019 D10: terminal cascade-kill is *not* this handler's job —
-/// we touch session storage only.
+/// `DELETE /api/sessions/:name[?confirm=true]` — unlink the record from disk
+/// and evict the cache. ADR-0019 D10: terminal cascade-kill is *not* this
+/// handler's job — we touch session storage only, so terminals mounted only
+/// here stay in the alive pool (ADR-0053 D12 conservative semantics).
+/// Gated by [`session_lifecycle_gate`] (ADR-0053 D6/D12) for non-browser
+/// callers: password re-presentation via `X-Gtmux-Password` when a password
+/// is set, `?confirm=true` in password-less Local mode, 403 in password-less
+/// Cloud mode.
 pub async fn delete_handler(
     State(state): State<crate::AppState>,
     AxumPath(name): AxumPath<String>,
+    req: Request<Body>,
 ) -> Response {
+    let (parts, _body) = req.into_parts();
+    let peer = crate::auth::peer_from_parts(&parts);
+    let confirm = confirm_from_query(parts.uri.query());
+    if let Err(resp) = session_lifecycle_gate(&state, &parts.headers, peer, confirm).await {
+        return resp;
+    }
     let Some(wm) = state.workspace.as_ref() else {
         return service_unavailable("workspace_not_configured");
     };
@@ -2243,45 +2386,402 @@ pub async fn layout_put_handler(
     drop(snap);
     state.attach_index.apply_diff(&name, &removed, &added);
 
-    // ADR-0021 D8 amend ② / 0075/0076/0077 — rebind history replay.
-    // For each terminal_id newly *added* to this layout that resolves to
-    // an alive PaneId, emit the current ring buffer to this session's WS
-    // so the xterm panel renders existing history immediately on mount
-    // (instead of staying blank until the next WS reconnect's catch-up
-    // replay). `added` is the set diff against the prior layout — drag
-    // / no-op PUTs naturally yield `added == []` and emit nothing.
-    if !added.is_empty() {
-        if let Some(hub) = state.hub.as_ref() {
-            let backend = hub.backend().clone();
-            for uuid in &added {
-                let Some(pane) = state.terminal_map.lookup_pane(uuid).await else {
-                    // unmatched UUID — handled by the attach_confirm /
-                    // match-or-spawn flow, not by replay.
-                    continue;
-                };
-                let Some((replay, _rx)) = backend.subscribe_output(pane) else {
-                    continue;
-                };
-                // `_rx` is dropped at end-of-statement so the temporary
-                // broadcast subscriber unregisters immediately; we only
-                // wanted the ring-buffer snapshot returned alongside.
-                if replay.is_empty() {
-                    continue;
-                }
-                hub.publish_attach_replay(
-                    std::sync::Arc::from(name.as_str()),
-                    pane.0,
-                    axum::body::Bytes::from(replay),
-                );
-            }
-        }
-    }
+    // ADR-0021 D8 amend ② / 0075/0076/0077 — rebind history replay for the
+    // newly added terminal UUIDs. `added` is the set diff against the prior
+    // layout — drag / no-op PUTs naturally yield `added == []` and emit
+    // nothing.
+    publish_replay_for_added(&state, &name, &added).await;
 
     Response::builder()
         .status(StatusCode::NO_CONTENT)
         .header(header::ETAG, &new_etag_quoted)
         .body(Body::empty())
         .expect("static headers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  POST /api/sessions/:name/layout/ops (ADR-0053 D5/D6/D10/D13)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Map a per-op failure to the wire shape: 409 for `locked` (ADR-0053 D6),
+/// 400 for everything else. `failed_index` is `null` when the failure came
+/// from the batch-level pipeline (degrade→recompute→validate) rather than a
+/// specific op.
+fn ops_failure_response(failed_index: Option<usize>, e: crate::layout_ops::OpError) -> Response {
+    let status = if e.locked {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(json!({
+            "error": e.code,
+            "code": e.code,
+            "failed_index": failed_index,
+            "message": e.message,
+        })),
+    )
+        .into_response()
+}
+
+/// Pre-flight for `create image|document` ops (ADR-0053 D10 amend ② a/b):
+/// stat the workspace-relative `path` against the session's effective
+/// Workspace(B) — a broken reference fails the batch up front — and, for
+/// images, derive `mime` / `original_w` / `original_h` from the file bytes
+/// when the caller left them unset. Runs *before* the session write lock
+/// (fs I/O off the lock; the stat is a best-effort guard, the hard
+/// A+denylist boundary stays at serve time — `GET /api/fs/file`).
+async fn prepare_create_ops(
+    state: &crate::AppState,
+    wm: &Arc<WorkspaceManager>,
+    name: &str,
+    ops: &mut [crate::layout_ops::LayoutOp],
+) -> Result<(), (Option<usize>, crate::layout_ops::OpError)> {
+    use crate::layout_ops::{LayoutOp, OpError};
+
+    // Resolve the effective Workspace(B) once — ops cannot change it
+    // (workspace mutation is a dedicated endpoint, ADR-0053 D12).
+    let mut b_root: Option<std::path::PathBuf> = None;
+
+    for (index, op) in ops.iter_mut().enumerate() {
+        let LayoutOp::Create {
+            item_type, fields, ..
+        } = op
+        else {
+            continue;
+        };
+        if item_type != "image" && item_type != "document" {
+            continue;
+        }
+        let Some(Value::Object(map)) = fields.as_mut() else {
+            continue; // no fields → validate() reports the missing source.
+        };
+        let Some(rel) = map.get("path").and_then(Value::as_str).map(str::to_owned) else {
+            continue; // content / asset_id origins carry no fs reference.
+        };
+        let fail = |code: &'static str, message: String| {
+            Err((
+                Some(index),
+                OpError {
+                    code,
+                    message,
+                    locked: false,
+                },
+            ))
+        };
+        if !schema::is_clean_relative_workspace_path(&rel) {
+            return fail(
+                "workspace_path_invalid",
+                format!("path {rel:?} is not a clean workspace-relative path"),
+            );
+        }
+        let root = match &b_root {
+            Some(r) => r.clone(),
+            None => {
+                let r = session_effective_workspace(state, wm, name).await;
+                b_root = Some(r.clone());
+                r
+            }
+        };
+        let abs = root.join(&rel);
+        let canonical = match abs.canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                return fail(
+                    "path_not_found",
+                    format!("workspace file {rel:?} does not exist"),
+                );
+            }
+        };
+        if !fs_guard::is_path_allowed(&canonical, &state.server_workspace, &state.fs_denylist) {
+            return fail(
+                "path_not_allowed",
+                format!("workspace file {rel:?} resolves outside the allowed workspace"),
+            );
+        }
+        if !canonical.is_file() {
+            return fail("path_not_found", format!("{rel:?} is not a regular file"));
+        }
+        // Image meta derivation (D10 amend ② b) — only when the caller left
+        // the fields unset.
+        if item_type == "image" {
+            let needs_mime = !matches!(map.get("mime"), Some(v) if !v.is_null());
+            let needs_dims = !matches!(map.get("original_w"), Some(v) if !v.is_null())
+                || !matches!(map.get("original_h"), Some(v) if !v.is_null());
+            if needs_mime || needs_dims {
+                let read_path = canonical.clone();
+                let bytes = match tokio::task::spawn_blocking(move || std::fs::read(&read_path))
+                    .await
+                {
+                    Ok(Ok(b)) => b,
+                    _ => {
+                        return fail(
+                            "path_not_found",
+                            format!("workspace file {rel:?} could not be read"),
+                        );
+                    }
+                };
+                if needs_mime {
+                    map.insert("mime".into(), json!(crate::assets::sniff_any(&bytes)));
+                }
+                if needs_dims {
+                    if let Some((w, h)) = crate::layout_ops::image_dimensions(&bytes) {
+                        map.entry("original_w").or_insert(json!(w));
+                        map.entry("original_h").or_insert(json!(h));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `POST /api/sessions/:name/layout/ops` — server-side batch layout ops
+/// (ADR-0053 D5). Atomic: every op applies, or the batch is rejected with
+/// `{failed_index, code}` and nothing changes. The successful path runs the
+/// same pipeline as the full-layout PUT (degrade dangling path endpoints →
+/// recompute path bboxes → validate), writes disk-first under the
+/// per-session write lock, then publishes the new ETag on the WS hub (0x80).
+///
+/// Terminal lifecycle (ADR-0053 D11): `spawn` persists a fresh TerminalItem
+/// in the batch, then PTY-spawns it *after* the commit (headless-complete —
+/// no browser/attach required; a PTY failure is surfaced in
+/// `spawn_failures` while the item stays persisted for the attach-confirm
+/// self-heal). `mount` requires an alive pool terminal (pre-flight → 400
+/// `terminal_not_alive`) and adds a referencing item without spawning.
+///
+/// **Authorization (ADR-0053 D6)**: bearer middleware only — deliberately
+/// *no* `owner_holds_session` attach gate. The CLI client never attaches
+/// (attaching would steal the browser's single-attach lock); a local token
+/// holder is the user by threat model (ADR-0003 D6).
+pub async fn layout_ops_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(name): AxumPath<String>,
+    req: Request<Body>,
+) -> Response {
+    let Some(wm) = state.workspace.as_ref() else {
+        return service_unavailable("workspace_not_configured");
+    };
+    if let Err(e) = validate_session_name(&name) {
+        return SessionError::Workspace(e).into_response();
+    }
+
+    let body_bytes = match read_bounded_body(req, SESSION_PUT_MAX_BYTES).await {
+        Ok(b) => b,
+        Err(BodyReadError::TooLarge) => return SessionError::PayloadTooLarge.into_response(),
+        Err(BodyReadError::Io(msg)) => return SessionError::BadJson(msg).into_response(),
+    };
+    let mut request: crate::layout_ops::LayoutOpsRequest =
+        match serde_json::from_slice(&body_bytes) {
+            Ok(r) => r,
+            Err(e) => return SessionError::BadJson(e.to_string()).into_response(),
+        };
+    if request.ops.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "empty_ops",
+                "message": "ops must contain at least one op",
+            })),
+        )
+            .into_response();
+    }
+
+    // Create pre-flight (fs stat + image meta) — outside the write lock.
+    if let Err((index, e)) = prepare_create_ops(&state, wm, &name, &mut request.ops).await {
+        return ops_failure_response(index, e);
+    }
+
+    // Mount pre-flight (ADR-0053 D11): the referenced UUID must be an
+    // *alive pool terminal*. Best-effort like the create fs stat (TOCTOU
+    // between this check and the commit is accepted — a terminal dying in
+    // that window leaves a dangling item, the same state the FE handles via
+    // the terminal-died overlay).
+    for (index, op) in request.ops.iter().enumerate() {
+        if let crate::layout_ops::LayoutOp::Mount { uuid, .. } = op {
+            if state.terminal_map.lookup_pane(uuid).await.is_none() {
+                return ops_failure_response(
+                    Some(index),
+                    crate::layout_ops::OpError {
+                        code: "terminal_not_alive",
+                        message: format!(
+                            "terminal {uuid:?} is not an alive pool terminal (mount needs a \
+                             live PTY — use spawn for a fresh terminal)"
+                        ),
+                        locked: false,
+                    },
+                );
+            }
+        }
+    }
+
+    let arc = match state.session_cache.get_or_load(wm, &name).await {
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
+    let mut snap = arc.write().await;
+
+    // Apply against a clone — the cached snapshot stays untouched until the
+    // disk write lands (all-or-nothing, ADR-0053 D5).
+    let mut layout = snap.layout.clone();
+    let outcome = match crate::layout_ops::apply_ops(&mut layout, &request.ops) {
+        Ok(o) => o,
+        Err((index, e)) => return ops_failure_response(Some(index), e),
+    };
+
+    // Pipeline — identical order to `layout_put_handler` (ADR-0053 D5):
+    // degrade dangling path endpoints → recompute path bbox caches →
+    // validate. A validation failure rejects the whole batch.
+    schema::degrade_dangling_path_endpoints(&mut layout);
+    schema::recompute_path_bboxes(&mut layout);
+    if let Err(e) = schema::validate(&layout) {
+        return ops_failure_response(
+            None,
+            crate::layout_ops::OpError {
+                code: e.code(),
+                message: e.to_string(),
+                locked: false,
+            },
+        );
+    }
+
+    // Disk-first atomic write under the held write lock (ADR-0006 D13),
+    // mirroring the PUT path (serialize once, fsync/rename on the blocking
+    // pool).
+    let bytes = canonical_bytes(&layout);
+    let new_snap = SessionLayout::new_with_bytes(layout, &bytes);
+    let path = match wm.session_path(&name) {
+        Ok(p) => p,
+        Err(e) => return SessionError::Workspace(e).into_response(),
+    };
+    let write_path = path.clone();
+    let write_bytes = bytes;
+    match tokio::task::spawn_blocking(move || atomic_write_session(&write_path, &write_bytes)).await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return SessionError::Workspace(e).into_response(),
+        Err(join_err) => {
+            tracing::error!(
+                error = %join_err,
+                "layout_ops: atomic_write_session spawn_blocking panicked"
+            );
+            return service_unavailable("write_failed");
+        }
+    }
+
+    // attach_index diff while the write lock is held (ADR-0021 D7 amend ③ —
+    // same ordering rationale as the PUT path). `spawn`/`mount` add terminal
+    // UUIDs, `delete` removes them.
+    let old_uuids = crate::attach_index::terminal_uuids_in(&snap.layout);
+    let new_uuids = crate::attach_index::terminal_uuids_in(&new_snap.layout);
+    let (removed, added) = diff_terminal_uuids(&old_uuids, &new_uuids);
+    let etag_raw = new_snap.etag;
+    let etag_hex = new_snap.etag_hex.clone();
+    *snap = new_snap;
+    drop(snap);
+    state.attach_index.apply_diff(&name, &removed, &added);
+
+    // ADR-0053 D7 — `mount` parity with the FE mount path: replay ring
+    // history for newly added *alive* UUIDs (spawn UUIDs are not alive yet
+    // at this point and are skipped; a fresh PTY has no history anyway).
+    publish_replay_for_added(&state, &name, &added).await;
+
+    // `delete` with kill_terminal=true — SIGTERM + unregister + forget, the
+    // same post-commit sequence as `delete_item_handler` (ADR-0021 D9.2).
+    for uuid in &outcome.kill_terminal_uuids {
+        tracing::info!(
+            session = %name,
+            uuid = %uuid,
+            "layout_ops: delete kill_terminal=true → SIGTERM + forget metadata"
+        );
+        kill_and_unregister_terminal(&state, uuid).await;
+        state.terminal_meta.forget(uuid).await;
+    }
+
+    // `spawn` — PTY spawn after the layout commit (ADR-0053 D11: the item
+    // is already persisted, so a spawn failure leaves the same "unmatched
+    // UUID" state the attach/confirm flow self-heals; headless callers see
+    // the failure in `spawn_failures`). Spawn publishes 0x88
+    // TERMINAL_SPAWNED per UUID (inside `spawn_terminal_with_uuid`); the
+    // pool-growth hint mirrors `attach_confirm_handler`.
+    let mut spawn_failures: Vec<Value> = Vec::new();
+    if !outcome.spawned_terminal_uuids.is_empty() {
+        let cwd = session_effective_workspace(&state, wm, &name).await;
+        let (spawned, _already_present, failed) =
+            spawn_session_terminals(&state, &name, cwd, &outcome.spawned_terminal_uuids).await;
+        if !spawned.is_empty() {
+            if let Some(hub) = state.hub.as_ref() {
+                hub.publish_terminal_list_change(&name, &spawned, &[]);
+            }
+        }
+        for f in &failed {
+            tracing::error!(session = %name, failure = %f, "layout_ops: spawn op PTY spawn failed");
+        }
+        spawn_failures = failed;
+    }
+
+    // ADR-0053 D5/D7 — broadcast the new ETag so live FE subscribers
+    // re-hydrate (0x80 LAYOUT_CHANGED).
+    if let Some(hub) = state.hub.as_ref() {
+        hub.publish_layout_changed(etag_raw);
+    }
+
+    let etag_quoted = format!("\"{etag_hex}\"");
+    let mut resp = (
+        StatusCode::OK,
+        Json(json!({
+            "etag": etag_hex,
+            "applied": request.ops.len(),
+            "created_ids": outcome.created_ids,
+            // Non-empty only when a `spawn` op committed its item but the
+            // PTY spawn failed — the layout is still the new state (the
+            // caller can retry via respawn / attach-confirm).
+            "spawn_failures": spawn_failures,
+        })),
+    )
+        .into_response();
+    if let Ok(val) = HeaderValue::from_str(&etag_quoted) {
+        resp.headers_mut().insert(header::ETAG, val);
+    }
+    resp
+}
+
+/// ADR-0021 D8 amend ② — rebind history replay: for each terminal UUID
+/// newly *added* to a session layout that resolves to an alive PaneId, emit
+/// the current ring buffer to this session's WS so the xterm panel renders
+/// existing history immediately on mount (instead of staying blank until the
+/// next WS reconnect's catch-up replay). Shared by [`layout_put_handler`]
+/// (FE mount cascade) and [`layout_ops_handler`] (`mount` op — ADR-0053 D7
+/// "기존 경로대로" parity). UUIDs without an alive PaneId are skipped — the
+/// attach_confirm / match-or-spawn flow owns those.
+async fn publish_replay_for_added(state: &crate::AppState, name: &str, added: &[String]) {
+    if added.is_empty() {
+        return;
+    }
+    let Some(hub) = state.hub.as_ref() else {
+        return;
+    };
+    let backend = hub.backend().clone();
+    for uuid in added {
+        let Some(pane) = state.terminal_map.lookup_pane(uuid).await else {
+            continue;
+        };
+        let Some((replay, _rx)) = backend.subscribe_output(pane) else {
+            continue;
+        };
+        // `_rx` is dropped at end-of-statement so the temporary broadcast
+        // subscriber unregisters immediately; we only wanted the ring-buffer
+        // snapshot returned alongside.
+        if replay.is_empty() {
+            continue;
+        }
+        hub.publish_attach_replay(
+            std::sync::Arc::from(name),
+            pane.0,
+            axum::body::Bytes::from(replay),
+        );
+    }
 }
 
 /// Compute `(removed, added)` between two terminal UUID lists drawn from
@@ -2518,8 +3018,17 @@ async fn read_bounded_body(
     req: Request<Body>,
     cap: usize,
 ) -> Result<axum::body::Bytes, BodyReadError> {
+    read_bounded_body_bytes(req.into_body(), cap).await
+}
+
+/// Body-only variant of [`read_bounded_body`] for handlers that have already
+/// split the request into parts (e.g. [`create_handler`], which needs the
+/// headers for the ADR-0053 D6 gate).
+async fn read_bounded_body_bytes(
+    body: Body,
+    cap: usize,
+) -> Result<axum::body::Bytes, BodyReadError> {
     use http_body_util::BodyExt;
-    let body = req.into_body();
     let collected = body
         .collect()
         .await

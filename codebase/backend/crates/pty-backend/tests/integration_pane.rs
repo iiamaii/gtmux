@@ -398,6 +398,58 @@ async fn late_attach_replays_ring_buffer() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Scrollback clear — ESC[3J truncates the ring snapshot (ADR-0054 §구현 노트).
+//  A fresh attach after `clear` must NOT replay pre-clear output.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ring_snapshot_drops_output_before_scrollback_clear() {
+    let backend = PtyBackend::new();
+    let id = backend.spawn(shell_spec()).expect("spawn");
+    let (_snap, mut rx) = backend.subscribe_output(id).expect("subscribe");
+
+    sleep(Duration::from_millis(150)).await;
+
+    // Silence line-discipline echo so the literal command text does not land
+    // in the ring and confuse the marker assertions (same trick as gate3).
+    backend
+        .send_input(id, b"stty -echo\n".to_vec())
+        .expect("send stty");
+    sleep(Duration::from_millis(200)).await;
+
+    // Emit a pre-clear marker, then a scrollback-clear (ESC[3J) followed by a
+    // post-clear marker — mirrors what `clear` writes under xterm-256color.
+    backend
+        .send_input(id, b"printf 'PRE_CLEAR_MARK'\n".to_vec())
+        .expect("send pre");
+    let _ = read_until(&mut rx, b"PRE_CLEAR_MARK", Duration::from_secs(3)).await;
+
+    backend
+        .send_input(id, b"printf '\\033[3JPOST_CLEAR_MARK'\n".to_vec())
+        .expect("send clear");
+    // Reading the marker off the live broadcast guarantees the ESC[3J chunk
+    // has already gone through `ring_append` (ring is updated before the
+    // broadcast send in the reader thread).
+    let _ = read_until(&mut rx, b"POST_CLEAR_MARK", Duration::from_secs(3)).await;
+    // Let the trailing prompt settle into the ring.
+    sleep(Duration::from_millis(150)).await;
+
+    // Fresh attach → its snapshot reflects the post-clear ring only.
+    let (snap, _rx2) = backend.subscribe_output(id).expect("re-subscribe");
+    assert!(
+        snap.windows(15).any(|w| w == b"POST_CLEAR_MARK"),
+        "post-clear marker missing from snapshot: {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+    assert!(
+        !snap.windows(14).any(|w| w == b"PRE_CLEAR_MARK"),
+        "pre-clear output survived the scrollback clear in the snapshot: {:?}",
+        String::from_utf8_lossy(&snap)
+    );
+
+    backend.kill(id).expect("kill");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Drop cleanup — letting PtyBackend go out of scope tears down all panes.
 // ─────────────────────────────────────────────────────────────────────────────
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

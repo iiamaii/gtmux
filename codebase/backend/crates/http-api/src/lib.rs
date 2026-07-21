@@ -53,6 +53,7 @@ mod fs_file;
 mod fs_guard;
 mod fs_list;
 mod fs_move;
+mod layout_ops;
 pub mod fs_search;
 pub mod schema;
 mod session_lock;
@@ -453,6 +454,11 @@ impl AppState {
     /// Spawn a fresh Terminal in the PTY backend and bind it to `uuid` in
     /// the [`TerminalMap`] (Stage 4-A / ADR-0018 D6 *fresh spawn* arm).
     ///
+    /// `canvas_session` is the canvas session name the spawn is scoped to
+    /// (ADR-0053 D4 — injected as `GTMUX_CANVAS_SESSION`; `None` for
+    /// session-less paths like an orphan respawn, which then omits the
+    /// variable).
+    ///
     /// Idempotent on the UUID axis: if `uuid` is already mapped to an alive
     /// PaneId the existing binding is returned with no side effect. Two
     /// concurrent calls for the same UUID will at worst spawn one extra
@@ -466,6 +472,7 @@ impl AppState {
         &self,
         uuid: String,
         cwd: Option<std::path::PathBuf>,
+        canvas_session: Option<&str>,
     ) -> Result<gtmux_pty_backend::PaneId, SpawnTerminalError> {
         if let Some(existing) = self.terminal_map.lookup_pane(&uuid).await {
             return Ok(existing);
@@ -477,8 +484,12 @@ impl AppState {
         // ADR-0046 D2 — default cwd = the session's effective workspace(B).
         // `None` keeps the pty-backend default ($HOME → process cwd); a
         // per-terminal template cwd override would win here in the future.
+        // ADR-0053 D4 — every spawn path injects the terminal's canvas
+        // identity into the child env (self-identification for in-terminal
+        // agents).
         let pane = hub.backend().spawn(gtmux_pty_backend::SpawnSpec {
             cwd,
+            env: terminal_identity_env(&uuid, canvas_session),
             ..gtmux_pty_backend::SpawnSpec::default_shell()
         })?;
         match self.terminal_map.register(uuid.clone(), pane).await {
@@ -625,6 +636,24 @@ impl AppState {
     ) -> Self {
         Self::with_hub_shared(config, token, hub).with_workspace(workspace)
     }
+}
+
+/// Canvas-identity env for a terminal child process (ADR-0053 D4):
+/// `GTMUX_TERMINAL_ID` = the terminal UUID (= canvas item id, ADR-0018 D2),
+/// `GTMUX_CANVAS_SESSION` = the canvas session name when the spawn is
+/// session-scoped. Deliberately distinct from `GTMUX_SESSION` /
+/// `GTMUX_SERVER_INSTANCE` (server instance markers injected by the pty
+/// backend). Values can go stale (session rename, unmount) — consumers
+/// validate by hitting the HTTP API and treating 404 as stale (D4).
+pub(crate) fn terminal_identity_env(
+    uuid: &str,
+    canvas_session: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = vec![("GTMUX_TERMINAL_ID".to_string(), uuid.to_string())];
+    if let Some(name) = canvas_session {
+        env.push(("GTMUX_CANVAS_SESSION".to_string(), name.to_string()));
+    }
+    env
 }
 
 /// Errors from [`AppState::spawn_terminal_with_uuid`]. Distinct from
@@ -803,6 +832,12 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             get(sessions::layout_get_handler).put(sessions::layout_put_handler),
         )
         .route(
+            // ADR-0053 D5 — server-side batch layout ops (CLI write path).
+            // Bearer middleware only; deliberately not attach-gated (D6).
+            "/api/sessions/{name}/layout/ops",
+            axum::routing::post(sessions::layout_ops_handler),
+        )
+        .route(
             // ADR-0046 D8 — change a session's Workspace(B) root (N:1, no
             // uniqueness). Kept separate from PATCH /{name} (= rename).
             "/api/sessions/{name}/workspace",
@@ -841,6 +876,15 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         .route(
             "/api/terminals/{id}/respawn",
             axum::routing::post(terminals::respawn_handler),
+        )
+        // ADR-0054 D1/D2 — read a pane's raw ring snapshot / inject raw stdin.
+        .route(
+            "/api/terminals/{id}/output",
+            get(terminals::output_handler),
+        )
+        .route(
+            "/api/terminals/{id}/input",
+            axum::routing::post(terminals::input_handler),
         )
         .route(
             "/api/settings",
@@ -2640,7 +2684,7 @@ mod tests {
 
         // POST /api/sessions { name: "demo" } → 201
         let create_body = serde_json::to_vec(
-            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let resp = app
@@ -2813,7 +2857,7 @@ mod tests {
         let (app, token, _) = make_app_with_workspace(&dir);
         let body = || {
             serde_json::to_vec(
-                &json!({ "name": "twin", "workspace_root": dir.path().to_str().unwrap() }),
+                &json!({ "name": "twin", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
             )
             .unwrap()
         };
@@ -2838,7 +2882,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
         for bad in ["", "../etc", "a/b", "has space"] {
-            let body = serde_json::to_vec(&json!({ "name": bad })).unwrap();
+            let body = serde_json::to_vec(&json!({ "name": bad, "confirm": true })).unwrap();
             let resp = app
                 .clone()
                 .oneshot(
@@ -2904,7 +2948,7 @@ mod tests {
         let (app, token, _wd) = make_app_with_workspace(&dir);
         // Seed by creating the same name first.
         let create_body = serde_json::to_vec(
-            &json!({ "name": "dup", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "dup", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let r1 = app
@@ -3320,7 +3364,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
         let create_body = serde_json::to_vec(
-            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "demo", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         app.clone()
@@ -3419,7 +3463,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
         let create_body = serde_json::to_vec(
-            &json!({ "name": "be4", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "be4", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         app.clone()
@@ -3594,7 +3638,7 @@ mod tests {
         workspace_root: &std::path::Path,
     ) {
         let create_body = serde_json::to_vec(
-            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap() }),
+            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let resp = app
@@ -3871,7 +3915,7 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .method(Method::DELETE)
-                    .uri("/api/sessions/alpha")
+                    .uri("/api/sessions/alpha?confirm=true")
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(&token))
                     .body(Body::empty())
@@ -3894,7 +3938,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, workspace_dir) = make_app_with_workspace(&dir);
         let create_body = serde_json::to_vec(
-            &json!({ "name": "doomed", "workspace_root": dir.path().to_str().unwrap() }),
+            &json!({ "name": "doomed", "workspace_root": dir.path().to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         app.clone()
@@ -3917,7 +3961,7 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .method(Method::DELETE)
-                    .uri("/api/sessions/doomed")
+                    .uri("/api/sessions/doomed?confirm=true")
                     .header(header::HOST, TEST_HOST)
                     .header(header::AUTHORIZATION, bearer(&token))
                     .body(Body::empty())
@@ -3941,6 +3985,245 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── ADR-0053 D6/D12 (Batch B): session lifecycle extra-auth gate ──
+
+    /// Local mode, no password, bearer-only (non-browser): create without
+    /// the explicit confirm flag → 400 `confirm_required`; with it → 201.
+    /// Delete mirrors via `?confirm=true`.
+    #[tokio::test]
+    async fn session_lifecycle_gate_local_requires_confirm_for_bearer() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store) = make_app_with_workspace(&dir);
+
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({ "name": "gated", "workspace_root": dir.path().to_str().unwrap() })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "confirm_required");
+
+        let (status, _) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({
+                "name": "gated",
+                "workspace_root": dir.path().to_str().unwrap(),
+                "confirm": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // DELETE without confirm → 400; with → 204.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/gated")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/gated?confirm=true")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Browser flow non-regression (ADR-0053 D6): a request authenticated
+    /// by a valid `gtmux_auth` session cookie keeps the pre-gate rules —
+    /// no confirm flag, no password header.
+    #[tokio::test]
+    async fn session_lifecycle_gate_cookie_browser_flow_bypasses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, _token, _store, state) = make_app_with_workspace_and_state(&dir);
+        let cookie = state
+            .session_table
+            .issue(auth::AuthMode::Token)
+            .await
+            .expect("issue cookie");
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("{COOKIE_NAME_STR}={cookie}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": "webflow",
+                            "workspace_root": dir.path().to_str().unwrap(),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "cookie-authenticated (browser) create must not need confirm"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/webflow")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::COOKIE, format!("{COOKIE_NAME_STR}={cookie}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "cookie-authenticated (browser) delete must not need confirm"
+        );
+    }
+
+    /// Password set (mode-independent): bearer callers must re-present the
+    /// password via `X-Gtmux-Password` — missing → 401 credential_required,
+    /// wrong → 401 invalid_credential, correct → 201. The confirm flag does
+    /// not substitute.
+    #[tokio::test]
+    async fn session_lifecycle_gate_password_mode_requires_header() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _store, state) = make_app_with_workspace_and_state(&dir);
+        let hash = hash_password("hunter2 correct horse").expect("hash");
+        *state.password_hash.write().await = Some(hash);
+
+        let create_body = json!({
+            "name": "pwgated",
+            "workspace_root": dir.path().to_str().unwrap(),
+            "confirm": true,
+        });
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(create_body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "credential_required");
+
+        let post_with_pw = |pw: &'static str| {
+            let app = app.clone();
+            let token = token.clone();
+            let body = create_body.clone();
+            async move {
+                let resp = app
+                    .oneshot(
+                        HttpRequest::builder()
+                            .method(Method::POST)
+                            .uri("/api/sessions")
+                            .header(header::HOST, TEST_HOST)
+                            .header(header::AUTHORIZATION, bearer(&token))
+                            .header("x-gtmux-password", pw)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let body: Value = if bytes.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&bytes).unwrap()
+                };
+                (status, body)
+            }
+        };
+
+        let (status, body) = post_with_pw("wrong password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], "invalid_credential");
+
+        let (status, _) = post_with_pw("hunter2 correct horse").await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Delete also honours the password header (no confirm needed).
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/sessions/pwgated")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header("x-gtmux-password", "hunter2 correct horse")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Cloud mode without a configured password: non-browser session
+    /// lifecycle is refused outright (403 `password_required`) — cloud
+    /// presumes the password flow (ADR-0053 잔여 확인 1).
+    #[tokio::test]
+    async fn session_lifecycle_gate_cloud_without_password_403() {
+        let token = issue_token().expect("token");
+        let state = AppState::new(cloud_test_config(false), token.clone());
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(
+                            &json!({ "name": "c", "workspace_root": "/tmp", "confirm": true }),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "password_required");
     }
 
     #[tokio::test]
@@ -4690,6 +4973,754 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ── ADR-0053 D5/D6/D10/D13: POST /api/sessions/:name/layout/ops ──
+    //
+    // NB: none of these tests call `seed_owner_attached` — the ops endpoint
+    // is deliberately *not* attach-gated (ADR-0053 D6, bearer only), so a
+    // 200 here is itself the regression guard for that decision.
+
+    fn ops_rect_item(id: &str, z: i32) -> Value {
+        json!({
+            "id": id, "type": "rect",
+            "parent_id": null,
+            "x": 10.0, "y": 20.0, "w": 100.0, "h": 50.0, "z": z,
+            "visibility": "visible", "locked": false, "minimized": false,
+            "stroke": "#000", "fill": "#fff", "stroke_width": 2
+        })
+    }
+
+    fn ops_layout(items: Vec<Value>, groups: Vec<Value>) -> Value {
+        json!({
+            "schema_version": 2,
+            "groups": groups,
+            "items": items,
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        })
+    }
+
+    async fn post_ops(
+        app: &Router,
+        token: &TokenString,
+        session: &str,
+        ops: Value,
+    ) -> (StatusCode, Value) {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/sessions/{session}/layout/ops"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "ops": ops })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
+    }
+
+    async fn ops_get_layout(app: &Router, token: &TokenString, session: &str) -> (Value, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/sessions/{session}/layout"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let etag = resp
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bytes = to_bytes(resp.into_body(), 16 * 1024 * 1024).await.unwrap();
+        (serde_json::from_slice(&bytes).unwrap(), etag)
+    }
+
+    fn ops_find_item<'a>(layout: &'a Value, id: &str) -> &'a Value {
+        layout["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|it| it["id"] == id)
+            .unwrap_or_else(|| panic!("item {id} missing from layout"))
+    }
+
+    const OPS_A: &str = "7f3a0000-b9e2-4111-8222-0000000000aa";
+    const OPS_B: &str = "7f3a0000-b9e2-4111-8222-0000000000ab";
+    const OPS_G1: &str = "0d990000-0000-4111-8222-0000000000b1";
+    const OPS_G2: &str = "0d990000-0000-4111-8222-0000000000b2";
+
+    /// Atomicity (ADR-0053 D5): a failing op in the middle rejects the whole
+    /// batch — the first (valid) move must not land, the ETag must not move.
+    #[tokio::test]
+    async fn layout_ops_atomic_failure_leaves_layout_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![ops_rect_item(OPS_A, 0)], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+        let (_, etag_before) = ops_get_layout(&app, &token, "demo").await;
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([
+                { "op": "move", "id": OPS_A, "x": 500.0, "y": 500.0 },
+                { "op": "move", "id": "00000000-0000-4000-8000-00000000dead", "x": 1.0, "y": 1.0 },
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "item_not_found");
+        assert_eq!(body["failed_index"], 1);
+
+        let (layout, etag_after) = ops_get_layout(&app, &token, "demo").await;
+        assert_eq!(ops_find_item(&layout, OPS_A)["x"], 10.0, "op 0 must not land");
+        assert_eq!(etag_before, etag_after, "ETag must be unchanged on reject");
+    }
+
+    /// Locked policy (ADR-0053 D6): mutation on a locked item is 409
+    /// `locked` without `force:true`, applies with it.
+    #[tokio::test]
+    async fn layout_ops_locked_409_then_force_applies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let mut locked = ops_rect_item(OPS_A, 0);
+        locked["locked"] = json!(true);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![locked], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "move", "id": OPS_A, "x": 99.0, "y": 99.0 }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "locked");
+        assert_eq!(body["failed_index"], 0);
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "move", "id": OPS_A, "x": 99.0, "y": 99.0, "force": true }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied"], 1);
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        assert_eq!(ops_find_item(&layout, OPS_A)["x"], 99.0);
+    }
+
+    /// Group cycle (ADR-0010 R5 wired by ADR-0053 D5): reparenting a group
+    /// under its own descendant is rejected by the pipeline validate.
+    #[tokio::test]
+    async fn layout_ops_reparent_cycle_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let groups = vec![
+            json!({
+                "id": OPS_G1, "parent_id": null, "label": "g1", "color": null,
+                "visibility": "visible", "locked": false, "order": 0
+            }),
+            json!({
+                "id": OPS_G2, "parent_id": OPS_G1, "label": "g2", "color": null,
+                "visibility": "visible", "locked": false, "order": 1
+            }),
+        ];
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], groups)).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "reparent", "id": OPS_G1, "parent_id": OPS_G2 }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "group_cycle");
+        assert_eq!(body["failed_index"], Value::Null);
+
+        // Layout unchanged — G1 still rooted.
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        let g1 = layout["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["id"] == OPS_G1)
+            .unwrap();
+        assert_eq!(g1["parent_id"], Value::Null);
+    }
+
+    /// Delete pipeline (ADR-0053 D5/D10): deleting a path-connected target
+    /// degrades the connected endpoint to `free` at its fallback point —
+    /// the ops route must not inherit the old DELETE handler's degrade gap.
+    #[tokio::test]
+    async fn layout_ops_delete_degrades_connected_path_endpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let path_id = "7f3a0000-b9e2-4111-8222-0000000000ac";
+        let path_item = json!({
+            "id": path_id, "type": "path",
+            "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0, "z": 1,
+            "visibility": "visible", "locked": false, "minimized": false,
+            "from": {
+                "kind": "connected", "item_id": OPS_A, "anchor": "E",
+                "fallback_point": { "x": 110.0, "y": 45.0 }
+            },
+            "to": { "kind": "free", "point": { "x": 400.0, "y": 300.0 } },
+            "routing": "straight",
+            "head_from": "none", "head_to": "none",
+            "stroke": "#000", "stroke_width": 2
+        });
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(
+                vec![ops_rect_item(OPS_A, 0), path_item],
+                vec![],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+
+        let (status, _) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "delete", "id": OPS_A }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        assert_eq!(layout["items"].as_array().unwrap().len(), 1);
+        let path = ops_find_item(&layout, path_id);
+        assert_eq!(path["from"]["kind"], "free", "endpoint must degrade to free");
+        assert_eq!(path["from"]["point"]["x"], 110.0);
+        assert_eq!(path["from"]["point"]["y"], 45.0);
+    }
+
+    /// Create (ADR-0053 D10): server-issued id in `created_ids`, default
+    /// placement = stored-viewport center minus half the type default size,
+    /// z = max+1. Response ETag matches the follow-up GET.
+    #[tokio::test]
+    async fn layout_ops_create_defaults_etag_and_created_ids() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![ops_rect_item(OPS_A, 3)], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+        let (_, etag_before) = ops_get_layout(&app, &token, "demo").await;
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "create", "item_type": "text" }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["applied"], 1);
+        let created = body["created_ids"].as_array().unwrap();
+        assert_eq!(created.len(), 1);
+        let new_id = created[0].as_str().unwrap();
+        assert_eq!(new_id.len(), 36, "created id must be UUID-shaped");
+
+        let (layout, etag_after) = ops_get_layout(&app, &token, "demo").await;
+        assert_ne!(etag_before, etag_after, "ETag must change on success");
+        assert_eq!(
+            etag_after,
+            format!("\"{}\"", body["etag"].as_str().unwrap()),
+            "response etag must match the stored layout's ETag"
+        );
+        let item = ops_find_item(&layout, new_id);
+        assert_eq!(item["type"], "text");
+        // Nominal FHD viewport center (960, 540) minus half of 160x56.
+        assert_eq!(item["x"], 880.0);
+        assert_eq!(item["y"], 512.0);
+        assert_eq!(item["w"], 160.0);
+        assert_eq!(item["h"], 56.0);
+        assert_eq!(item["z"], 4);
+        assert_eq!(item["parent_id"], Value::Null);
+        assert_eq!(item["visibility"], "visible");
+    }
+
+    /// Edit (ADR-0053 D10): `type` is immutable — a change attempt is 400.
+    #[tokio::test]
+    async fn layout_ops_edit_type_change_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![ops_rect_item(OPS_A, 0)], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "edit", "id": OPS_A, "fields": { "type": "note" } }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "edit_field_immutable");
+    }
+
+    /// ADR-0053 D5/D7 — a successful batch publishes the new ETag on the
+    /// hub's layout broadcast (0x80 path).
+    #[tokio::test]
+    async fn layout_ops_success_publishes_layout_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![ops_rect_item(OPS_A, 0)], vec![])).unwrap(),
+        )
+        .unwrap();
+        let mut layout_rx = state.hub.as_ref().unwrap().subscribe_layout();
+        let app = router_with_state(state);
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "move", "id": OPS_A, "x": 42.0, "y": 42.0 }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let published = layout_rx
+            .try_recv()
+            .expect("layout_ops must publish LAYOUT_CHANGED on success");
+        let published_hex: String = published.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(published_hex, body["etag"].as_str().unwrap());
+    }
+
+    /// Group create + ungroup round-trip (ADR-0053 D13 / ADR-0010 D12/D14).
+    #[tokio::test]
+    async fn layout_ops_group_create_then_ungroup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(
+                vec![ops_rect_item(OPS_A, 0), ops_rect_item(OPS_B, 1)],
+                vec![],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "group_create", "ids": [OPS_A, OPS_B] }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let gid = body["created_ids"][0].as_str().unwrap().to_string();
+
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        assert_eq!(layout["groups"].as_array().unwrap().len(), 1);
+        assert_eq!(layout["groups"][0]["id"].as_str().unwrap(), gid);
+        assert_eq!(layout["groups"][0]["label"], "Group 1");
+        assert_eq!(ops_find_item(&layout, OPS_A)["parent_id"].as_str().unwrap(), gid);
+        assert_eq!(ops_find_item(&layout, OPS_B)["parent_id"].as_str().unwrap(), gid);
+
+        let (status, _) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "ungroup", "group_id": gid }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        assert!(layout["groups"].as_array().unwrap().is_empty());
+        assert_eq!(ops_find_item(&layout, OPS_A)["parent_id"], Value::Null);
+        assert_eq!(ops_find_item(&layout, OPS_B)["parent_id"], Value::Null);
+    }
+
+    /// Delete with kill_terminal=true drops the pool entry + metadata
+    /// (parity with DELETE /items — ADR-0053 D10 amend ②).
+    #[tokio::test]
+    async fn layout_ops_delete_kill_terminal_drops_pool_entry() {
+        use gtmux_pty_backend::PaneId;
+        let uuid = "11111111-2222-4333-8444-5555555555aa";
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(7))
+            .await
+            .unwrap();
+        state.terminal_meta.record_spawn(uuid).await;
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&make_layout_with_one_terminal(uuid)).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state.clone());
+
+        let (status, _) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "delete", "id": uuid, "kill_terminal": true }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(state.terminal_map.lookup_pane(uuid).await.is_none());
+        assert!(state.terminal_meta.get(uuid).await.is_none());
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        assert!(layout["items"].as_array().unwrap().is_empty());
+    }
+
+    /// Create image (ADR-0053 D10 amend ② a/b): the workspace-relative path
+    /// is stat-checked at create time and mime / original_w/h are derived
+    /// from the file when unset.
+    #[tokio::test]
+    async fn layout_ops_create_image_stats_path_and_derives_meta() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        // Session workspace_root = the A root (dir); write a real PNG there.
+        let mut layout = ops_layout(vec![], vec![]);
+        layout["workspace_root"] = json!(dir.path().to_str().unwrap());
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        png.extend_from_slice(&[0, 0, 0, 13]);
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&48u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        std::fs::write(dir.path().join("img.png"), &png).unwrap();
+        let app = router_with_state(state);
+
+        // Missing file → 400 path_not_found, before anything is written.
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "create", "item_type": "image", "fields": { "path": "missing.png" } }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "path_not_found");
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "create", "item_type": "image", "fields": { "path": "img.png" } }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let new_id = body["created_ids"][0].as_str().unwrap().to_string();
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        let item = ops_find_item(&layout, &new_id);
+        assert_eq!(item["path"], "img.png");
+        assert_eq!(item["mime"], "image/png");
+        assert_eq!(item["original_w"], 64);
+        assert_eq!(item["original_h"], 48);
+    }
+
+    /// Z 4-action semantics over the ops route (ADR-0024): raise_top moves
+    /// the block to the top of its parent level and z stays consecutive.
+    #[tokio::test]
+    async fn layout_ops_raise_top_reorders_consecutively() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        let c_id = "7f3a0000-b9e2-4111-8222-0000000000ad";
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(
+                vec![
+                    ops_rect_item(OPS_A, 0),
+                    ops_rect_item(OPS_B, 1),
+                    ops_rect_item(c_id, 2),
+                ],
+                vec![],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+
+        let (status, _) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "raise_top", "id": OPS_A }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        assert_eq!(ops_find_item(&layout, OPS_B)["z"], 0);
+        assert_eq!(ops_find_item(&layout, c_id)["z"], 1);
+        assert_eq!(ops_find_item(&layout, OPS_A)["z"], 2);
+    }
+
+    /// Snippets create issues server-side entry ids (ADR-0053 D10 amend ② c).
+    #[tokio::test]
+    async fn layout_ops_create_snippets_issues_entry_ids() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{
+                "op": "create", "item_type": "snippets",
+                "fields": { "entries": [ { "key": "deploy", "body": "make deploy" } ] }
+            }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let new_id = body["created_ids"][0].as_str().unwrap().to_string();
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        let item = ops_find_item(&layout, &new_id);
+        let entry_id = item["entries"][0]["id"].as_str().unwrap();
+        assert_eq!(entry_id.len(), 36, "entry id must be server-issued UUID");
+        assert_eq!(item["entries"][0]["key"], "deploy");
+    }
+
+    /// Terminal create is rejected — spawn (ADR-0053 D11) is Batch B.
+    #[tokio::test]
+    async fn layout_ops_create_terminal_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state);
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "create", "item_type": "terminal" }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "create_terminal_not_allowed");
+    }
+
+    // ── ADR-0053 D11 (Batch B): spawn / mount ops ──
+
+    /// `spawn` is headless-complete (ADR-0053 D11): with no browser or
+    /// attach anywhere, one ops call persists the TerminalItem (default
+    /// create placement) *and* leaves an alive PTY bound to the new UUID,
+    /// with the 0x88 TERMINAL_SPAWNED binding published.
+    #[tokio::test]
+    async fn layout_ops_spawn_headless_persists_item_and_spawns_pty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], vec![])).unwrap(),
+        )
+        .unwrap();
+        let hub = state.hub.as_ref().expect("hub wired").clone();
+        let mut spawned_rx = hub.subscribe_terminal_spawned();
+        let app = router_with_state(state.clone());
+
+        let (status, body) = post_ops(&app, &token, "demo", json!([{ "op": "spawn" }])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["spawn_failures"], json!([]));
+        let uuid = body["created_ids"][0].as_str().unwrap().to_string();
+        assert_eq!(uuid.len(), 36, "spawn id must be a server-issued UUID");
+
+        // Layout persisted with the create-rule default placement
+        // (viewport (0,0,1) → center (960,540); terminal 480x320).
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        let item = ops_find_item(&layout, &uuid);
+        assert_eq!(item["type"], "terminal");
+        assert_eq!(item["x"], 720.0);
+        assert_eq!(item["y"], 380.0);
+        assert_eq!(item["w"], 480.0);
+        assert_eq!(item["h"], 320.0);
+
+        // PTY alive + 0x88 binding published + attach_index membership.
+        let pane = state
+            .terminal_map
+            .lookup_pane(&uuid)
+            .await
+            .expect("spawn op must leave an alive PTY binding");
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), spawned_rx.recv())
+            .await
+            .expect("0x88 must be published")
+            .expect("recv");
+        assert_eq!(&*event.terminal_id, uuid.as_str());
+        assert_eq!(event.pane_id, pane.0);
+        assert_eq!(
+            state.attach_index.read_attached_sessions(&uuid),
+            vec!["demo".to_string()],
+        );
+
+        // Cleanup — SIGTERM the real child shell.
+        let _ = hub.backend().kill(pane);
+    }
+
+    /// Atomicity across the spawn side effect: a failing op in the same
+    /// batch rejects everything — no layout change *and no PTY spawn*.
+    #[tokio::test]
+    async fn layout_ops_spawn_atomic_with_failing_op_spawns_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state.clone());
+
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([
+                { "op": "spawn" },
+                { "op": "move", "id": "00000000-0000-4000-8000-00000000dead", "x": 1.0, "y": 1.0 },
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "item_not_found");
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        assert!(layout["items"].as_array().unwrap().is_empty());
+        assert!(
+            state.terminal_map.is_empty().await,
+            "rejected batch must not spawn any PTY"
+        );
+    }
+
+    /// `mount` adds an item for an alive pool terminal without spawning;
+    /// a dead/unknown UUID is rejected up front, and a second mount of the
+    /// same UUID into the same session is an explicit 400 (ADR-0053 D11).
+    #[tokio::test]
+    async fn layout_ops_mount_alive_validation_and_duplicate_reject() {
+        use gtmux_pty_backend::PaneId;
+        let uuid = "11111111-2222-4333-8444-5555555555bb";
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        std::fs::write(
+            workspace_dir.join("demo.json"),
+            serde_json::to_vec(&ops_layout(vec![], vec![])).unwrap(),
+        )
+        .unwrap();
+        let app = router_with_state(state.clone());
+
+        // Unknown UUID → 400 terminal_not_alive, nothing written.
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "mount", "uuid": "00000000-0000-4000-8000-00000000beef" }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "terminal_not_alive");
+        assert_eq!(body["failed_index"], 0);
+
+        // Alive pool terminal → mounted with explicit coordinates, no
+        // fresh spawn (the pool binding is untouched).
+        state
+            .terminal_map
+            .register(uuid.into(), PaneId(9))
+            .await
+            .unwrap();
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "mount", "uuid": uuid, "x": 5.0, "y": 6.0 }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["created_ids"],
+            json!([]),
+            "mount reuses a caller-supplied id — nothing is server-issued"
+        );
+        let (layout, _) = ops_get_layout(&app, &token, "demo").await;
+        let item = ops_find_item(&layout, uuid);
+        assert_eq!(item["type"], "terminal");
+        assert_eq!(item["x"], 5.0);
+        assert_eq!(item["y"], 6.0);
+        assert_eq!(item["w"], 480.0);
+        assert_eq!(item["h"], 320.0);
+        assert_eq!(state.terminal_map.lookup_pane(uuid).await, Some(PaneId(9)));
+        assert_eq!(
+            state.attach_index.read_attached_sessions(uuid),
+            vec!["demo".to_string()],
+        );
+
+        // Duplicate mount into the same session layout → explicit reject.
+        let (status, body) = post_ops(
+            &app,
+            &token,
+            "demo",
+            json!([{ "op": "mount", "uuid": uuid }]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "already_mounted");
+    }
+
     #[tokio::test]
     async fn terminal_kill_404_when_not_in_pool() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4749,6 +5780,238 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    // ── ADR-0054: terminal output read + input send ──
+
+    #[tokio::test]
+    async fn terminal_output_404_when_not_in_pool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/output")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "terminal_not_alive");
+    }
+
+    #[tokio::test]
+    async fn terminal_output_503_without_hub() {
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/output")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn terminal_input_404_when_not_in_pool() {
+        use base64::Engine as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let app = router_with_state(state);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"ls\n");
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/input")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "bytes_base64": b64 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "terminal_not_alive");
+    }
+
+    #[tokio::test]
+    async fn terminal_input_400_on_bad_base64() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let uuid = "11111111-2222-4333-8444-5555555554cc";
+        state.terminal_map.register(uuid.into(), PaneId(2)).await.unwrap();
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/terminals/{uuid}/input"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "bytes_base64": "!!!not base64!!!" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "bad_base64");
+    }
+
+    #[tokio::test]
+    async fn terminal_input_413_over_cap() {
+        use base64::Engine as _;
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let uuid = "11111111-2222-4333-8444-5555555554aa";
+        // The cap check precedes the send; a bound pane is registered only so
+        // the failure is unambiguously the size gate rather than a 404.
+        state.terminal_map.register(uuid.into(), PaneId(1)).await.unwrap();
+        let app = router_with_state(state);
+        let oversized = vec![b'x'; crate::terminals::INPUT_MAX_BYTES + 1];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&oversized);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/terminals/{uuid}/input"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "bytes_base64": b64 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "input_too_large");
+    }
+
+    /// End-to-end: spawn a real PTY, inject `echo <marker>` via the input
+    /// endpoint, then read it back through the output endpoint. The PTY
+    /// echoes typed input, so the marker is guaranteed to surface in the
+    /// ring even before the command runs. Also exercises `?tail=N`.
+    #[tokio::test]
+    async fn terminal_input_reaches_pty_and_output_reads_back() {
+        use base64::Engine as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let uuid = "11111111-2222-4333-8444-5555555554bb";
+        let pane = state
+            .spawn_terminal_with_uuid(uuid.to_string(), None, None)
+            .await
+            .expect("spawn a real PTY");
+        let app = router_with_state(state.clone());
+
+        let marker = "GTMUX_ADR0054_MARKER";
+        let line = format!("echo {marker}\n");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&line);
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/terminals/{uuid}/input"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "bytes_base64": b64 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(sent["sent"].as_u64().unwrap(), line.len() as u64);
+
+        // Poll the output endpoint until the echoed marker appears.
+        let mut full: Vec<u8> = Vec::new();
+        for _ in 0..40 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/terminals/{uuid}/output"))
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::AUTHORIZATION, bearer(&token))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap())
+                    .unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(body["bytes_base64"].as_str().unwrap())
+                .unwrap();
+            // `len` echoes the returned byte count; a fresh pane never fills
+            // the 128 KiB ring, so `truncated` is false.
+            assert_eq!(body["len"].as_u64().unwrap(), decoded.len() as u64);
+            assert_eq!(body["truncated"], false);
+            if String::from_utf8_lossy(&decoded).contains(marker) {
+                full = decoded;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            String::from_utf8_lossy(&full).contains(marker),
+            "marker never appeared in the pane output ring"
+        );
+
+        // `?tail=N` returns exactly the last N bytes of the snapshot.
+        let n = 8usize.min(full.len());
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/terminals/{uuid}/output?tail={n}"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+        let tail = base64::engine::general_purpose::STANDARD
+            .decode(body["bytes_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(tail.len(), n, "tail=N must return exactly N bytes");
+
+        // Cleanup — SIGTERM the real child shell.
+        let _ = state.hub.as_ref().unwrap().backend().kill(pane);
+    }
+
     // ── Stage 3: cross-server session attach lock (ADR-0019 D3/D6) ──
 
     async fn create_session(
@@ -4758,7 +6021,7 @@ mod tests {
         workspace_root: &std::path::Path,
     ) {
         let body = serde_json::to_vec(
-            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap() }),
+            &json!({ "name": name, "workspace_root": workspace_root.to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let resp = app
@@ -5029,7 +6292,7 @@ mod tests {
 
         // Create the session (no attach yet) with workspace_root = project dir.
         let create = serde_json::to_vec(
-            &json!({ "name": "demo", "workspace_root": project.to_str().unwrap() }),
+            &json!({ "name": "demo", "workspace_root": project.to_str().unwrap(), "confirm": true }),
         )
         .unwrap();
         let resp = app
@@ -5938,7 +7201,7 @@ mod tests {
         let uuid = "11111111-2222-4333-8444-66666666666e";
         let mut rx = hub.subscribe_terminal_spawned();
         let pane = state
-            .spawn_terminal_with_uuid(uuid.to_string(), None)
+            .spawn_terminal_with_uuid(uuid.to_string(), None, None)
             .await
             .expect("spawn");
         let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
@@ -5960,7 +7223,7 @@ mod tests {
         let uuid = "11111111-2222-4333-8444-66666666666f";
         let mut rx = hub.subscribe_terminal_spawned();
         let _first = state
-            .spawn_terminal_with_uuid(uuid.to_string(), None)
+            .spawn_terminal_with_uuid(uuid.to_string(), None, None)
             .await
             .expect("spawn 1");
         let _drain = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
@@ -5969,13 +7232,36 @@ mod tests {
             .expect("recv");
         // Re-spawn the same UUID — fast-path lookup, no fresh broadcast.
         let _second = state
-            .spawn_terminal_with_uuid(uuid.to_string(), None)
+            .spawn_terminal_with_uuid(uuid.to_string(), None, None)
             .await
             .expect("spawn 2");
         let racy = tokio::time::timeout(std::time::Duration::from_millis(80), rx.recv()).await;
         assert!(
             racy.is_err(),
             "idempotent re-spawn must not publish a second binding, got: {racy:?}"
+        );
+    }
+
+    /// ADR-0053 D4 — canvas identity env injected into every spawn:
+    /// `GTMUX_TERMINAL_ID` always, `GTMUX_CANVAS_SESSION` only for
+    /// session-scoped spawns. (Runtime propagation into the child shell is
+    /// the pty backend's existing `SpawnSpec.env` contract; the end-to-end
+    /// echo check is a Batch E 실측 item.)
+    #[test]
+    fn terminal_identity_env_maps_uuid_and_session() {
+        let uuid = "11111111-2222-4333-8444-666666666601";
+        let env = terminal_identity_env(uuid, Some("demo"));
+        assert_eq!(
+            env,
+            vec![
+                ("GTMUX_TERMINAL_ID".to_string(), uuid.to_string()),
+                ("GTMUX_CANVAS_SESSION".to_string(), "demo".to_string()),
+            ]
+        );
+        let env = terminal_identity_env(uuid, None);
+        assert_eq!(
+            env,
+            vec![("GTMUX_TERMINAL_ID".to_string(), uuid.to_string())]
         );
     }
 
@@ -8279,7 +9565,7 @@ mod tests {
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "needs-ws" })),
+            Some(json!({ "name": "needs-ws", "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -8296,7 +9582,7 @@ mod tests {
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "escape", "workspace_root": "/etc" })),
+            Some(json!({ "name": "escape", "workspace_root": "/etc", "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -8318,7 +9604,7 @@ mod tests {
                 &token,
                 Method::POST,
                 "/api/sessions",
-                Some(json!({ "name": name, "workspace_root": proj.to_string_lossy() })),
+                Some(json!({ "name": name, "workspace_root": proj.to_string_lossy(), "confirm": true })),
             )
             .await;
             assert_eq!(
@@ -8392,7 +9678,7 @@ mod tests {
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "movable", "workspace_root": proj1.to_string_lossy() })),
+            Some(json!({ "name": "movable", "workspace_root": proj1.to_string_lossy(), "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
@@ -8462,7 +9748,7 @@ mod tests {
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "orig", "workspace_root": proj.to_string_lossy() })),
+            Some(json!({ "name": "orig", "workspace_root": proj.to_string_lossy(), "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);

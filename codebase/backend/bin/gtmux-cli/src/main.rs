@@ -26,7 +26,12 @@
 #![deny(unsafe_code)]
 #![warn(clippy::all)]
 
+mod align;
+mod ansi;
+mod http;
 mod process_audit;
+mod remote;
+mod skill;
 mod state_files;
 
 use std::io::IsTerminal;
@@ -175,6 +180,35 @@ enum Cmd {
         #[command(subcommand)]
         command: SessionCmd,
     },
+    /// Canvas layout control over the live server's HTTP API (ADR-0053).
+    /// Targets are an item UUID or an exact label (D3); `--session` falls
+    /// back to $GTMUX_CANVAS_SESSION inside gtmux-spawned terminals.
+    Layout {
+        #[command(subcommand)]
+        command: remote::LayoutCmd,
+    },
+    /// Terminal lifecycle: spawn/mount/unmount panels, kill/list the pool
+    /// (ADR-0053 D11).
+    Terminal {
+        #[command(subcommand)]
+        command: remote::TerminalCmd,
+    },
+    /// Get or re-point a session's Workspace(B) root (ADR-0053 D12).
+    /// Session-level command — the session must be named explicitly.
+    Workspace {
+        #[command(subcommand)]
+        command: remote::WorkspaceCmd,
+    },
+    /// Bring files into the workspace over the live server (ADR-0053 D14).
+    Fs {
+        #[command(subcommand)]
+        command: remote::FsCmd,
+    },
+    /// Read or install the embedded gtmux CLI Agent Skill (ADR-0055 D2).
+    /// Offline — no server connection. `gtmux skill` prints the whole
+    /// embedded SKILL.md; `--section <n>` prints one section; `install`
+    /// writes it into user-level skill directories so agents pick it up.
+    Skill(skill::SkillArgs),
     /// Set or replace the password used by ADR-0020 password-mode auth.
     /// Prompts twice on the TTY (or reads from stdin in non-interactive
     /// environments) and writes an Argon2id PHC hash to
@@ -227,6 +261,45 @@ enum SessionCmd {
         #[arg(long = "workspace", value_name = "PATH")]
         workspace_path: Option<PathBuf>,
     },
+    /// Create a session on the *running* server (online — ADR-0053 D12).
+    /// Gated: password re-presentation when one is set; password-less Local
+    /// mode requires --yes (D6).
+    Create {
+        /// New session name (explicit — session-level commands never take an
+        /// implicit target).
+        session: String,
+        /// Session Workspace(B) root (required — ADR-0046 D5).
+        #[arg(long = "workspace", value_name = "PATH")]
+        workspace: Option<String>,
+        /// Confirm the lifecycle action without a password (password-less
+        /// Local mode only).
+        #[arg(long)]
+        yes: bool,
+        /// Gate password (else $GTMUX_PASSWORD, else a TTY prompt after the
+        /// server answers 401 credential_required).
+        #[arg(long)]
+        password: Option<String>,
+        /// Server instance (default: $GTMUX_SERVER_INSTANCE, else the single
+        /// running instance).
+        #[arg(long, env = "GTMUX_SERVER_INSTANCE", value_name = "INSTANCE")]
+        instance: Option<String>,
+    },
+    /// Delete a session record on the *running* server (online — ADR-0053
+    /// D12; same gate as `create`). Mounted terminals stay in the pool.
+    Delete {
+        /// Session name to delete.
+        session: String,
+        /// Confirm the destructive action (password-less Local mode only).
+        #[arg(long)]
+        yes: bool,
+        /// Gate password (else $GTMUX_PASSWORD, else a TTY prompt).
+        #[arg(long)]
+        password: Option<String>,
+        /// Server instance (default: $GTMUX_SERVER_INSTANCE, else the single
+        /// running instance).
+        #[arg(long, env = "GTMUX_SERVER_INSTANCE", value_name = "INSTANCE")]
+        instance: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -234,7 +307,18 @@ fn main() -> ExitCode {
     // grill-D20 exit-code matrix without losing context (clap's anyhow path
     // collapses everything to exit 1).
     let cli = Cli::parse();
-    if deprecated_session_alias_used() {
+    // `--session` is a deprecated *instance* alias only on the lifecycle
+    // commands; the ADR-0053 remote surface (`layout`/`terminal`/`fs`) uses
+    // `--session` legitimately for the canvas session — don't warn there.
+    let session_alias_deprecated = matches!(
+        cli.command,
+        Cmd::Start { .. }
+            | Cmd::Stop { .. }
+            | Cmd::Teardown { .. }
+            | Cmd::RotateToken { .. }
+            | Cmd::Status { .. }
+    );
+    if session_alias_deprecated && deprecated_session_alias_used() {
         eprintln!("gtmux: --session is deprecated; use --name.");
     }
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -277,7 +361,31 @@ fn main() -> ExitCode {
         })),
         Cmd::RotateToken { name } => rotate_token_cmd(&name),
         Cmd::Status { name } => rt.block_on(status_cmd(name.as_deref())),
+        Cmd::Session {
+            command:
+                SessionCmd::Create {
+                    session,
+                    workspace,
+                    yes,
+                    password,
+                    instance,
+                },
+        } => remote::run_session_create(session, workspace, yes, password, instance),
+        Cmd::Session {
+            command:
+                SessionCmd::Delete {
+                    session,
+                    yes,
+                    password,
+                    instance,
+                },
+        } => remote::run_session_delete(session, yes, password, instance),
         Cmd::Session { command } => session_cmd(command),
+        Cmd::Layout { command } => remote::run_layout(command),
+        Cmd::Terminal { command } => remote::run_terminal(command),
+        Cmd::Workspace { command } => remote::run_workspace(command),
+        Cmd::Fs { command } => remote::run_fs(command),
+        Cmd::Skill(args) => skill::run(args),
         Cmd::SetPassword => set_password_cmd(),
         Cmd::ResetPassword => reset_password_cmd(),
     }
@@ -1729,6 +1837,11 @@ fn session_cmd(command: SessionCmd) -> ExitCode {
             name_as,
             workspace_path,
         } => session_import(&name, &file, name_as, workspace_path),
+        // Online lifecycle variants are routed to `remote::` in `main`
+        // *before* this offline dispatcher is reached.
+        SessionCmd::Create { .. } | SessionCmd::Delete { .. } => {
+            unreachable!("online session lifecycle is dispatched in main")
+        }
     }
 }
 
@@ -2296,6 +2409,47 @@ mod tests {
                 assert_eq!(name_as.as_deref(), Some("copy"));
             }
             other => panic!("expected Session::Import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_subcommands_parse() {
+        // Bare `gtmux skill` → whole document (no section, no subcommand).
+        let cli = Cli::parse_from(["gtmux", "skill"]);
+        match cli.command {
+            Cmd::Skill(skill::SkillArgs { section, command }) => {
+                assert!(section.is_none());
+                assert!(command.is_none());
+            }
+            other => panic!("expected Skill, got {other:?}"),
+        }
+        // `--section 2`.
+        let cli = Cli::parse_from(["gtmux", "skill", "--section", "2"]);
+        match cli.command {
+            Cmd::Skill(skill::SkillArgs { section, command }) => {
+                assert_eq!(section.as_deref(), Some("2"));
+                assert!(command.is_none());
+            }
+            other => panic!("expected Skill, got {other:?}"),
+        }
+        // `install --claude --force`.
+        let cli = Cli::parse_from(["gtmux", "skill", "install", "--claude", "--force"]);
+        match cli.command {
+            Cmd::Skill(skill::SkillArgs {
+                section,
+                command:
+                    Some(skill::SkillCmd::Install {
+                        claude,
+                        codex,
+                        force,
+                    }),
+            }) => {
+                assert!(section.is_none());
+                assert!(claude);
+                assert!(!codex);
+                assert!(force);
+            }
+            other => panic!("expected Skill::Install, got {other:?}"),
         }
     }
 

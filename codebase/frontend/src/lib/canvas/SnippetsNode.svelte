@@ -30,6 +30,7 @@
     constrainResizeAspectIfShift,
     scheduleLiveAspectResize,
   } from './resizeConstraint';
+  import { holdLayoutRefetch, releaseLayoutRefetch } from '$lib/ws/layoutRefetch.svelte';
 
   interface SnippetsNodeData {
     id: string;
@@ -317,7 +318,14 @@
     );
   }
 
+  // ADR-0053 D7 — resize gesture 동안 외부발 0x80 refetch defer (node drag 와
+  // 동일 가드). NodeResizer 는 d3-drag 기반 — start/end 는 항상 짝으로 발화.
+  function onResizeStart(): void {
+    holdLayoutRefetch();
+  }
+
   async function onResizeEnd(event: unknown, params: ResizeParams): Promise<void> {
+    releaseLayoutRefetch();
     const constrained = constrainResizeAspectIfShift(
       event,
       params,
@@ -408,6 +416,7 @@
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
       lineClass="panel-resize-line"
+      {onResizeStart}
       {onResize}
       {onResizeEnd}
     />

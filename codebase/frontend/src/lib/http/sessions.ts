@@ -30,6 +30,7 @@ import type {
   SessionListResponse,
 } from '$lib/types/sessions';
 import { getWebpageId, webpageHeaders } from '$lib/session/webpageId';
+import { layoutEtag } from '$lib/stores/layoutEtag';
 import { observeServerId } from '$lib/session/serverId';
 
 const JSON_HEADERS: Record<string, string> = {
@@ -444,6 +445,8 @@ export async function deleteItem(
   if (res.status === 401) throw new UnauthorizedError();
   if (res.status === 404) throw new Error(`item "${itemId}" not found`);
   if (!res.ok) throw new Error(`DELETE item returned ${res.status}`);
+  // ADR-0053 D7 — 204 응답의 새 ETag 도 echo 판별 기준값으로 기록.
+  layoutEtag.note((res.headers.get('ETag') ?? '').replace(/^"|"$/g, ''));
 }
 
 /**
@@ -465,6 +468,8 @@ export async function getLayout(
   if (!res.ok) throw new Error(`GET layout returned ${res.status}`);
   const { layout, workspace_root } = parseLayoutBody(await json<unknown>(res));
   const etag = (res.headers.get('ETag') ?? '').replace(/^"|"$/g, '');
+  // ADR-0053 D7 — 0x80 echo 판별 기준값 갱신.
+  layoutEtag.note(etag);
   return { layout, etag, workspace_root };
 }
 
@@ -501,6 +506,8 @@ export async function putLayout(
   if (res.status === 428) throw new Error('precondition required (If-Match missing)');
   if (!res.ok) throw new Error(await responseErrorMessage(res, 'PUT layout returned'));
   const newEtag = (res.headers.get('ETag') ?? '').replace(/^"|"$/g, '');
+  // ADR-0053 D7 — 자기 발신 PUT 의 0x80 broadcast 를 echo 로 인지시키는 기록.
+  layoutEtag.note(newEtag);
   return { etag: newEtag };
 }
 

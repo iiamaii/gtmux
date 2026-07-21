@@ -40,10 +40,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -52,6 +54,11 @@ use tokio::sync::RwLock;
 /// ADR-0018 D8). Enforced by [`patch_handler`] before the label hits
 /// the metadata store.
 pub const MAX_LABEL_BYTES: usize = 4096;
+
+/// Hard cap on the decoded byte length of a `POST /api/terminals/:id/input`
+/// body (ADR-0054 D2). A larger payload is rejected with 413 before it
+/// reaches the PTY writer.
+pub const INPUT_MAX_BYTES: usize = 64 * 1024;
 
 /// Per-terminal metadata stored alongside the [`crate::TerminalMap`].
 /// Created when a spawn registers a UUID, dropped when the same UUID
@@ -342,8 +349,16 @@ pub async fn respawn_handler(
     crate::sessions::kill_and_unregister_terminal(&state, &id).await;
     // ADR-0046 D2 — respawn in the effective Workspace(B) of a session that
     // references this terminal (best-effort; falls back to the pty default).
-    let cwd = crate::sessions::terminal_respawn_cwd(&state, &id).await;
-    match state.spawn_terminal_with_uuid(id.clone(), cwd).await {
+    // The same session name rides along as the canvas identity env
+    // (ADR-0053 D4); an orphan UUID spawns without it.
+    let (cwd, session) = match crate::sessions::terminal_respawn_cwd(&state, &id).await {
+        Some((cwd, session)) => (Some(cwd), Some(session)),
+        None => (None, None),
+    };
+    match state
+        .spawn_terminal_with_uuid(id.clone(), cwd, session.as_deref())
+        .await
+    {
         Ok(_) => (StatusCode::OK, Json(json!({ "id": id, "reused": false }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -353,6 +368,155 @@ pub async fn respawn_handler(
             })),
         )
             .into_response(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GET /api/terminals/:id/output — ring snapshot read (ADR-0054 D1)
+//  POST /api/terminals/:id/input — raw stdin injection (ADR-0054 D2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 404 body for a terminal that is absent from the alive pool (or died
+/// between the map lookup and the backend call). Code = `terminal_not_alive`
+/// (ADR-0054 D1/D2); shape mirrors the sibling `terminals.rs` handlers.
+fn terminal_not_alive(id: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "terminal_not_alive",
+            "message": format!("terminal '{id}' is not in the alive pool"),
+        })),
+    )
+        .into_response()
+}
+
+/// Query for [`output_handler`] — `?tail=<N>` returns only the last N bytes
+/// of the ring snapshot (default: the whole snapshot).
+#[derive(Debug, Deserialize)]
+pub struct OutputQuery {
+    #[serde(default)]
+    pub tail: Option<usize>,
+}
+
+/// `GET /api/terminals/:id/output` — return the pane's raw PTY ring-buffer
+/// snapshot (ADR-0054 D1). `{id}` is the Terminal UUID (= item id, ADR-0018
+/// D2); a missing / dead terminal is 404 `terminal_not_alive`.
+///
+/// The server does not process the bytes — the ring holds raw PTY output
+/// ("the server is only aware of raw bytes"), so the response carries them
+/// base64-encoded (JSON cannot carry arbitrary bytes) alongside a `truncated`
+/// flag and the returned byte count.
+///
+/// Response: `{ "bytes_base64": <string>, "truncated": <bool>, "len": <n> }`.
+///
+/// bearer-only (the `/api/*` middleware); no owner / attach-lock gate
+/// (ADR-0054 D3).
+pub async fn output_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(id): AxumPath<String>,
+    Query(q): Query<OutputQuery>,
+) -> Response {
+    let Some(hub) = state.hub.as_ref() else {
+        return service_unavailable("hub_not_configured");
+    };
+    let Some(pane) = state.terminal_map.lookup_pane(&id).await else {
+        return terminal_not_alive(&id);
+    };
+    // Take the ring snapshot and immediately drop the broadcast receiver —
+    // this is a one-shot read, so keeping the subscription alive would leak
+    // an idle receiver against the pane's output channel (ADR-0054 D1).
+    let Some((snapshot, _rx)) = hub.backend().subscribe_output(pane) else {
+        // Pane vanished between the map lookup and the subscribe (raced death).
+        return terminal_not_alive(&id);
+    };
+    // `truncated` = the ring was at capacity, so the oldest output may have
+    // been dropped (ADR-0054 D1 known lossiness). This is an *approximation*:
+    // the ring holds at most RING_CAPACITY bytes, so a full snapshot means
+    // either the ring dropped old bytes OR the pane happened to emit exactly
+    // RING_CAPACITY bytes with no loss. We cannot distinguish the two without
+    // tracking a total-bytes counter, and the false-positive is harmless for
+    // the "did I lose scrollback?" question this flag answers.
+    let truncated = snapshot.len() >= gtmux_pty_backend::RING_CAPACITY;
+    // `?tail=N` — last N bytes only. `truncated` still reflects the *ring*
+    // state (not the tail slice), so a caller that asks for a small tail of a
+    // full ring still learns that older output was dropped.
+    let bytes: &[u8] = match q.tail {
+        Some(n) if n < snapshot.len() => &snapshot[snapshot.len() - n..],
+        _ => &snapshot,
+    };
+    Json(json!({
+        "bytes_base64": BASE64.encode(bytes),
+        "truncated": truncated,
+        "len": bytes.len(),
+    }))
+    .into_response()
+}
+
+/// Body for [`input_handler`] — the bytes to inject, base64-encoded. Base64
+/// (rather than an `application/octet-stream` raw body) keeps this endpoint
+/// symmetric with [`output_handler`]'s response and lets the whole remote
+/// surface stay JSON (the CLI's HTTP client is JSON-only bar the fs upload).
+#[derive(Debug, Deserialize)]
+pub struct InputBody {
+    pub bytes_base64: String,
+}
+
+/// `POST /api/terminals/:id/input` — decode the base64 body and write the raw
+/// bytes to the pane's PTY stdin (ADR-0054 D2). No shell tokenization / escape
+/// — raw stdin injection (ADR-0013 model); a caller expresses "run this
+/// command" by including a trailing newline in the bytes.
+///
+/// Returns:
+///   * 200 `{ "sent": <n> }` — n raw bytes queued to the PTY writer.
+///   * 400 `bad_base64` — body was not valid base64.
+///   * 413 `input_too_large` — decoded body exceeds [`INPUT_MAX_BYTES`].
+///   * 404 `terminal_not_alive` — no such alive pool terminal.
+///   * 503 `hub_not_configured` — no backend attached.
+///
+/// bearer-only (ADR-0054 D3).
+pub async fn input_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<InputBody>,
+) -> Response {
+    let Some(hub) = state.hub.as_ref() else {
+        return service_unavailable("hub_not_configured");
+    };
+    let bytes = match BASE64.decode(body.bytes_base64.as_bytes()) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "bad_base64",
+                    "message": format!("bytes_base64 is not valid base64: {e}"),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if bytes.len() > INPUT_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": "input_too_large",
+                "message": format!(
+                    "input length {} exceeds cap {INPUT_MAX_BYTES}",
+                    bytes.len()
+                ),
+            })),
+        )
+            .into_response();
+    }
+    let Some(pane) = state.terminal_map.lookup_pane(&id).await else {
+        return terminal_not_alive(&id);
+    };
+    let sent = bytes.len();
+    match hub.backend().send_input(pane, bytes) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "sent": sent }))).into_response(),
+        // The pane died between the lookup and the send (its writer channel
+        // is closed) — surface the same 404 as an absent terminal.
+        Err(_) => terminal_not_alive(&id),
     }
 }
 

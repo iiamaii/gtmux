@@ -28,6 +28,10 @@ ipnet = { workspace = true }
 # Offline `gtmux session ls|export|import` (ADR-0044 D-C2) reads/wraps/validates
 # session layout + export-envelope JSON directly against the workspace dir.
 serde_json = { workspace = true }
+# `gtmux terminal read|send` (ADR-0054 D4) — the read/input wire carries raw
+# PTY bytes base64-encoded (JSON can't hold arbitrary bytes), so the CLI
+# encodes the input payload and decodes the output snapshot.
+base64 = { workspace = true }
 # libc surfaces `pid_t` + `kill(2)` for the pidfile + SIGTERM teardown
 # logic in `state_files.rs` (inlined from the pre-Stage-B lifecycle crate
 # after ADR-0013 made the tmux-specific parts of that crate obsolete).
@@ -38,6 +42,12 @@ libc = "0.2"
 sysinfo = { workspace = true }
 # Read a password from the TTY without echoing it.
 rpassword = { workspace = true }
+# Blocking HTTP client for the ADR-0053 remote-control surface
+# (`gtmux layout|terminal|workspace|fs` + online `session create|delete`).
+# default-features = false drops TLS/gzip — the CLI only talks plain HTTP
+# to the local instance, so the TLS dependency tree buys nothing (D9
+# lightweight-client requirement).
+ureq = { version = "2.12", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
