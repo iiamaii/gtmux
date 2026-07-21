@@ -38,6 +38,12 @@ libc = "0.2"
 sysinfo = { workspace = true }
 # Read a password from the TTY without echoing it.
 rpassword = { workspace = true }
+# Blocking HTTP client for the ADR-0053 remote-control surface
+# (`gtmux layout|terminal|workspace|fs` + online `session create|delete`).
+# default-features = false drops TLS/gzip — the CLI only talks plain HTTP
+# to the local instance, so the TLS dependency tree buys nothing (D9
+# lightweight-client requirement).
+ureq = { version = "2.12", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
