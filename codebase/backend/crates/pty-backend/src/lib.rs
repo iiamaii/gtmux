@@ -303,10 +303,131 @@ struct PaneHandle {
     writer_join: Option<JoinHandle<()>>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ring-buffer scrollback-clear detection (ADR-0054 §구현 노트).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Longest scrollback-clear sequence scanned in the append hot path
+/// (`ESC[3J` = 4 bytes). A rolling tail of `CLEAR_SCAN_MAX_LEN - 1` bytes
+/// from the ring lets a sequence split across two PTY reads still match.
+const CLEAR_SCAN_MAX_LEN: usize = 4;
+
+/// Byte sequences whose appearance means an xterm-class emulator (xterm.js
+/// in the browser) drops its saved scrollback at that point. The server
+/// ring mirrors that so every `subscribe_output` snapshot — the HTTP
+/// `GET /api/terminals/{id}/output` read *and* the WS attach-replay — matches
+/// the user-visible screen after `clear` / `reset`.
+///
+/// - `ESC [ 3 J` — CSI 3 J (ED, param 3): erase scrollback. Emitted by
+///   `clear(1)` (as part of `ESC[H ESC[2J ESC[3J`) and `tput E3` under
+///   `TERM=xterm-256color` — the TERM every gtmux child inherits (see
+///   `spawn_inner`).
+/// - `ESC c` — RIS, full reset. Emitted by `reset(1)` / `tput reset`
+///   (xterm `rs1 = \Ec`).
+///
+/// Deliberately **excludes** `ESC [ 2 J` (CSI 2 J, erase visible screen):
+/// xterm keeps scrollback on a bare 2J, so Ctrl-L / `tput clear` (which emit
+/// only `ESC[H ESC[2J`) intentionally keep it here too — matching what the
+/// browser terminal shows.
+const CLEAR_SEQUENCES: [&[u8]; 2] = [b"\x1b[3J", b"\x1bc"];
+
+/// Locate the *last* scrollback-clear sequence in the virtual byte stream
+/// `ring_tail ++ chunk` and return the offset **into `chunk`** at which the
+/// surviving content begins (= the first byte to keep, i.e. the start of the
+/// last clear sequence). A negative offset means the surviving content begins
+/// `-offset` bytes back inside `ring_tail` (the sequence straddled the read
+/// boundary). `None` = no clear sequence — append normally.
+///
+/// `ring_tail` is at most `CLEAR_SCAN_MAX_LEN - 1` trailing bytes of the ring;
+/// any clear sequence fully contained in the older ring was already applied on
+/// the append that completed it, so it never needs re-scanning here.
+fn find_clear_cut(ring_tail: &[u8], chunk: &[u8]) -> Option<isize> {
+    // A fully-in-chunk match always starts at a higher virtual index than a
+    // boundary-straddling one, so it wins the "last clear" race — look for
+    // those first and only fall back to the boundary scan when none exist.
+    let mut best_in_chunk: Option<usize> = None;
+    for pat in CLEAR_SEQUENCES {
+        if chunk.len() >= pat.len() {
+            if let Some(i) = chunk.windows(pat.len()).rposition(|w| w == pat) {
+                best_in_chunk = Some(best_in_chunk.map_or(i, |b| b.max(i)));
+            }
+        }
+    }
+    if let Some(i) = best_in_chunk {
+        return Some(i as isize);
+    }
+    // Boundary straddle: a sequence that starts inside `ring_tail` and
+    // finishes in `chunk`. Keep the greatest (latest) such start.
+    let tail_len = ring_tail.len();
+    let mut best: Option<isize> = None;
+    for pat in CLEAR_SEQUENCES {
+        let plen = pat.len();
+        let s_min = tail_len.saturating_sub(plen - 1);
+        for s in s_min..tail_len {
+            if matches_across(ring_tail, chunk, s, pat) {
+                let off = s as isize - tail_len as isize;
+                best = Some(best.map_or(off, |b| b.max(off)));
+            }
+        }
+    }
+    best
+}
+
+/// True when `pat` equals the `pat.len()` bytes of the virtual buffer
+/// `ring_tail ++ chunk` starting at virtual index `start`. Returns false when
+/// the window runs past the end of `chunk` (partial — not yet a match).
+fn matches_across(ring_tail: &[u8], chunk: &[u8], start: usize, pat: &[u8]) -> bool {
+    let tail_len = ring_tail.len();
+    for (k, &want) in pat.iter().enumerate() {
+        let idx = start + k;
+        let got = if idx < tail_len {
+            ring_tail[idx]
+        } else {
+            match chunk.get(idx - tail_len) {
+                Some(&b) => b,
+                None => return false,
+            }
+        };
+        if got != want {
+            return false;
+        }
+    }
+    true
+}
+
+/// Cap-enforcing append: drop oldest bytes so the ring never exceeds
+/// [`RING_CAPACITY`]. A single burst > cap keeps only the trailing window —
+/// matches `crates/ws-server/src/ring.rs` semantics. Factored out of
+/// [`PaneHandle::ring_append`] so the normal path and the post-clear tail
+/// share one implementation.
+fn append_capped(buf: &mut VecDeque<u8>, bytes: &[u8]) {
+    if bytes.len() >= RING_CAPACITY {
+        buf.clear();
+        buf.extend(&bytes[bytes.len() - RING_CAPACITY..]);
+        return;
+    }
+    let combined = buf.len() + bytes.len();
+    if combined > RING_CAPACITY {
+        let drop = combined - RING_CAPACITY;
+        buf.drain(..drop);
+    }
+    buf.extend(bytes);
+}
+
 impl PaneHandle {
-    /// Append `bytes` to the late-mount ring. Drops oldest bytes when
-    /// the cap is exceeded. Single-burst > cap keeps only the trailing
-    /// window — matches `crates/ws-server/src/ring.rs` semantics.
+    /// Append `bytes` to the late-mount ring, honouring both the size cap and
+    /// scrollback-clear semantics.
+    ///
+    /// Size: drops oldest bytes when [`RING_CAPACITY`] is exceeded (via
+    /// [`append_capped`]).
+    ///
+    /// Clear: if the incoming bytes carry a scrollback-clear / full-reset
+    /// sequence ([`CLEAR_SEQUENCES`]) the ring discards everything preceding
+    /// the *last* such sequence, mirroring what an xterm-class emulator does to
+    /// its scrollback. Without this the ring — and therefore every
+    /// `subscribe_output` snapshot (HTTP read + WS attach replay) — would keep
+    /// replaying pre-`clear` output the user no longer sees (ADR-0054 §구현
+    /// 노트). The live broadcast path is untouched and stays byte-transparent.
     fn ring_append(ring: &StdMutex<VecDeque<u8>>, bytes: &[u8]) {
         let Ok(mut buf) = ring.lock() else {
             // PoisonError — another thread panicked while holding the
@@ -315,17 +436,35 @@ impl PaneHandle {
             warn!("pty-backend: ring buffer mutex poisoned, dropping burst");
             return;
         };
-        if bytes.len() >= RING_CAPACITY {
-            buf.clear();
-            buf.extend(&bytes[bytes.len() - RING_CAPACITY..]);
+
+        // Snapshot up to CLEAR_SCAN_MAX_LEN-1 trailing ring bytes so a clear
+        // sequence split across two PTY reads is still detected at the seam.
+        let tail_len = buf.len().min(CLEAR_SCAN_MAX_LEN - 1);
+        let mut tail_arr = [0u8; CLEAR_SCAN_MAX_LEN - 1];
+        for (i, slot) in tail_arr[..tail_len].iter_mut().enumerate() {
+            *slot = buf[buf.len() - tail_len + i];
+        }
+        let ring_tail = &tail_arr[..tail_len];
+
+        if let Some(cut) = find_clear_cut(ring_tail, bytes) {
+            if cut >= 0 {
+                // Clear sequence begins inside `bytes`: the whole prior ring
+                // plus the pre-sequence prefix of `bytes` are erased.
+                buf.clear();
+                append_capped(&mut buf, &bytes[cut as usize..]);
+            } else {
+                // Sequence straddles the boundary: keep the trailing `-cut`
+                // bytes already in the ring, drop everything older, then append
+                // the whole chunk.
+                let keep_old = (-cut) as usize;
+                let drop = buf.len() - keep_old;
+                buf.drain(..drop);
+                append_capped(&mut buf, bytes);
+            }
             return;
         }
-        let combined = buf.len() + bytes.len();
-        if combined > RING_CAPACITY {
-            let drop = combined - RING_CAPACITY;
-            buf.drain(..drop);
-        }
-        buf.extend(bytes);
+
+        append_capped(&mut buf, bytes);
     }
 
     /// Copy the current ring contents into a contiguous Vec.
@@ -1142,5 +1281,107 @@ mod tests {
         assert!(high > low);
         assert_eq!(high, STALL_HIGH_WATERMARK);
         assert_eq!(low, STALL_LOW_WATERMARK);
+    }
+
+    // ── Ring scrollback-clear truncation (ADR-0054 §구현 노트) ─────────────
+
+    /// Feed `chunks` through `ring_append` in order (each a distinct PTY read)
+    /// and return the resulting ring contents.
+    fn ring_of(chunks: &[&[u8]]) -> Vec<u8> {
+        let ring = StdMutex::new(VecDeque::<u8>::new());
+        for c in chunks {
+            PaneHandle::ring_append(&ring, c);
+        }
+        let buf = ring.lock().unwrap();
+        buf.iter().copied().collect()
+    }
+
+    #[test]
+    fn ring_plain_appends_are_concatenated() {
+        // Regression: no clear sequence → unchanged concat behavior.
+        assert_eq!(ring_of(&[b"hello ", b"world"]), b"hello world".to_vec());
+    }
+
+    #[test]
+    fn ring_esc3j_drops_content_before_clear() {
+        // `clear` emits ESC[H ESC[2J ESC[3J then a fresh prompt. Everything
+        // before the ESC[3J (scrollback clear) must be gone; the sequence and
+        // what follows are kept.
+        let out = ring_of(&[b"old scrollback\n", b"\x1b[H\x1b[2J\x1b[3J$ "]);
+        assert_eq!(out, b"\x1b[3J$ ".to_vec());
+        assert!(!out.windows(3).any(|w| w == b"old"));
+    }
+
+    #[test]
+    fn ring_ris_reset_drops_prior_content() {
+        // RIS (ESC c) from `reset` / `tput reset`.
+        let out = ring_of(&[b"before reset", b"\x1bcafter reset"]);
+        assert_eq!(out, b"\x1bcafter reset".to_vec());
+    }
+
+    #[test]
+    fn ring_esc3j_split_across_reads_is_detected() {
+        // ESC[3 arrives in one read, J in the next — boundary straddle.
+        let out = ring_of(&[b"stale", b"\x1b[3", b"Jfresh"]);
+        assert_eq!(out, b"\x1b[3Jfresh".to_vec());
+    }
+
+    #[test]
+    fn ring_esc_c_split_across_reads_is_detected() {
+        // ESC then c in separate reads (2-byte RIS straddling the boundary).
+        let out = ring_of(&[b"stale", b"\x1b", b"cfresh"]);
+        assert_eq!(out, b"\x1bcfresh".to_vec());
+    }
+
+    #[test]
+    fn ring_esc2j_alone_keeps_scrollback() {
+        // Ctrl-L / `tput clear` emit ESC[H ESC[2J with no ESC[3J — xterm keeps
+        // scrollback, so the ring must keep it too (no truncation).
+        let out = ring_of(&[b"keep me\n", b"\x1b[H\x1b[2J$ "]);
+        assert_eq!(out, b"keep me\n\x1b[H\x1b[2J$ ".to_vec());
+    }
+
+    #[test]
+    fn ring_last_clear_wins_within_one_chunk() {
+        // Two clears in one read → keep only from the last one.
+        let out = ring_of(&[b"a\x1b[3Jb\x1b[3Jc"]);
+        assert_eq!(out, b"\x1b[3Jc".to_vec());
+    }
+
+    #[test]
+    fn ring_post_clear_output_accumulates() {
+        // Content after a clear keeps accumulating on later appends; the clear
+        // is not re-applied to erase it.
+        let out = ring_of(&[b"old", b"x\x1b[3Jprompt", b" more"]);
+        assert_eq!(out, b"\x1b[3Jprompt more".to_vec());
+    }
+
+    #[test]
+    fn ring_clear_at_chunk_start_drops_all_prior() {
+        let out = ring_of(&[b"prev content", b"\x1b[3Jnext"]);
+        assert_eq!(out, b"\x1b[3Jnext".to_vec());
+    }
+
+    #[test]
+    fn ring_cap_still_drops_oldest_without_clear() {
+        // Regression: the size cap still evicts oldest bytes on overflow.
+        let ring = StdMutex::new(VecDeque::<u8>::new());
+        PaneHandle::ring_append(&ring, &vec![b'A'; RING_CAPACITY]);
+        PaneHandle::ring_append(&ring, &[b'B'; 64]);
+        let buf = ring.lock().unwrap();
+        assert_eq!(buf.len(), RING_CAPACITY);
+        assert!(buf.iter().rev().take(64).all(|&b| b == b'B'));
+    }
+
+    #[test]
+    fn find_clear_cut_offsets() {
+        // In-chunk match → non-negative offset (start of the sequence).
+        assert_eq!(find_clear_cut(b"", b"pre\x1b[3Jpost"), Some(3));
+        // Boundary straddle → negative offset back into the tail.
+        assert_eq!(find_clear_cut(b"\x1b[3", b"Jrest"), Some(-3));
+        // No clear anywhere.
+        assert_eq!(find_clear_cut(b"ab", b"plain text"), None);
+        // In-chunk match dominates a concurrent boundary straddle.
+        assert_eq!(find_clear_cut(b"\x1b[3", b"Jx\x1b[3Jy"), Some(2));
     }
 }
