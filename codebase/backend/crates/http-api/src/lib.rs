@@ -877,6 +877,15 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             "/api/terminals/{id}/respawn",
             axum::routing::post(terminals::respawn_handler),
         )
+        // ADR-0054 D1/D2 — read a pane's raw ring snapshot / inject raw stdin.
+        .route(
+            "/api/terminals/{id}/output",
+            get(terminals::output_handler),
+        )
+        .route(
+            "/api/terminals/{id}/input",
+            axum::routing::post(terminals::input_handler),
+        )
         .route(
             "/api/settings",
             get(settings::get_handler).patch(settings::patch_handler),
@@ -5769,6 +5778,238 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── ADR-0054: terminal output read + input send ──
+
+    #[tokio::test]
+    async fn terminal_output_404_when_not_in_pool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/output")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "terminal_not_alive");
+    }
+
+    #[tokio::test]
+    async fn terminal_output_503_without_hub() {
+        let (app, token) = make_app();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/output")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn terminal_input_404_when_not_in_pool() {
+        use base64::Engine as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let app = router_with_state(state);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"ls\n");
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/api/terminals/00000000-0000-4000-8000-000000000000/input")
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "bytes_base64": b64 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "terminal_not_alive");
+    }
+
+    #[tokio::test]
+    async fn terminal_input_400_on_bad_base64() {
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let uuid = "11111111-2222-4333-8444-5555555554cc";
+        state.terminal_map.register(uuid.into(), PaneId(2)).await.unwrap();
+        let app = router_with_state(state);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/terminals/{uuid}/input"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "bytes_base64": "!!!not base64!!!" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "bad_base64");
+    }
+
+    #[tokio::test]
+    async fn terminal_input_413_over_cap() {
+        use base64::Engine as _;
+        use gtmux_pty_backend::PaneId;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let uuid = "11111111-2222-4333-8444-5555555554aa";
+        // The cap check precedes the send; a bound pane is registered only so
+        // the failure is unambiguously the size gate rather than a 404.
+        state.terminal_map.register(uuid.into(), PaneId(1)).await.unwrap();
+        let app = router_with_state(state);
+        let oversized = vec![b'x'; crate::terminals::INPUT_MAX_BYTES + 1];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&oversized);
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/terminals/{uuid}/input"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "bytes_base64": b64 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "input_too_large");
+    }
+
+    /// End-to-end: spawn a real PTY, inject `echo <marker>` via the input
+    /// endpoint, then read it back through the output endpoint. The PTY
+    /// echoes typed input, so the marker is guaranteed to surface in the
+    /// ring even before the command runs. Also exercises `?tail=N`.
+    #[tokio::test]
+    async fn terminal_input_reaches_pty_and_output_reads_back() {
+        use base64::Engine as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let uuid = "11111111-2222-4333-8444-5555555554bb";
+        let pane = state
+            .spawn_terminal_with_uuid(uuid.to_string(), None, None)
+            .await
+            .expect("spawn a real PTY");
+        let app = router_with_state(state.clone());
+
+        let marker = "GTMUX_ADR0054_MARKER";
+        let line = format!("echo {marker}\n");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&line);
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/terminals/{uuid}/input"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "bytes_base64": b64 }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sent: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(sent["sent"].as_u64().unwrap(), line.len() as u64);
+
+        // Poll the output endpoint until the echoed marker appears.
+        let mut full: Vec<u8> = Vec::new();
+        for _ in 0..40 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .method(Method::GET)
+                        .uri(format!("/api/terminals/{uuid}/output"))
+                        .header(header::HOST, TEST_HOST)
+                        .header(header::AUTHORIZATION, bearer(&token))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap())
+                    .unwrap();
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(body["bytes_base64"].as_str().unwrap())
+                .unwrap();
+            // `len` echoes the returned byte count; a fresh pane never fills
+            // the 128 KiB ring, so `truncated` is false.
+            assert_eq!(body["len"].as_u64().unwrap(), decoded.len() as u64);
+            assert_eq!(body["truncated"], false);
+            if String::from_utf8_lossy(&decoded).contains(marker) {
+                full = decoded;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            String::from_utf8_lossy(&full).contains(marker),
+            "marker never appeared in the pane output ring"
+        );
+
+        // `?tail=N` returns exactly the last N bytes of the snapshot.
+        let n = 8usize.min(full.len());
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/terminals/{uuid}/output?tail={n}"))
+                    .header(header::HOST, TEST_HOST)
+                    .header(header::AUTHORIZATION, bearer(&token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+        let tail = base64::engine::general_purpose::STANDARD
+            .decode(body["bytes_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(tail.len(), n, "tail=N must return exactly N bytes");
+
+        // Cleanup — SIGTERM the real child shell.
+        let _ = state.hub.as_ref().unwrap().backend().kill(pane);
     }
 
     // ── Stage 3: cross-server session attach lock (ADR-0019 D3/D6) ──

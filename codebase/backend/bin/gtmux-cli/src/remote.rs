@@ -22,6 +22,8 @@
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use clap::{Args, Subcommand};
 use gtmux_http_api::{Item, Layout, PathEndpoint};
 use serde_json::{json, Map, Value};
@@ -358,6 +360,40 @@ pub enum TerminalCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Read a pool terminal's recent output (GET /api/terminals/:id/output).
+    /// Default output is ANSI-stripped text (LLM-readable); the raw ring is
+    /// lossy (128 KiB drop-oldest) and may contain escape sequences.
+    Read {
+        /// Pool terminal UUID or exact label (`gtmux terminal ls`).
+        target: String,
+        /// Return only the last N bytes of the ring snapshot.
+        #[arg(long)]
+        tail: Option<usize>,
+        /// Emit the raw PTY bytes verbatim instead of ANSI-stripped text.
+        #[arg(long)]
+        raw: bool,
+        #[command(flatten)]
+        instance: InstanceOpt,
+    },
+    /// Send input to a pool terminal (POST /api/terminals/:id/input). Raw
+    /// stdin injection — no shell escaping. Beware self-injection: sending to
+    /// `$GTMUX_TERMINAL_ID` pollutes your own input stream.
+    Send {
+        /// Pool terminal UUID or exact label.
+        target: String,
+        /// Text to send. A trailing newline is appended (runs the command)
+        /// unless `--no-enter`. Omit when using `--bytes`.
+        text: Option<String>,
+        /// Do not append a trailing newline (send the keystrokes only).
+        #[arg(long = "no-enter")]
+        no_enter: bool,
+        /// Send raw control bytes as hex (e.g. `03` = Ctrl-C, `1b5b41` = Up).
+        /// Mutually exclusive with the positional text.
+        #[arg(long, value_name = "HEX")]
+        bytes: Option<String>,
+        #[command(flatten)]
+        instance: InstanceOpt,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -454,6 +490,8 @@ pub fn run_terminal(cmd: TerminalCmd) -> ExitCode {
         TerminalCmd::Unmount { .. } => "terminal unmount",
         TerminalCmd::Kill { .. } => "terminal kill",
         TerminalCmd::Ls { .. } => "terminal ls",
+        TerminalCmd::Read { .. } => "terminal read",
+        TerminalCmd::Send { .. } => "terminal send",
     };
     finish_cmd(label, terminal_dispatch(cmd))
 }
@@ -828,6 +866,78 @@ fn terminal_dispatch(cmd: TerminalCmd) -> Result<(), CliError> {
                     sessions.join(",")
                 );
             }
+            Ok(())
+        }
+        TerminalCmd::Read {
+            target,
+            tail,
+            raw,
+            instance,
+        } => {
+            let client = connect(instance.instance)?;
+            let uuid = resolve_pool_terminal(&client, &target)?;
+            let mut path = format!("/api/terminals/{uuid}/output");
+            if let Some(n) = tail {
+                path.push_str(&format!("?tail={n}"));
+            }
+            let resp = client.get_json(&path)?;
+            let b64 = resp
+                .get("bytes_base64")
+                .and_then(Value::as_str)
+                .ok_or_else(|| CliError::local("unexpected output response shape"))?;
+            let bytes = BASE64
+                .decode(b64.as_bytes())
+                .map_err(|e| CliError::Local(format!("server returned invalid base64: {e}")))?;
+            if raw {
+                use std::io::Write;
+                std::io::stdout().write_all(&bytes).ok();
+            } else {
+                // ANSI strip is client-side (server keeps raw bytes). Lossy
+                // bytes are rendered leniently so a mid-sequence ring cut
+                // doesn't abort the read.
+                print!("{}", crate::ansi::strip_ansi(&String::from_utf8_lossy(&bytes)));
+            }
+            Ok(())
+        }
+        TerminalCmd::Send {
+            target,
+            text,
+            no_enter,
+            bytes,
+            instance,
+        } => {
+            let payload: Vec<u8> = match (text, bytes) {
+                (Some(_), Some(_)) => {
+                    return Err(CliError::local(
+                        "pass either the text argument or --bytes, not both",
+                    ))
+                }
+                (None, None) => {
+                    return Err(CliError::local(
+                        "nothing to send: provide text or --bytes <hex>",
+                    ))
+                }
+                (Some(t), None) => {
+                    let mut v = t.into_bytes();
+                    if !no_enter {
+                        v.push(b'\n');
+                    }
+                    v
+                }
+                // --no-enter does not apply to raw control bytes.
+                (None, Some(hex)) => crate::ansi::parse_hex(&hex).map_err(CliError::Local)?,
+            };
+            let client = connect(instance.instance)?;
+            let uuid = resolve_pool_terminal(&client, &target)?;
+            let b64 = BASE64.encode(&payload);
+            let resp = client.send_json(
+                "POST",
+                &format!("/api/terminals/{uuid}/input"),
+                &json!({ "bytes_base64": b64 }),
+                &[],
+            )?;
+            let sent = resp.get("sent").and_then(Value::as_u64).unwrap_or(0);
+            println!("sent {sent} bytes to {uuid}");
             Ok(())
         }
     }

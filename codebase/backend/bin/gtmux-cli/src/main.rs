@@ -27,6 +27,7 @@
 #![warn(clippy::all)]
 
 mod align;
+mod ansi;
 mod http;
 mod process_audit;
 mod remote;
