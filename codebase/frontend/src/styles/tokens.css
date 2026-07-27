@@ -31,6 +31,13 @@
   --color-warning: #facc15;
   --color-danger: #e5484d;
   --color-info: #0d99ff;
+  /* Edit-mode signal (ADR-0016 amend, ADR-0057 D1 / ADR-0037 D1 UI amend
+     2026-07-27). Purple = "edit mode" app-wide (snippet edit segment + surface
+     tint, preview Edit segment). Light: violet-600 (#7c3aed) — white-fg glyph
+     contrast ~4.9:1, purple-on-white text ~4.9:1. Filled-button + surface-tint
+     both read as one system with accent/danger (which stay theme-agnostic; the
+     dark override below lifts legibility on the darker surface tint). */
+  --color-mode-edit: #7c3aed;
 
   /* ── Canvas ─────────────────────────────────────────── */
   --canvas-bg: #f3f3f3;
@@ -137,6 +144,11 @@
 
   /* accent / success / warning / danger / info — Figma blue is
    * theme-agnostic, semantic colors keep identity across themes. */
+
+  /* Edit-mode purple — lifted on dark (violet-500ish #9b6dff): white-fg glyph
+     contrast ~3.0:1 (≈ accent's white-on-#0d99ff parity) and purple-on-dark-
+     surface tint ~4.5:1, keeping the 11-13px glyphs legible on #2c2c2c. */
+  --color-mode-edit: #9b6dff;
 
   --canvas-bg: #1a1a1a;
   --canvas-grid: rgba(255, 255, 255, 0.10);

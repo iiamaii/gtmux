@@ -14,6 +14,7 @@
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
+  import CanvasGlyph from './CanvasGlyph.svelte';
   import { fsFileUrl } from '$lib/http/fs';
   import {
     IMAGE_EXTENSIONS,
@@ -237,7 +238,21 @@
       {onResizeEnd}
     />
     <CanvasCloseButton id={data.id} variant={hasAsset ? 'dark' : 'light'} disabled={isLocked} />
-    {#if !isLocked}
+    {#if isLocked}
+      <!-- Locked-state indicator — unified CanvasGlyph 'lock' (lock UX
+           unification 2026-07-27, ADR-0018 D9 family). ImageNode has no chrome
+           header, so a persistent top-left corner badge carries the lock state
+           (change button is hidden below; close is disabled). Static indicator —
+           unlock stays in the Inspector State section. -->
+      <span
+        class="image-lock"
+        class:on-asset={hasAsset}
+        title="Locked — unlock in the Inspector"
+        aria-label="Locked"
+      >
+        <CanvasGlyph name="lock" />
+      </span>
+    {:else}
       <button
         type="button"
         class="image-change"
@@ -245,11 +260,7 @@
         aria-label={hasAsset ? 'Change image' : 'Load image'}
         onclick={onLoadImageClick}
       >
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-          <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
-          <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
-          <line x1="8" x2="16" y1="12" y2="12"/>
-        </svg>
+        <CanvasGlyph name="change" />
       </button>
     {/if}
     <div class="image-clip" class:is-empty={!hasAsset}>
@@ -261,16 +272,19 @@
           draggable="false"
         />
         <div class="img-caption" aria-hidden="true">
+          <!-- Type-identity glyph — unified via CanvasGlyph 'image' (icon
+               unification 2026-07-27, ADR-0016 정합). Canvas-tier 12px, sits
+               left of the filename so the hover caption reads as the image's
+               identity row. -->
+          <span class="caption-glyph"><CanvasGlyph name="image" /></span>
           <span class="filename">{imageLabel}</span>
           <span class="right">image</span>
         </div>
       {:else}
         <span class="empty-idle" aria-hidden="true">
-          <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" stroke-linecap="round">
-            <rect x="4" y="5" width="16" height="14" rx="1.5"/>
-            <path d="M7 16l4.1-4.1 3 3L16 13l3 3"/>
-            <circle cx="15.5" cy="9.5" r="1.2"/>
-          </svg>
+          <!-- Type-identity glyph — unified via CanvasGlyph 'image'
+               (icon unification 2026-07-27, ADR-0016 정합). -->
+          <CanvasGlyph name="image" size={24} />
         </span>
       {/if}
     </div>
@@ -323,6 +337,15 @@
     place-items: center;
   }
 
+  /* Asset state — TRANSPARENT body (2026-07-27 spec) so the contain letterbox /
+     padding region reveals the canvas behind the node instead of a colored
+     backdrop. Border + shadow (node chrome) stay from the base rule; only the
+     fill is dropped. Border + drop shadow (chrome) stay. Empty state keeps its
+     dashed drop-zone surface. */
+  .image-node:not(.is-empty) {
+    background: transparent;
+  }
+
   .image-node.m-single {
     outline: none;
   }
@@ -331,10 +354,21 @@
     cursor: default;
   }
 
+  /* Contain-scaling (2026-07-27, user request) — the ENTIRE image must always
+     be visible regardless of node aspect. Was object-fit: cover, which cropped
+     the image to fill the frame. `contain` letterboxes the image; `--space-8`
+     (8px) padding keeps a consistent inset so the image never touches the frame
+     edge (or the hover caption). box-sizing: border-box so the padding lives
+     inside the 100%×100% clip. The letterbox/padding region is TRANSPARENT
+     (2026-07-27 spec addition) — the asset-state node body paints no fill (see
+     `.image-node:not(.is-empty)` below), so the busy canvas shows through
+     around the contained image. */
   .image-asset {
     width: 100%;
     height: 100%;
-    object-fit: cover;
+    object-fit: contain;
+    padding: var(--space-8);
+    box-sizing: border-box;
     display: block;
   }
 
@@ -363,13 +397,27 @@
     opacity: 1;
   }
 
+  /* Caption filename — NoteNode-anchored micro-label family (icon system
+     unification 2026-07-27, ADR-0016 정합). NO uppercase — filename is
+     case-bearing. */
   .img-caption .filename {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    font-size: 9.5px;
     font-weight: 540;
+    letter-spacing: 0.6px;
     color: #ffffff;
+  }
+
+  /* Identity glyph in the hover caption — canvas-tier 12px, aligned with the
+     filename baseline. currentColor inherits the caption's white text. */
+  .img-caption .caption-glyph {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: #ffffff;
+    opacity: 0.85;
   }
 
   .img-caption .right {
@@ -396,18 +444,17 @@
     transition: opacity var(--motion-fast) var(--motion-easing);
   }
 
-  .empty-icon {
-    width: 24px;
-    height: 24px;
-  }
-
   .image-change {
     position: absolute;
+    /* 1px gap to the close button (SoT §1 canvas cluster gap). Empty state uses
+       the light CanvasCloseButton at 6/6 → change at 6+20+1 = 27px; the asset
+       state uses the dark close at 8/8 (see :not(.is-empty) override below).
+       Was right:34px / top:6px (8px gap + 2px vertical drift), 2026-07-27. */
     top: 6px;
-    right: 34px;
+    right: 27px;
     z-index: 12;
-    width: 22px;
-    height: 22px;
+    width: 20px; /* canvas-tier standard box (icon unification 2026-07-27) */
+    height: 20px;
     display: grid;
     place-items: center;
     border: none;
@@ -423,6 +470,13 @@
       color var(--motion-fast) var(--motion-easing);
   }
 
+  /* Asset state — the close button switches to the dark variant at 8/8, so the
+     change button follows it: 8+20+1 = 29px, top 8px (1px gap, aligned). */
+  .image-node:not(.is-empty) .image-change {
+    top: 8px;
+    right: 29px;
+  }
+
   .image-node:hover .image-change,
   .image-change:focus-visible {
     opacity: 1;
@@ -431,5 +485,33 @@
   .image-change:hover {
     background: var(--color-glass-2);
     color: var(--color-fg);
+  }
+
+  /* Locked badge — persistent (status, not hover-reveal), top-left corner so it
+     never collides with the top-right close/change cluster. Canvas-tier 20×20
+     box like the sibling controls. Empty state = surface-2 chip; asset state =
+     dark translucent chip so the glyph reads over any image. */
+  .image-lock {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    z-index: 12;
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--color-surface-2) 88%, transparent);
+    color: var(--color-fg-muted);
+    pointer-events: none;
+  }
+
+  .image-lock.on-asset {
+    top: 8px;
+    left: 8px;
+    background: rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    color: #ffffff;
   }
 </style>

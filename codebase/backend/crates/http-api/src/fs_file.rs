@@ -1,5 +1,6 @@
-//! ADR-0047 D2 / D3 — Server Workspace(A)-scoped file *bytes* in and out:
+//! ADR-0047 D2 / D3 + ADR-0057 D3 — Server Workspace(A)-scoped file *bytes* in and out:
 //!   GET  /api/fs/file?path=<abs>   — stream a workspace file (image/document render source)
+//!   PUT  /api/fs/file?path=<abs>   — overwrite a text file (If-Match required, atomic)
 //!   POST /api/fs/upload            — multipart upload into a workspace directory
 //!
 //! These complete the workspace-sourced-asset model (ADR-0047, supersedes the
@@ -18,15 +19,18 @@
 //! same allowlist the asset store used (ADR-0033 D3/D4), reused from
 //! [`crate::assets`].
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use axum::body::Body;
+use atomic_write_file::OpenOptions as AwfOpenOptions;
+use axum::body::{Body, Bytes};
 use axum::extract::{Multipart, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use utoipa::ToSchema;
 
 use crate::assets::{sniff_allowed_upload, sniff_any, SVG_SERVE_CSP};
 use crate::fs_guard;
@@ -90,13 +94,7 @@ pub async fn fs_file_serve_handler(
     }
 
     // ETag = mtime(nanos)-size. Mutable files → revalidate via If-None-Match.
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let etag = format!("\"{mtime}-{}\"", meta.len());
+    let etag = file_etag(&meta);
     if let Some(inm) = req.headers().get(header::IF_NONE_MATCH) {
         if inm.to_str().map(|v| v == etag).unwrap_or(false) {
             return Response::builder()
@@ -147,6 +145,156 @@ pub async fn fs_file_serve_handler(
     builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| internal_500("response_build_failed"))
+}
+
+/// Strong ETag for a mutable workspace file: `"<mtime-nanos>-<size>"`. Shared
+/// by the GET (`If-None-Match` revalidation) and PUT (`If-Match` precondition)
+/// handlers so both sides of the edit contract use the identical format
+/// (ADR-0057 D3 — the PUT's `If-Match` is exactly the ETag the GET emitted).
+fn file_etag(meta: &std::fs::Metadata) -> String {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("\"{mtime}-{}\"", meta.len())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  PUT /api/fs/file — overwrite a workspace text file (ADR-0057 D3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct FsFileWriteQuery {
+    /// Absolute path of the file to overwrite. Must resolve inside A and
+    /// outside the denylist.
+    pub path: String,
+}
+
+/// `PUT /api/fs/file` response — the post-write identity, so the client can
+/// refresh its `If-Match` for the next save without a re-GET (ADR-0057 D3).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FsFileWriteResponse {
+    /// Strong ETag of the written file (`"<mtime-nanos>-<size>"` — same
+    /// format `GET /api/fs/file` emits).
+    pub etag: String,
+    /// File size in bytes after the write.
+    pub size_bytes: u64,
+}
+
+/// `PUT /api/fs/file?path=<abs>` — ADR-0057 D3. Overwrites an *existing*
+/// regular text file with the raw request body. Conflict-safe by contract:
+/// `If-Match` (the ETag the GET emitted) is mandatory, so there is no
+/// unconditional-overwrite path. The body must be valid UTF-8 (text-only
+/// channel — no MIME sniff allowlist, unlike upload); the write is atomic
+/// (temp file in the same directory + rename, so a concurrent reader sees
+/// either the old or the new content, never a partial write). Creation is
+/// upload's job — a missing target is 404, not created.
+///
+/// Outcomes: 200 `{ etag, size_bytes }` / 400 invalid_path / 400 not_a_file
+/// (directory or symlink target) / 400 not_utf8 / 403 path_not_allowed /
+/// 404 file_not_found / 412 etag_mismatch / 413 payload_too_large /
+/// 428 precondition_required / 500 write_failed.
+pub async fn fs_file_write_handler(
+    State(state): State<AppState>,
+    Query(q): Query<FsFileWriteQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let server_workspace = state.server_workspace.as_path();
+    let max_size_bytes = state.config.assets.max_size_bytes;
+
+    let candidate = PathBuf::from(&q.path);
+    if !candidate.is_absolute() || q.path.contains('\0') {
+        return error(StatusCode::BAD_REQUEST, "invalid_path");
+    }
+
+    // Size cap — the route's `DefaultBodyLimit` (shared with upload) already
+    // bounds the stream, but it includes multipart headroom; recount the raw
+    // bytes against the exact configured ceiling (defense in depth).
+    if body.len() as u64 > max_size_bytes {
+        return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large");
+    }
+
+    // If-Match is mandatory (ADR-0057 D3) — absent means the client skipped
+    // the conflict check, and an unconditional-overwrite path must not exist.
+    let Some(if_match) = headers.get(header::IF_MATCH) else {
+        return error(StatusCode::PRECONDITION_REQUIRED, "precondition_required");
+    };
+
+    // Text-only channel: the body must be valid UTF-8. This is a contract
+    // check, not a conversion — the original bytes are written unchanged.
+    if std::str::from_utf8(&body).is_err() {
+        return error(StatusCode::BAD_REQUEST, "not_utf8");
+    }
+
+    // Refuse a symlink target up front (lexical lstat on the final component —
+    // `canonicalize` below would silently follow it). Same fail-closed stance
+    // as `/api/fs/copy`. A missing target is 404: creation is upload's job.
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return error(StatusCode::BAD_REQUEST, "not_a_file");
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error(StatusCode::NOT_FOUND, "file_not_found");
+        }
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_path"),
+    }
+    let canonical = match candidate.canonicalize() {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error(StatusCode::NOT_FOUND, "file_not_found");
+        }
+        Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_path"),
+    };
+    // Single hard boundary: inside A AND outside the denylist (ADR-0045 D6).
+    if !fs_guard::is_path_allowed(&canonical, server_workspace, &state.fs_denylist) {
+        return error(StatusCode::FORBIDDEN, "path_not_allowed");
+    }
+
+    let meta = match std::fs::metadata(&canonical) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error(StatusCode::NOT_FOUND, "file_not_found");
+        }
+        Err(_) => return internal_500("stat_failed"),
+    };
+    if !meta.is_file() {
+        return error(StatusCode::BAD_REQUEST, "not_a_file");
+    }
+
+    // Conflict check: the presented ETag must match the file's current one.
+    let current_etag = file_etag(&meta);
+    if !if_match.to_str().map(|v| v == current_etag).unwrap_or(false) {
+        return error(StatusCode::PRECONDITION_FAILED, "etag_mismatch");
+    }
+
+    // Atomic write off the blocking pool (same-directory temp file + rename —
+    // `atomic-write-file` discards the temp on failure, so an aborted write
+    // leaves neither a partial target nor a stray temp file). Then stat the
+    // renamed file so the response carries the post-write ETag.
+    let write_path = canonical.clone();
+    let write_result = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::Metadata> {
+        let mut f = AwfOpenOptions::new().open(&write_path)?;
+        f.write_all(&body)?;
+        f.commit()?;
+        std::fs::metadata(&write_path)
+    })
+    .await;
+    match write_result {
+        Ok(Ok(new_meta)) => (
+            StatusCode::OK,
+            Json(FsFileWriteResponse {
+                etag: file_etag(&new_meta),
+                size_bytes: new_meta.len(),
+            }),
+        )
+            .into_response(),
+        Ok(Err(_)) => internal_500("write_failed"),
+        Err(_) => internal_500("write_task_panicked"),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

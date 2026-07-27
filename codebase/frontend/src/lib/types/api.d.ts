@@ -15,6 +15,50 @@ export interface components {
          */
         Anchor: "N" | "NE" | "E" | "SE" | "S" | "SW" | "W" | "NW" | "center";
         /**
+         * @description ADR-0056 D2 — anchor addressing scheme: source-view line (`CodeViewer`)
+         *     vs rendered-markdown block (`DocumentMarkdownView`).
+         * @enum {string}
+         */
+        DocumentAnchorKind: "line" | "block";
+        /**
+         * @description ADR-0056 D2 — content anchor. `kind` picks the addressing scheme, `index`
+         *     addresses the top visible unit, `frac` is the progress within that unit.
+         *     `validate()` enforces `frac` finite and in `0.0..=1.0`
+         *     (`DocumentViewStateInvalid`); `index` is intentionally *not*
+         *     range-checked — the BE does not know the document's content, the FE
+         *     clamps to the content end on restore (ADR-0056 D2).
+         */
+        DocumentViewAnchor: {
+            /**
+             * Format: double
+             * @description Progress within the anchored line/block. Finite, `0.0..=1.0`.
+             */
+            frac: number;
+            /**
+             * Format: int32
+             * @description `line` → 1-based top visible source line (reuses the `data-line`
+             *     addressing contract, ADR-0037 D7.5); `block` → 0-based direct-child
+             *     block index of the rendered-markdown scroll container.
+             */
+            index: number;
+            kind: components["schemas"]["DocumentAnchorKind"];
+        };
+        /**
+         * @description ADR-0056 D3 — document render mode (re-states ADR-0037 D1's 2-mode
+         *     toggle as the durable wire form). Wire form: `"rendered" | "source"`.
+         * @enum {string}
+         */
+        DocumentViewMode: "rendered" | "source";
+        /**
+         * @description ADR-0056 D1/D2 — persisted document view state: rendered/source mode plus
+         *     a width-invariant content anchor. Both fields are optional; an absent
+         *     field means "FE default" (`mode` → rendered, `anchor` → top of document).
+         */
+        DocumentViewState: {
+            anchor?: null | components["schemas"]["DocumentViewAnchor"];
+            mode?: null | components["schemas"]["DocumentViewMode"];
+        };
+        /**
          * @description Figure / path stroke dash pattern (ADR-0018 D4 amend ① — 2026-05-20
          *     batch 5; extended to `path` by ADR-0043). 4-variant enum with an explicit
          *     `Solid` default.
@@ -44,6 +88,22 @@ export interface components {
          * @enum {string}
          */
         FontWeight: "light" | "normal" | "bold";
+        /**
+         * @description `PUT /api/fs/file` response — the post-write identity, so the client can
+         *     refresh its `If-Match` for the next save without a re-GET (ADR-0057 D3).
+         */
+        FsFileWriteResponse: {
+            /**
+             * @description Strong ETag of the written file (`"<mtime-nanos>-<size>"` — same
+             *     format `GET /api/fs/file` emits).
+             */
+            etag: string;
+            /**
+             * Format: int64
+             * @description File size in bytes after the write.
+             */
+            size_bytes: number;
+        };
         /** @description One search hit (ADR-0052 D5). */
         FsSearchEntry: {
             /**
@@ -317,6 +377,7 @@ export interface components {
              *     size (legacy asset). `path` items may omit it.
              */
             size_bytes?: number | null;
+            view_state?: null | components["schemas"]["DocumentViewState"];
         } & {
             /** @enum {string} */
             type: "document";

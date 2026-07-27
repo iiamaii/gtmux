@@ -8,15 +8,18 @@
 //! meaningful for canvas fields.
 
 use gtmux_http_api::schema::{
-    Anchor, FigureStrokeDash, FontFamily, FontWeight, Group, Head, Item, ItemCommon, Layout,
-    PathEndpoint, PathWaypoint, Point, Routing, SnippetEntry, TextAlign, TextVerticalAlign,
-    Viewport, Visibility,
+    Anchor, DocumentAnchorKind, DocumentViewAnchor, DocumentViewMode, DocumentViewState,
+    FigureStrokeDash, FontFamily, FontWeight, Group, Head, Item, ItemCommon, Layout, PathEndpoint,
+    PathWaypoint, Point, Routing, SnippetEntry, TextAlign, TextVerticalAlign, Viewport, Visibility,
 };
 // ADR-0052 D5 — Files-tab recursive search (`GET /api/fs/search`) response
 // contract. Surfaced as component schemas so the FE `api.d.ts` carries the
 // `FsSearchResponse` / `FsSearchEntry` types (the query params are `IntoParams`,
 // not component schemas — this doc is schema-only, `paths: {}`).
 use gtmux_http_api::{FsSearchEntry, FsSearchResponse};
+// ADR-0057 D3 — `PUT /api/fs/file` (text-file overwrite) response contract:
+// the post-write ETag + size the FE uses to refresh its next `If-Match`.
+use gtmux_http_api::FsFileWriteResponse;
 use utoipa::OpenApi;
 
 #[derive(OpenApi)]
@@ -45,9 +48,16 @@ use utoipa::OpenApi;
         Routing,
         PathEndpoint,
         PathWaypoint,
+        // ADR-0056 — document view_state (mode + scroll anchor).
+        DocumentViewState,
+        DocumentViewMode,
+        DocumentViewAnchor,
+        DocumentAnchorKind,
         // ADR-0052 D5 — Files-tab recursive search response.
         FsSearchResponse,
         FsSearchEntry,
+        // ADR-0057 D3 — text-file write (PUT /api/fs/file) response.
+        FsFileWriteResponse,
     ))
 )]
 struct ApiDoc;

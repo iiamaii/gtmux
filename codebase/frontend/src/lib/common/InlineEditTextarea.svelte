@@ -30,6 +30,12 @@
     plain?: boolean;
     /** focus 시 전체 선택 여부. Canvas text 는 기존 위치 편집감을 위해 false 사용. */
     selectOnFocus?: boolean;
+    /**
+     * selectOnFocus=false 일 때 focus 시 caret offset (draft 길이로 clamp).
+     * null = browser default. Note body 의 caret-at-point 진입용
+     * (ADR-0018 D9 amend 2026-07-23).
+     */
+    initialCaret?: number | null;
     textAlign?: 'left' | 'center' | 'right';
     /** Plain Enter commits instead of inserting a newline. default false. */
     commitOnEnter?: boolean;
@@ -46,6 +52,7 @@
     rows = 4,
     plain = false,
     selectOnFocus = true,
+    initialCaret = null,
     textAlign = 'left',
     commitOnEnter = false,
   }: Props = $props();
@@ -74,7 +81,15 @@
       draft = untrack(() => value);
       void tick().then(() => {
         textareaEl?.focus();
-        if (untrack(() => selectOnFocus)) textareaEl?.select();
+        if (untrack(() => selectOnFocus)) {
+          textareaEl?.select();
+        } else {
+          const caret = untrack(() => initialCaret);
+          if (caret !== null && textareaEl !== undefined) {
+            const pos = Math.min(Math.max(0, caret), textareaEl.value.length);
+            textareaEl.setSelectionRange(pos, pos);
+          }
+        }
         syncAutoHeight();
       });
       escUnregister = escRouter.register({

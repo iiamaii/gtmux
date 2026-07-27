@@ -917,6 +917,21 @@
     );
   }
 
+  // ADR-0018 D9 amend 2026-07-23 — drill-in double-click suppresses the inline
+  // text editor for text|rect|ellipse|note in both drill paths (capture-phase
+  // pointerdown + onnodeclick).
+  function suppressInlineEditOnDrillIn(nodeId: string): void {
+    const itemType = sessionStore.items.get(nodeId)?.type;
+    if (
+      itemType === 'text' ||
+      itemType === 'rect' ||
+      itemType === 'ellipse' ||
+      itemType === 'note'
+    ) {
+      sessionStore.suppressTextEditDblClick(nodeId);
+    }
+  }
+
   function onCanvasPointerDown(e: PointerEvent) {
     if (isCanvasControlSurface(e.target)) return;
 
@@ -968,9 +983,7 @@
                 overlayGroupId ?? targetAtDrillLevel(nodeId, hitTarget, sessionStore.items, sessionStore.groups);
               sessionStore.setM([nextSelected]);
               if (pathEditStore.editingPathId !== nextSelected) pathEditStore.end();
-              if (sessionStore.items.get(nodeId)?.type === 'text') {
-                sessionStore.suppressTextEditDblClick(nodeId);
-              }
+              suppressInlineEditOnDrillIn(nodeId);
               e.preventDefault();
               e.stopPropagation();
               return;
@@ -2287,10 +2300,7 @@
             overlayGroupId ?? targetAtDrillLevel(id, target, sessionStore.items, sessionStore.groups);
           sessionStore.setM([nextSelected]);
           if (pathEditStore.editingPathId !== nextSelected) pathEditStore.end();
-          const itemType = sessionStore.items.get(id)?.type;
-          if (itemType === 'text' || itemType === 'rect' || itemType === 'ellipse') {
-            sessionStore.suppressTextEditDblClick(id);
-          }
+          suppressInlineEditOnDrillIn(id);
         } else {
           sessionStore.setM([target]);
           if (pathEditStore.editingPathId !== target) pathEditStore.end();

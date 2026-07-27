@@ -78,6 +78,7 @@ pub use fs_guard::{
     build_denylist, effective_workspace, resolve_server_workspace, validate_workspace_root,
     ServerWorkspaceError, WorkspaceRootError,
 };
+pub use fs_file::FsFileWriteResponse;
 pub use fs_search::{FsSearchEntry, FsSearchResponse};
 pub use schema::{
     degrade_dangling_path_endpoints, detect_shape, migrate_v1_to_v2, recompute_path_bboxes,
@@ -953,8 +954,14 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
         .route(
             // ADR-0047 D3 — serve a workspace file's bytes (image/document
             // render source). A-scope + denylist guard, magic-byte MIME sniff.
+            // ADR-0057 D3 — PUT overwrites an existing text file (If-Match
+            // required, UTF-8 only, atomic temp+rename). Shares the asset
+            // byte ceiling with upload; the GET side ignores request bodies
+            // so the widened limit is inert there.
             "/api/fs/file",
-            get(fs_file::fs_file_serve_handler),
+            get(fs_file::fs_file_serve_handler)
+                .put(fs_file::fs_file_write_handler)
+                .layer(DefaultBodyLimit::max(asset_body_limit)),
         )
         .route(
             // ADR-0047 D2 — multipart upload into a workspace dir. Shares the
@@ -8437,6 +8444,389 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── ADR-0057 D3 — `PUT /api/fs/file` (text-file overwrite) ─────────────
+
+    /// `PUT /api/fs/file?path=<abs>` request with an optional `If-Match`.
+    fn fs_file_put_request(
+        token: &TokenString,
+        abs_path: &str,
+        if_match: Option<&str>,
+        body: Vec<u8>,
+    ) -> HttpRequest<Body> {
+        // Same percent-encoding as `fs_file_request` (serde_urlencoded query).
+        let mut q = String::new();
+        for b in abs_path.bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                    q.push(b as char)
+                }
+                _ => q.push_str(&format!("%{b:02X}")),
+            }
+        }
+        let mut builder = HttpRequest::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/fs/file?path={q}"))
+            .header(header::HOST, TEST_HOST)
+            .header(header::AUTHORIZATION, bearer(token))
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8");
+        if let Some(etag) = if_match {
+            builder = builder.header(header::IF_MATCH, etag);
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    /// GET the file and return its ETag header (the PUT's `If-Match` input).
+    async fn fs_file_fetch_etag(app: &Router, token: &TokenString, abs: &str) -> String {
+        let resp = app
+            .clone()
+            .oneshot(fs_file_request(token, abs))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Happy path: PUT with the current ETag → 200 `{ etag, size_bytes }`;
+    /// a re-GET serves the new content under exactly the returned ETag, and
+    /// no temp file is left behind in the directory.
+    #[tokio::test]
+    async fn fs_file_write_happy_path_returns_new_etag() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, b"old content").unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+        let abs = abs.to_str().unwrap();
+
+        let etag = fs_file_fetch_etag(&app, &token, abs).await;
+        let new_content = "new content \u{d55c}\u{ae00}\n";
+        let resp = app
+            .clone()
+            .oneshot(fs_file_put_request(
+                &token,
+                abs,
+                Some(&etag),
+                new_content.as_bytes().to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        let new_etag = body["etag"].as_str().unwrap().to_string();
+        assert_ne!(new_etag, etag);
+        assert_eq!(
+            body["size_bytes"].as_u64().unwrap(),
+            new_content.len() as u64
+        );
+
+        // Re-GET: new bytes under exactly the returned ETag.
+        let resp = app
+            .clone()
+            .oneshot(fs_file_request(&token, abs))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            new_etag
+        );
+        let got = to_bytes(resp.into_body(), 64 * 1024).await.unwrap().to_vec();
+        assert_eq!(got, new_content.as_bytes());
+
+        // Atomicity hygiene: the rename left no temp file behind — the A root
+        // holds exactly the target file plus the store/ dir the harness made.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["note.txt".to_string(), "store".to_string()]);
+    }
+
+    /// A write between the GET and the PUT changes the ETag → 412
+    /// etag_mismatch, and the concurrent content survives untouched.
+    #[tokio::test]
+    async fn fs_file_write_stale_etag_412() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let file = dir.path().join("doc.md");
+        std::fs::write(&file, b"v1").unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+        let abs = abs.to_str().unwrap();
+
+        let stale = fs_file_fetch_etag(&app, &token, abs).await;
+        // External edit (terminal / agent) — different size, so a new ETag
+        // even on filesystems with coarse mtime granularity.
+        std::fs::write(&file, b"v2 external edit").unwrap();
+
+        let resp = app
+            .clone()
+            .oneshot(fs_file_put_request(
+                &token,
+                abs,
+                Some(&stale),
+                b"my draft".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "etag_mismatch");
+        assert_eq!(std::fs::read(&file).unwrap(), b"v2 external edit");
+    }
+
+    /// If-Match is mandatory — no unconditional-overwrite path exists: 428.
+    #[tokio::test]
+    async fn fs_file_write_missing_if_match_428() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"keep").unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+
+        let resp = app
+            .oneshot(fs_file_put_request(
+                &token,
+                abs.to_str().unwrap(),
+                None,
+                b"clobber".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "precondition_required");
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+    }
+
+    /// Creation is upload's job: a missing target inside A → 404.
+    #[tokio::test]
+    async fn fs_file_write_missing_file_404() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let missing = dir.path().join("nope.txt");
+
+        let resp = app
+            .oneshot(fs_file_put_request(
+                &token,
+                missing.to_str().unwrap(),
+                Some("\"0-0\""),
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "file_not_found");
+        assert!(!missing.exists());
+    }
+
+    /// Only regular files are writable: a directory or a symlink target →
+    /// 400 not_a_file (symlinks are refused lexically, before canonicalize
+    /// would follow them — the link target stays untouched).
+    #[tokio::test]
+    async fn fs_file_write_rejects_directory_and_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+
+        // Directory target.
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        let resp = app
+            .clone()
+            .oneshot(fs_file_put_request(
+                &token,
+                std::fs::canonicalize(&sub).unwrap().to_str().unwrap(),
+                Some("\"0-0\""),
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "not_a_file");
+
+        // Symlink target (points at a real file inside A).
+        let real = dir.path().join("real.txt");
+        std::fs::write(&real, b"real").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resp = app
+            .oneshot(fs_file_put_request(
+                &token,
+                link.to_str().unwrap(),
+                Some("\"0-0\""),
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "not_a_file");
+        assert_eq!(std::fs::read(&real).unwrap(), b"real");
+    }
+
+    /// Text-only channel: a non-UTF-8 body → 400 not_utf8, file untouched.
+    #[tokio::test]
+    async fn fs_file_write_non_utf8_400() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let file = dir.path().join("t.txt");
+        std::fs::write(&file, b"text").unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+        let etag = fs_file_fetch_etag(&app, &token, abs.to_str().unwrap()).await;
+
+        // 0xFF can never appear in valid UTF-8.
+        let resp = app
+            .oneshot(fs_file_put_request(
+                &token,
+                abs.to_str().unwrap(),
+                Some(&etag),
+                vec![0x68, 0x69, 0xFF, 0xFE],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "not_utf8");
+        assert_eq!(std::fs::read(&file).unwrap(), b"text");
+    }
+
+    /// fs_guard applies unchanged: outside A and inside the Store denylist →
+    /// 403 path_not_allowed (mirrors the GET's guard tests).
+    #[tokio::test]
+    async fn fs_file_write_guard_403_outside_and_denylist() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let (app, token, store_dir) = make_app_with_workspace(&dir);
+
+        // Outside A.
+        let out_file = outside.path().join("x.txt");
+        std::fs::write(&out_file, b"out").unwrap();
+        let resp = app
+            .clone()
+            .oneshot(fs_file_put_request(
+                &token,
+                std::fs::canonicalize(&out_file).unwrap().to_str().unwrap(),
+                Some("\"0-0\""),
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(std::fs::read(&out_file).unwrap(), b"out");
+
+        // Inside the Store (denylist) — even though it is inside A.
+        let store_file = store_dir.join("secret.json");
+        std::fs::write(&store_file, b"{}").unwrap();
+        let resp = app
+            .oneshot(fs_file_put_request(
+                &token,
+                std::fs::canonicalize(&store_file).unwrap().to_str().unwrap(),
+                Some("\"0-0\""),
+                b"x".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "path_not_allowed");
+        assert_eq!(std::fs::read(&store_file).unwrap(), b"{}");
+    }
+
+    /// The explicit byte-count gate fires at exactly `assets.max_size_bytes`
+    /// (the route's DefaultBodyLimit is that plus multipart headroom, so a
+    /// body in the gap exercises the handler's own check) → 413 JSON.
+    #[tokio::test]
+    async fn fs_file_write_over_cap_413() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let token = issue_token().expect("token");
+        let mut cfg = test_config();
+        cfg.assets.max_size_bytes = 64;
+        let server_workspace = dir.path().to_path_buf();
+        let store_dir = server_workspace.join("store");
+        let wm = WorkspaceManager::from_path(store_dir).expect("workspace");
+        let state = AppState::new(cfg, token.clone())
+            .with_server_workspace(server_workspace)
+            .with_workspace(wm);
+        let app = router_with_state(state);
+
+        let file = dir.path().join("small.txt");
+        std::fs::write(&file, b"ok").unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+
+        let resp = app
+            .oneshot(fs_file_put_request(
+                &token,
+                abs.to_str().unwrap(),
+                Some("\"0-0\""),
+                vec![b'a'; 65],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "payload_too_large");
+        assert_eq!(std::fs::read(&file).unwrap(), b"ok");
+    }
+
+    /// Atomicity under failure: an unwritable directory makes the temp-file
+    /// creation fail → 500 write_failed, the target keeps its old content,
+    /// and no temp file is left behind.
+    #[tokio::test]
+    async fn fs_file_write_failure_leaves_old_content_and_no_temp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (app, token, _) = make_app_with_workspace(&dir);
+        let sub = dir.path().join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        let file = sub.join("f.txt");
+        std::fs::write(&file, b"before").unwrap();
+        let abs = std::fs::canonicalize(&file).unwrap();
+        let etag = fs_file_fetch_etag(&app, &token, abs.to_str().unwrap()).await;
+
+        // Read+traverse but no write: temp-file creation in `sub` must fail.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let resp = app
+            .oneshot(fs_file_put_request(
+                &token,
+                abs.to_str().unwrap(),
+                Some(&etag),
+                b"after".to_vec(),
+            ))
+            .await
+            .unwrap();
+        // Restore before asserting so TempDir cleanup works even on failure.
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["error"], "internal");
+        assert_eq!(body["reason"], "write_failed");
+        assert_eq!(std::fs::read(&file).unwrap(), b"before");
+        let names: Vec<String> = std::fs::read_dir(&sub)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["f.txt".to_string()]);
     }
 
     // ─────────────────────────────────────────────────────────────────────

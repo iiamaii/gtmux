@@ -55,6 +55,20 @@ body {
   color: var(--color-fg);
 }
 
+/* In-document find (ADR-0058 D3) — CSS Custom Highlight API registries set by
+ * findHighlight.ts. Accent-wash tone matches the left panel's .search-mark
+ * (ADR-0052 D4); the current match is a stronger wash. Global because
+ * ::highlight() cannot be Svelte-scoped. Unsupported browsers simply never
+ * populate the registries (counter/navigation still work). */
+::highlight(gtmux-find) {
+  background-color: color-mix(in srgb, var(--color-accent) 28%, transparent);
+}
+
+::highlight(gtmux-find-current) {
+  background-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
+  color: var(--color-fg);
+}
+
 /* Button reset for src/lib/ui/ primitives. */
 button {
   font-family: inherit;

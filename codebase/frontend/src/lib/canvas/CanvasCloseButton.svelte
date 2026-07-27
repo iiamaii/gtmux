@@ -1,5 +1,6 @@
 <script lang="ts">
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import CanvasGlyph from './CanvasGlyph.svelte';
 
   interface Props {
     id: string;
@@ -33,9 +34,7 @@
   onclick={(e) => void onClose(e)}
   onpointerdown={(e: PointerEvent) => e.stopPropagation()}
 >
-  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-    <path d="M3 3l6 6M9 3l-6 6"/>
-  </svg>
+  <CanvasGlyph name="close" />
 </button>
 
 <style>
@@ -62,8 +61,8 @@
   }
 
   .canvas-close.dark {
-    width: 22px;
-    height: 22px;
+    width: 20px; /* canvas-tier standard box (icon unification 2026-07-27) */
+    height: 20px;
     top: 8px;
     right: 8px;
     background: rgba(0, 0, 0, 0.45);

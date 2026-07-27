@@ -12,6 +12,7 @@
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
+  import CanvasGlyph from './CanvasGlyph.svelte';
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { FilePathItem, CanvasItem } from '$lib/types/canvas';
@@ -235,7 +236,20 @@
       {onResizeEnd}
     />
     <CanvasCloseButton id={data.id} disabled={isLocked} />
-    {#if !isLocked}
+    {#if isLocked}
+      <!-- Locked-state indicator — unified CanvasGlyph 'lock' (lock UX
+           unification 2026-07-27, ADR-0018 D9 family). FilePathNode has no
+           chrome header, so a persistent top-left corner badge carries the
+           lock state (change is hidden below; close is disabled). Static —
+           unlock stays in the Inspector State section. -->
+      <span
+        class="fp-lock"
+        title="Locked — unlock in the Inspector"
+        aria-label="Locked"
+      >
+        <CanvasGlyph name="lock" />
+      </span>
+    {:else}
       <button
         type="button"
         class="fp-change"
@@ -243,25 +257,20 @@
         aria-label="Change file"
         onclick={onPickClick}
       >
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-          <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
-          <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
-          <line x1="8" x2="16" y1="12" y2="12"/>
-        </svg>
+        <CanvasGlyph name="change" />
       </button>
     {/if}
     <div class="fp-card">
       <!-- Main row — icon + meta (path / name) (시안 §03 fp-main). -->
       <div class="fp-main" ondblclick={(e) => void onCopyPathDblClick(e)} role="presentation">
+        <!-- Type-identity glyph — unified via CanvasGlyph file/folder
+             (icon unification 2026-07-27, ADR-0016 정합). -->
         <div class="fp-icon" aria-hidden="true">
-          <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round">
-            {#if data.kind === 'directory'}
-              <path d="M1.5 3.5a1 1 0 0 1 1-1h3l1.2 1.5h5.3a1 1 0 0 1 1 1V11a1 1 0 0 1-1 1H2.5a1 1 0 0 1-1-1V3.5z" />
-            {:else}
-              <path d="M3.5 1.5h4.5L11 4.5V12.5H3.5V1.5z"/>
-              <path d="M8 1.5v3h3"/>
-            {/if}
-          </svg>
+          {#if data.kind === 'directory'}
+            <CanvasGlyph name="folder" />
+          {:else}
+            <CanvasGlyph name="file" />
+          {/if}
         </div>
         <div class="fp-meta">
           {#if data.path.length === 0}
@@ -331,10 +340,13 @@
   .fp-change {
     position: absolute;
     top: 6px;
-    right: 34px;
+    /* 1px gap to the close button (SoT §1 canvas cluster gap). CanvasCloseButton
+       sits at right:6px, 20px wide → change at 6+20+1 = 27px (was 34px / 8px
+       gap, 2026-07-27 cluster-unification). */
+    right: 27px;
     z-index: 12;
-    width: 22px;
-    height: 22px;
+    width: 20px; /* canvas-tier standard box (icon unification 2026-07-27) */
+    height: 20px;
     display: grid;
     place-items: center;
     border: 0;
@@ -358,6 +370,24 @@
   .fp-change:hover {
     background: var(--color-glass-2);
     color: var(--color-fg);
+  }
+
+  /* Locked badge — persistent (status, not hover-reveal), top-left corner so it
+     never collides with the top-right close/change cluster. Canvas-tier 20×20
+     box; sits above the card (z 12). */
+  .fp-lock {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    z-index: 12;
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    border-radius: var(--radius-sm);
+    background: var(--color-surface-2);
+    color: var(--color-fg-muted);
+    pointer-events: none;
   }
 
   /* ref/frontend-design/components-v5 §03 — .shape-filepath. */
@@ -398,10 +428,13 @@
     white-space: nowrap;
   }
 
+  /* Card title (filename) — NoteNode-anchored micro-label family (icon
+     system unification 2026-07-27, ADR-0016 정합). NO uppercase — filename
+     is case-bearing. */
   .fp-name {
-    font-size: 13px;
+    font-size: 9.5px;
     font-weight: 540;
-    letter-spacing: -0.1px;
+    letter-spacing: 0.6px;
     color: var(--color-fg);
     overflow: hidden;
     text-overflow: ellipsis;
