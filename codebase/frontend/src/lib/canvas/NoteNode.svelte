@@ -10,6 +10,7 @@
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
+  import CanvasGlyph from './CanvasGlyph.svelte';
   import { componentSettings } from '$lib/stores/componentSettings.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import type { NoteItem, CanvasItem } from '$lib/types/canvas';
@@ -17,6 +18,7 @@
     constrainResizeAspectIfShift,
     scheduleLiveAspectResize,
   } from './resizeConstraint';
+  import { mapDisplayHitToBodyOffset } from './noteCaret';
   import { holdLayoutRefetch, releaseLayoutRefetch } from '$lib/ws/layoutRefetch.svelte';
 
   interface NoteNodeData {
@@ -74,9 +76,51 @@
   const RESTORE_DEFAULT_W = 240;
   const RESTORE_DEFAULT_H = 96;
 
+  // ADR-0018 D9 amend 2026-07-23 — caret-at-point body edit entry. The display
+  // <pre> renders the raw body string as plain text, so a caret hit in the
+  // display DOM maps 1:1 onto a textarea offset (pure mapping in noteCaret).
+  let bodyDisplayEl: HTMLElement | undefined = $state();
+  let bodyEditCaret: number | null = $state(null);
+
+  function caretHitFromPoint(x: number, y: number): { node: Node; offset: number } | null {
+    const doc = document as unknown as {
+      caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+      caretRangeFromPoint?: (x: number, y: number) => Range | null;
+    };
+    if (typeof doc.caretPositionFromPoint === 'function') {
+      const pos = doc.caretPositionFromPoint(x, y);
+      if (pos !== null) return { node: pos.offsetNode, offset: pos.offset };
+    }
+    if (typeof doc.caretRangeFromPoint === 'function') {
+      const range = doc.caretRangeFromPoint(x, y);
+      if (range !== null) return { node: range.startContainer, offset: range.startOffset };
+    }
+    return null;
+  }
+
+  function bodyCaretFromPoint(x: number, y: number): number {
+    const el = bodyDisplayEl;
+    const bodyLength = data.body.length;
+    if (!el) return bodyLength;
+    const hit = caretHitFromPoint(x, y);
+    if (hit === null || !el.contains(hit.node)) return bodyLength;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const nodeLengths: number[] = [];
+    let hitIndex = -1;
+    let node = walker.nextNode();
+    while (node !== null) {
+      if (node === hit.node) hitIndex = nodeLengths.length;
+      nodeLengths.push((node as Text).length);
+      node = walker.nextNode();
+    }
+    return mapDisplayHitToBodyOffset(nodeLengths, hitIndex, hit.offset, bodyLength);
+  }
+
   function onTitleDblClick(e: MouseEvent): void {
     if (isLocked || isMinimized) return;
     e.stopPropagation();
+    // ADR-0018 D9 amend 2026-07-23 — grouped-note drill-in dblclick only drills.
+    if (sessionStore.consumeSuppressedTextEditDblClick(data.id)) return;
     titleEditing = true;
   }
 
@@ -101,6 +145,9 @@
       cursor = cursor.parentElement;
     }
     e.stopPropagation();
+    // ADR-0018 D9 amend 2026-07-23 — grouped-note drill-in dblclick only drills.
+    if (sessionStore.consumeSuppressedTextEditDblClick(data.id)) return;
+    bodyEditCaret = bodyCaretFromPoint(e.clientX, e.clientY);
     bodyEditing = true;
   }
 
@@ -286,11 +333,11 @@
       title={isMinimized ? `${data.title || 'Untitled'} — click to restore` : undefined}
     >
       <div class="note-head">
-      <!-- lucide scroll-text — simplified for 12-unit small chrome. -->
-      <svg class="note-glyph" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-        <rect x="1.5" y="2" width="9" height="8" rx="1.5"/>
-        <path d="M3.5 4.5h5M3.5 6.5h5M3.5 8.5h3"/>
-      </svg>
+      <!-- Type-identity glyph — unified via CanvasGlyph 'note' (normalized
+           scroll-text silhouette; icon unification 2026-07-27, ADR-0016 정합). -->
+      <span class="note-glyph" aria-hidden="true">
+        <CanvasGlyph name="note" />
+      </span>
       <span class="note-label" ondblclick={onTitleDblClick} role="presentation">
         {#if titleEditing}
           <InlineEditField
@@ -307,46 +354,58 @@
           <b>{data.title.length > 0 ? data.title : 'Untitled'}</b>
         {/if}
       </span>
-      {#if !isLocked}
+      {#if isLocked}
+        <!-- Locked-state indicator — unified CanvasGlyph 'lock' (lock UX
+             unification 2026-07-27, ADR-0018 D9 family). Persistent status
+             glyph (NOT hover-reveal like the note's buttons) so the lock state
+             is always legible. Unlock stays in the Inspector State section.
+             Minimize / close are hidden while locked; maximize is view-only so
+             it stays in the hover-reveal cluster below. -->
+        <span class="note-lock" title="Locked — unlock in the Inspector" aria-label="Locked">
+          <CanvasGlyph name="lock" size={12} />
+        </span>
+      {/if}
+      <!-- Action cluster — 1px unified inter-button gap (icon unification
+           2026-07-27); the 6px head gap stays between title and cluster.
+           Hover-reveal (NoteNode has no full header strip). -->
+      <span class="note-actions" role="presentation">
+        {#if !isLocked}
         <button
           type="button"
           class="note-btn nodrag"
+          class:is-active={isMinimized}
           title={isMinimized ? 'Restore' : 'Minimize'}
           aria-label={isMinimized ? 'Restore' : 'Minimize'}
           onclick={(e) => void onMinimizeClick(e)}
         >
           {#if isMinimized}
-            <!-- restore (small square) -->
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
-              <rect x="2" y="2" width="6" height="6" rx="0.6"/>
-            </svg>
+            <!-- restore-from-minimized = square -->
+            <CanvasGlyph name="restore-min" size={12} />
           {:else}
             <!-- minimize (underscore) -->
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" aria-hidden="true">
-              <path d="M2.5 7h5"/>
-            </svg>
+            <CanvasGlyph name="minimize" size={12} />
           {/if}
         </button>
+        {/if}
+        <!-- Maximize — view-only (ephemeral modal overlay, no layout mutation),
+             so it stays available while locked. -->
         <button
           type="button"
-          class="note-btn nodrag"
+          class="note-btn toggle-on nodrag"
+          class:is-active={isMaximized}
           title={isMaximized ? 'Restore' : 'Maximize'}
           aria-label={isMaximized ? 'Restore' : 'Maximize'}
           onclick={onMaximizeClick}
         >
           {#if isMaximized}
-            <!-- restore (two windows) -->
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
-              <rect x="1.5" y="3" width="5.4" height="5.3" rx="0.4"/>
-              <path d="M3.2 3V1.6h5.3V7H7"/>
-            </svg>
+            <!-- restore-while-maximized = lucide minimize (corner brackets in) -->
+            <CanvasGlyph name="restore-max" size={12} />
           {:else}
-            <!-- maximize (square outline) -->
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
-              <rect x="2" y="2" width="6" height="6" rx="0.6"/>
-            </svg>
+            <!-- lucide maximize (corner brackets out) -->
+            <CanvasGlyph name="maximize" size={12} />
           {/if}
         </button>
+        {#if !isLocked}
         <button
           type="button"
           class="note-btn close nodrag"
@@ -354,11 +413,10 @@
           aria-label="Close"
           onclick={(e) => void onCloseClick(e)}
         >
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-            <path d="M2.5 2.5l5 5M7.5 2.5l-5 5"/>
-          </svg>
+          <CanvasGlyph name="close" size={12} />
         </button>
-      {/if}
+        {/if}
+      </span>
     </div>
 
       <div class="note-body-wrap" role="presentation">
@@ -368,6 +426,8 @@
           editing={true}
           allowEmpty={true}
           plain={true}
+          selectOnFocus={false}
+          initialCaret={bodyEditCaret}
           placeholder="Body…"
           class="note-body-edit"
           onCommit={(next: string) => void commit('body', next)}
@@ -376,7 +436,7 @@
       {:else if data.body.length === 0}
         <span class="note-placeholder">Double-click to add body</span>
       {:else}
-        <pre class="note-body">{data.body}</pre>
+        <pre class="note-body" bind:this={bodyDisplayEl}>{data.body}</pre>
       {/if}
       </div>
 
@@ -427,13 +487,30 @@
     letter-spacing: 0.6px;
     text-transform: uppercase;
     color: var(--color-fg-muted);
-    height: 18px;
+    height: 20px; /* fits the 20×20 canvas-tier buttons */
     min-width: 0;
   }
+  .note-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px; /* unified inter-button gap (icon unification 2026-07-27) */
+    flex-shrink: 0;
+  }
   .note-glyph {
-    width: 12px; height: 12px;
+    display: inline-flex;
     flex-shrink: 0;
     color: var(--note-accent, var(--color-accent));
+  }
+  /* Locked-state indicator — 20×20 canvas-tier box matching .note-btn, but
+     PERSISTENT (no hover-reveal, unlike the note's buttons) since it carries
+     status. Muted fg, non-interactive. */
+  .note-lock {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    color: var(--color-fg-muted);
   }
   .note-label {
     color: var(--color-fg-muted);
@@ -447,8 +524,11 @@
     letter-spacing: 0.4px;
     margin-right: 4px;
   }
+  /* 20×20 canvas-tier standard box (icon unification 2026-07-27). Hover-
+     reveal stays NOTE-ONLY — the note has no full header strip, so its
+     controls appear on node hover; other components keep always-visible. */
   .note-btn {
-    width: 18px; height: 18px;
+    width: 20px; height: 20px;
     flex-shrink: 0;
     display: grid; place-items: center;
     border: none;
@@ -464,6 +544,21 @@
   .note-btn:hover {
     background: var(--color-glass-2);
     color: var(--color-fg);
+  }
+  /* icon system unification 2026-07-27 (ADR-0016 정합) — active-state treatment
+     matches the terminal/document panel reference: neutral glass fill + fg
+     color (no accent). Effect/shape only; color scheme unchanged. */
+  .note-btn.is-active {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
+  }
+  /* Toggle-ON standard (SoT §3) — maximized-active tints its icon with the
+     rail current-tab accent, mirroring .rail-btn.active. Minimize keeps the
+     neutral-glass rule above (SoT §3 exception). Accent is theme-agnostic. */
+  .note-btn.toggle-on.is-active,
+  .note-btn.toggle-on.is-active:hover {
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
   }
   .note-btn.close:hover {
     background: #e5484d;

@@ -17,6 +17,7 @@
    */
 
   import { onMount } from 'svelte';
+  import CanvasGlyph from '$lib/canvas/CanvasGlyph.svelte';
   import { muxStore } from '$lib/stores/mux.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
@@ -1979,19 +1980,19 @@
 
 {#snippet horizontalAlignIcon(value: TextAlign)}
   {#if value === 'left'}
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
       <line x1="4" y1="6" x2="20" y2="6" />
       <line x1="4" y1="12" x2="14" y2="12" />
       <line x1="4" y1="18" x2="18" y2="18" />
     </svg>
   {:else if value === 'center'}
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
       <line x1="4" y1="6" x2="20" y2="6" />
       <line x1="7" y1="12" x2="17" y2="12" />
       <line x1="5" y1="18" x2="19" y2="18" />
     </svg>
   {:else}
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
       <line x1="4" y1="6" x2="20" y2="6" />
       <line x1="10" y1="12" x2="20" y2="12" />
       <line x1="6" y1="18" x2="20" y2="18" />
@@ -2001,19 +2002,19 @@
 
 {#snippet verticalAlignIcon(value: TextVerticalAlign)}
   {#if value === 'top'}
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
       <line x1="5" y1="5" x2="19" y2="5" />
       <line x1="8" y1="10" x2="16" y2="10" />
       <line x1="10" y1="15" x2="14" y2="15" />
     </svg>
   {:else if value === 'middle'}
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
       <line x1="6" y1="7" x2="18" y2="7" />
       <line x1="4" y1="12" x2="20" y2="12" />
       <line x1="6" y1="17" x2="18" y2="17" />
     </svg>
   {:else}
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
       <line x1="10" y1="9" x2="14" y2="9" />
       <line x1="8" y1="14" x2="16" y2="14" />
       <line x1="5" y1="19" x2="19" y2="19" />
@@ -2026,33 +2027,33 @@
   <div class="align-row" role="group" aria-label="Alignment">
     <div class="align-group" aria-label="Align horizontal">
       <button type="button" class="align-btn" title="Align left" aria-label="Align left" onclick={() => onAlign('left')}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="9" height="6" x="6" y="14" rx="2"/><rect width="16" height="6" x="6" y="4" rx="2"/><path d="M2 2v20"/></svg>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="9" height="6" x="6" y="14" rx="2"/><rect width="16" height="6" x="6" y="4" rx="2"/><path d="M2 2v20"/></svg>
       </button>
       <button type="button" class="align-btn" title="Align center horizontally" aria-label="Align center horizontally" onclick={() => onAlign('center-x')}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v20"/><path d="M8 10H4a2 2 0 0 1-2-2V6c0-1.1.9-2 2-2h4"/><path d="M16 10h4a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-4"/><path d="M8 20H7a2 2 0 0 1-2-2v-2c0-1.1.9-2 2-2h1"/><path d="M16 14h1a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-1"/></svg>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v20"/><path d="M8 10H4a2 2 0 0 1-2-2V6c0-1.1.9-2 2-2h4"/><path d="M16 10h4a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-4"/><path d="M8 20H7a2 2 0 0 1-2-2v-2c0-1.1.9-2 2-2h1"/><path d="M16 14h1a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-1"/></svg>
       </button>
       <button type="button" class="align-btn" title="Align right" aria-label="Align right" onclick={() => onAlign('right')}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="16" height="6" x="2" y="4" rx="2"/><rect width="9" height="6" x="9" y="14" rx="2"/><path d="M22 22V2"/></svg>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="16" height="6" x="2" y="4" rx="2"/><rect width="9" height="6" x="9" y="14" rx="2"/><path d="M22 22V2"/></svg>
       </button>
     </div>
     <div class="align-group" aria-label="Align vertical">
       <button type="button" class="align-btn" title="Align top" aria-label="Align top" onclick={() => onAlign('top')}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="16" x="4" y="6" rx="2"/><rect width="6" height="9" x="14" y="6" rx="2"/><path d="M22 2H2"/></svg>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="16" x="4" y="6" rx="2"/><rect width="6" height="9" x="14" y="6" rx="2"/><path d="M22 2H2"/></svg>
       </button>
       <button type="button" class="align-btn" title="Align center vertically" aria-label="Align center vertically" onclick={() => onAlign('center-y')}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12h20"/><path d="M10 16v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/><path d="M10 8V4a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v4"/><path d="M20 16v1a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-1"/><path d="M14 8V7c0-1.1.9-2 2-2h2a2 2 0 0 1 2 2v1"/></svg>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12h20"/><path d="M10 16v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4"/><path d="M10 8V4a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v4"/><path d="M20 16v1a2 2 0 0 1-2 2h-2a2 2 0 0 1-2-2v-1"/><path d="M14 8V7c0-1.1.9-2 2-2h2a2 2 0 0 1 2 2v1"/></svg>
       </button>
       <button type="button" class="align-btn" title="Align bottom" aria-label="Align bottom" onclick={() => onAlign('bottom')}>
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="16" x="4" y="2" rx="2"/><rect width="6" height="9" x="14" y="9" rx="2"/><path d="M22 22H2"/></svg>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="16" x="4" y="2" rx="2"/><rect width="6" height="9" x="14" y="9" rx="2"/><path d="M22 22H2"/></svg>
       </button>
     </div>
     {#if showDistribute}
       <div class="align-group" aria-label="Distribute">
         <button type="button" class="align-btn" title="Distribute horizontally" aria-label="Distribute horizontally" onclick={() => onDistribute('horizontal')}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="14" x="4" y="5" rx="2"/><rect width="6" height="10" x="14" y="7" rx="2"/><path d="M17 22v-5"/><path d="M17 7V2"/><path d="M7 22v-3"/><path d="M7 5V2"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="6" height="14" x="4" y="5" rx="2"/><rect width="6" height="10" x="14" y="7" rx="2"/><path d="M17 22v-5"/><path d="M17 7V2"/><path d="M7 22v-3"/><path d="M7 5V2"/></svg>
         </button>
         <button type="button" class="align-btn" title="Distribute vertically" aria-label="Distribute vertically" onclick={() => onDistribute('vertical')}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 17h-3"/><path d="M22 7h-5"/><path d="M5 17H2"/><path d="M7 7H2"/><rect x="5" y="14" width="14" height="6" rx="2"/><rect x="7" y="4" width="10" height="6" rx="2"/></svg>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 17h-3"/><path d="M22 7h-5"/><path d="M5 17H2"/><path d="M7 7H2"/><rect x="5" y="14" width="14" height="6" rx="2"/><rect x="7" y="4" width="10" height="6" rx="2"/></svg>
         </button>
       </div>
     {/if}
@@ -2133,17 +2134,9 @@
             onclick={() => void applyGroupVisibility(groupSelection.visibility !== 'visible')}
           >
             {#if groupSelection.visibility === 'visible'}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/>
-                <circle cx="12" cy="12" r="3"/>
-              </svg>
+              <CanvasGlyph name="eye" size={13} />
             {:else}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
-                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
-                <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
-                <line x1="1" y1="1" x2="23" y2="23"/>
-              </svg>
+              <CanvasGlyph name="eye-off" size={13} />
             {/if}
           </button>
 
@@ -2162,15 +2155,9 @@
             onclick={() => void applyGroupLocked(!groupSelection.locked)}
           >
             {#if groupSelection.locked}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="11" width="16" height="10" rx="2"/>
-                <path d="M8 11V8a4 4 0 1 1 8 0v3"/>
-              </svg>
+              <CanvasGlyph name="lock" size={13} />
             {:else}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="11" width="16" height="10" rx="2"/>
-                <path d="M8 11V8a4 4 0 0 1 7.5-2"/>
-              </svg>
+              <CanvasGlyph name="lock-open" size={13} />
             {/if}
           </button>
         </div>
@@ -2212,22 +2199,14 @@
             onclick={() => void applySelectedGroupVisibility(!(selectedGroupVisibilityState ?? false))}
           >
             {#if selectedGroupVisibilityState === null}
-              <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
-                <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              <svg class="mixed-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="2"/>
+                <path d="M8 12h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
               </svg>
             {:else if selectedGroupVisibilityState === true}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/>
-                <circle cx="12" cy="12" r="3"/>
-              </svg>
+              <CanvasGlyph name="eye" size={13} />
             {:else}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
-                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
-                <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
-                <line x1="1" y1="1" x2="23" y2="23"/>
-              </svg>
+              <CanvasGlyph name="eye-off" size={13} />
             {/if}
           </button>
 
@@ -2242,20 +2221,14 @@
             onclick={() => void applySelectedGroupLocked(!(selectedGroupLockedState ?? false))}
           >
             {#if selectedGroupLockedState === null}
-              <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
-                <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              <svg class="mixed-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="2"/>
+                <path d="M8 12h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
               </svg>
             {:else if selectedGroupLockedState === true}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="11" width="16" height="10" rx="2"/>
-                <path d="M8 11V8a4 4 0 1 1 8 0v3"/>
-              </svg>
+              <CanvasGlyph name="lock" size={13} />
             {:else}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="11" width="16" height="10" rx="2"/>
-                <path d="M8 11V8a4 4 0 0 1 7.5-2"/>
-              </svg>
+              <CanvasGlyph name="lock-open" size={13} />
             {/if}
           </button>
         </div>
@@ -2359,11 +2332,7 @@
                   disabled={(selectedPanel as { locked?: boolean }).locked === true}
                   onclick={() => changeTerminalDialog.show(selectedPanel.id as string)}
                 >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                    <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
-                    <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
-                    <line x1="8" x2="16" y1="12" y2="12"/>
-                  </svg>
+                  <CanvasGlyph name="change" size={13} />
                 </button>
               {/if}
             </div>
@@ -3731,7 +3700,7 @@
                       disabled={txt.locked}
                       onclick={() => void applyTextAlign('left')}
                     >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="4" y1="6" x2="20" y2="6"/>
                         <line x1="4" y1="12" x2="14" y2="12"/>
                         <line x1="4" y1="18" x2="18" y2="18"/>
@@ -3747,7 +3716,7 @@
                       disabled={txt.locked}
                       onclick={() => void applyTextAlign('center')}
                     >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="4" y1="6" x2="20" y2="6"/>
                         <line x1="7" y1="12" x2="17" y2="12"/>
                         <line x1="5" y1="18" x2="19" y2="18"/>
@@ -3763,7 +3732,7 @@
                       disabled={txt.locked}
                       onclick={() => void applyTextAlign('right')}
                     >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="4" y1="6" x2="20" y2="6"/>
                         <line x1="10" y1="12" x2="20" y2="12"/>
                         <line x1="6" y1="18" x2="20" y2="18"/>
@@ -3784,7 +3753,7 @@
                       disabled={txt.locked}
                       onclick={() => void applyTextVerticalAlign('top')}
                     >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="5" y1="5" x2="19" y2="5"/>
                         <line x1="8" y1="10" x2="16" y2="10"/>
                         <line x1="10" y1="15" x2="14" y2="15"/>
@@ -3800,7 +3769,7 @@
                       disabled={txt.locked}
                       onclick={() => void applyTextVerticalAlign('middle')}
                     >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="6" y1="7" x2="18" y2="7"/>
                         <line x1="4" y1="12" x2="20" y2="12"/>
                         <line x1="6" y1="17" x2="18" y2="17"/>
@@ -3816,7 +3785,7 @@
                       disabled={txt.locked}
                       onclick={() => void applyTextVerticalAlign('bottom')}
                     >
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <line x1="10" y1="9" x2="14" y2="9"/>
                         <line x1="8" y1="14" x2="16" y2="14"/>
                         <line x1="5" y1="19" x2="19" y2="19"/>
@@ -3923,10 +3892,7 @@
                     aria-label="Copy path"
                     onclick={() => void copyInspectorPath(copyPath)}
                   >
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <rect x="5" y="5" width="8" height="9" rx="1.2"/>
-                      <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
-                    </svg>
+                    <CanvasGlyph name="copy" size={13} />
                   </button>
                 {/if}
                 <button
@@ -3937,11 +3903,7 @@
                   disabled={sessionItem.locked}
                   onclick={changeFilePathFromInspector}
                 >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                    <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
-                    <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
-                    <line x1="8" x2="16" y1="12" y2="12"/>
-                  </svg>
+                  <CanvasGlyph name="change" size={13} />
                 </button>
               </div>
             </div>
@@ -3961,10 +3923,7 @@
                     aria-label="Copy path"
                     onclick={() => void copyInspectorPath(copyPath)}
                   >
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <rect x="5" y="5" width="8" height="9" rx="1.2"/>
-                      <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
-                    </svg>
+                    <CanvasGlyph name="copy" size={13} />
                   </button>
                 {/if}
                 <button
@@ -3975,11 +3934,7 @@
                   disabled={sessionItem.locked}
                   onclick={() => void changeImageFromInspector()}
                 >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                    <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
-                    <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
-                    <line x1="8" x2="16" y1="12" y2="12"/>
-                  </svg>
+                  <CanvasGlyph name="change" size={13} />
                 </button>
               </div>
             </div>
@@ -3999,10 +3954,7 @@
                     aria-label="Copy path"
                     onclick={() => void copyInspectorPath(copyPath)}
                   >
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <rect x="5" y="5" width="8" height="9" rx="1.2"/>
-                      <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
-                    </svg>
+                    <CanvasGlyph name="copy" size={13} />
                   </button>
                 {/if}
                 <button
@@ -4013,11 +3965,7 @@
                   disabled={sessionItem.locked}
                   onclick={() => void changeDocumentFromInspector()}
                 >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                    <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
-                    <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
-                    <line x1="8" x2="16" y1="12" y2="12"/>
-                  </svg>
+                  <CanvasGlyph name="change" size={13} />
                 </button>
               </div>
             </div>
@@ -4050,9 +3998,7 @@
                     });
                   }}
                 >
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                    <path d="M12 5v14M5 12h14"/>
-                  </svg>
+                  <CanvasGlyph name="plus" size={13} />
                 </button>
               </div>
             </div>
@@ -4074,24 +4020,16 @@
             onclick={() => void applyCommonBool('visible', !(visibleState ?? false))}
           >
             {#if visibleState === null}
-              <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
-                <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              <svg class="mixed-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="2"/>
+                <path d="M8 12h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
               </svg>
             {:else if visibleState === false}
               <!-- eye-off -->
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/>
-                <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/>
-                <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
-                <line x1="1" y1="1" x2="23" y2="23"/>
-              </svg>
+              <CanvasGlyph name="eye-off" size={13} />
             {:else}
               <!-- eye -->
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12z"/>
-                <circle cx="12" cy="12" r="3"/>
-              </svg>
+              <CanvasGlyph name="eye" size={13} />
             {/if}
           </button>
 
@@ -4106,22 +4044,16 @@
             onclick={() => void applyCommonBool('locked', !(lockedState ?? false))}
           >
             {#if lockedState === null}
-              <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
-                <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              <svg class="mixed-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="2"/>
+                <path d="M8 12h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
               </svg>
             {:else if lockedState === true}
               <!-- lock closed -->
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="11" width="16" height="10" rx="2"/>
-                <path d="M8 11V8a4 4 0 1 1 8 0v3"/>
-              </svg>
+              <CanvasGlyph name="lock" size={13} />
             {:else}
               <!-- lock open -->
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="11" width="16" height="10" rx="2"/>
-                <path d="M8 11V8a4 4 0 0 1 7.5-2"/>
-              </svg>
+              <CanvasGlyph name="lock-open" size={13} />
             {/if}
           </button>
 
@@ -4137,22 +4069,17 @@
               onclick={() => void applyCommonBool('minimized', !(minimizedState ?? false))}
             >
               {#if minimizedState === null}
-                <svg class="mixed-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="1.8"/>
-                  <path d="M8 12h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                <svg class="mixed-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <rect x="4" y="4" width="16" height="16" rx="3" stroke="currentColor" stroke-width="2"/>
+                  <path d="M8 12h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                 </svg>
               {:else if minimizedState === true}
                 <!-- restore — PanelNode header 의 restore 아이콘과 정합 (두 줄). -->
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <line x1="5" y1="12" x2="19" y2="12"/>
-                  <line x1="5" y1="18" x2="19" y2="18"/>
-                </svg>
+                <CanvasGlyph name="restore-min" size={13} />
               {:else}
                 <!-- minimize (underscore) — bottom line 만. restore 의 두 줄 중
                      아래 라인과 y 일치 (전환 시 위 라인만 들고/내림). -->
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <line x1="5" y1="18" x2="19" y2="18"/>
-                </svg>
+                <CanvasGlyph name="minimize" size={13} />
               {/if}
             </button>
           {/if}
@@ -4168,14 +4095,9 @@
               onclick={toggleSelectedMaximize}
             >
               {#if maximizedState}
-                <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
-                  <rect x="2" y="3.6" width="6.5" height="6.4" rx="0.5"/>
-                  <path d="M4 3.6V2.4h6.5v6.4H9"/>
-                </svg>
+                <CanvasGlyph name="restore-max" size={13} />
               {:else}
-                <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
-                  <rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/>
-                </svg>
+                <CanvasGlyph name="maximize" size={13} />
               {/if}
             </button>
           {/if}

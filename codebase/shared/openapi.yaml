@@ -25,6 +25,74 @@ components:
       - W
       - NW
       - center
+    DocumentAnchorKind:
+      type: string
+      description: |-
+        ADR-0056 D2 — anchor addressing scheme: source-view line (`CodeViewer`)
+        vs rendered-markdown block (`DocumentMarkdownView`).
+      enum:
+      - line
+      - block
+    DocumentViewAnchor:
+      type: object
+      description: |-
+        ADR-0056 D2 — content anchor. `kind` picks the addressing scheme, `index`
+        addresses the top visible unit, `frac` is the progress within that unit.
+        `validate()` enforces `frac` finite and in `0.0..=1.0`
+        (`DocumentViewStateInvalid`); `index` is intentionally *not*
+        range-checked — the BE does not know the document's content, the FE
+        clamps to the content end on restore (ADR-0056 D2).
+      required:
+      - kind
+      - index
+      - frac
+      properties:
+        frac:
+          type: number
+          format: double
+          description: Progress within the anchored line/block. Finite, `0.0..=1.0`.
+        index:
+          type: integer
+          format: int32
+          description: |-
+            `line` → 1-based top visible source line (reuses the `data-line`
+            addressing contract, ADR-0037 D7.5); `block` → 0-based direct-child
+            block index of the rendered-markdown scroll container.
+          minimum: 0
+        kind:
+          $ref: '#/components/schemas/DocumentAnchorKind'
+      additionalProperties: false
+    DocumentViewMode:
+      type: string
+      description: |-
+        ADR-0056 D3 — document render mode (re-states ADR-0037 D1's 2-mode
+        toggle as the durable wire form). Wire form: `"rendered" | "source"`.
+      enum:
+      - rendered
+      - source
+    DocumentViewState:
+      type: object
+      description: |-
+        ADR-0056 D1/D2 — persisted document view state: rendered/source mode plus
+        a width-invariant content anchor. Both fields are optional; an absent
+        field means "FE default" (`mode` → rendered, `anchor` → top of document).
+      properties:
+        anchor:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/DocumentViewAnchor'
+            description: |-
+              ADR-0056 D2 — content anchor (deliberately *not* a pixel `scrollTop`:
+              canvas and maximize render at different widths, so only a content
+              anchor maps to the same position on both surfaces). Absent = top.
+        mode:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/DocumentViewMode'
+            description: |-
+              ADR-0056 D3 — durable rendered/source toggle. Absent = `"rendered"`
+              (the default is not stored, matching the FE store's absent-entry rule).
+      additionalProperties: false
     FigureStrokeDash:
       type: string
       description: |-
@@ -65,6 +133,25 @@ components:
       - light
       - normal
       - bold
+    FsFileWriteResponse:
+      type: object
+      description: |-
+        `PUT /api/fs/file` response — the post-write identity, so the client can
+        refresh its `If-Match` for the next save without a re-GET (ADR-0057 D3).
+      required:
+      - etag
+      - size_bytes
+      properties:
+        etag:
+          type: string
+          description: |-
+            Strong ETag of the written file (`"<mtime-nanos>-<size>"` — same
+            format `GET /api/fs/file` emits).
+        size_bytes:
+          type: integer
+          format: int64
+          description: File size in bytes after the write.
+          minimum: 0
     FsSearchEntry:
       type: object
       description: One search hit (ADR-0052 D5).
@@ -591,6 +678,15 @@ components:
                 Optional size in bytes — `content.len()` (inline) or the real file
                 size (legacy asset). `path` items may omit it.
               minimum: 0
+            view_state:
+              oneOf:
+              - type: 'null'
+              - $ref: '#/components/schemas/DocumentViewState'
+                description: |-
+                  ADR-0056 D1/D2 — persisted view state (mode + scroll anchor).
+                  Additive optional: legacy records round-trip to `None` and the
+                  field is omitted when unset (no schema_version bump — the
+                  `restored_geom` precedent, ADR-0018 D11).
         - type: object
           description: |-
             ADR-0047 D1 (amends ADR-0018 D10) — three-origin document item, exactly

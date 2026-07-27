@@ -20,17 +20,38 @@
    * h2 로, 나머지를 p 로 분할 렌더. 인라인 편집 진입 (더블 클릭) 은 후속.
    */
 
+  import { tick, untrack } from 'svelte';
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { documentViewModeStore } from '$lib/stores/documentViewMode.svelte';
+  import { documentScrollStore } from '$lib/stores/documentScroll.svelte';
+  import {
+    attachDocumentScroll,
+    type ScrollSurfaceKind,
+  } from './documentScrollController';
+  import {
+    buildDocumentViewState,
+    flushDocumentViewStateSave,
+  } from '$lib/stores/documentViewStateSaver';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import InlineEditTextarea from '$lib/common/InlineEditTextarea.svelte';
+  import FindBar from '$lib/common/FindBar.svelte';
+  import {
+    DocumentFindController,
+    recordFindHandoff,
+    consumeFindHandoff,
+  } from '$lib/common/documentFind.svelte';
+  import {
+    registerDocumentFindSurface,
+    type DocumentFindOpenRequest,
+  } from '$lib/common/findController';
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import { fsFileUrl } from '$lib/http/fs';
   import { UnauthorizedError } from '$lib/http/sessions';
   import CodeViewer from './CodeViewer.svelte';
+  import CanvasGlyph from './CanvasGlyph.svelte';
   import DocumentMarkdownView from '$lib/viewers/DocumentMarkdownView.svelte';
   import HtmlViewer from '$lib/viewers/HtmlViewer.svelte';
   import PdfViewer from '$lib/viewers/PdfViewer.svelte';
@@ -50,10 +71,9 @@
     renderMarkdown,
     renderHtml,
     isToggleableFileType,
-    getNextViewMode,
-    getNextViewModeLabel,
     RENDERED_HTML_IFRAME_SANDBOX,
     buildRenderedHtmlSrcdoc,
+    type DocumentViewMode,
   } from './documentRender';
   import type { CanvasItem, DocumentItem } from '$lib/types/canvas';
   import {
@@ -81,6 +101,8 @@
     content?: string;
     mime?: string;
     size_bytes?: number;
+    /** ADR-0056 — durable render mode + scroll anchor. */
+    view_state?: DocumentItem['view_state'];
     /** Canvas.svelte group selection proxy. Descendants must not show own controls. */
     group_selected?: boolean;
   }
@@ -159,7 +181,19 @@
    *  도 reset 없음. */
   const viewMode = $derived(documentViewModeStore.get(data.id));
   const canToggleView = $derived(isToggleableFileType(fileTypeLabel));
-  const nextViewModeLabel = $derived(getNextViewModeLabel(viewMode, fileTypeLabel));
+
+  /** ADR-0037 D1 UI amend 2026-07-27 — set the rendered/source view mode
+   *  directly (two-button segmented control). No-op when already on `next`.
+   *  ADR-0056 D3 — mode is durable; flush the toggle immediately (history-
+   *  exempt), not on debounce. */
+  function setViewModeTo(next: DocumentViewMode): void {
+    if (viewMode === next) return;
+    documentViewModeStore.set(data.id, next);
+    void flushDocumentViewStateSave(
+      data.id,
+      buildDocumentViewState(next, documentScrollStore.get(data.id)),
+    );
+  }
   const renderedHtmlSrcdoc = $derived(buildRenderedHtmlSrcdoc(data.content ?? ''));
   const renderedHtmlSrcdocAsset = $derived(buildRenderedHtmlSrcdoc(assetPreviewText ?? ''));
   // Inline content (data.content) 의 mime 추정은 markdown 으로 기본 — fileTypeLabel
@@ -385,7 +419,14 @@
   const DOC_MIN_H = 35;
   const DOC_RESTORE_W = 360;
   const DOC_RESTORE_H = 220;
-  const DOC_RESIZE_MIN_W = 220;
+  /* Min width derived from the widest real header content (2026-07-27
+     refinement). doc-head = padding(14+4) + glyph(12) + gap(6) + title-min(~45)
+     + gap(6) + doc-actions(margin-left 2 + full unlocked/workspace cluster):
+     [Rendered|Source] mode-group(43 + 6px side margins) + find/copy/change/
+     min/max/close (6×20=120) + 6×1px inter-button gaps = 175. Sum ≈ 260, so a
+     narrow-width document keeps the whole action cluster + a legible title
+     without clipping. Spawn default (360) and restore (360) both exceed it. */
+  const DOC_RESIZE_MIN_W = 260;
   const DOC_RESIZE_MIN_H = 160;
 
   function applyLiveResize(next: ResizeParams): void {
@@ -636,6 +677,124 @@
       window.removeEventListener('pointerdown', onWindowPointerDown, true);
     };
   });
+
+  // ── In-document find (ADR-0058) ──
+  let docBodyEl = $state<HTMLDivElement | null>(null);
+  let findBar = $state<{
+    focusInput: (opts?: { selectAll?: boolean }) => void;
+    prefill: (text: string) => void;
+  } | null>(null);
+
+  const findCtl = new DocumentFindController({
+    getRoot: () => docBodyEl,
+    getCodeText: () => (isInline ? (data.content ?? '') : (assetPreviewText ?? '')),
+  });
+
+  /** Searchable views only (ADR-0058 D3/D4): markdown rendered + source view.
+   *  Not html rendered (sandbox iframe) / pdf / empty / minimized / while
+   *  the inline editor is open (edit-mode find is a follow-up, D3). */
+  const findSearchable = $derived.by((): boolean => {
+    if (data.minimized === true || isEmpty || contentEditing) return false;
+    if (isPdfAsset) return false;
+    const text = isInline ? (data.content ?? '') : (assetPreviewText ?? '');
+    if (text.trim().length === 0) return false;
+    if (viewMode === 'source') return true;
+    return fileTypeLabel !== 'html';
+  });
+
+  function openFindSurface(req?: DocumentFindOpenRequest): void {
+    findCtl.openBar();
+    void tick().then(() => {
+      // Prefill = first line of the selection (line-based code matching never
+      // matches across newlines, ADR-0058 D2).
+      const prefill = (req?.prefill ?? '').split('\n')[0]?.trim() ?? '';
+      if (prefill.length > 0) findBar?.prefill(prefill);
+      findBar?.focusInput({ selectAll: true });
+    });
+  }
+
+  // Cmd/Ctrl+F routing target (ADR-0058 D5) — registered only while searchable.
+  $effect(() => {
+    if (!findSearchable) return;
+    return registerDocumentFindSurface(`node:${data.id}`, openFindSurface);
+  });
+
+  // View became unsearchable (edit entered, file swapped to pdf/html, …) →
+  // drop the open bar instead of showing a dead counter.
+  $effect(() => {
+    if (!findSearchable && findCtl.open) findCtl.close();
+  });
+
+  // Maximize handoff — node → modal (ADR-0058 D1 override 2026-07-23, survive
+  // maximize/restore). When this document is maximized while its find is open,
+  // stash the query + current index so the modal's find resumes with it. The
+  // modal's openWith() closes THIS controller (single-active invariant), so no
+  // explicit close here. Keyed on isMaximized; the open-state read is untracked.
+  $effect(() => {
+    if (!isMaximized) return;
+    untrack(() => {
+      if (findCtl.open) recordFindHandoff(data.id, findCtl.query, findCtl.currentIndex);
+    });
+  });
+
+  // Restore handoff — modal → node (ADR-0058 D1 override). When this document is
+  // un-maximized, consume the record the modal stashed on teardown and reopen
+  // the node's find with the same query + index. The CONSUME is deferred into
+  // the post-flush tick() callback (not the effect body): the modal records the
+  // handoff in its unmount cleanup, which runs in the same maximizedItemId flush
+  // — reading it after tick guarantees the record exists (consume-before-record
+  // race otherwise). Consumes only a matching record, so an explicit close (no
+  // record) or an unrelated toggle is a no-op.
+  $effect(() => {
+    if (isMaximized) return;
+    void tick().then(() =>
+      untrack(() => {
+        if (isMaximized || !findSearchable) return;
+        const handoff = consumeFindHandoff(data.id);
+        if (handoff === null) return;
+        findCtl.openWith(handoff.query, handoff.currentIndex);
+      }),
+    );
+  });
+
+  $effect(() => {
+    return () => findCtl.destroy();
+  });
+
+  // ── Document scroll persistence (ADR-0056) ──
+  /** The active scroll surface for anchor measurement, or null for excluded
+   *  views (html rendered iframe / pdf / empty / minimized / editing — D6). */
+  const scrollSurfaceKind = $derived.by((): ScrollSurfaceKind | null => {
+    if (data.minimized === true || isEmpty || contentEditing) return null;
+    if (isPdfAsset) return null;
+    const text = isInline ? (data.content ?? '') : (assetPreviewText ?? '');
+    if (text.trim().length === 0) return null;
+    if (viewMode === 'source') return 'line';
+    if (fileTypeLabel === 'html') return null; // rendered HTML = sandbox iframe
+    return 'block';
+  });
+
+  // Attach on mount / view switch / content load; re-run swaps the container.
+  $effect(() => {
+    const kind = scrollSurfaceKind;
+    const host = docBodyEl;
+    // Depend on the source text so this re-runs when async asset content lands
+    // (relayout) — the scroll container element only exists once content does.
+    void (isInline ? data.content : assetPreviewText);
+    if (kind === null || host === null) return;
+    const el = host.querySelector<HTMLElement>(
+      kind === 'line' ? '.code-viewer' : '.document-markdown-view',
+    );
+    if (el === null) return;
+    const seed = data.view_state?.anchor ?? null;
+    return attachDocumentScroll({
+      el,
+      kind,
+      itemId: data.id,
+      seedAnchor: seed !== null && seed.kind === kind ? seed : null,
+      getMode: () => viewMode,
+    });
+  });
 </script>
 
 {#if isVisible}
@@ -658,7 +817,7 @@
     <NodeResizer
       nodeId={data.id}
       isVisible={isInM && !isLocked && data.minimized !== true}
-      minWidth={220}
+      minWidth={260}
       minHeight={160}
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
@@ -667,12 +826,13 @@
       {onResize}
       {onResizeEnd}
     />
-    <!-- 1. Doc-head: file svg + title + actions. Filename lives in footer. -->
+    <!-- 1. Doc-head: file glyph + title + actions. Filename lives in footer.
+         Type-identity glyph unified via CanvasGlyph 'file' (icon system
+         unification 2026-07-27, ADR-0016 정합). -->
     <header class="doc-head">
-      <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-        <path d="M3 1.5h4.5L9.5 3.5V10.5H3V1.5z" />
-        <path d="M7.5 1.5V3.5h2" />
-      </svg>
+      <span class="doc-glyph" aria-hidden="true">
+        <CanvasGlyph name="file" />
+      </span>
       {#if labelEditing}
         <InlineEditField
           value={documentTitle}
@@ -691,36 +851,71 @@
           role="presentation"
         >{documentTitle}</span>
       {/if}
-      {#if !isLocked || documentCopyPath !== null}
-        <div class="doc-actions">
-          {#if !isLocked && canToggleView}
-            <!-- ADR-0037 amend — markdown/html use one 2-mode rendered↔source
-                 transition. The icon hints the next mode. -->
+      <div class="doc-actions">
+          {#if isLocked}
+            <!-- Locked-state indicator — unified CanvasGlyph 'lock' (lock UX
+                 unification 2026-07-27, ADR-0018 D9 family). Static status
+                 glyph — unlock stays in the Inspector State section. Mutating
+                 buttons (change / minimize / close) are hidden while locked;
+                 the view-only controls (mode toggle / find / copy / maximize)
+                 stay so a locked document is still fully readable. -->
+            <span class="doc-lock" title="Locked — unlock in the Inspector" aria-label="Locked">
+              <CanvasGlyph name="lock" />
+            </span>
+          {/if}
+          {#if canToggleView}
+            <!-- ADR-0037 amend / ADR-0037 D1 UI amend 2026-07-27 — rendered↔
+                 source is a two-button segmented control [Rendered | Source]
+                 leading the actions (same vocabulary as SnippetsNode's
+                 .snip-mode-group). Active side is accent-filled like the
+                 snippet modes (NOT an edit mode, so no purple). Mode persists
+                 via documentViewModeStore / view_state; the D3 flush lives in
+                 setViewModeTo. -->
+            <div class="doc-mode-group" role="group" aria-label="Document view mode">
+              <button
+                type="button"
+                class="doc-btn doc-mode-btn nodrag"
+                class:is-active={viewMode === 'rendered'}
+                title="Rendered"
+                aria-label="Rendered view"
+                aria-pressed={viewMode === 'rendered'}
+                onclick={(e: MouseEvent) => { e.stopPropagation(); setViewModeTo('rendered'); }}
+                onmousedown={(e: MouseEvent) => e.stopPropagation()}
+              >
+                <!-- book-open (rendered) — visibility eye 와 겹침 회피. -->
+                <CanvasGlyph name="book-open" />
+              </button>
+              <button
+                type="button"
+                class="doc-btn doc-mode-btn nodrag"
+                class:is-active={viewMode === 'source'}
+                title="Source"
+                aria-label="Source view"
+                aria-pressed={viewMode === 'source'}
+                onclick={(e: MouseEvent) => { e.stopPropagation(); setViewModeTo('source'); }}
+                onmousedown={(e: MouseEvent) => e.stopPropagation()}
+              >
+                <!-- </> code (source) -->
+                <CanvasGlyph name="code" />
+              </button>
+            </div>
+          {/if}
+          {#if findSearchable}
+            <!-- ADR-0058 D4 — magnifier opens the in-document FindBar. Shown
+                 for read-only (locked) documents too: find never mutates. -->
             <button
               type="button"
-              class="doc-btn nodrag"
-              class:is-active={viewMode !== 'rendered'}
-              title={nextViewModeLabel}
-              aria-label={nextViewModeLabel}
+              class="doc-btn toggle-on nodrag"
+              class:is-active={findCtl.open}
+              title="Find in document"
+              aria-label="Find in document"
               onclick={(e: MouseEvent) => {
                 e.stopPropagation();
-                documentViewModeStore.set(data.id, getNextViewMode(viewMode, fileTypeLabel));
+                openFindSurface();
               }}
               onmousedown={(e: MouseEvent) => e.stopPropagation()}
             >
-              {#if viewMode === 'source'}
-                <!-- book-open (show rendered) — visibility eye 와 겹침 회피. -->
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                  <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
-                  <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
-                </svg>
-              {:else}
-                <!-- </> code (show source) -->
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-                  <polyline points="16 18 22 12 16 6"/>
-                  <polyline points="8 6 2 12 8 18"/>
-                </svg>
-              {/if}
+              <CanvasGlyph name="search" />
             </button>
           {/if}
           {#if documentCopyPath !== null}
@@ -732,10 +927,7 @@
               onclick={(e) => void onCopyPathClick(e)}
               onmousedown={(e: MouseEvent) => e.stopPropagation()}
             >
-              <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="5" y="5" width="8" height="9" rx="1.2"/>
-                <path d="M3 11V3a1 1 0 0 1 1-1h6"/>
-              </svg>
+              <CanvasGlyph name="copy" />
             </button>
           {/if}
           {#if !isLocked}
@@ -747,11 +939,7 @@
             onclick={(e) => void onLoadFileClick(e)}
             onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-              <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
-              <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
-              <line x1="8" x2="16" y1="12" y2="12"/>
-            </svg>
+            <CanvasGlyph name="change" />
           </button>
           <button
             type="button"
@@ -763,28 +951,30 @@
             onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
             {#if data.minimized === true}
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-                <path d="M3 5h6"/><path d="M3 8h6"/>
-              </svg>
+              <CanvasGlyph name="restore-min" />
             {:else}
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-                <path d="M3 8h6"/>
-              </svg>
+              <CanvasGlyph name="minimize" />
             {/if}
           </button>
+          {/if}
+          <!-- Maximize — view-only (ephemeral modal overlay, no layout
+               mutation), so it stays visible while locked. -->
           <button
             type="button"
-            class="doc-btn nodrag"
+            class="doc-btn toggle-on nodrag"
             class:is-active={isMaximized}
             title={isMaximized ? 'Restore' : 'Maximize'}
             aria-label={isMaximized ? 'Restore' : 'Maximize'}
             onclick={onMaximizeClick}
             onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
-            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
-              <rect x="2.5" y="2.5" width="7" height="7" rx="0.5"/>
-            </svg>
+            {#if isMaximized}
+              <CanvasGlyph name="restore-max" />
+            {:else}
+              <CanvasGlyph name="maximize" />
+            {/if}
           </button>
+          {#if !isLocked}
           <button
             type="button"
             class="doc-btn close nodrag"
@@ -793,22 +983,40 @@
             onclick={(e) => void onCloseClick(e)}
             onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
-            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-              <path d="M3 3l6 6M9 3l-6 6"/>
-            </svg>
+            <CanvasGlyph name="close" />
           </button>
           {/if}
         </div>
-      {/if}
     </header>
 
     <!-- 2. Doc-body: eyebrow + h2 + p (placeholder 시 empty hint) -->
-    <div
-      class="doc-body nowheel"
-      ondblclick={onBodyDblClick}
-      onwheel={onBodyWheel}
-      role="presentation"
-    >
+    <!-- ADR-0058 D1 — FindBar sits as a SIBLING of the observed scroll root
+         (docBodyEl), not inside it: its live counter text must not fire
+         docBodyEl's MutationObserver (subtree/characterData → rAF re-match per
+         navigation). The wrapper is the positioned anchor so the floating
+         overlay still lands at the same top-right box. -->
+    <div class="doc-body-wrap">
+      {#if findCtl.open && findSearchable}
+        <!-- floating find overlay (absolute, top-right). -->
+        <FindBar
+          bind:this={findBar}
+          matchCount={findCtl.count}
+          currentIndex={findCtl.currentIndex}
+          capped={findCtl.capped}
+          initialQuery={findCtl.query}
+          onQueryChange={(q: string) => findCtl.setQuery(q)}
+          onNavigate={(dir: 1 | -1) => findCtl.navigate(dir)}
+          onClose={() => findCtl.close()}
+        />
+      {/if}
+      <div
+        bind:this={docBodyEl}
+        class="doc-body nowheel"
+        data-find-surface={findSearchable ? `node:${data.id}` : undefined}
+        ondblclick={onBodyDblClick}
+        onwheel={onBodyWheel}
+        role="presentation"
+      >
       {#if contentEditing}
         <InlineEditTextarea
           value={data.content ?? ''}
@@ -823,11 +1031,8 @@
       {:else if isEmpty}
         <div class="empty-hint">
           <span class="empty-idle" aria-hidden="true">
-            <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" stroke-linecap="round">
-              <path d="M7 3.5h7l3 3v14H7z"/>
-              <path d="M14 3.5v3h3"/>
-              <path d="M10 11h4M10 14h5M10 17h3"/>
-            </svg>
+            <!-- unified via CanvasGlyph 'file' (icon unification 2026-07-27) -->
+            <CanvasGlyph name="file" size={24} />
           </span>
         </div>
       {:else if isInline}
@@ -900,16 +1105,16 @@
           {/if}
         {:else}
           <div class="asset-summary">
-            <svg class="asset-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-              <path d="M7 3.5h7l3 3v14H7z"/>
-              <path d="M14 3.5v3h3"/>
-              <path d="M10 11h4M10 14h5M10 17h3"/>
-            </svg>
+            <span class="asset-icon" aria-hidden="true">
+              <!-- unified via CanvasGlyph 'file' (icon unification 2026-07-27) -->
+              <CanvasGlyph name="file" size={24} />
+            </span>
             <h2>{displayFileName}</h2>
             <p>{assetPreviewError ?? 'Preview is not available for this document type.'}</p>
           </div>
         {/if}
       {/if}
+      </div>
     </div>
 
     <!-- 3. Doc-foot: page-dot + count + right meta -->
@@ -947,7 +1152,20 @@
    * grid 30 / 1fr / 26 (head/body/foot). */
   .document-node {
     display: grid;
-    grid-template-rows: 30px 1fr 26px;
+    /* header chrome unification 2026-07-27 (ADR-0017 정합) — head row 32px to
+       match PanelNode's 32px .panel-header (the chrome anchor). Body (1fr)
+       absorbs the +2px; foot stays 26px. */
+    grid-template-rows: 32px 1fr 26px;
+    /* Pin the single implicit column to the node width. Without the `minmax(0, …)`
+       floor the `auto` track grows to the body's max-content — the source view's
+       CodeViewer sets `min-width: max-content` on its lines, so a long source line
+       widened the shared grid column and pushed the header's right-aligned
+       `.doc-actions` (find / view toggle / copy / min·max·close) past the node's
+       `overflow: hidden` edge → the icons vanished and the toggle became
+       unclickable (view-source live-testing regression). The maximized modal was
+       immune because its `.max-body` grid item is a scroll container (min-width 0);
+       `.doc-body-wrap` is not, so cap the track here. */
+    grid-template-columns: minmax(0, 1fr);
     box-sizing: border-box;
     background: var(--color-surface);
     border: 1px solid var(--color-border);
@@ -991,12 +1209,29 @@
     border-top: 1px solid var(--color-border);
   }
 
-  .doc-head svg {
+  .doc-glyph {
+    display: inline-flex;
     flex-shrink: 0;
     opacity: 0.75;
   }
 
-  .doc-head .doc-title,
+  /* Header title — NoteNode-anchored micro-label family (icon system
+     unification 2026-07-27, ADR-0016 정합): mono · 9.5px · 540 · 0.6px.
+     NO uppercase: the title is a filename/stem (case-bearing — uppercase
+     would semantically distort it). Footer filename keeps its meta look. */
+  .doc-head .doc-title {
+    flex: 1 1 auto;
+    font-family: var(--font-mono);
+    color: var(--color-fg);
+    font-size: 9.5px;
+    font-weight: var(--weight-semibold);
+    letter-spacing: 0.6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+
   .doc-foot .filename {
     flex: 1 1 auto;
     color: var(--color-fg);
@@ -1044,12 +1279,14 @@
     margin-left: 2px;
   }
 
+  /* 20×20 canvas-tier standard box (icon system unification 2026-07-27,
+     ADR-0016 정합; NoteNode-anchored rev). */
   .doc-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
-    height: 22px;
+    width: 20px;
+    height: 20px;
     border: none;
     background: transparent;
     border-radius: 4px;
@@ -1061,6 +1298,18 @@
       color var(--motion-fast) var(--motion-easing);
   }
 
+  /* Locked-state indicator — canvas-tier 20×20 box matching the .doc-btn
+     footprint so the header stays aligned. Non-interactive status glyph. */
+  .doc-lock {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    color: var(--color-fg-muted);
+    flex: 0 0 auto;
+  }
+
   .doc-btn:hover:not(:disabled) {
     background: var(--color-glass-2);
     color: var(--color-fg);
@@ -1069,6 +1318,40 @@
   .doc-btn.is-active {
     background: var(--color-glass-2);
     color: var(--color-fg);
+  }
+
+  /* Toggle-ON standard (SoT §3) — a persistent "view/surface active" toggle
+     (find open, maximized) tints its icon with the rail current-tab accent,
+     mirroring .rail-btn.active. Minimize keeps the neutral-glass rule above
+     (SoT §3 exception). Accent is theme-agnostic → reads on light + dark. */
+  .doc-btn.toggle-on.is-active,
+  .doc-btn.toggle-on.is-active:hover:not(:disabled) {
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  }
+
+  /* ADR-0037 D1 UI amend 2026-07-27 — [Rendered | Source] segmented control.
+     Faint container + inter-button gap read as one unit (matches SnippetsNode's
+     .snip-mode-group). Buttons keep the 22×22 doc-btn footprint; the active
+     side is accent-filled like the snippet modes (not an edit mode → accent,
+     no purple), kept on hover. */
+  .doc-mode-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 1px;
+    padding: 1px;
+    background: var(--color-glass-1);
+    border-radius: var(--radius-sm);
+    flex: 0 0 auto;
+    /* Mode-group ↔ neighbouring buttons = 4px (SoT §1: group-adjacency gap).
+       3px side margin + the cluster's 1px flex gap reads as 4px to the next
+       button, while plain button↔button stays 1px (2026-07-27 refinement). */
+    margin: 0 3px;
+  }
+  .doc-mode-btn.is-active,
+  .doc-mode-btn.is-active:hover:not(:disabled) {
+    background: var(--color-accent);
+    color: var(--color-accent-fg);
   }
 
   .doc-btn.close:hover:not(:disabled) {
@@ -1082,7 +1365,12 @@
   }
 
   .document-node.is-min {
-    grid-template-rows: 30px;
+    /* header chrome unification 2026-07-27 (ADR-0017 정합) — collapsed head fills
+       the DOC_MIN_H (35) node via 1fr, matching PanelNode (.panel.minimized
+       .panel-header { height:100% }) and SnippetsNode (.is-min → 1fr). A fixed
+       track (was 30px) left a gap below the head so the minimized document read
+       shorter than the minimized terminal; 1fr removes it. */
+    grid-template-rows: 1fr;
     border: 0;
     box-shadow: none;
     background: transparent;
@@ -1103,13 +1391,24 @@
     border-width: calc(1.5px / var(--canvas-zoom, 1));
   }
 
-  .document-node.is-min .doc-body,
+  .document-node.is-min .doc-body-wrap,
   .document-node.is-min .doc-foot {
     display: none;
   }
 
-  /* body — generous padding, eyebrow + h2 + p */
+  /* body wrapper — the grid 1fr slot + positioned anchor for the floating
+     FindBar overlay (ADR-0058 D1). FindBar is a sibling of the scroll root so
+     its counter mutations stay out of docBodyEl's MutationObserver. */
+  .doc-body-wrap {
+    position: relative;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* body — generous padding, eyebrow + h2 + p. Fills the wrapper and scrolls. */
   .doc-body {
+    flex: 1 1 auto;
     padding: 28px 36px 24px;
     overflow: auto;
     min-height: 0;
@@ -1224,8 +1523,7 @@
   }
 
   .asset-icon {
-    width: 24px;
-    height: 24px;
+    display: inline-flex;
     color: var(--color-fg-muted);
   }
 
@@ -1259,11 +1557,6 @@
     color: var(--color-fg-muted);
     opacity: 0.7;
     transition: opacity var(--motion-fast) var(--motion-easing);
-  }
-
-  .empty-icon {
-    width: 24px;
-    height: 24px;
   }
 
   /* Inline edit chrome — doc-content-edit textarea + doc-name-edit input.

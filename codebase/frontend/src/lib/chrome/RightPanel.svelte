@@ -87,7 +87,7 @@
       aria-label="Expand right panel"
       onclick={() => chromeStore.togglePaneInfo()}
     >
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <polyline points="15 18 9 12 15 6" />
       </svg>
     </button>
@@ -102,7 +102,7 @@
       onclick={() => expandAndSelect('inspect')}
     >
       <!-- info circle -->
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="9"/>
         <line x1="12" y1="11" x2="12" y2="17"/>
         <line x1="12" y1="7.5" x2="12" y2="7.6"/>
@@ -117,7 +117,7 @@
       disabled={noActiveSession}
       onclick={() => expandAndSelect('preview')}
     >
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h8L20 10.5v8A1.5 1.5 0 0 1 18.5 20h-13A1.5 1.5 0 0 1 4 18.5v-13z"/>
         <path d="M13 4v7h7"/>
       </svg>

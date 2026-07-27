@@ -36,6 +36,12 @@ import { layoutEtag } from '$lib/stores/layoutEtag';
 import { panelCloseDialog } from '$lib/stores/panelCloseDialog.svelte';
 import { danglingTerminals } from '$lib/stores/danglingTerminals.svelte';
 import { historyStore } from '$lib/stores/historyStore.svelte';
+import { documentViewModeStore } from '$lib/stores/documentViewMode.svelte';
+import { documentScrollStore } from '$lib/stores/documentScroll.svelte';
+import {
+  discardDocumentViewStateSave,
+  resetDocumentViewStateSaver,
+} from '$lib/stores/documentViewStateSaver';
 import { terminalPool } from '$lib/stores/terminalPool.svelte';
 import { sessionStorageHint } from '$lib/stores/sessionStorageHint';
 import { toastStore } from '$lib/ui/toast-store.svelte';
@@ -293,10 +299,23 @@ class SessionStore {
     // entry 시점에 *FE 측 invariant* 정합. Idempotent — 이미 정합인 layout 은
     // z 값 변경 0건. 다음 mutation PUT 시 normalized z 가 BE 로 자연 commit.
     const normalized = normalizePathItems(normalizeLayout(layout));
+    // ADR-0056 D3 — seed the live viewMode store from durable `view_state.mode`,
+    // but only for items *new* to this load (F5 / session switch / newly added).
+    // On an external 0x80 refetch, items already present keep their live store
+    // value — the in-memory store wins for surfaces the user is actively
+    // viewing (ADR-0056 D4). Absent view_state.mode = default 'rendered'.
+    const prevIds = new Set(this.items.keys());
     this.items.clear();
     for (const it of normalized.items) {
       const item = normalizeLoadedItem(it);
       this.items.set(item.id, item);
+      if (
+        item.type === 'document' &&
+        !prevIds.has(item.id) &&
+        item.view_state?.mode !== undefined
+      ) {
+        documentViewModeStore.set(item.id, item.view_state.mode);
+      }
     }
     this.groups.clear();
     for (const g of normalized.groups) {
@@ -396,6 +415,10 @@ class SessionStore {
     this.focusMode = { enabled: false, targetPanelId: null };
     this.justSpawnedTextId = null;
     this.suppressedTextEditDblClick = null;
+    // ADR-0056 D1/D4 — drop per-item document view-state so a session switch
+    // does not carry stale scroll anchors / saver timers into the next session.
+    resetDocumentViewStateSaver();
+    documentScrollStore.clearAll();
     sessionStorageHint.clear();
     historyStore.setActive(null);
     // ADR-0053 D7 — 이전 session 의 etag 가 새 session 의 0x80 판별을 오염하지
@@ -1392,6 +1415,14 @@ class SessionStore {
    * `killTerminal=true` 호출 시 — terminal 도 죽이므로 undo 시 unmatched 가
    * 더 흔함. caller (PanelNode performClose 의 kill 선택지) 가 명시 책임.
    */
+  /** ADR-0056 D1/D4 — prune the deleted item's document view-state (scroll
+   *  anchor + saver bookkeeping). No-op for non-document ids (the maps only
+   *  ever hold document ids), so it is safe to call for every deleted id. */
+  #cleanupDocumentViewState(id: string): void {
+    discardDocumentViewStateSave(id);
+    documentScrollStore.clear(id);
+  }
+
   async applyDeletion(
     ids: readonly string[],
     options: {
@@ -1429,6 +1460,7 @@ class SessionStore {
         const result = results[i]!;
         const id = ids[i]!;
         if (result.status === 'fulfilled') {
+          this.#cleanupDocumentViewState(id);
           ok += 1;
           continue;
         }
@@ -1474,6 +1506,7 @@ class SessionStore {
         await deleteItem(active.name, id, kill);
         this.items.delete(id);
         this.M.delete(id);
+        this.#cleanupDocumentViewState(id);
         ok += 1;
       } catch (err) {
         if (err instanceof UnauthorizedError) {

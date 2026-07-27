@@ -41,6 +41,7 @@
     labelWithShortcut,
     primaryModifierBinding,
   } from '$lib/keyboard/shortcutDisplay';
+  import CanvasGlyph from '$lib/canvas/CanvasGlyph.svelte';
 
   interface ToolDef {
     id: ToolId;
@@ -313,10 +314,7 @@
           (e.currentTarget as HTMLButtonElement).blur();
         }}
       >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M3 7v6h6"/>
-          <path d="M21 17a9 9 0 0 0-15-6.7L3 13"/>
-        </svg>
+        <CanvasGlyph name="undo" size={18} />
         <span class="tooltip">{labelWithShortcut('Undo', undoHint)}</span>
       </button>
       <button
@@ -330,10 +328,7 @@
           (e.currentTarget as HTMLButtonElement).blur();
         }}
       >
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M21 7v6h-6"/>
-          <path d="M3 17a9 9 0 0 1 15-6.7L21 13"/>
-        </svg>
+        <CanvasGlyph name="redo" size={18} />
         <span class="tooltip">{labelWithShortcut('Redo', redoHint)}</span>
       </button>
     </div>

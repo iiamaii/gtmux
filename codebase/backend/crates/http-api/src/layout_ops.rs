@@ -1795,6 +1795,48 @@ mod tests {
         }
     }
 
+    /// ADR-0056 D5 — `edit` is a field-whitelist-free partial merge
+    /// (ADR-0053 D), so `view_state` is settable through the generic path
+    /// with no special-casing (`gtmux layout edit <id> --json '{"view_state":…}'`).
+    #[test]
+    fn edit_sets_document_view_state_via_generic_merge() {
+        let doc: Item = serde_json::from_value(serde_json::json!({
+            "type": "document",
+            "id": A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 100.0, "h": 50.0, "z": 0,
+            "visibility": "visible", "locked": false, "minimized": false,
+            "content": "# hi"
+        }))
+        .unwrap();
+        let mut l = layout_with(vec![doc]);
+        op_edit(
+            &mut l,
+            A,
+            &serde_json::json!({
+                "view_state": {
+                    "mode": "source",
+                    "anchor": { "kind": "line", "index": 120, "frac": 0.3 }
+                }
+            }),
+            false,
+        )
+        .unwrap();
+        match &l.items[0] {
+            Item::Document {
+                view_state: Some(vs),
+                ..
+            } => {
+                assert_eq!(vs.mode, Some(schema::DocumentViewMode::Source));
+                let anchor = vs.anchor.as_ref().unwrap();
+                assert_eq!(anchor.kind, schema::DocumentAnchorKind::Line);
+                assert_eq!(anchor.index, 120);
+                assert!((anchor.frac - 0.3).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected item {other:?}"),
+        }
+        assert!(schema::validate(&l).is_ok());
+    }
+
     #[test]
     fn locked_item_requires_force() {
         let mut l = layout_with(vec![rect(A, 0)]);

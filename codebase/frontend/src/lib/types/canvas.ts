@@ -243,6 +243,29 @@ export interface ImageItem extends ItemCommon {
   original_h?: number;
 }
 
+/** ADR-0056 D2 — content-anchor addressing kind. `line` = source view
+ *  (CodeViewer, 1-based `data-line`), `block` = rendered markdown (0-based
+ *  direct-child block index of the scroll container). */
+export type DocumentAnchorKind = 'line' | 'block';
+
+/** ADR-0056 D2 — width-invariant content anchor (pixel `scrollTop` 미채택 —
+ *  canvas 패널과 maximize 의 콘텐츠 폭이 달라 픽셀이 매핑되지 않음). */
+export interface DocumentViewAnchor {
+  kind: DocumentAnchorKind;
+  /** `block` → 0-based block index; `line` → 1-based `data-line`. */
+  index: number;
+  /** Progress within the anchored unit, `0..=1` (BE-validated finite/in-range). */
+  frac: number;
+}
+
+/** ADR-0056 D1/D2 — persisted document view state: render mode + scroll anchor.
+ *  Both fields optional; absent `mode` = 'rendered', absent `anchor` = top.
+ *  Hand-maintained mirror of the BE wire shape (api.d.ts `DocumentViewState`). */
+export interface DocumentViewState {
+  mode?: 'rendered' | 'source';
+  anchor?: DocumentViewAnchor;
+}
+
 export interface DocumentItem extends ItemCommon {
   type: 'document';
   /**
@@ -261,6 +284,9 @@ export interface DocumentItem extends ItemCommon {
   size_bytes?: number;
   /** Inline-stored mode 의 UTF-8 markdown content (cap 64 KB). */
   content?: string;
+  /** ADR-0056 — durable render mode + scroll anchor (canvas↔maximize 공유,
+   *  F5 생존). Additive optional — 옛 record 자연 round-trip. */
+  view_state?: DocumentViewState;
 }
 
 export interface FilePathItem extends ItemCommon {

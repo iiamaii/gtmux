@@ -20,6 +20,7 @@
   import { NodeResizer, useSvelteFlow } from '@xyflow/svelte';
   import PanelDanglingOverlay from './PanelDanglingOverlay.svelte';
   import XtermHost from './XtermHost.svelte';
+  import CanvasGlyph from './CanvasGlyph.svelte';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import PanelCloseConfirmModal from '$lib/chrome/PanelCloseConfirmModal.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
@@ -47,6 +48,9 @@
   // DocumentNode 의 change document button (link icon) 과 동일 패턴.
   function onChangeTerminalClick(e: MouseEvent): void {
     e.stopPropagation();
+    // Defensive — the button is hidden while locked; this guards any other
+    // path (presentation-only, BE stays the ADR-0053 locked-gate authority).
+    if (data.locked === true) return;
     changeTerminalDialog.show(data.id);
   }
 
@@ -247,6 +251,9 @@
   function onClose(e: MouseEvent): void {
     e.stopPropagation();
     if (closing) return;
+    // Defensive — close is hidden while locked (presentation); BE remains the
+    // ADR-0053 locked-gate authority for the actual panel/terminal removal.
+    if (isLocked) return;
     // ADR-0021 G25.1.b — auto-kill 설정이 켜져 있으면 modal 우회하고 즉시
     // [Panel + Terminal] 흐름 실행. 설정 toggle 은 SettingsOverlay 의 Behavior
     // section. Default false 라 load 전에는 자연스럽게 modal 띄움 (fallback).
@@ -366,6 +373,9 @@
   async function onMinimizeClick(e: MouseEvent): Promise<void> {
     e.stopPropagation();
     e.preventDefault();
+    // Minimize persists a geometry change to the layout — a locked-gated
+    // mutation. Button is hidden while locked; guard defensively.
+    if (isLocked) return;
     if (sessionStore.active === null) return;
     const cur = sessionStore.items.get(data.id);
     if (cur === undefined) return;
@@ -430,12 +440,11 @@
       {onResizeEnd}
     />
     <header class="panel-header" aria-label={`Drag handle for ${headerLabel}`}>
-      <!-- ref/frontend-design/components-v5 §04 — panel glyph (terminal icon). -->
-      <svg class="panel-glyph" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <rect x="1" y="1.6" width="11" height="9.8" rx="1.4"/>
-        <path d="M3 5l1.8 1.4L3 7.8"/>
-        <path d="M6 8.4h4"/>
-      </svg>
+      <!-- Type-identity glyph — unified via CanvasGlyph 'terminal'
+           (icon system unification 2026-07-27, ADR-0016 정합). -->
+      <span class="panel-glyph" aria-hidden="true">
+        <CanvasGlyph name="terminal" />
+      </span>
       {#if labelEditing}
         <span class="panel-label-host" role="presentation">
           <InlineEditField
@@ -476,46 +485,50 @@
           <span class="badge badge-input" aria-label="Input target" title="Input target">I</span>
         {/if}
         {#if isLocked}
-          <span class="badge badge-lock" aria-label="Locked" title="Locked">L</span>
+          <!-- Locked-state indicator — unified CanvasGlyph 'lock' (lock UX
+               unification 2026-07-27, ADR-0018 D9 family). Replaces the former
+               literal "L" badge. Static status glyph — unlock stays in the
+               Inspector State section. Mutating buttons (change / minimize /
+               close) are hidden below; maximize is view-only so it stays. -->
+          <span class="panel-lock" aria-label="Locked" title="Locked — unlock in the Inspector">
+            <CanvasGlyph name="lock" />
+          </span>
         {/if}
-        <!-- Change terminal (leftmost, 사용자 요구 2026-05-21 polish) — 가장
-             빈번한 액션이라 우선 노출. DocumentNode change document link icon. -->
+        {#if !isLocked}
+          <!-- Change terminal (leftmost, 사용자 요구 2026-05-21 polish) — 가장
+               빈번한 액션이라 우선 노출. DocumentNode change document link icon.
+               Hidden while locked (mutates the panel's backing terminal). -->
+          <button
+            type="button"
+            class="panel-btn nodrag"
+            aria-label="Change terminal"
+            title="Change terminal"
+            onclick={onChangeTerminalClick}
+            onmousedown={(e: MouseEvent) => e.stopPropagation()}
+          >
+            <CanvasGlyph name="change" />
+          </button>
+          <button
+            type="button"
+            class="panel-btn nodrag"
+            class:is-active={data.minimized === true}
+            aria-label={data.minimized === true ? 'Restore' : 'Minimize'}
+            title={data.minimized === true ? 'Restore' : 'Minimize'}
+            onclick={(e) => void onMinimizeClick(e)}
+            onmousedown={(e: MouseEvent) => e.stopPropagation()}
+          >
+            {#if data.minimized === true}
+              <CanvasGlyph name="restore-min" />
+            {:else}
+              <CanvasGlyph name="minimize" />
+            {/if}
+          </button>
+        {/if}
+        <!-- Maximize — view-only (ephemeral modal overlay, no layout mutation),
+             so it stays visible while locked. -->
         <button
           type="button"
-          class="panel-btn nodrag"
-          aria-label="Change terminal"
-          title="Change terminal"
-          onclick={onChangeTerminalClick}
-          onmousedown={(e: MouseEvent) => e.stopPropagation()}
-        >
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-            <path d="M9 17H7A5 5 0 0 1 7 7h2"/>
-            <path d="M15 7h2a5 5 0 1 1 0 10h-2"/>
-            <line x1="8" x2="16" y1="12" y2="12"/>
-          </svg>
-        </button>
-        <button
-          type="button"
-          class="panel-btn nodrag"
-          class:is-active={data.minimized === true}
-          aria-label={data.minimized === true ? 'Restore' : 'Minimize'}
-          title={data.minimized === true ? 'Restore' : 'Minimize'}
-          onclick={(e) => void onMinimizeClick(e)}
-          onmousedown={(e: MouseEvent) => e.stopPropagation()}
-        >
-          {#if data.minimized === true}
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-              <path d="M3 5.5h6"/><path d="M3 8.5h6"/>
-            </svg>
-          {:else}
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-              <path d="M3 8.5h6"/>
-            </svg>
-          {/if}
-        </button>
-        <button
-          type="button"
-          class="panel-btn nodrag"
+          class="panel-btn toggle-on nodrag"
           class:is-active={isMaximized}
           aria-label={isMaximized ? 'Restore' : 'Maximize'}
           title={isMaximized ? 'Restore' : 'Maximize'}
@@ -523,29 +536,24 @@
           onmousedown={(e: MouseEvent) => e.stopPropagation()}
         >
           {#if isMaximized}
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
-              <rect x="2" y="3.6" width="6.5" height="6.4" rx="0.5"/>
-              <path d="M4 3.6V2.4h6.5v6.4H9"/>
-            </svg>
+            <CanvasGlyph name="restore-max" />
           {:else}
-            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" aria-hidden="true">
-              <rect x="2.5" y="2.5" width="7" height="7" rx="0.6"/>
-            </svg>
+            <CanvasGlyph name="maximize" />
           {/if}
         </button>
-        <button
-          type="button"
-          class="panel-btn close nodrag"
-          aria-label={closeTooltip}
-          title={closeTooltip}
-          disabled={closing}
-          onclick={onClose}
-          onmousedown={(e: MouseEvent) => e.stopPropagation()}
-        >
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-            <path d="M3 3l6 6M9 3l-6 6"/>
-          </svg>
-        </button>
+        {#if !isLocked}
+          <button
+            type="button"
+            class="panel-btn close nodrag"
+            aria-label={closeTooltip}
+            title={closeTooltip}
+            disabled={closing}
+            onclick={onClose}
+            onmousedown={(e: MouseEvent) => e.stopPropagation()}
+          >
+            <CanvasGlyph name="close" />
+          </button>
+        {/if}
       </div>
     </header>
     <div class="panel-body">
@@ -630,21 +638,24 @@
   }
 
   .panel-glyph {
-    width: 13px;
-    height: 13px;
+    display: inline-flex;
     color: var(--color-fg);
     opacity: 0.75;
     flex: 0 0 auto;
   }
 
+  /* Header title — NoteNode-anchored micro-label family (icon system
+     unification 2026-07-27, ADR-0016 정합): mono · 9.5px · 540 · 0.6px.
+     NO uppercase: the title is a terminal UUID / user label (case-bearing
+     identifier — uppercase would distort it). */
   .panel-title {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 9.5px;
     font-weight: 540;
-    letter-spacing: 0.2px;
+    letter-spacing: 0.6px;
     color: var(--color-fg);
     flex: 0 1 auto;
     min-width: 0;
@@ -728,13 +739,14 @@
     flex: 0 0 auto;
   }
 
-  /* 22×22 ghost button — panel-btn (시안 §04). close 변형: red on hover. */
+  /* 20×20 ghost button — canvas-tier standard box (icon system unification
+     2026-07-27, ADR-0016 정합; NoteNode-anchored rev). close: red on hover. */
   .panel-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
-    height: 22px;
+    width: 20px;
+    height: 20px;
     border-radius: 4px;
     background: transparent;
     border: 0;
@@ -755,6 +767,15 @@
   .panel-btn.is-active {
     background: var(--color-glass-2);
     color: var(--color-fg);
+  }
+
+  /* Toggle-ON standard (SoT §3) — maximized-active tints its icon with the
+     rail current-tab accent, mirroring .rail-btn.active. Minimize keeps the
+     neutral-glass rule above (SoT §3 exception). Accent is theme-agnostic. */
+  .panel-btn.toggle-on.is-active,
+  .panel-btn.toggle-on.is-active:hover:not(:disabled) {
+    color: var(--color-accent);
+    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
   }
 
   .panel-btn:focus-visible {
@@ -784,9 +805,17 @@
     color: var(--color-fg-muted);
   }
 
-  .badge-lock {
-    background: var(--color-fg-subtle);
-    color: var(--color-bg);
+  /* Locked-state indicator — canvas-tier 20×20 box matching the sibling
+     .panel-btn footprint so the header stays aligned. Non-interactive status
+     glyph (muted fg, no hover). */
+  .panel-lock {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    color: var(--color-fg-muted);
+    flex: 0 0 auto;
   }
 
   /* .badge-min 제거 — minimize 상태는 panel-btn 의 is-active 로 표시. */

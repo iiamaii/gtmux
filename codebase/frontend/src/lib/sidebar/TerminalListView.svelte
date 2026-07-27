@@ -587,7 +587,11 @@
 
   .term-row {
     display: grid;
-    grid-template-columns: 8px minmax(0, 1fr) auto auto auto;
+    /* First track 12px = 8px LED + 4px slack: the LED fills a FIXED track, so
+       margin on the dot cannot push the name column (grid tracks don't grow
+       from item margins) — the LED↔name gap is track slack + column gap
+       (4+4 = 8px, 2026-07-27 user request). Other column gaps stay 4px. */
+    grid-template-columns: 12px minmax(0, 1fr) auto auto auto;
     align-items: center;
     gap: var(--space-4);
     padding: var(--space-4) var(--space-8) var(--space-4) var(--space-12);

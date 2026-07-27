@@ -5,6 +5,11 @@
 
 import { UnauthorizedError } from './sessions';
 import type { components } from '$lib/types/api';
+import {
+  classifyWriteStatus,
+  writeErrorMessage,
+  type WriteResult,
+} from './fsWriteResult';
 
 export interface FsEntry {
   name: string;
@@ -518,6 +523,59 @@ export function downloadWorkspaceFile(path: string, name: string): void {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+}
+
+/**
+ * `PUT /api/fs/file?path=<abs>` — text-only file write with mandatory `If-Match`
+ * conflict check (ADR-0057 D3). Body is the raw UTF-8 file content; `etag` is the
+ * `"<mtime-nanos>-<size>"` value captured from the GET at load time.
+ *
+ * Returns a discriminated result so the caller can drive the 412 conflict UX
+ * (ADR-0057 D4) without try/catch. `401` still throws to route to /auth like the
+ * rest of the fs client.
+ */
+export async function fsFileWrite(path: string, text: string, etag: string): Promise<WriteResult> {
+  const res = await fetch(fsFileUrl(path), {
+    method: 'PUT',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'If-Match': etag,
+    },
+    body: text,
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { etag?: unknown; size_bytes?: unknown };
+    const nextEtag =
+      typeof body.etag === 'string' && body.etag.length > 0
+        ? body.etag
+        : (res.headers.get('etag') ?? etag);
+    const size =
+      typeof body.size_bytes === 'number' ? body.size_bytes : new TextEncoder().encode(text).length;
+    return { ok: true, etag: nextEtag, sizeBytes: size };
+  }
+  const code = await errorBodyCode(res);
+  const kind = classifyWriteStatus(res.status, code);
+  return { ok: false, kind, status: res.status, message: writeErrorMessage(kind, res.status, code) };
+}
+
+/**
+ * Re-issue a bare `GET /api/fs/file` purely to capture the current ETag header
+ * (ADR-0057 D4 overwrite branch — re-GET the fresh etag, then re-PUT with it).
+ * Returns `null` when the response carries no ETag or the file is gone.
+ */
+export async function fsFileGetEtag(path: string): Promise<string | null> {
+  const res = await fetch(fsFileUrl(path), {
+    method: 'GET',
+    credentials: 'include',
+    headers: { Accept: 'text/plain,application/json,*/*' },
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) return null;
+  // Drain the body so the connection can be reused.
+  await res.text().catch(() => '');
+  return res.headers.get('etag');
 }
 
 export async function uploadFs(

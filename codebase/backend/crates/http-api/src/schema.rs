@@ -239,6 +239,63 @@ pub struct SnippetEntry {
     pub body: String,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Document view state (ADR-0056)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// ADR-0056 D1/D2 — persisted document view state: rendered/source mode plus
+/// a width-invariant content anchor. Both fields are optional; an absent
+/// field means "FE default" (`mode` → rendered, `anchor` → top of document).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentViewState {
+    /// ADR-0056 D3 — durable rendered/source toggle. Absent = `"rendered"`
+    /// (the default is not stored, matching the FE store's absent-entry rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<DocumentViewMode>,
+    /// ADR-0056 D2 — content anchor (deliberately *not* a pixel `scrollTop`:
+    /// canvas and maximize render at different widths, so only a content
+    /// anchor maps to the same position on both surfaces). Absent = top.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<DocumentViewAnchor>,
+}
+
+/// ADR-0056 D3 — document render mode (re-states ADR-0037 D1's 2-mode
+/// toggle as the durable wire form). Wire form: `"rendered" | "source"`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DocumentViewMode {
+    Rendered,
+    Source,
+}
+
+/// ADR-0056 D2 — content anchor. `kind` picks the addressing scheme, `index`
+/// addresses the top visible unit, `frac` is the progress within that unit.
+/// `validate()` enforces `frac` finite and in `0.0..=1.0`
+/// (`DocumentViewStateInvalid`); `index` is intentionally *not*
+/// range-checked — the BE does not know the document's content, the FE
+/// clamps to the content end on restore (ADR-0056 D2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentViewAnchor {
+    pub kind: DocumentAnchorKind,
+    /// `line` → 1-based top visible source line (reuses the `data-line`
+    /// addressing contract, ADR-0037 D7.5); `block` → 0-based direct-child
+    /// block index of the rendered-markdown scroll container.
+    pub index: u32,
+    /// Progress within the anchored line/block. Finite, `0.0..=1.0`.
+    pub frac: f64,
+}
+
+/// ADR-0056 D2 — anchor addressing scheme: source-view line (`CodeViewer`)
+/// vs rendered-markdown block (`DocumentMarkdownView`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum DocumentAnchorKind {
+    Line,
+    Block,
+}
+
 /// ADR-0043 D1 — one endpoint of a `path` item. A `free` endpoint pins to an
 /// absolute canvas point; a `connected` endpoint tracks another item's anchor
 /// and keeps a `fallback_point` (the last resolved anchor coordinate plus
@@ -669,6 +726,12 @@ pub enum Item {
         /// size (legacy asset). `path` items may omit it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size_bytes: Option<u64>,
+        /// ADR-0056 D1/D2 — persisted view state (mode + scroll anchor).
+        /// Additive optional: legacy records round-trip to `None` and the
+        /// field is omitted when unset (no schema_version bump — the
+        /// `restored_geom` precedent, ADR-0018 D11).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_state: Option<DocumentViewState>,
     },
     FilePath {
         #[serde(flatten)]
@@ -791,6 +854,11 @@ pub enum ValidationError {
     /// ADR-0018 D10 amend ① — inline-stored content exceeds the cap.
     #[error("document inline content exceeds {} bytes", DOCUMENT_INLINE_MAX_BYTES)]
     DocumentInlineTooLong,
+    /// ADR-0056 D2 — `view_state.anchor.frac` is not a finite value in
+    /// `0.0..=1.0`. (`anchor.index` is intentionally not range-checked — the
+    /// BE does not know the document's content; the FE clamps on restore.)
+    #[error("document view_state.anchor.frac must be finite and within 0.0..=1.0")]
+    DocumentViewStateInvalid,
     /// ADR-0047 D1 / F1a — an image/document `path` is not a clean
     /// workspace(B)-relative path (empty, absolute, NUL, or `.`/`..`
     /// traversal). The runtime A+denylist boundary is enforced separately at
@@ -866,6 +934,7 @@ impl ValidationError {
             Self::DocumentMissingSource => "document_missing_source",
             Self::DocumentBothSources => "document_both_sources",
             Self::DocumentInlineTooLong => "document_inline_too_long",
+            Self::DocumentViewStateInvalid => "document_view_state_invalid",
             Self::WorkspacePathInvalid => "workspace_path_invalid",
             Self::PathEndpointMissing => "path_endpoint_missing",
             Self::PathInvalidEndpoint => "path_invalid_endpoint",
@@ -1127,6 +1196,7 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                 path,
                 asset_id,
                 content,
+                view_state,
                 ..
             } => {
                 // ADR-0047 D1 (amends ADR-0018 D10) — exactly one of the three
@@ -1150,6 +1220,15 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                     }
                     // Any combination of two or more origins is ambiguous.
                     _ => return Err(ValidationError::DocumentBothSources),
+                }
+                // ADR-0056 D2 — anchor `frac` must be finite and in 0.0..=1.0.
+                // `index` is intentionally not range-checked (the BE does not
+                // know the document content; the FE clamps on restore).
+                // Absent mode/anchor/view_state are always valid.
+                if let Some(anchor) = view_state.as_ref().and_then(|vs| vs.anchor.as_ref()) {
+                    if !anchor.frac.is_finite() || !(0.0..=1.0).contains(&anchor.frac) {
+                        return Err(ValidationError::DocumentViewStateInvalid);
+                    }
                 }
             }
             Item::Path {
@@ -1723,6 +1802,7 @@ mod tests {
             mime: Some("text/markdown".into()),
             file_name: Some("notes.md".into()),
             size_bytes: Some(5),
+            view_state: None,
         });
         assert_eq!(validate(&l), Ok(()));
     }
@@ -1741,6 +1821,7 @@ mod tests {
             mime: Some("application/pdf".into()),
             file_name: Some("spec.pdf".into()),
             size_bytes: Some(12345),
+            view_state: None,
         });
         assert_eq!(validate(&l), Ok(()));
     }
@@ -1757,6 +1838,7 @@ mod tests {
             mime: None,
             file_name: None,
             size_bytes: None,
+            view_state: None,
         });
         assert_eq!(validate(&l), Ok(()));
     }
@@ -1773,6 +1855,7 @@ mod tests {
             mime: Some("text/plain".into()),
             file_name: Some("ghost.txt".into()),
             size_bytes: Some(0),
+            view_state: None,
         });
         assert_eq!(validate(&l), Err(ValidationError::DocumentMissingSource));
     }
@@ -1789,6 +1872,7 @@ mod tests {
             mime: Some("text/markdown".into()),
             file_name: Some("conflicted.md".into()),
             size_bytes: Some(4),
+            view_state: None,
         });
         assert_eq!(validate(&l), Err(ValidationError::DocumentBothSources));
         // path + content is also rejected.
@@ -1801,6 +1885,7 @@ mod tests {
             mime: None,
             file_name: None,
             size_bytes: None,
+            view_state: None,
         });
         assert_eq!(validate(&l2), Err(ValidationError::DocumentBothSources));
     }
@@ -1818,6 +1903,7 @@ mod tests {
                 mime: None,
                 file_name: None,
                 size_bytes: None,
+                view_state: None,
             });
             assert_eq!(
                 validate(&l),
@@ -1839,8 +1925,132 @@ mod tests {
             mime: Some("text/markdown".into()),
             file_name: Some("huge.md".into()),
             size_bytes: Some((DOCUMENT_INLINE_MAX_BYTES + 1) as u64),
+            view_state: None,
         });
         assert_eq!(validate(&l), Err(ValidationError::DocumentInlineTooLong));
+    }
+
+    // ── ADR-0056 D1/D2/D3 — Document view_state (mode + anchor) ──
+
+    /// Build a valid inline-stored document carrying the given `view_state`.
+    fn document_with_view_state(view_state: Option<DocumentViewState>) -> Layout {
+        let mut l = Layout::empty();
+        l.items.push(Item::Document {
+            common: item_common(UUID_A),
+            path: None,
+            asset_id: None,
+            content: Some("# Hi\n".into()),
+            mime: Some("text/markdown".into()),
+            file_name: Some("notes.md".into()),
+            size_bytes: Some(5),
+            view_state,
+        });
+        l
+    }
+
+    /// Full / mode-only / anchor-only / absent view_state all validate and
+    /// round-trip losslessly (ADR-0056 D2 — both sub-fields optional).
+    #[test]
+    fn document_view_state_round_trips_and_validates() {
+        let cases: [Option<DocumentViewState>; 4] = [
+            Some(DocumentViewState {
+                mode: Some(DocumentViewMode::Source),
+                anchor: Some(DocumentViewAnchor {
+                    kind: DocumentAnchorKind::Line,
+                    index: 120,
+                    frac: 0.3,
+                }),
+            }),
+            Some(DocumentViewState {
+                mode: Some(DocumentViewMode::Rendered),
+                anchor: None,
+            }),
+            Some(DocumentViewState {
+                mode: None,
+                anchor: Some(DocumentViewAnchor {
+                    kind: DocumentAnchorKind::Block,
+                    index: 0,
+                    frac: 1.0,
+                }),
+            }),
+            None,
+        ];
+        for view_state in cases {
+            let l = document_with_view_state(view_state);
+            assert_eq!(validate(&l), Ok(()));
+            let s = serde_json::to_string(&l).unwrap();
+            let parsed: Layout = serde_json::from_str(&s).unwrap();
+            assert_eq!(l, parsed);
+        }
+        // Wire shape spot-check: lowercase enum values.
+        let l = document_with_view_state(Some(DocumentViewState {
+            mode: Some(DocumentViewMode::Source),
+            anchor: Some(DocumentViewAnchor {
+                kind: DocumentAnchorKind::Line,
+                index: 120,
+                frac: 0.3,
+            }),
+        }));
+        let v = serde_json::to_value(&l).unwrap();
+        assert_eq!(v["items"][0]["view_state"]["mode"], "source");
+        assert_eq!(v["items"][0]["view_state"]["anchor"]["kind"], "line");
+        assert_eq!(v["items"][0]["view_state"]["anchor"]["index"], 120);
+    }
+
+    /// A pre-ADR-0056 record without `view_state` deserializes to `None`
+    /// (additive optional — backward compat, no schema_version bump).
+    #[test]
+    fn document_view_state_absent_deserializes_to_none() {
+        let v = json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "document",
+                "id": UUID_A, "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 100.0, "h": 50.0, "z": 0,
+                "visibility": "visible", "locked": false, "minimized": false,
+                "content": "# Hi\n"
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        let l: Layout = serde_json::from_value(v).unwrap();
+        match &l.items[0] {
+            Item::Document { view_state, .. } => assert_eq!(view_state, &None),
+            other => panic!("unexpected variant {other:?}"),
+        }
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// `frac` outside 0.0..=1.0 (or non-finite) → `document_view_state_invalid`.
+    #[test]
+    fn document_view_state_bad_frac_rejected() {
+        for bad in [1.5, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let l = document_with_view_state(Some(DocumentViewState {
+                mode: None,
+                anchor: Some(DocumentViewAnchor {
+                    kind: DocumentAnchorKind::Block,
+                    index: 3,
+                    frac: bad,
+                }),
+            }));
+            assert_eq!(
+                validate(&l),
+                Err(ValidationError::DocumentViewStateInvalid),
+                "expected reject for frac {bad:?}"
+            );
+        }
+    }
+
+    /// `view_state: None` is skipped on serialize — the wire object carries
+    /// no `"view_state"` key at all (not `"view_state": null`).
+    #[test]
+    fn document_view_state_none_skipped_on_serialize() {
+        let l = document_with_view_state(None);
+        let v = serde_json::to_value(&l).unwrap();
+        assert!(
+            v["items"][0].as_object().unwrap().get("view_state").is_none(),
+            "view_state must be omitted when None"
+        );
     }
 
     // ── ADR-0047 D1 — Image path/asset_id xor ──

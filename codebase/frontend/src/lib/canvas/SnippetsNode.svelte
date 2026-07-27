@@ -31,6 +31,7 @@
     scheduleLiveAspectResize,
   } from './resizeConstraint';
   import { holdLayoutRefetch, releaseLayoutRefetch } from '$lib/ws/layoutRefetch.svelte';
+  import CanvasGlyph from './CanvasGlyph.svelte';
 
   interface SnippetsNodeData {
     id: string;
@@ -423,18 +424,26 @@
 
     <!-- Head strip — same vocabulary as Document's doc-head -->
     <div class="snip-head">
-      <!-- ADR-0038 — lucide square-library (scaled 24→12 ×0.5). -->
-      <svg class="snip-glyph" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-        <rect x="1.5" y="1.5" width="9" height="9" rx="1"/>
-        <path d="M3.5 3.5v5"/>
-        <path d="M5.5 3.5v5"/>
-        <path d="m7.5 3.5 1 5"/>
-      </svg>
+      <!-- ADR-0038 — lucide square-library, unified via CanvasGlyph
+           (icon system unification 2026-07-27, ADR-0016 정합). -->
+      <span class="snip-glyph" aria-hidden="true">
+        <CanvasGlyph name="library" />
+      </span>
       <span class="eyebrow" title={displayLabel}>{displayLabel}</span>
       <span class="sep">·</span>
       <span class="count">{entries.length} / {SNIPPETS_CAP}</span>
-      {#if !isLocked}
-        <div class="snip-actions">
+      <div class="snip-actions">
+        {#if isLocked}
+          <!-- Locked-state indicator — unified CanvasGlyph 'lock' (lock UX
+               unification 2026-07-27, ADR-0018 D9 family). SnippetsNode has no
+               view-only header controls (no maximize / find / copy), so when
+               locked only the static lock glyph remains. Unlock stays in the
+               Inspector State section. -->
+          <span class="snip-lock" title="Locked — unlock in the Inspector" aria-label="Locked">
+            <CanvasGlyph name="lock" />
+          </span>
+        {/if}
+        {#if !isLocked}
           <!-- 2026-05-24 — mode segmented control. 3 buttons, only one active.
                Clicking switches mode; the active button is highlighted. -->
           <div class="snip-mode-group" role="group" aria-label="Snippet interaction mode">
@@ -450,10 +459,7 @@
               onmousedown={(e: MouseEvent) => e.stopPropagation()}
             >
               <!-- copy / clipboard glyph -->
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <rect x="4" y="2.5" width="6" height="7" rx="0.8"/>
-                <path d="M2 4.5v5a1 1 0 0 0 1 1h4"/>
-              </svg>
+              <CanvasGlyph name="copy" />
             </button>
             <button
               type="button"
@@ -467,10 +473,7 @@
               onmousedown={(e: MouseEvent) => e.stopPropagation()}
             >
               <!-- pencil -->
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M2 10l1-3 5-5 2 2-5 5z"/>
-                <path d="M7 3l2 2"/>
-              </svg>
+              <CanvasGlyph name="pencil" />
             </button>
             <button
               type="button"
@@ -484,10 +487,7 @@
               onmousedown={(e: MouseEvent) => e.stopPropagation()}
             >
               <!-- trash -->
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3 4h6M5 4V3a1 1 0 0 1 1-1h0a1 1 0 0 1 1 1v1"/>
-                <path d="M4 4l.5 6a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1L8 4"/>
-              </svg>
+              <CanvasGlyph name="trash" />
             </button>
           </div>
           <button
@@ -500,13 +500,9 @@
             onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
             {#if isMinimized}
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-                <path d="M3 5h6"/><path d="M3 8h6"/>
-              </svg>
+              <CanvasGlyph name="restore-min" />
             {:else}
-              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-                <path d="M3 8.5h6"/>
-              </svg>
+              <CanvasGlyph name="minimize" />
             {/if}
           </button>
           <button
@@ -517,12 +513,10 @@
             onclick={(e: MouseEvent) => void onCloseClick(e)}
             onmousedown={(e: MouseEvent) => e.stopPropagation()}
           >
-            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" aria-hidden="true">
-              <path d="M3 3l6 6M9 3l-6 6"/>
-            </svg>
+            <CanvasGlyph name="close" />
           </button>
-        </div>
-      {/if}
+        {/if}
+      </div>
     </div>
 
     <!-- Body strip — pill collection. When empty, only the `[+]` add badge
@@ -617,7 +611,10 @@
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.06);
     color: var(--color-fg);
     display: grid;
-    grid-template-rows: 30px 1fr;
+    /* header chrome unification 2026-07-27 (ADR-0017 정합) — head row 32px to
+       match PanelNode's 32px .panel-header (the chrome anchor). Body (1fr)
+       absorbs the +2px. */
+    grid-template-rows: 32px 1fr;
     overflow: visible;
     font-family: var(--font-sans);
     container-type: inline-size;
@@ -676,16 +673,21 @@
     border-width: calc(1.5px / var(--canvas-zoom, 1));
   }
   .snip-head .snip-glyph {
+    display: inline-flex;
     flex-shrink: 0;
     opacity: 0.75;
   }
+  /* Header title (the node's user label) — NoteNode-anchored micro-label
+     family (icon system unification 2026-07-27, ADR-0016 정합): mono ·
+     9.5px · 540 · 0.6px · UPPERCASE (label, not a filename — safe to
+     transform, matches the note head). The `· count` stays as muted meta. */
   .snip-head .eyebrow {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--color-fg);
-    font-weight: 540;
+    font-weight: var(--weight-semibold);
     letter-spacing: 0.6px;
     text-transform: uppercase;
     font-size: 9.5px;
@@ -706,17 +708,18 @@
   /* Head action cluster — always visible (header-bearing components convention,
      matches PanelNode .panel-btn / DocumentNode .doc-btn). Note: NoteNode uses
      hover-reveal because it has no full header — just a tiny compact chrome.
-     All buttons use the 22×22 canonical chrome size — icons 11×11 centered. */
+     All buttons use the 20×20 canvas-tier box — 12px glyphs centered
+     (icon system unification 2026-07-27, ADR-0016 정합). */
   .snip-actions {
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 1px; /* unified inter-button gap (icon unification 2026-07-27) */
     margin-left: auto;
     padding-left: 8px;
     flex-shrink: 0;
   }
   /* 3-button segmented control for viewMode. Same button size as the rest
-     of the chrome (22×22) — segmentation comes from the faint container
+     of the chrome (20×20) — segmentation comes from the faint container
      surround + 1px inter-button gap, not from a smaller button footprint. */
   .snip-mode-group {
     display: inline-flex;
@@ -725,10 +728,24 @@
     padding: 1px;
     background: var(--color-glass-1);
     border-radius: var(--radius-sm);
+    /* Mode-group ↔ neighbouring buttons (minimize/close) = 4px (SoT §1:
+       group-adjacency gap). 3px side margin + the .snip-actions 1px flex gap
+       = 4px to the minimize button; button↔button stays 1px (2026-07-27). */
+    margin: 0 3px;
+  }
+  /* Locked-state indicator — canvas-tier 20×20 box matching .snip-btn-icon so
+     the head stays aligned. Non-interactive status glyph. */
+  .snip-lock {
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    color: var(--color-fg-muted);
+    flex-shrink: 0;
   }
   .snip-btn-icon {
-    width: 22px;
-    height: 22px;
+    width: 20px; /* canvas-tier standard box (icon unification 2026-07-27) */
+    height: 20px;
     display: grid;
     place-items: center;
     border: none;
@@ -747,19 +764,31 @@
     outline: 1px dashed var(--color-accent);
     outline-offset: 1px;
   }
+  /* icon system unification 2026-07-27 (ADR-0016 정합) — the plain minimize
+     button's active treatment now matches the terminal/document panel
+     reference: neutral glass fill + fg color (no accent). Mode buttons keep
+     their per-mode fills via the more-specific `.snip-mode-btn.is-active`
+     rules below (source order wins). Color scheme unchanged — effect/shape
+     only, per the unification brief. */
   .snip-btn-icon.is-active {
-    color: var(--color-accent);
+    background: var(--color-glass-2);
+    color: var(--color-fg);
   }
   .snip-btn-icon.close:hover:not(:disabled) {
     background: var(--color-danger);
     color: #fff;
   }
-  /* Mode buttons — share .snip-btn-icon's 22×22 size. Active state per-mode
-     swaps to accent / danger fill so the active button reads as "selected"
-     within the segmented group. */
+  /* Mode buttons — share .snip-btn-icon's 20×20 size. Active state per-mode
+     swaps fill so the active button reads as "selected" within the segmented
+     group: copy=accent, edit=purple (ADR-0037 D1 UI amend 2026-07-27 —
+     "edit mode = purple" app-wide, token --color-mode-edit), delete=danger. */
   .snip-mode-btn.is-active {
     background: var(--color-accent);
     color: var(--color-accent-fg);
+  }
+  .snip-mode-btn[data-mode='edit'].is-active {
+    background: var(--color-mode-edit);
+    color: #fff;
   }
   .snip-mode-btn[data-mode='delete'].is-active {
     background: var(--color-danger);
@@ -769,6 +798,10 @@
     /* Keep the active fill on hover; don't fall back to ghost hover. */
     background: var(--color-accent);
     color: var(--color-accent-fg);
+  }
+  .snip-mode-btn[data-mode='edit'].is-active:hover:not(:disabled) {
+    background: var(--color-mode-edit);
+    color: #fff;
   }
   .snip-mode-btn[data-mode='delete'].is-active:hover:not(:disabled) {
     background: var(--color-danger);
@@ -859,12 +892,14 @@
     background: color-mix(in srgb, var(--color-success) 18%, transparent);
     color: var(--color-success);
   }
-  /* Edit mode — deeper accent tint signals edit affordance. */
+  /* Edit mode — purple tint + purple text signal the edit affordance
+     (ADR-0037 D1 UI amend 2026-07-27, token --color-mode-edit). */
   .snip-pill.mode-edit {
-    background: color-mix(in srgb, var(--color-accent) 24%, transparent);
+    background: color-mix(in srgb, var(--color-mode-edit) 24%, transparent);
+    color: var(--color-mode-edit);
   }
   .snip-pill.mode-edit:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--color-accent) 36%, transparent);
+    background: color-mix(in srgb, var(--color-mode-edit) 36%, transparent);
   }
   /* Delete mode — danger color tint signals destructive affordance. */
   .snip-pill.mode-delete {
