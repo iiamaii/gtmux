@@ -528,7 +528,7 @@
              so it stays visible while locked. -->
         <button
           type="button"
-          class="panel-btn toggle-on nodrag"
+          class="panel-btn nodrag"
           class:is-active={isMaximized}
           aria-label={isMaximized ? 'Restore' : 'Maximize'}
           title={isMaximized ? 'Restore' : 'Maximize'}
@@ -764,18 +764,11 @@
     color: var(--color-fg);
   }
 
+  /* Active-toggle treatment = neutral glass (SoT §3 — the 2026-07-27 accent
+     tint experiment was reverted the same day on user review). */
   .panel-btn.is-active {
     background: var(--color-glass-2);
     color: var(--color-fg);
-  }
-
-  /* Toggle-ON standard (SoT §3) — maximized-active tints its icon with the
-     rail current-tab accent, mirroring .rail-btn.active. Minimize keeps the
-     neutral-glass rule above (SoT §3 exception). Accent is theme-agnostic. */
-  .panel-btn.toggle-on.is-active,
-  .panel-btn.toggle-on.is-active:hover:not(:disabled) {
-    color: var(--color-accent);
-    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
   }
 
   .panel-btn:focus-visible {

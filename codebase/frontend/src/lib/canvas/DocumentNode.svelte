@@ -420,13 +420,14 @@
   const DOC_RESTORE_W = 360;
   const DOC_RESTORE_H = 220;
   /* Min width derived from the widest real header content (2026-07-27
-     refinement). doc-head = padding(14+4) + glyph(12) + gap(6) + title-min(~45)
+     refinement; re-derived same day for the 8px group-adjacency gap).
+     doc-head = padding(14+4) + glyph(12) + gap(6) + title-min(~45)
      + gap(6) + doc-actions(margin-left 2 + full unlocked/workspace cluster):
-     [Rendered|Source] mode-group(43 + 6px side margins) + find/copy/change/
-     min/max/close (6×20=120) + 6×1px inter-button gaps = 175. Sum ≈ 260, so a
+     [Rendered|Source] mode-group(43 + 14px side margins) + find/copy/change/
+     min/max/close (6×20=120) + 6×1px inter-button gaps = 183. Sum ≈ 268, so a
      narrow-width document keeps the whole action cluster + a legible title
      without clipping. Spawn default (360) and restore (360) both exceed it. */
-  const DOC_RESIZE_MIN_W = 260;
+  const DOC_RESIZE_MIN_W = 268;
   const DOC_RESIZE_MIN_H = 160;
 
   function applyLiveResize(next: ResizeParams): void {
@@ -817,7 +818,7 @@
     <NodeResizer
       nodeId={data.id}
       isVisible={isInM && !isLocked && data.minimized !== true}
-      minWidth={260}
+      minWidth={268}
       minHeight={160}
       color="var(--color-accent)"
       handleClass="panel-resize-handle"
@@ -905,7 +906,7 @@
                  for read-only (locked) documents too: find never mutates. -->
             <button
               type="button"
-              class="doc-btn toggle-on nodrag"
+              class="doc-btn nodrag"
               class:is-active={findCtl.open}
               title="Find in document"
               aria-label="Find in document"
@@ -961,7 +962,7 @@
                mutation), so it stays visible while locked. -->
           <button
             type="button"
-            class="doc-btn toggle-on nodrag"
+            class="doc-btn nodrag"
             class:is-active={isMaximized}
             title={isMaximized ? 'Restore' : 'Maximize'}
             aria-label={isMaximized ? 'Restore' : 'Maximize'}
@@ -1315,19 +1316,11 @@
     color: var(--color-fg);
   }
 
+  /* Active-toggle treatment = neutral glass (SoT §3 — the 2026-07-27 accent
+     tint experiment was reverted the same day on user review). */
   .doc-btn.is-active {
     background: var(--color-glass-2);
     color: var(--color-fg);
-  }
-
-  /* Toggle-ON standard (SoT §3) — a persistent "view/surface active" toggle
-     (find open, maximized) tints its icon with the rail current-tab accent,
-     mirroring .rail-btn.active. Minimize keeps the neutral-glass rule above
-     (SoT §3 exception). Accent is theme-agnostic → reads on light + dark. */
-  .doc-btn.toggle-on.is-active,
-  .doc-btn.toggle-on.is-active:hover:not(:disabled) {
-    color: var(--color-accent);
-    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
   }
 
   /* ADR-0037 D1 UI amend 2026-07-27 — [Rendered | Source] segmented control.
@@ -1343,10 +1336,10 @@
     background: var(--color-glass-1);
     border-radius: var(--radius-sm);
     flex: 0 0 auto;
-    /* Mode-group ↔ neighbouring buttons = 4px (SoT §1: group-adjacency gap).
-       3px side margin + the cluster's 1px flex gap reads as 4px to the next
-       button, while plain button↔button stays 1px (2026-07-27 refinement). */
-    margin: 0 3px;
+    /* Mode-group ↔ neighbouring buttons = 8px (SoT §1.1: group-adjacency gap,
+       2026-07-27 ×2 re-adjust). 7px side margin + the cluster's 1px flex gap
+       reads as 8px to the next button; plain button↔button stays 1px. */
+    margin: 0 7px;
   }
   .doc-mode-btn.is-active,
   .doc-mode-btn.is-active:hover:not(:disabled) {

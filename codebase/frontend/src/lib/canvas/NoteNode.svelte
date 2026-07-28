@@ -333,8 +333,8 @@
       title={isMinimized ? `${data.title || 'Untitled'} — click to restore` : undefined}
     >
       <div class="note-head">
-      <!-- Type-identity glyph — unified via CanvasGlyph 'note' (normalized
-           scroll-text silhouette; icon unification 2026-07-27, ADR-0016 정합). -->
+      <!-- Type-identity glyph — unified via CanvasGlyph 'note' (Toolbar2-anchored
+           lucide scroll-text; note glyph unification 2026-07-27, ADR-0016 정합). -->
       <span class="note-glyph" aria-hidden="true">
         <CanvasGlyph name="note" />
       </span>
@@ -391,7 +391,7 @@
              so it stays available while locked. -->
         <button
           type="button"
-          class="note-btn toggle-on nodrag"
+          class="note-btn nodrag"
           class:is-active={isMaximized}
           title={isMaximized ? 'Restore' : 'Maximize'}
           aria-label={isMaximized ? 'Restore' : 'Maximize'}
@@ -441,12 +441,11 @@
       </div>
 
       <!-- 32×32 chip 모드 시 표시되는 type glyph (note-head/body 는 hide).
-           lucide scroll-text — head .note-glyph 와 동일 silhouette,
-           14-unit viewBox 에 맞춰 약간 확대. -->
-      <svg class="note-chip" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-        <rect x="2" y="2.5" width="10" height="9" rx="1.5"/>
-        <path d="M4 5h6M4 7h6M4 9h3.5"/>
-      </svg>
+           Note glyph unification 2026-07-27 — same CanvasGlyph 'note'
+           (Toolbar2-anchored lucide scroll-text) as every other note surface. -->
+      <span class="note-chip" aria-hidden="true">
+        <CanvasGlyph name="note" size={14} />
+      </span>
     </div>
   </div>
 {/if}
@@ -552,14 +551,6 @@
     background: var(--color-glass-2);
     color: var(--color-fg);
   }
-  /* Toggle-ON standard (SoT §3) — maximized-active tints its icon with the
-     rail current-tab accent, mirroring .rail-btn.active. Minimize keeps the
-     neutral-glass rule above (SoT §3 exception). Accent is theme-agnostic. */
-  .note-btn.toggle-on.is-active,
-  .note-btn.toggle-on.is-active:hover {
-    color: var(--color-accent);
-    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
-  }
   .note-btn.close:hover {
     background: #e5484d;
     color: #ffffff;
@@ -596,6 +587,7 @@
   .note-chip {
     display: none;
     width: 14px; height: 14px;
+    place-items: center;
     color: var(--color-fg);
   }
 
@@ -621,7 +613,7 @@
   }
   .note-node.is-min .note-head,
   .note-node.is-min .note-body-wrap { display: none; }
-  .note-node.is-min .note-chip { display: block; }
+  .note-node.is-min .note-chip { display: grid; }
   .note-node.is-min:hover {
     background: var(--color-surface-2);
   }

@@ -24,6 +24,7 @@
   import { groupHover } from '$lib/stores/groupHover.svelte';
   import { buildChildBlocks, normalizeLayout } from '$lib/stores/zSpace';
   import { renameItemLabel } from '$lib/canvas/terminalLabel';
+  import CanvasGlyph from '$lib/canvas/CanvasGlyph.svelte';
   import { directParentGroupId, effectiveLocked } from '$lib/types/group';
   import InlineEditField from '$lib/common/InlineEditField.svelte';
   import { readExpandedTreeState, writeExpandedTreeState } from './treeExpansionState';
@@ -1217,10 +1218,9 @@
 {#snippet typeIconSvg(p: PanelData)}
   <span class="type-icon" aria-hidden="true">
     {#if p.type === 'note'}
-      <svg width="13" height="13" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
-        <rect x="1.5" y="2" width="9" height="8" rx="1.5"/>
-        <path d="M3.5 4.5h5M3.5 6.5h5M3.5 8.5h3"/>
-      </svg>
+      <!-- Note glyph unification 2026-07-27 — single note drawing app-wide
+           (CanvasGlyph 'note' = Toolbar2 note-tool lucide scroll-text). -->
+      <CanvasGlyph name="note" size={13} />
     {:else if p.type === 'snippets'}
       <svg width="13" height="13" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round">
         <rect x="1.5" y="1.5" width="9" height="9" rx="1"/>

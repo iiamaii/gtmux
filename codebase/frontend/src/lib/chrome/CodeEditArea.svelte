@@ -210,7 +210,12 @@
   }
 
   .cea-gutter-num {
-    padding-right: var(--space-8);
+    /* No padding-right: the number is right-aligned flush to the 28px track
+       edge, exactly like read-mode CodeViewer's `.cv-gutter` (which sits in a
+       28px grid column with no padding). The 8px gap to the code then comes
+       from `.cea-overlay`/`.cea-textarea` padding-left (--cea-pad-x), mirroring
+       CodeViewer's grid `gap`. A padding-right here pulled the digits 8px left
+       of the read-mode position (visible number shift on Viewer↔Edit toggle). */
     color: var(--color-fg-subtle);
     text-align: right;
     white-space: pre;
@@ -278,5 +283,12 @@
   .cea-textarea::selection {
     /* Selection paints on the textarea layer (overlay text is transparent). */
     background: var(--color-selection, rgba(120, 160, 255, 0.35));
+    /* Selected glyphs must stay invisible too. Browsers force a visible
+       foreground on selected text, overriding the base `color: transparent`;
+       that made the textarea's own (metric-divergent) glyphs paint on top of
+       the overlay tokens → doubled/ghosted text under the highlight. Pin both
+       the logical color and WebKit's text-fill so only the overlay paints. */
+    color: transparent;
+    -webkit-text-fill-color: transparent;
   }
 </style>
