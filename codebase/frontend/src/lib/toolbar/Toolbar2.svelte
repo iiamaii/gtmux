@@ -217,11 +217,6 @@
     <path d="M4 17c2-4 4-2 6-5s2-7 5-7 5 4 5 6"/>
   {:else if id === 'text'}
     <path d="M5 5h14M12 5v14M9 19h6" stroke-width="2"/>
-  {:else if id === 'note'}
-    <path d="M15 12h-5"/>
-    <path d="M15 8h-5"/>
-    <path d="M19 17V5a2 2 0 0 0-2-2H4"/>
-    <path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/>
   {:else if id === 'snippets'}
     <rect x="3" y="3" width="18" height="18" rx="2"/>
     <path d="M7 7v10"/>
@@ -276,19 +271,28 @@
               (e.currentTarget as HTMLButtonElement).blur();
             }}
           >
-            <svg
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="1.6"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              aria-hidden="true"
-            >
-              {@render toolIcon(tool.id)}
-            </svg>
+            {#if tool.id === 'note'}
+              <!-- Note glyph unification 2026-07-27 — the note tool consumes
+                   the shared CanvasGlyph (single source both ways: CanvasGlyph
+                   'note' IS this toolbar icon's lucide scroll-text geometry).
+                   Stroke drops to the toolbar tier's 1.6 via the class
+                   override below so it sits evenly among its sibling tools. -->
+              <CanvasGlyph name="note" size={18} class="tool-note-glyph" />
+            {:else}
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                {@render toolIcon(tool.id)}
+              </svg>
+            {/if}
             <span class="tooltip">{labelWithShortcut(tool.name, hint)}</span>
           </button>
         {/each}
@@ -426,6 +430,12 @@
   .tool.active {
     background: var(--color-accent);
     color: var(--color-accent-fg);
+  }
+  /* Note tool consumes the shared CanvasGlyph (stroke-width attr 2); the CSS
+     property wins over the presentation attribute, matching the 1.6 tier of
+     the sibling tool icons. */
+  .tool :global(.tool-note-glyph) {
+    stroke-width: 1.6;
   }
 
   .tool.active:hover {

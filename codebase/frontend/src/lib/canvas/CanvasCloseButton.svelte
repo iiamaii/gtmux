@@ -60,15 +60,18 @@
       color var(--motion-fast) var(--motion-easing);
   }
 
+  /* Dark variant is used only over image content (ImageNode). 2026-07-27
+     re-spec: resting background TRANSPARENT (note-style) instead of the dark
+     chip; a soft drop-shadow keeps the white glyph legible over arbitrary
+     images. Red hover fill is unchanged. */
   .canvas-close.dark {
     width: 20px; /* canvas-tier standard box (icon unification 2026-07-27) */
     height: 20px;
     top: 8px;
     right: 8px;
-    background: rgba(0, 0, 0, 0.45);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    background: transparent;
     color: #ffffff;
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
   }
 
   :global(.svelte-flow__node:hover) .canvas-close,

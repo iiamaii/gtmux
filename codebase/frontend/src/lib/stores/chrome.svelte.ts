@@ -10,6 +10,7 @@
 
 import { pathEditStore } from '$lib/stores/pathEditStore.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
+import { resolveWidthToggle } from '$lib/stores/panelWidthToggle';
 
 export type LeftPanelTab = 'layers' | 'terminals' | 'files';
 export type RightPanelTab = 'inspect' | 'preview';
@@ -28,6 +29,10 @@ const LEFT_PANEL_MIN_WIDTH = 230;
 const LEFT_PANEL_MAX_WIDTH = 520;
 const RIGHT_PANEL_MIN_WIDTH = 240;
 const RIGHT_PANEL_MAX_WIDTH = 560;
+// Floor for the content-fit restore: when a panel is at MIN and its content is
+// narrow enough to fit within this width, expand to this width anyway so the
+// double-click restore never looks like a no-op (ADR-0017 amend ㉓ 재지정).
+const PANEL_RESTORE_FLOOR = 268;
 
 const DEFAULT: ChromeState = {
   sidebarCollapsed: false,
@@ -65,8 +70,17 @@ class ChromeStore {
   }
 
   /** Switch the active tab in the right panel and sync the left panel domain:
-   *  Preview owns Files; Inspect owns Layers/Terminals. */
-  setRightPanelTab(tab: RightPanelTab): void {
+   *  Preview owns Files; Inspect owns Layers/Terminals.
+   *
+   *  ADR-0017 amend ㉒ (D7 amend ③ 정정) + ADR-0046 D6 amend ⑮:
+   *  fold (`paneInfoCollapsed`) is PRESERVED by default. Selection routing
+   *  (Files file select → 'preview', canvas select → 'inspect') must NOT
+   *  expand a collapsed right panel — a folded rail only updates its active
+   *  tab indicator and stays folded until the user expands it. Only an
+   *  explicit reveal action (collapsed-rail tab-icon click) passes
+   *  `{ expand: true }`. When the panel is already expanded, the default
+   *  preserves that expanded state, so tab-switching UX is unchanged. */
+  setRightPanelTab(tab: RightPanelTab, opts?: { expand?: boolean }): void {
     const leftPanelTab = leftPanelTabForRight(tab, this.state.leftPanelTab);
     if (tab !== this.state.rightPanelTab || leftPanelTab !== this.state.leftPanelTab) {
       clearSelectionsForTabTransition('right', tab);
@@ -76,7 +90,7 @@ class ChromeStore {
       leftPanelTab,
       rightPanelTab: tab,
       sidebarCollapsed: false,
-      paneInfoCollapsed: false,
+      paneInfoCollapsed: opts?.expand === true ? false : this.state.paneInfoCollapsed,
     };
     this.persist();
   }
@@ -95,6 +109,34 @@ class ChromeStore {
       rightPanelWidth: clamp(width, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
     };
     this.persist();
+  }
+
+  /** Resize-handle double-click: toggle the left panel width between MIN and the
+   *  content-fit width (measured from the DOM by the component, clamped to
+   *  [floor 268, MAX]). Fold state untouched. ADR-0017 amend ㉓ (재지정). */
+  toggleLeftPanelWidthMinimize(contentFitWidth: number): void {
+    const width = resolveWidthToggle(
+      this.state.leftPanelWidth,
+      LEFT_PANEL_MIN_WIDTH,
+      contentFitWidth,
+      PANEL_RESTORE_FLOOR,
+      LEFT_PANEL_MAX_WIDTH,
+    );
+    this.setLeftPanelWidth(width);
+  }
+
+  /** Resize-handle double-click: toggle the right panel width between MIN and the
+   *  content-fit width (measured from the DOM by the component, clamped to
+   *  [floor 268, MAX]). Fold state untouched. ADR-0017 amend ㉓ (재지정). */
+  toggleRightPanelWidthMinimize(contentFitWidth: number): void {
+    const width = resolveWidthToggle(
+      this.state.rightPanelWidth,
+      RIGHT_PANEL_MIN_WIDTH,
+      contentFitWidth,
+      PANEL_RESTORE_FLOOR,
+      RIGHT_PANEL_MAX_WIDTH,
+    );
+    this.setRightPanelWidth(width);
   }
 
   /** Force a specific state — used by tests / scripted demos. */

@@ -15,6 +15,7 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import CanvasGlyph from './CanvasGlyph.svelte';
+  import { copyTextToSystemClipboard } from '$lib/clipboard/textClipboard';
   import { fsFileUrl } from '$lib/http/fs';
   import {
     IMAGE_EXTENSIONS,
@@ -86,6 +87,21 @@
   );
   const hasAsset = $derived(imageSrc.length > 0);
   const imageLabel = $derived(data.label ?? 'image');
+  // Copy-path target — resolved ABSOLUTE workspace path (same source as
+  // DocumentNode's documentCopyPath). null → no copy button (asset_id-only
+  // or empty image has no filesystem path to copy).
+  const imageCopyPath = $derived(resolvedWorkspacePath);
+
+  async function onCopyPathClick(e: MouseEvent): Promise<void> {
+    e.stopPropagation();
+    const path = imageCopyPath;
+    if (path === null) return;
+    const result = await copyTextToSystemClipboard(path);
+    toastStore.show({
+      message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
+  }
 
   type ResizeParams = { x: number; y: number; width: number; height: number };
   const RESIZE_MIN_W = 120;
@@ -238,6 +254,21 @@
       {onResizeEnd}
     />
     <CanvasCloseButton id={data.id} variant={hasAsset ? 'dark' : 'light'} disabled={isLocked} />
+    {#if imageCopyPath !== null}
+      <!-- Copy path — view-only (never mutates), so it stays VISIBLE while
+           locked (SoT §5 philosophy, document precedent). Copies the resolved
+           ABSOLUTE workspace path with the same toast UX as DocumentNode.
+           Cluster order: copy · change · close (1px gaps, 20×20). -->
+      <button
+        type="button"
+        class="image-copy"
+        title="Copy path"
+        aria-label="Copy path"
+        onclick={(e) => void onCopyPathClick(e)}
+      >
+        <CanvasGlyph name="copy" />
+      </button>
+    {/if}
     {#if isLocked}
       <!-- Locked-state indicator — unified CanvasGlyph 'lock' (lock UX
            unification 2026-07-27, ADR-0018 D9 family). ImageNode has no chrome
@@ -272,10 +303,11 @@
           draggable="false"
         />
         <div class="img-caption" aria-hidden="true">
-          <!-- Type-identity glyph — unified via CanvasGlyph 'image' (icon
-               unification 2026-07-27, ADR-0016 정합). Canvas-tier 12px, sits
-               left of the filename so the hover caption reads as the image's
-               identity row. -->
+          <!-- Type-identity glyph + filename — bottom caption (2026-07-27
+               re-spec: restored to the original bottom placement, HOVER-REVEAL
+               in sync with the overlay buttons). Unified via CanvasGlyph
+               'image' (ADR-0016 정합); canvas-tier 12px, sits left of the
+               filename so the caption reads as the image's identity row. -->
           <span class="caption-glyph"><CanvasGlyph name="image" /></span>
           <span class="filename">{imageLabel}</span>
           <span class="right">image</span>
@@ -372,6 +404,11 @@
     display: block;
   }
 
+  /* Bottom identity caption (2026-07-27 re-spec — restored to original bottom
+     placement). Glyph + filename over a bottom-up dark gradient so it reads
+     over any image. HOVER-REVEAL: opacity 0 → 1 on node hover / focus-within,
+     in sync with the overlay buttons. pointer-events:none so it never blocks
+     the image. */
   .img-caption {
     position: absolute;
     left: 0;
@@ -397,9 +434,8 @@
     opacity: 1;
   }
 
-  /* Caption filename — NoteNode-anchored micro-label family (icon system
-     unification 2026-07-27, ADR-0016 정합). NO uppercase — filename is
-     case-bearing. */
+  /* Caption filename — NoteNode-anchored micro-label family (ADR-0016 정합).
+     NO uppercase — filename is case-bearing. */
   .img-caption .filename {
     min-width: 0;
     overflow: hidden;
@@ -411,7 +447,7 @@
     color: #ffffff;
   }
 
-  /* Identity glyph in the hover caption — canvas-tier 12px, aligned with the
+  /* Identity glyph in the caption — canvas-tier 12px, aligned with the
      filename baseline. currentColor inherits the caption's white text. */
   .img-caption .caption-glyph {
     display: inline-flex;
@@ -421,12 +457,9 @@
   }
 
   .img-caption .right {
-    opacity: 0.7;
-  }
-
-  .img-caption .right {
     margin-left: auto;
     flex-shrink: 0;
+    opacity: 0.7;
   }
 
   :global(.image-node .svelte-flow__resize-control) {
@@ -459,8 +492,13 @@
     place-items: center;
     border: none;
     border-radius: var(--radius-sm);
-    background: color-mix(in srgb, var(--color-surface-2) 88%, transparent);
+    /* Resting background TRANSPARENT — note-style (NoteNode .note-btn parity,
+       2026-07-27 re-spec). Glass fill on hover only. Glyph carries a soft
+       drop-shadow so it stays legible over arbitrary image content while
+       resting transparent. */
+    background: transparent;
     color: var(--color-fg-muted);
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.55));
     cursor: pointer;
     padding: 0;
     opacity: 0;
@@ -483,6 +521,60 @@
   }
 
   .image-change:hover {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
+  }
+
+  /* Copy-path button — one 20px slot left of change (cluster order
+     copy · change · close, 1px gaps). Empty state: close 6 → change 27 →
+     copy 48; asset state (dark close at 8/8): 8 → 29 → 50. While locked the
+     change button is hidden, so copy compacts into the change slot. Same
+     hover-reveal + chip style as .image-change. */
+  .image-copy {
+    position: absolute;
+    top: 6px;
+    right: 48px;
+    z-index: 12;
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    border: none;
+    border-radius: var(--radius-sm);
+    /* Resting background TRANSPARENT — note-style (NoteNode .note-btn parity,
+       2026-07-27 re-spec). Glass fill on hover only. Soft glyph drop-shadow
+       for legibility over arbitrary image content. */
+    background: transparent;
+    color: var(--color-fg-muted);
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.55));
+    cursor: pointer;
+    padding: 0;
+    opacity: 0;
+    transition:
+      opacity var(--motion-fast) var(--motion-easing),
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  .image-node:not(.is-empty) .image-copy {
+    top: 8px;
+    right: 50px;
+  }
+
+  .image-node.locked .image-copy {
+    right: 27px;
+  }
+
+  .image-node.locked:not(.is-empty) .image-copy {
+    right: 29px;
+  }
+
+  .image-node:hover .image-copy,
+  .image-copy:focus-visible {
+    opacity: 1;
+  }
+
+  .image-copy:hover {
     background: var(--color-glass-2);
     color: var(--color-fg);
   }

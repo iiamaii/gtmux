@@ -17,6 +17,7 @@
   import { toastStore } from '$lib/ui/toast-store.svelte';
   import type { FilePathItem, CanvasItem } from '$lib/types/canvas';
   import CanvasCloseButton from './CanvasCloseButton.svelte';
+  import { resolveWorkspacePath } from '$lib/files/workspaceAssets';
   import {
     constrainResizeAspectIfShift,
     scheduleLiveAspectResize,
@@ -111,6 +112,29 @@
     filePicker.openFor('', (path, kind) => {
       void onCommit(path, kind);
     }, { allowDirectories: true });
+  }
+
+  // Copy-path target — ABSOLUTE path (DocumentNode documentCopyPath parity,
+  // 2026-07-27). The picker commits absolute paths, so a leading "/" is copied
+  // as-is; a legacy workspace-relative value is resolved against the active
+  // workspace root first.
+  const workspaceRoot = $derived(sessionStore.effectiveWorkspaceRoot);
+  const fpCopyPath = $derived.by((): string | null => {
+    const raw = (data.path ?? '').trim();
+    if (raw.length === 0) return null;
+    if (raw.startsWith('/')) return raw;
+    return resolveWorkspacePath(workspaceRoot, raw);
+  });
+
+  async function onCopyPathClick(e: MouseEvent): Promise<void> {
+    e.stopPropagation();
+    const path = fpCopyPath;
+    if (path === null) return;
+    const result = await copyTextToSystemClipboard(path);
+    toastStore.show({
+      message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
   }
 
   async function onCopyPathDblClick(e: MouseEvent): Promise<void> {
@@ -236,6 +260,21 @@
       {onResizeEnd}
     />
     <CanvasCloseButton id={data.id} disabled={isLocked} />
+    {#if fpCopyPath !== null}
+      <!-- Copy path — view-only (never mutates), so it stays VISIBLE while
+           locked (SoT §5 philosophy, document precedent). Copies the absolute
+           path with the same toast UX as DocumentNode. Cluster order:
+           copy · change · close (1px gaps, 20×20). -->
+      <button
+        type="button"
+        class="fp-copy"
+        title="Copy path"
+        aria-label="Copy path"
+        onclick={(e) => void onCopyPathClick(e)}
+      >
+        <CanvasGlyph name="copy" />
+      </button>
+    {/if}
     {#if isLocked}
       <!-- Locked-state indicator — unified CanvasGlyph 'lock' (lock UX
            unification 2026-07-27, ADR-0018 D9 family). FilePathNode has no
@@ -351,6 +390,10 @@
     place-items: center;
     border: 0;
     border-radius: var(--radius-sm);
+    /* Resting background CHIP — surface-2 + muted fg (2026-07-28 partial revert
+       of the 2026-07-27 transparent re-spec, SoT §1.3 / ADR-0016). A narrow
+       node lets this overlay sit atop the path text; an opaque chip masks the
+       text so the glyph stays legible. Glass fill + fg appear on hover. */
     background: var(--color-surface-2);
     color: var(--color-fg-muted);
     cursor: pointer;
@@ -368,6 +411,50 @@
   }
 
   .fp-change:hover {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
+  }
+
+  /* Copy-path button — one 20px slot left of change (cluster order
+     copy · change · close, 1px gaps): close 6 → change 27 → copy 48. While
+     locked the change button is hidden, so copy compacts into the change
+     slot. Same hover-reveal + chip style as .fp-change. */
+  .fp-copy {
+    position: absolute;
+    top: 6px;
+    right: 48px;
+    z-index: 12;
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: var(--radius-sm);
+    /* Resting background CHIP — surface-2 + muted fg (2026-07-28 partial revert
+       of the 2026-07-27 transparent re-spec, SoT §1.3 / ADR-0016). Opaque chip
+       keeps the glyph legible when a narrow node overlaps the path text. Glass
+       fill + fg appear on hover. */
+    background: var(--color-surface-2);
+    color: var(--color-fg-muted);
+    cursor: pointer;
+    padding: 0;
+    opacity: 0;
+    transition:
+      opacity var(--motion-fast) var(--motion-easing),
+      background var(--motion-fast) var(--motion-easing),
+      color var(--motion-fast) var(--motion-easing);
+  }
+
+  .file-path-node.locked .fp-copy {
+    right: 27px;
+  }
+
+  .file-path-node:hover .fp-copy,
+  .fp-copy:focus-visible {
+    opacity: 1;
+  }
+
+  .fp-copy:hover {
     background: var(--color-glass-2);
     color: var(--color-fg);
   }

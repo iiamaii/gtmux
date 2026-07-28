@@ -14,6 +14,7 @@
 
   import { onDestroy } from 'svelte';
   import { chromeStore, type RightPanelTab } from '$lib/stores/chrome.svelte';
+  import { measurePanelContentFitWidth } from '$lib/stores/panelWidthToggle';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import ItemInfoView from './ItemInfoView.svelte';
   import FilePreviewView from './FilePreviewView.svelte';
@@ -34,7 +35,10 @@
   }
 
   function expandAndSelect(tab: RightPanelTab): void {
-    chromeStore.setRightPanelTab(tab); // also flips paneInfoCollapsed → false
+    // Explicit reveal — collapsed-rail tab-icon click. Passes expand:true so
+    // the folded panel opens (ADR-0017 amend ㉒). Selection routing uses the
+    // default fold-preserving path instead.
+    chromeStore.setRightPanelTab(tab, { expand: true });
   }
 
   function rightTabTitle(tab: RightPanelTab): string {
@@ -47,6 +51,15 @@
       return leftTab === 'files' ? 'Preview' : 'Switch to Files and preview';
     }
     return leftTab === 'files' ? 'Switch to Layers and inspect' : 'Inspect';
+  }
+
+  // Resize-handle double-click: measure content-fit width from the live DOM
+  // (only meaningful when expanding from MIN; ignored by the resolver on the
+  // minimize branch) and hand it to the store toggle. ADR-0017 amend ㉓ (재지정).
+  function onResizeDblClick(): void {
+    const contentFit =
+      panelEl === null ? panelWidth : measurePanelContentFitWidth(panelEl, panelWidth);
+    chromeStore.toggleRightPanelWidthMinimize(contentFit);
   }
 
   function onResizePointerDown(e: PointerEvent): void {
@@ -135,8 +148,9 @@
       type="button"
       class="resize-handle"
       aria-label="Resize right panel"
-      title="Resize right panel"
+      title="Resize right panel (double-click to minimize width)"
       onpointerdown={onResizePointerDown}
+      ondblclick={onResizeDblClick}
     ></button>
     <header class="right-panel-head">
       <div class="panel-tabs" role="tablist" aria-label="Right panel tabs">

@@ -20,6 +20,7 @@
   import { onMount } from 'svelte';
   import { useSvelteFlow, type Viewport } from '@xyflow/svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
+  import { effectiveVisibility } from '$lib/types/group';
   import { shortcutRegistry, type ShortcutDescriptor } from '$lib/keyboard/shortcutRegistry.svelte';
   import { labelWithShortcut, shortcutForAction } from '$lib/keyboard/shortcutDisplay';
   import { VIEWPORT_ZOOM_STEP, clampViewportZoom } from '$lib/canvas/viewportPolicy';
@@ -47,8 +48,17 @@
   function onReset100(): void {
     setZoom(1);
   }
+  // Fit all — panel-aware (ADR-0017 amend ㉔). Instead of raw `flow.fitView()`
+  // (which fits to the full window and lets open panels cover the result), route
+  // every non-hidden canvas item through the same `zoomToIds` → Canvas
+  // `computeVisibleCanvas()` path used by Fit selection, which excludes the
+  // panel/rail-occupied region. Empty item set no-ops (zoomToIds guards it).
   function onFit(): void {
-    void flow.fitView({ duration: 200, padding: 0.2 });
+    const groupsById = new Map(sessionStore.groups);
+    const ids = [...sessionStore.items.values()]
+      .filter((it) => effectiveVisibility(it.visibility, it.parent_id, groupsById))
+      .map((it) => it.id);
+    sessionStore.zoomToIds(ids, { mode: 'fit' });
   }
   function onFitSelection(): void {
     sessionStore.zoomToSelection({ mode: 'fit' });

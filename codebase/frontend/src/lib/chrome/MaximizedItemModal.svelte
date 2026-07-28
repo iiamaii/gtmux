@@ -969,15 +969,11 @@
     background: var(--color-glass-1);
     color: var(--color-fg);
   }
-  /* Toggle-ON standard (SoT §3) — a persistent "view/surface active" toggle
-     (find open, maximized→restore) tints its icon with the rail current-tab
-     accent, mirroring .rail-btn.active. The [Rendered|Source] mode segment
-     keeps its accent FILL via the more-specific .max-mode-btn override below.
-     Accent is theme-agnostic → reads on light + dark. */
-  .max-btn.is-active,
-  .max-btn.is-active:hover {
-    color: var(--color-accent);
-    background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+  /* Active-toggle treatment = neutral glass (SoT §3 — the 2026-07-27 accent
+     tint experiment was reverted the same day on user review). */
+  .max-btn.is-active {
+    background: var(--color-glass-2);
+    color: var(--color-fg);
   }
 
   /* ADR-0037 D1 UI amend 2026-07-27 — [Rendered | Source] segmented control.
@@ -993,10 +989,10 @@
     background: var(--color-glass-1);
     border-radius: var(--radius-sm);
     flex-shrink: 0;
-    /* Mode-group ↔ neighbouring buttons = 4px (SoT §1: group-adjacency gap).
-       3px side margin + the cluster's 1px flex gap = 4px to the next button;
-       plain button↔button stays 1px (2026-07-27 refinement). */
-    margin: 0 3px;
+    /* Mode-group ↔ neighbouring buttons = 8px (SoT §1.1: group-adjacency gap,
+       2026-07-27 ×2 re-adjust). 7px side margin + the cluster's 1px flex gap
+       = 8px to the next button; plain button↔button stays 1px. */
+    margin: 0 7px;
   }
   .max-mode-btn {
     width: 22px;

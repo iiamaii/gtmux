@@ -728,10 +728,10 @@
     padding: 1px;
     background: var(--color-glass-1);
     border-radius: var(--radius-sm);
-    /* Mode-group ↔ neighbouring buttons (minimize/close) = 4px (SoT §1:
-       group-adjacency gap). 3px side margin + the .snip-actions 1px flex gap
-       = 4px to the minimize button; button↔button stays 1px (2026-07-27). */
-    margin: 0 3px;
+    /* Mode-group ↔ neighbouring buttons (minimize/close) = 8px (SoT §1.1:
+       group-adjacency gap, 2026-07-27 ×2 re-adjust). 7px side margin + the
+       .snip-actions 1px flex gap = 8px; button↔button stays 1px. */
+    margin: 0 7px;
   }
   /* Locked-state indicator — canvas-tier 20×20 box matching .snip-btn-icon so
      the head stays aligned. Non-interactive status glyph. */

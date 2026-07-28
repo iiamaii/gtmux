@@ -957,6 +957,24 @@
     applyRowSelection([row], row.path, row.path);
   }
 
+  // ADR-0046 D6 amend ⑯ — explicit double-click reveal on a tree row.
+  // A dblclick is two clicks; the row selection has already happened via the
+  // single-click path (fold-preserving, amend ⑮), so this handler only adds the
+  // explicit reveal routing:
+  //   - file row → expand the (possibly folded) right panel onto Preview
+  //     (`{ expand: true }` = the "explicit user action" class of ADR-0017 ㉒).
+  //   - directory row → toggle tree expand/collapse, reusing the caret contract
+  //     (select-then-toggle, amend ⑨). Never touches the right-panel fold.
+  function onRowDblClick(row: Row, e: MouseEvent): void {
+    e.stopPropagation();
+    if (row.entry.kind === 'directory') {
+      applyRowSelection([row], row.path, row.path);
+      toggleDirectory(row.path);
+      return;
+    }
+    chromeStore.setRightPanelTab('preview', { expand: true });
+  }
+
   function onRowContextMenu(row: Row, e: MouseEvent): void {
     e.preventDefault();
     e.stopPropagation();
@@ -1943,6 +1961,7 @@
           ondrop={(e: DragEvent) => onFileRowDrop(row, e)}
           ondragend={clearFileDragState}
           oncontextmenu={(e: MouseEvent) => onRowContextMenu(row, e)}
+          ondblclick={(e: MouseEvent) => onRowDblClick(row, e)}
         >
           <div
             class="row-inner"

@@ -28,8 +28,10 @@
    *   - CHROME tier (FilePreviewView toolbar, MaximizedItemModal, RightPanel
    *     inspector + rail, FindBar) -> size 13.
    * Type-identity glyphs share the button metrics so the header reads as one
-   * system; 'note' keeps a normalized simplified silhouette (lucide
-   * scroll-text is too busy at 12px) drawn to the same 24-unit/stroke-2 spec.
+   * system; 'note' = lucide scroll-text, anchored to the Toolbar2 note tool
+   * (note glyph unification 2026-07-27 — the earlier simplified silhouette,
+   * drawn because scroll-text is busy at 12px, was superseded by the user's
+   * explicit toolbar-anchor directive).
    */
 
   type GlyphName =
@@ -56,7 +58,7 @@
     | 'terminal' // lucide square-terminal — PanelNode / modal terminal header
     | 'file' // lucide file — DocumentNode / FilePathNode(file) / modal doc header
     | 'folder' // lucide folder — FilePathNode(directory)
-    | 'note' // normalized scroll-text silhouette — NoteNode / modal note header
+    | 'note' // lucide scroll-text (Toolbar2 anchor) — note tool / NoteNode / modal / layer tree
     | 'library' // lucide square-library — SnippetsNode header
     | 'image' // lucide image — ImageNode empty state
     // Inspector state glyphs (RightPanel inspect tab)
@@ -158,8 +160,14 @@
   {:else if name === 'folder'}
     <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
   {:else if name === 'note'}
-    <rect x="3" y="4" width="18" height="16" rx="3" />
-    <path d="M7 9h10" /><path d="M7 13h10" /><path d="M7 17h6" />
+    <!-- lucide scroll-text — anchored to the Toolbar2 note-tool icon (note
+         glyph unification 2026-07-27). Replaces the earlier simplified
+         silhouette so toolbar / node header / modal / layer tree / minimized
+         chip all share one drawing. -->
+    <path d="M15 12h-5" />
+    <path d="M15 8h-5" />
+    <path d="M19 17V5a2 2 0 0 0-2-2H4" />
+    <path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3" />
   {:else if name === 'library'}
     <rect width="18" height="18" x="3" y="3" rx="2" />
     <path d="M7 7v10" />

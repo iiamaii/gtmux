@@ -19,6 +19,7 @@
 
   import { onDestroy, onMount } from 'svelte';
   import { chromeStore, type LeftPanelTab } from '$lib/stores/chrome.svelte';
+  import { measurePanelContentFitWidth } from '$lib/stores/panelWidthToggle';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { registerLeftPanelSearchController } from './leftPanelSearchController';
   import LayerTreeView from './LayerTreeView.svelte';
@@ -94,6 +95,15 @@
 
   function expandAndSelect(tab: LeftPanelTab): void {
     chromeStore.setLeftPanelTab(tab); // also flips sidebarCollapsed → false
+  }
+
+  // Resize-handle double-click: measure the content-fit width from the live DOM
+  // (only meaningful when expanding from MIN; ignored by the resolver on the
+  // minimize branch) and hand it to the store toggle. ADR-0017 amend ㉓ (재지정).
+  function onResizeDblClick(): void {
+    const contentFit =
+      panelEl === null ? panelWidth : measurePanelContentFitWidth(panelEl, panelWidth);
+    chromeStore.toggleLeftPanelWidthMinimize(contentFit);
   }
 
   function onResizePointerDown(e: PointerEvent): void {
@@ -296,8 +306,9 @@
       type="button"
       class="resize-handle"
       aria-label="Resize left panel"
-      title="Resize left panel"
+      title="Resize left panel (double-click to minimize width)"
       onpointerdown={onResizePointerDown}
+      ondblclick={onResizeDblClick}
     ></button>
   </aside>
 {/if}
