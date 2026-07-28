@@ -933,6 +933,16 @@
   }
 
   function onCanvasPointerDown(e: PointerEvent) {
+    // ADR-0017 amend ㉕: reclaim keyboard focus from a focused iframe on canvas
+    // click. The preventDefault selection branches below (group-member select,
+    // drill-in, modifier toggle, selection drag) suppress this click's native
+    // focus transfer, so a still-focused HTML/PDF rendered-document iframe would
+    // keep swallowing keydown from the window-bubble shortcutRegistry (e.g.
+    // Cmd/Ctrl+2 leaking to the browser). IFRAME-only guard — never touch
+    // editables/xterm (their IME/inline-edit/terminal input must be untouched).
+    const active = document.activeElement;
+    if (active instanceof HTMLIFrameElement) active.blur();
+
     if (isCanvasControlSurface(e.target)) return;
 
     if (e.button === 0 && isSelectMode && !isDragTool && !isSpacePressed && !isHandTool) {
