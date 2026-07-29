@@ -69,10 +69,12 @@ export interface DockPlacement {
 }
 
 /**
- * Eligible item types for docking (ADR-0051 D1).
+ * Eligible item types for docking (ADR-0051 D1, D1 amend 2026-07-29).
  *
  * Figure types (rect / ellipse / line / path / text / free_draw) are excluded —
  * their aspect / angle semantics (ADR-0031) conflict with plain size matching.
+ * web_view (ADR-0059 box-form node) was folded in as the 7th type on 2026-07-29
+ * (D1 amend — user report that it was missing).
  */
 const ELIGIBLE_TYPES: ReadonlySet<CanvasItemType> = new Set<CanvasItemType>([
   'terminal',
@@ -81,9 +83,10 @@ const ELIGIBLE_TYPES: ReadonlySet<CanvasItemType> = new Set<CanvasItemType>([
   'image',
   'file_path',
   'snippets',
+  'web_view',
 ]);
 
-/** True iff `type` is one of the 6 dock-eligible types (ADR-0051 D1). */
+/** True iff `type` is one of the 7 dock-eligible types (ADR-0051 D1). */
 export function eligibleForDock(type: CanvasItemType): boolean {
   return ELIGIBLE_TYPES.has(type);
 }
@@ -91,9 +94,10 @@ export function eligibleForDock(type: CanvasItemType): boolean {
 /**
  * Per-type minimum dimensions — mirrors each node's NodeResizer minWidth /
  * minHeight (PanelNode 240×140, NoteNode 160×60, DocumentNode 220×160,
- * ImageNode 120×80, FilePathNode 200×80, SnippetsNode 200×75). Used to clamp
- * the matched dimension (ADR-0051 D6). Caller may override via `computeDock`'s
- * `min` argument; this map is the canonical fallback for the 6 eligible types.
+ * ImageNode 120×80, FilePathNode 200×80, SnippetsNode 200×75, WebViewNode
+ * 240×160). Used to clamp the matched dimension (ADR-0051 D6). Caller may
+ * override via `computeDock`'s `min` argument; this map is the canonical
+ * fallback for the 7 eligible types (web_view added D1 amend 2026-07-29).
  */
 export const DOCK_MIN_SIZE: Readonly<Record<string, DockMin>> = {
   terminal: { w: 240, h: 140 },
@@ -102,6 +106,7 @@ export const DOCK_MIN_SIZE: Readonly<Record<string, DockMin>> = {
   image: { w: 120, h: 80 },
   file_path: { w: 200, h: 80 },
   snippets: { w: 200, h: 75 },
+  web_view: { w: 240, h: 160 },
 };
 
 /** Min-size lookup for an eligible type. Falls back to {w:1,h:1} if unknown. */

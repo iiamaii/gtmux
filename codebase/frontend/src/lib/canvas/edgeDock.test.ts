@@ -26,8 +26,16 @@ const TARGET: DockBox = { x: 100, y: 100, w: 200, h: 160 };
 // TARGET sides: L x=100, R x=300, T y=100, B y=260; extents x∈[100,300] y∈[100,260].
 
 describe('eligibleForDock', () => {
-  it('accepts the 6 eligible types', () => {
-    for (const t of ['terminal', 'note', 'document', 'image', 'file_path', 'snippets'] as const) {
+  it('accepts the 7 eligible types (web_view added D1 amend 2026-07-29)', () => {
+    for (const t of [
+      'terminal',
+      'note',
+      'document',
+      'image',
+      'file_path',
+      'snippets',
+      'web_view',
+    ] as const) {
       expect(eligibleForDock(t)).toBe(true);
     }
   });
@@ -35,6 +43,15 @@ describe('eligibleForDock', () => {
     for (const t of ['rect', 'ellipse', 'line', 'path', 'text', 'free_draw'] as const) {
       expect(eligibleForDock(t)).toBe(false);
     }
+  });
+});
+
+describe('dockMinForType', () => {
+  it('web_view min = 240×160 (D1 amend 2026-07-29, matches WebViewNode resizer)', () => {
+    expect(dockMinForType('web_view')).toEqual({ w: 240, h: 160 });
+  });
+  it('falls back to {w:1,h:1} for a non-eligible type', () => {
+    expect(dockMinForType('rect')).toEqual({ w: 1, h: 1 });
   });
 });
 
