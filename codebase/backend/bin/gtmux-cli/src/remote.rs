@@ -132,7 +132,7 @@ pub enum LayoutCmd {
         #[command(flatten)]
         ctx: Ctx,
     },
-    /// Minimize an item (terminal/note/document/snippets only).
+    /// Minimize an item (terminal/note/document/snippets/web_view only).
     Minimize {
         target: String,
         #[arg(long)]
@@ -213,7 +213,7 @@ pub enum LayoutCmd {
     /// `gtmux terminal spawn`).
     Create {
         /// Item type: text|note|rect|ellipse|line|free_draw|image|document|
-        /// file_path|path|snippets.
+        /// web_view|file_path|path|snippets.
         #[arg(value_name = "TYPE")]
         item_type: String,
         #[arg(long, allow_hyphen_values = true)]
@@ -1354,6 +1354,10 @@ fn item_type_name(it: &Item) -> &'static str {
         Item::FilePath { .. } => "file_path",
         Item::Path { .. } => "path",
         Item::Snippets { .. } => "snippets",
+        // ADR-0059 — schema variant added in plan 0025 Batch A; the agent-
+        // facing CLI surface (`layout create web_view`, help, SKILL.md) landed
+        // in Batch C. Generic create/edit plumbing carries the `url` field.
+        Item::WebView { .. } => "web_view",
     }
 }
 
@@ -1939,6 +1943,40 @@ mod tests {
         let mut spawn = obj(&[("op", json!("spawn"))]);
         insert_opt_f64(&mut spawn, "x", None);
         assert_eq!(Value::Object(spawn), json!({"op": "spawn"}));
+    }
+
+    #[test]
+    fn web_view_create_op_carries_url_field() {
+        // ADR-0059 D4 — `layout create web_view --set url=…` rides the generic
+        // create plumbing: the CLI forwards the type + `url` field verbatim and
+        // the server (Batch A) owns scheme/own-origin/4KiB validation.
+        let fields = fields_from_args(&["url=https://example.com".to_string()], None)
+            .unwrap()
+            .unwrap();
+        let create = build_create_op("web_view", None, None, None, None, Some(fields));
+        assert_eq!(
+            create,
+            json!({
+                "op": "create", "item_type": "web_view",
+                "fields": {"url": "https://example.com"}
+            })
+        );
+        // A workspace-relative path is an opaque string to the CLI too.
+        let fields = fields_from_args(&["url=docs/report.md".to_string()], None)
+            .unwrap()
+            .unwrap();
+        let edit = json!({ "op": "edit", "id": ID_TERM, "fields": fields, "force": false });
+        assert_eq!(edit["fields"]["url"], "docs/report.md");
+    }
+
+    #[test]
+    fn web_view_item_type_name_maps() {
+        let it: Item = serde_json::from_value(merged(
+            common(ID_NOTE_A, "site", 0.0, 0.0, 480.0, 360.0),
+            json!({"type": "web_view", "url": "https://example.com"}),
+        ))
+        .expect("web_view item parses");
+        assert_eq!(item_type_name(&it), "web_view");
     }
 
     #[test]

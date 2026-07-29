@@ -831,6 +831,69 @@ components:
           pairs. Click a badge ⇒ copy `body` to clipboard (FE-side action,
           no BE involvement). All edits round-trip through the standard
           `PUT /layout` endpoint.
+      - allOf:
+        - $ref: '#/components/schemas/ItemCommon'
+        - type: object
+          required:
+          - url
+          properties:
+            url:
+              type: string
+              description: |-
+                The linked address. `http(s)://` absolute URL or a clean
+                workspace(B)-relative file path. Validated by [`validate`].
+        - type: object
+          description: |-
+            ADR-0059 D1 — Web View. A **live read-only window** onto an address:
+            either an `http(s)://` absolute URL or a workspace(B)-relative file
+            path (html/md/image). Pure web state — no tmux surface (invariant #1/#2).
+
+            Distinct from `Document` (which *owns* a workspace file with edit /
+            find / view_state); this component only *renders* whatever the address
+            currently serves (reload = latest). `url` form is validated on every
+            create / edit (`validate()` → [`is_valid_web_view_url`]):
+              * **accept** — `http://` / `https://` absolute URLs, or a clean
+                workspace(B)-relative path (same form guard as `image`/`document`
+                `path`; the hard A+denylist boundary stays at serve time,
+                `GET /api/fs/file`).
+              * **reject** — any other scheme (`javascript:` / `file:` / `data:` /
+                `vbscript:` …), scheme-relative `//host`, empty string, or a
+                traversal / absolute local path (`WebViewUrlInvalid`).
+
+            The app's own origin (`host:port` == the running server's bind) is a
+            separate reject enforced at the handler layer where the server port is
+            known — [`reject_own_origin_web_views`] (ADR-0059 D8). No `view_state`
+            persists in v1 (cross-origin iframe scroll restore is structurally
+            impossible) — only `url` is durable.
+          required:
+          - type
+          properties:
+            type:
+              type: string
+              enum:
+              - web_view
+        description: |-
+          ADR-0059 D1 — Web View. A **live read-only window** onto an address:
+          either an `http(s)://` absolute URL or a workspace(B)-relative file
+          path (html/md/image). Pure web state — no tmux surface (invariant #1/#2).
+
+          Distinct from `Document` (which *owns* a workspace file with edit /
+          find / view_state); this component only *renders* whatever the address
+          currently serves (reload = latest). `url` form is validated on every
+          create / edit (`validate()` → [`is_valid_web_view_url`]):
+            * **accept** — `http://` / `https://` absolute URLs, or a clean
+              workspace(B)-relative path (same form guard as `image`/`document`
+              `path`; the hard A+denylist boundary stays at serve time,
+              `GET /api/fs/file`).
+            * **reject** — any other scheme (`javascript:` / `file:` / `data:` /
+              `vbscript:` …), scheme-relative `//host`, empty string, or a
+              traversal / absolute local path (`WebViewUrlInvalid`).
+
+          The app's own origin (`host:port` == the running server's bind) is a
+          separate reject enforced at the handler layer where the server port is
+          known — [`reject_own_origin_web_views`] (ADR-0059 D8). No `view_state`
+          persists in v1 (cross-origin iframe scroll restore is structurally
+          impossible) — only `url` is durable.
       description: |-
         Canvas Item discriminated union (ADR-0018 D1, D4).
 

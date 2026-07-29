@@ -163,6 +163,8 @@
     label?: string | null;
     title?: string;
     file_name?: string;
+    /** ADR-0059 — web_view linked address. */
+    url?: string;
     /** ADR-0038 v8 §12.3 — snippets entries (key/body pairs). */
     entries?: ReadonlyArray<{ id: string; key: string; body: string }>;
     visibility?: boolean;
@@ -303,6 +305,7 @@
         label: it.label ?? null,
         title: it.type === 'note' ? it.title : undefined,
         file_name: it.type === 'document' ? it.file_name : undefined,
+        url: it.type === 'web_view' ? it.url : undefined,
         entries: it.type === 'snippets' ? it.entries : undefined,
       };
       consider(it.id, panelDisplayLabel(panelView), it.parent_id ?? null);
@@ -351,6 +354,7 @@
       label: it.label ?? null,
       title: it.type === 'note' ? it.title : undefined,
       file_name: it.type === 'document' ? it.file_name : undefined,
+      url: it.type === 'web_view' ? it.url : undefined,
       entries: it.type === 'snippets' ? it.entries : undefined,
       visibility: it.visibility === 'visible',
       locked: it.locked,
@@ -454,6 +458,10 @@
       return 'Snippets';
     }
     if (p.label != null && p.label.length > 0) return p.label;
+    if (p.type === 'web_view') {
+      const u = (p.url ?? '').trim();
+      return u.length > 0 ? u : 'Web view';
+    }
     if (p.type === 'document' && p.file_name != null && p.file_name.length > 0) {
       const base = p.file_name.trim().split('/').pop() ?? p.file_name.trim();
       const dot = base.lastIndexOf('.');
@@ -499,6 +507,8 @@
         return 'D';
       case 'file_path':
         return 'F';
+      case 'web_view':
+        return 'W';
       default:
         return '•';
     }
@@ -1275,6 +1285,9 @@
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round">
         <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
       </svg>
+    {:else if p.type === 'web_view'}
+      <!-- ADR-0059 — web_view identity = lucide globe (CanvasGlyph single source). -->
+      <CanvasGlyph name="globe" size={13} />
     {:else}
       {panelTypeIcon(p)}
     {/if}

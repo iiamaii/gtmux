@@ -31,7 +31,8 @@ export type ToolId =
   | 'image'
   | 'document'
   | 'file_path'
-  | 'snippets';
+  | 'snippets'
+  | 'web_view';
 
 /** Select / Hand 는 *mode* — one-shot 적용 X. */
 const STICKY_MODES: ReadonlySet<ToolId> = new Set(['select', 'hand']);

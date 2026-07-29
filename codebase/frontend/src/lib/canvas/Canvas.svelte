@@ -58,6 +58,7 @@
   import DocumentNode from './DocumentNode.svelte';
   import FreeDrawNode from './FreeDrawNode.svelte';
   import SnippetsNode from './SnippetsNode.svelte';
+  import WebViewNode from './WebViewNode.svelte';
   import GroupOverlay from './GroupOverlay.svelte';
   import DockOverlay from './DockOverlay.svelte';
   import {
@@ -69,6 +70,8 @@
     type DockTarget,
   } from './edgeDock';
   import { groupHover } from '$lib/stores/groupHover.svelte';
+  import { gestureShield } from '$lib/stores/gestureShield.svelte';
+  import { changeWebViewDialog } from '$lib/stores/changeWebViewDialog.svelte';
   import {
     commitNewItem,
     createCanvasItem,
@@ -86,6 +89,7 @@
     DEFAULT_IMAGE_SIZE,
     DEFAULT_DOCUMENT_SIZE,
     DEFAULT_SNIPPETS_SIZE,
+    DEFAULT_WEB_VIEW_SIZE,
   } from './itemFactory';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { projectPointToAngle } from './resizeConstraint';
@@ -266,6 +270,7 @@
     image: DEFAULT_IMAGE_SIZE,
     document: DEFAULT_DOCUMENT_SIZE,
     snippets: DEFAULT_SNIPPETS_SIZE,
+    web_view: DEFAULT_WEB_VIEW_SIZE,
   } as const;
   type GhostTool = keyof typeof POINT_SPAWN_DEFAULTS;
   const isGhostTool = $derived.by((): GhostTool | null => {
@@ -527,6 +532,27 @@
   const panOnDragMask = $derived(
     isSpacePressed || isHandTool ? [0, 1, 2] : [1, 2],
   );
+
+  /* ── Canvas gesture shield (ADR-0059 D7) ─────────────────────────────────
+   * Mirror the canvas gesture states into the shared gestureShield store so
+   * every embedded iframe (web_view + Html/Pdf viewers) drops pointer-events
+   * while a gesture is in progress — otherwise the gesture dies over an iframe.
+   * Reactive states cover hand tool / space-hold / lasso / drag-create; node
+   * drag is set/cleared in the onnodedrag/onnodedragstop handlers, node resize
+   * in each node's resizer. Wheel is deliberately NOT shielded (iframe wheel =
+   * page scroll, intended). */
+  $effect(() => {
+    gestureShield.handTool = isHandTool;
+  });
+  $effect(() => {
+    gestureShield.spaceHold = isSpacePressed;
+  });
+  $effect(() => {
+    gestureShield.lasso = lassoState !== null;
+  });
+  $effect(() => {
+    gestureShield.createDrag = dragState !== null;
+  });
 
   const GHOST_LINE_PADDING = 8;
 
@@ -1514,6 +1540,8 @@
     free_draw: FreeDrawNode,
     // ADR-0038 — snippet collection (badges + inline edit form).
     snippets: SnippetsNode,
+    // ADR-0059 — live web/local-file view node.
+    web_view: WebViewNode,
     // ADR-0010 D15 — group entity overlay (dotted BBox outline).
     'gtmux-group': GroupOverlay,
     // ADR-0051 D4 — edge-dock affordance (ghost landing box + side highlight).
@@ -1672,6 +1700,10 @@
           .map((e) => `${e.id}:${djb2(e.key)}:${djb2(e.body)}`)
           .join(',')}`;
         break;
+      case 'web_view':
+        // ADR-0059 — url is the only mutable payload. Missing = stale render.
+        payload = `|${item.url}`;
+        break;
     }
     return `${effVisible ? 1 : 0}|${effLocked ? 1 : 0}|${selected ? 1 : 0}|${selectedByGroup ? 1 : 0}|${groupHitTarget ? 1 : 0}|${mMulti ? 1 : 0}|${common}${payload}`;
   }
@@ -1713,7 +1745,11 @@
     // this class (which also suppresses the selection/hover ring that lives on the
     // wrapper). Only terminals need retain; other item types keep their own
     // `{#if isVisible}` unmount, so they are not given this class.
-    if (item.type === 'terminal' && !visible) {
+    // ADR-0059 D6 — web_view iframes are terminal-grade retain: a hidden
+    // web_view stays MOUNTED (iframe survives) with its wrapper display:none'd
+    // via node-hidden, exactly like terminals. Other item types keep their own
+    // `{#if isVisible}` unmount.
+    if ((item.type === 'terminal' || item.type === 'web_view') && !visible) {
       classes.push('node-hidden');
     }
     const common = {
@@ -2441,6 +2477,16 @@
           .catch(onSpawnError);
         return;
       }
+      if (tool === 'web_view') {
+        // ADR-0059 D3 — the BE rejects an empty `url` (WebViewUrlInvalid), so a
+        // web_view cannot be persisted url-less. Defer the spawn to the address
+        // modal (create mode), mirroring how the image/document tools defer to a
+        // file picker before committing; the node is created once a valid
+        // address is entered. (The node's own empty-state stays as a defensive
+        // fallback.) tool.consume() runs on modal commit/cancel.
+        changeWebViewDialog.showCreate(centered('web_view'));
+        return;
+      }
       if (tool === 'file_path') {
         const pos = centered('file_path');
         // ADR-0035 / ADR-0047 — file_path 는 파일/디렉터리 둘 다 참조 가능.
@@ -2962,6 +3008,8 @@
       // ADR-0053 D7 — drag 진행 중 외부발 0x80 refetch defer. release 는
       // onnodedragstop 이 snapshot 소거와 짝지어 정확히 1회 수행.
       holdLayoutRefetch();
+      // ADR-0059 D7 — shield iframes for the duration of the node drag.
+      gestureShield.nodeDrag = true;
     }
     // Live store update keeps derived group bboxes in sync while dragging.
     for (const [id, next] of movedById) {
@@ -2996,6 +3044,7 @@
     // release — 미짝 release 는 외부발 0x80 refetch 를 영구 defer 시킨다.
     const heldSnapshot = nodeDragPriorSnapshot;
     nodeDragPriorSnapshot = null;
+    gestureShield.nodeDrag = false;
     if (heldSnapshot !== null) releaseLayoutRefetch();
     if (nodes.length === 0) return;
     if (sessionStore.active === null) return;

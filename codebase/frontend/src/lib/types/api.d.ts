@@ -411,6 +411,15 @@ export interface components {
         } & {
             /** @enum {string} */
             type: "snippets";
+        }) | (components["schemas"]["ItemCommon"] & {
+            /**
+             * @description The linked address. `http(s)://` absolute URL or a clean
+             *     workspace(B)-relative file path. Validated by [`validate`].
+             */
+            url: string;
+        } & {
+            /** @enum {string} */
+            type: "web_view";
         });
         /**
          * @description Fields common to every Canvas Item — flattened into each variant of [`Item`]

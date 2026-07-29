@@ -28,6 +28,7 @@ import type {
   Point,
   SnippetsItem,
   PathItem,
+  WebViewItem,
 } from '$lib/types/canvas';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { generateUuidV4 } from '$lib/uuid';
@@ -79,6 +80,8 @@ export const DEFAULT_DOCUMENT_SIZE = { w: 360, h: 280 } as const;
  *  row with wrap. NodeResizer minWidth/minHeight (220/100) keeps the head
  *  + foot legible after shrink. */
 export const DEFAULT_SNIPPETS_SIZE = { w: 320, h: 150 } as const;
+/** ADR-0059 — Web View node default. Matches BE `Item::WebView` default 480×360. */
+export const DEFAULT_WEB_VIEW_SIZE = { w: 480, h: 360 } as const;
 export const LINE_MIN_LENGTH = 5;
 export const LINE_HIT_PADDING = 8;
 
@@ -363,6 +366,28 @@ export function createSnippetsItem(pos: { x: number; y: number }): SnippetsItem 
     w: DEFAULT_SNIPPETS_SIZE.w,
     h: DEFAULT_SNIPPETS_SIZE.h,
     entries: [],
+  };
+}
+
+/**
+ * ADR-0059 D3 — Web View node spawn. point-click 으로 빈 url 의 item 생성
+ * (480×360). node 는 empty url 상태에서 "Set an address…" empty state 를 렌더,
+ * change 모달로 url 지정. z 는 commitNewItem 안에서 max(z)+1 로 재계산.
+ */
+export function createWebViewItem(pos: { x: number; y: number }): WebViewItem {
+  return {
+    id: freshId(),
+    parent_id: null,
+    x: pos.x,
+    y: pos.y,
+    w: DEFAULT_WEB_VIEW_SIZE.w,
+    h: DEFAULT_WEB_VIEW_SIZE.h,
+    z: 0,
+    visibility: 'visible',
+    locked: false,
+    minimized: false,
+    type: 'web_view',
+    url: '',
   };
 }
 

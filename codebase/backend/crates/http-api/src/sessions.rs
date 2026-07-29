@@ -2304,6 +2304,16 @@ pub async fn layout_put_handler(
     if let Err(e) = schema::validate(&layout) {
         return SessionError::Validation(e).into_response();
     }
+    // ADR-0059 D8 — reject any web_view pointing at the app's own origin
+    // (self-embedding / token exposure). Needs the server port, so it runs
+    // here at the handler layer rather than inside the port-agnostic validate.
+    if let Err(e) = schema::reject_own_origin_web_views(
+        &layout,
+        &state.config.server.bind,
+        state.config.server.port,
+    ) {
+        return SessionError::Validation(e).into_response();
+    }
 
     // 4. CAS under the per-session write lock. Disk-first.
     //
@@ -2636,6 +2646,23 @@ pub async fn layout_ops_handler(
     schema::degrade_dangling_path_endpoints(&mut layout);
     schema::recompute_path_bboxes(&mut layout);
     if let Err(e) = schema::validate(&layout) {
+        return ops_failure_response(
+            None,
+            crate::layout_ops::OpError {
+                code: e.code(),
+                message: e.to_string(),
+                locked: false,
+            },
+        );
+    }
+    // ADR-0059 D8 — own-origin web_view reject (needs the server port; see
+    // the full-layout PUT path). Applies to create *and* edit ops alike since
+    // both land in `layout.items` before this pass.
+    if let Err(e) = schema::reject_own_origin_web_views(
+        &layout,
+        &state.config.server.bind,
+        state.config.server.port,
+    ) {
         return ops_failure_response(
             None,
             crate::layout_ops::OpError {

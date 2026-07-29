@@ -19,6 +19,7 @@
   import ContextMenu from '$lib/chrome/ContextMenu.svelte';
   import MaximizedItemModal from '$lib/chrome/MaximizedItemModal.svelte';
   import ChangeTerminalModal from '$lib/chrome/ChangeTerminalModal.svelte';
+  import ChangeWebViewModal from '$lib/chrome/ChangeWebViewModal.svelte';
   import SnippetEditPanel from '$lib/chrome/SnippetEditPanel.svelte';
   import SnippetDeleteConfirmModal from '$lib/chrome/SnippetDeleteConfirmModal.svelte';
   import GroupCloseConfirmModal from '$lib/chrome/GroupCloseConfirmModal.svelte';
@@ -499,6 +500,7 @@
 </div>
 <WorkspaceSwitcher />
 <ChangeTerminalModal />
+<ChangeWebViewModal />
 <SnippetEditPanel />
 <SnippetDeleteConfirmModal />
 <GroupCloseConfirmModal />

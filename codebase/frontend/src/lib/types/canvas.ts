@@ -314,6 +314,17 @@ export interface SnippetsItem extends ItemCommon {
   entries: SnippetEntry[];
 }
 
+/** ADR-0059 D1 — Web View item. Pure web state (tmux-무관, 불변식 #1/#2).
+ *  `url` = `http(s)://` 절대 URL 또는 clean workspace(B)-relative 파일 경로.
+ *  BE `schema.rs::Item::WebView` 정본 — 스킴 제한/거부는 BE `validate()` +
+ *  wire handler(own-origin). view_state 영속 없음(v1). */
+export interface WebViewItem extends ItemCommon {
+  type: 'web_view';
+  /** Linked address — `http(s)://` absolute URL or a clean workspace-relative
+   *  file path. Empty string = unset (node renders the "set an address" state). */
+  url: string;
+}
+
 export type PathRouting = Schemas['Routing'];
 
 export type PathEndpoint =
@@ -362,7 +373,8 @@ export type CanvasItem =
   | DocumentItem
   | FilePathItem
   | SnippetsItem
-  | PathItem;
+  | PathItem
+  | WebViewItem;
 
 /** `CanvasItem['type']` 의 모든 값 — UI registry / Toolbar 등록에 사용. */
 export type CanvasItemType = CanvasItem['type'];
@@ -409,3 +421,4 @@ export const isDocument = (it: CanvasItem): it is DocumentItem => it.type === 'd
 export const isFilePath = (it: CanvasItem): it is FilePathItem => it.type === 'file_path';
 export const isSnippets = (it: CanvasItem): it is SnippetsItem => it.type === 'snippets';
 export const isPath = (it: CanvasItem): it is PathItem => it.type === 'path';
+export const isWebView = (it: CanvasItem): it is WebViewItem => it.type === 'web_view';

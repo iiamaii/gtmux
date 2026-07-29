@@ -29,6 +29,7 @@ const TOOL_BINDINGS: Array<{
   { actionId: 'tool.document', key: 'd', tool: 'document', description: 'Document tool' },
   { actionId: 'tool.image', key: 'i', tool: 'image', description: 'Image tool' },
   { actionId: 'tool.file_path', key: 'f', tool: 'file_path', description: 'File path tool' },
+  { actionId: 'tool.web_view', key: 'w', tool: 'web_view', description: 'Web view tool' },
 ];
 
 function setTool(tool: ToolId): boolean {
