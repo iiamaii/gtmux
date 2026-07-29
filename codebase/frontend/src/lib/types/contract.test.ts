@@ -43,6 +43,7 @@ describe('canvas layout contract (FE side)', () => {
     const known = new Set([
       'terminal', 'text', 'note', 'rect', 'ellipse', 'line',
       'free_draw', 'image', 'document', 'file_path', 'snippets', 'path',
+      'web_view',
     ]);
     for (const it of items) {
       expect(known.has(it.type)).toBe(true);

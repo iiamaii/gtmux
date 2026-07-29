@@ -136,6 +136,11 @@
         name: 'File path',
         hint: 'F',
       },
+      {
+        id: 'web_view',
+        name: 'Web view',
+        hint: 'W',
+      },
     ],
   ];
 
@@ -278,6 +283,11 @@
                    Stroke drops to the toolbar tier's 1.6 via the class
                    override below so it sits evenly among its sibling tools. -->
               <CanvasGlyph name="note" size={18} class="tool-note-glyph" />
+            {:else if tool.id === 'web_view'}
+              <!-- ADR-0059 D3 — web_view identity = lucide globe, shared with
+                   the node header / modal / layer tree via CanvasGlyph. Stroke
+                   drops to the toolbar 1.6 tier like the note tool. -->
+              <CanvasGlyph name="globe" size={18} class="tool-note-glyph" />
             {:else}
               <svg
                 width="18"

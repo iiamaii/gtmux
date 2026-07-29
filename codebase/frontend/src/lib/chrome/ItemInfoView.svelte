@@ -21,6 +21,7 @@
   import { muxStore } from '$lib/stores/mux.svelte';
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { changeTerminalDialog } from '$lib/stores/changeTerminalDialog.svelte';
+  import { changeWebViewDialog } from '$lib/stores/changeWebViewDialog.svelte';
   import { terminalPool } from '$lib/stores/terminalPool.svelte';
   import { filePicker } from '$lib/stores/filePicker.svelte';
   import {
@@ -755,6 +756,7 @@
     }
     if (it.type === 'note') return it.title;
     if (it.type === 'document') return it.label?.trim() || fileStem(it.file_name ?? it.path ?? 'document');
+    if (it.type === 'web_view') return it.label?.trim() || it.url.trim() || 'Web view';
     return it.label ?? '';
   }
   function commonDisplayLabel(): string | 'Mixed' | null {
@@ -1492,6 +1494,15 @@
     const result = await copyTextToSystemClipboard(path);
     toastStore.show({
       message: result.ok ? 'Copied file path.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
+  }
+
+  async function copyInspectorUrl(url: string): Promise<void> {
+    if (url.length === 0) return;
+    const result = await copyTextToSystemClipboard(url);
+    toastStore.show({
+      message: result.ok ? 'Copied URL.' : (result.reason ?? 'Copy failed.'),
       tone: result.ok ? 'success' : 'error',
     });
   }
@@ -2888,7 +2899,7 @@
         </section>
       {/if}
 
-      {#if sessionItem !== null && selectionCount === 1 && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'path' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets')}
+      {#if sessionItem !== null && selectionCount === 1 && (sessionItem.type === 'rect' || sessionItem.type === 'ellipse' || sessionItem.type === 'line' || sessionItem.type === 'path' || sessionItem.type === 'text' || sessionItem.type === 'note' || sessionItem.type === 'file_path' || sessionItem.type === 'image' || sessionItem.type === 'document' || sessionItem.type === 'snippets' || sessionItem.type === 'web_view')}
         <section class="prop-section">
           <div class="prop-head"><h4>Item Payload</h4></div>
           {#if sessionItem.type === 'rect' || sessionItem.type === 'ellipse'}
@@ -3999,6 +4010,35 @@
                   }}
                 >
                   <CanvasGlyph name="plus" size={13} />
+                </button>
+              </div>
+            </div>
+          {:else if sessionItem.type === 'web_view'}
+            {@const wvUrl = sessionItem.url}
+            <div class="prop-row full">
+              <div class="display-row">
+                <span class="k">url</span>
+                <span class="display-val mono" title={wvUrl}>{strOr(wvUrl, '—')}</span>
+                {#if wvUrl.trim().length > 0}
+                  <button
+                    type="button"
+                    class="inline-action"
+                    title="Copy URL"
+                    aria-label="Copy URL"
+                    onclick={() => void copyInspectorUrl(wvUrl)}
+                  >
+                    <CanvasGlyph name="copy" size={13} />
+                  </button>
+                {/if}
+                <button
+                  type="button"
+                  class="inline-action"
+                  title="Change address"
+                  aria-label="Change address"
+                  disabled={sessionItem.locked}
+                  onclick={() => changeWebViewDialog.show(sessionItem.id)}
+                >
+                  <CanvasGlyph name="change" size={13} />
                 </button>
               </div>
             </div>

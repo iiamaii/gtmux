@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { gestureShield } from '$lib/stores/gestureShield.svelte';
+
   let {
     src,
     title,
@@ -8,11 +10,14 @@
     title: string;
     dragIsolated?: boolean;
   } = $props();
+
+  // ADR-0059 D7 — drop pointer-events during any canvas gesture as well.
+  const isolated = $derived(dragIsolated || gestureShield.active);
 </script>
 
 <iframe
   class="pdf-viewer-frame"
-  class:drag-isolated={dragIsolated}
+  class:drag-isolated={isolated}
   {src}
   {title}
   referrerpolicy="no-referrer"

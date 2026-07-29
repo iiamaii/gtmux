@@ -66,6 +66,9 @@
     buildRenderedHtmlSrcdoc,
     type DocumentViewMode,
   } from '$lib/canvas/documentRender';
+  import { classifyWebViewSource } from '$lib/canvas/webViewSource';
+  import { changeWebViewDialog } from '$lib/stores/changeWebViewDialog.svelte';
+  import PanelEmptyState from '$lib/chrome/PanelEmptyState.svelte';
   import type { CanvasItem, DocumentItem, NoteItem } from '$lib/types/canvas';
 
   const itemId = $derived(sessionStore.maximizedItemId);
@@ -73,6 +76,7 @@
   const isTerminal = $derived(item?.type === 'terminal');
   const isNote = $derived(item?.type === 'note');
   const isDocument = $derived(item?.type === 'document');
+  const isWebView = $derived(item?.type === 'web_view');
   const terminalPaneId = $derived(itemId !== null ? terminalPool.paneIdFor(itemId) : undefined);
 
   const noteAccent = $derived(item?.type === 'note' ? item.color : null);
@@ -85,6 +89,7 @@
     if (item === null) return '—';
     if (item.type === 'note') return item.title.length > 0 ? item.title : 'Untitled';
     if (item.type === 'document') return documentFileName.length > 0 ? documentFileName : 'document';
+    if (item.type === 'web_view') return item.url.trim().length > 0 ? item.url : 'No address';
     // Terminal label = persisted layout item.label (ADR-0050 D3, per-panel) —
     // same derivation as PanelNode's header. The in-memory terminal_meta label
     // is no longer consulted (it was wiped every boot). Fall back to a short id
@@ -241,6 +246,126 @@
     };
   });
 
+  // ── Web View (ADR-0059 §4.1 parity — modal renders its own iframe, D6
+  //    fresh-load accepted) ──────────────────────────────────────────────────
+  const webViewRaw = $derived(item?.type === 'web_view' ? item.url : '');
+  const webViewUrl = $derived(webViewRaw.trim());
+  const webViewEmpty = $derived(webViewUrl.length === 0);
+  const webViewSource = $derived(classifyWebViewSource(webViewUrl));
+  const webViewLocked = $derived(item?.type === 'web_view' && item.locked === true);
+  const webViewResolvedPath = $derived(
+    (webViewSource.kind === 'local-html' ||
+      webViewSource.kind === 'local-md' ||
+      webViewSource.kind === 'local-image') && item?.type === 'web_view'
+      ? resolveWorkspacePath(sessionStore.effectiveWorkspaceRoot, webViewUrl)
+      : null,
+  );
+  const webViewLabel = $derived(webViewEmpty ? 'No address' : webViewRaw);
+  const LOCAL_WV_HTML_SANDBOX = 'allow-scripts';
+  const WV_MAX_BYTES = 512 * 1024;
+
+  let webViewReloadNonce = $state(0);
+  let webViewText = $state<string | null>(null);
+  let webViewLoading = $state(false);
+  let webViewError = $state<string | null>(null);
+
+  const webViewFetchKey = $derived.by((): string => {
+    if (
+      (webViewSource.kind === 'local-html' || webViewSource.kind === 'local-md') &&
+      webViewResolvedPath !== null
+    ) {
+      return `${webViewReloadNonce} ${webViewResolvedPath}`;
+    }
+    return '';
+  });
+
+  $effect(() => {
+    const key = webViewFetchKey;
+    if (key.length === 0) {
+      webViewText = null;
+      webViewLoading = false;
+      webViewError = null;
+      return;
+    }
+    const path = key.split(' ')[1] ?? '';
+    let cancelled = false;
+    webViewText = null;
+    webViewError = null;
+    webViewLoading = true;
+    async function load(): Promise<void> {
+      try {
+        const res = await fetch(fsFileUrl(path), {
+          method: 'GET',
+          credentials: 'include',
+          headers: { Accept: 'text/html,text/markdown,text/plain,*/*' },
+        });
+        if (!res.ok) throw new Error(String(res.status));
+        const lenHeader = res.headers.get('content-length');
+        if (lenHeader !== null && Number(lenHeader) > WV_MAX_BYTES) throw new Error('too-large');
+        const text = await res.text();
+        if (new TextEncoder().encode(text).length > WV_MAX_BYTES) throw new Error('too-large');
+        if (!cancelled) webViewText = text;
+      } catch (err) {
+        if (!cancelled) {
+          webViewError = err instanceof Error && err.message === 'too-large'
+            ? 'This file is too large to preview here.'
+            : 'This file could not be loaded.';
+        }
+      } finally {
+        if (!cancelled) webViewLoading = false;
+      }
+    }
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  const webViewHtmlSrcdoc = $derived(webViewSource.kind === 'local-html' ? (webViewText ?? '') : '');
+  const webViewMdHtml = $derived(
+    webViewSource.kind === 'local-md' ? renderMarkdown(webViewText ?? '') : '',
+  );
+  const webViewImageSrc = $derived(
+    webViewSource.kind === 'local-image' && webViewResolvedPath !== null
+      ? `${fsFileUrl(webViewResolvedPath)}&_r=${webViewReloadNonce}`
+      : '',
+  );
+
+  function webViewExternalHref(): string {
+    if (webViewEmpty) return '';
+    if (webViewSource.kind === 'remote') return webViewRaw;
+    if (webViewResolvedPath !== null) return fsFileUrl(webViewResolvedPath);
+    return '';
+  }
+
+  function onWebViewReload(e: MouseEvent): void {
+    e.stopPropagation();
+    webViewReloadNonce += 1;
+  }
+
+  async function onWebViewCopyUrl(e: MouseEvent): Promise<void> {
+    e.stopPropagation();
+    if (webViewEmpty) return;
+    const result = await copyTextToSystemClipboard(webViewRaw);
+    toastStore.show({
+      message: result.ok ? 'Copied URL.' : (result.reason ?? 'Copy failed.'),
+      tone: result.ok ? 'success' : 'error',
+    });
+  }
+
+  function onWebViewOpenExternal(e: MouseEvent): void {
+    e.stopPropagation();
+    const href = webViewExternalHref();
+    if (href.length === 0) return;
+    window.open(href, '_blank', 'noopener,noreferrer');
+  }
+
+  function onWebViewChange(e: MouseEvent): void {
+    e.stopPropagation();
+    if (itemId === null) return;
+    changeWebViewDialog.show(itemId);
+  }
+
   // ── xterm DOM portal ────────────────────────────────────────────────────
   // Maximize 시 in-flow PanelNode 의 `[data-portal-id={itemId}]` 컨테이너 안의
   // XtermHost DOM (xterm 인스턴스 의 containerEl 트리) 을 modal 의 slot 으로
@@ -309,6 +434,22 @@
     if (e.target !== e.currentTarget) return;
     e.preventDefault();
     e.stopPropagation();
+  }
+
+  // ADR-0017 amend ㉕ extension (ADR-0059 D7) — a pointerdown on the modal
+  // backdrop or header blurs a still-focused iframe so Esc (a window listener)
+  // reaches this modal's Esc→restore handler instead of being swallowed by the
+  // maximized web_view / rendered-html iframe. IFRAME-only guard — never touch
+  // editables/xterm. A pointerdown INSIDE the iframe does not bubble here (the
+  // iframe is a separate browsing context), so iframe interaction is untouched.
+  function reclaimIframeFocus(): void {
+    const active = document.activeElement;
+    if (active instanceof HTMLIFrameElement) active.blur();
+  }
+
+  function onBackdropPointerDown(e: Event): void {
+    reclaimIframeFocus();
+    blockBackdropEvent(e);
   }
 
   function onKeyDown(e: KeyboardEvent): void {
@@ -575,7 +716,7 @@
     aria-modal="true"
     aria-label="Maximized item"
     tabindex="-1"
-    onpointerdown={blockBackdropEvent}
+    onpointerdown={onBackdropPointerDown}
     onpointerup={blockBackdropEvent}
     onmousedown={blockBackdropEvent}
     onmouseup={blockBackdropEvent}
@@ -599,6 +740,10 @@
         {:else if isDocument}
           <span class="header-glyph" aria-hidden="true">
             <CanvasGlyph name="file" size={13} />
+          </span>
+        {:else if isWebView}
+          <span class="header-glyph" aria-hidden="true">
+            <CanvasGlyph name="globe" size={13} />
           </span>
         {:else}
           <span class="header-glyph" aria-hidden="true">
@@ -709,6 +854,28 @@
             >
               <CanvasGlyph name="change" size={13} />
             </button>
+          {/if}
+          {#if isWebView}
+            <!-- ADR-0059 §4.1 parity — reload / copy-url / open-external /
+                 change (view-only ones stay while locked). -->
+            <button type="button" class="max-btn" aria-label="Reload" title="Reload"
+              onclick={onWebViewReload}>
+              <CanvasGlyph name="reload" size={13} />
+            </button>
+            <button type="button" class="max-btn" aria-label="Copy URL" title="Copy URL"
+              disabled={webViewEmpty} onclick={(e) => void onWebViewCopyUrl(e)}>
+              <CanvasGlyph name="copy" size={13} />
+            </button>
+            <button type="button" class="max-btn" aria-label="Open in browser" title="Open in browser"
+              disabled={webViewExternalHref().length === 0} onclick={onWebViewOpenExternal}>
+              <CanvasGlyph name="external" size={13} />
+            </button>
+            {#if !webViewLocked}
+              <button type="button" class="max-btn" aria-label="Change address" title="Change address"
+                onclick={onWebViewChange}>
+                <CanvasGlyph name="change" size={13} />
+              </button>
+            {/if}
           {/if}
           <!-- The modal IS the maximized state, so the restore control always
                shows the lucide minimize (corner-brackets-in) glyph in active
@@ -844,6 +1011,59 @@
               {/if}
             {/if}
           </article>
+        {:else if isWebView && item.type === 'web_view'}
+          <div class="web-view-body">
+            {#if webViewEmpty}
+              <PanelEmptyState icon="alert" lead="No address"
+                description="Set an address on the canvas node to view it here." />
+            {:else if webViewSource.kind === 'remote'}
+              <!-- Remote iframe: NO sandbox. SOP isolates the cross-origin page
+                   from the app; sandbox broke Chromium's built-in PDF viewer
+                   (ADR-0059 D2, 2026-07-29 정정). -->
+              <iframe
+                class="wv-modal-frame"
+                src={webViewRaw}
+                title={webViewLabel}
+                referrerpolicy="no-referrer"
+              ></iframe>
+            {:else if webViewSource.kind === 'local-html'}
+              {#if webViewLoading}
+                <div class="web-view-loading"><span class="wv-modal-spinner"></span></div>
+              {:else if webViewError !== null}
+                <PanelEmptyState icon="alert" lead="Preview unavailable" description={webViewError} tone="danger" />
+              {:else}
+                <iframe
+                  class="wv-modal-frame"
+                  srcdoc={webViewHtmlSrcdoc}
+                  title={webViewLabel}
+                  sandbox={LOCAL_WV_HTML_SANDBOX}
+                  referrerpolicy="no-referrer"
+                ></iframe>
+              {/if}
+            {:else if webViewSource.kind === 'local-md'}
+              {#if webViewLoading}
+                <div class="web-view-loading"><span class="wv-modal-spinner"></span></div>
+              {:else if webViewError !== null}
+                <PanelEmptyState icon="alert" lead="Preview unavailable" description={webViewError} tone="danger" />
+              {:else}
+                <DocumentMarkdownView
+                  html={webViewMdHtml}
+                  label={webViewLabel}
+                  scale={componentSettings.documentScale}
+                />
+              {/if}
+            {:else if webViewSource.kind === 'local-image'}
+              <div class="web-view-image-host">
+                <img class="web-view-image" src={webViewImageSrc} alt={webViewLabel} />
+              </div>
+            {:else}
+              <PanelEmptyState icon="alert"
+                lead={webViewSource.kind === 'unsupported' ? 'Unsupported file type' : 'Invalid address'}
+                description={webViewSource.kind === 'unsupported'
+                  ? 'This view renders web pages, HTML, Markdown, or images.'
+                  : 'Use an http(s):// URL or a workspace-relative file path.'} />
+            {/if}
+          </div>
         {/if}
       </div>
     </div>
@@ -1170,5 +1390,58 @@
     letter-spacing: 0.7px;
     text-transform: uppercase;
     color: var(--color-fg-subtle);
+  }
+
+  /* ADR-0059 §4.1 — web_view maximize body (fresh-load iframe). */
+  .web-view-body {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: var(--color-surface);
+    position: relative;
+    overflow: hidden;
+  }
+  .wv-modal-frame {
+    flex: 1 1 auto;
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+    border: 0;
+    background: #ffffff;
+  }
+  .web-view-image-host {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--space-16);
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+  .web-view-image {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+  }
+  .web-view-loading {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: var(--color-surface);
+  }
+  .wv-modal-spinner {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 2px solid var(--color-border-strong);
+    border-top-color: var(--color-accent);
+    animation: wv-modal-spin 0.7s linear infinite;
+  }
+  @keyframes wv-modal-spin {
+    to { transform: rotate(360deg); }
   }
 </style>

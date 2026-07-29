@@ -267,6 +267,12 @@ const SNIP_RESTORE_H: f64 = 150.0;
 /// FE `MINIMIZED_TERMINAL_PANEL_HEIGHT` (types/canvas.ts).
 const PANEL_STRIP_H: f64 = 35.0;
 const PANEL_RESTORE_H: f64 = 220.0;
+/// web_view minimize geometry — FE `WebViewNode.svelte` (WV_MIN_H / WV_RESTORE_W
+/// / WV_RESTORE_H). Minimize keeps `w`, sets `h = 35`; restore falls back to
+/// 480×360 (no schema-level geometry backup yet — see ADR-0018 D11 note above).
+const WV_STRIP_H: f64 = 35.0;
+const WV_RESTORE_W: f64 = 480.0;
+const WV_RESTORE_H: f64 = 360.0;
 
 /// Type default sizes — FE `itemFactory.ts` constants, verbatim.
 fn default_size(item_type: &str) -> (f64, f64) {
@@ -282,6 +288,7 @@ fn default_size(item_type: &str) -> (f64, f64) {
         ),
         "image" => (320.0, 240.0),
         "document" => (360.0, 280.0),
+        "web_view" => (480.0, 360.0),
         "snippets" => (320.0, 150.0),
         // Path x/y/w/h is a bbox cache — recomputed by the pipeline.
         "path" => (1.0, 1.0),
@@ -298,6 +305,7 @@ const KNOWN_CREATE_TYPES: &[&str] = &[
     "free_draw",
     "image",
     "document",
+    "web_view",
     "file_path",
     "path",
     "snippets",
@@ -591,7 +599,8 @@ fn set_common(item: &mut Item, f: impl FnOnce(&mut crate::schema::ItemCommon)) {
         | Item::Document { common, .. }
         | Item::FilePath { common, .. }
         | Item::Path { common, .. }
-        | Item::Snippets { common, .. } => f(common),
+        | Item::Snippets { common, .. }
+        | Item::WebView { common, .. } => f(common),
     }
 }
 
@@ -731,17 +740,23 @@ fn op_label(
     Err(OpError::not_found(id))
 }
 
-/// Minimize / restore — FE parity (`ItemInfoView.svelte::applyMinimizeGeom`).
-/// Only terminal / note / document / snippets support minimize; other types
-/// have no minimized visual and are rejected, matching the FE (the inspector
-/// hides the button for them). Already-in-state targets are a silent no-op.
+/// Minimize / restore — FE parity (`ItemInfoView.svelte::applyMinimizeGeom` for
+/// terminal/note/document/snippets; `WebViewNode.svelte::onMinimizeClick` for
+/// web_view). Only terminal / note / document / snippets / web_view support
+/// minimize; other types have no minimized visual and are rejected, matching the
+/// FE (the inspector / node header hides the button for them). Already-in-state
+/// targets are a silent no-op.
 fn op_minimize(layout: &mut Layout, id: &str, next: bool, force: bool) -> Result<(), OpError> {
     let idx = item_idx(layout, id).ok_or_else(|| OpError::not_found(id))?;
     ensure_unlocked_item(&layout.items[idx], force)?;
     let item = &mut layout.items[idx];
     let supported = matches!(
         item,
-        Item::Terminal { .. } | Item::Note { .. } | Item::Document { .. } | Item::Snippets { .. }
+        Item::Terminal { .. }
+            | Item::Note { .. }
+            | Item::Document { .. }
+            | Item::Snippets { .. }
+            | Item::WebView { .. }
     );
     if !supported {
         return Err(OpError::new(
@@ -767,6 +782,10 @@ fn op_minimize(layout: &mut Layout, id: &str, next: bool, force: bool) -> Result
                 c.minimized = true;
                 c.h = SNIP_STRIP_H;
             }),
+            Item::WebView { .. } => set_common(item, |c| {
+                c.minimized = true;
+                c.h = WV_STRIP_H;
+            }),
             _ => set_common(item, |c| {
                 c.minimized = true;
                 c.h = PANEL_STRIP_H;
@@ -790,6 +809,11 @@ fn op_minimize(layout: &mut Layout, id: &str, next: bool, force: bool) -> Result
                 c.minimized = false;
                 c.w = SNIP_RESTORE_W;
                 c.h = SNIP_RESTORE_H;
+            }),
+            Item::WebView { .. } => set_common(item, |c| {
+                c.minimized = false;
+                c.w = WV_RESTORE_W;
+                c.h = WV_RESTORE_H;
             }),
             _ => set_common(item, |c| {
                 c.minimized = false;
@@ -1054,6 +1078,10 @@ fn default_payload(item_type: &str, x: f64, y: f64) -> Map<String, Value> {
         }),
         "image" => json!({}),
         "document" => json!({}),
+        // ADR-0059 D1 — url is required; default empty so a missing-url create
+        // deserializes and then fails with the clean `web_view_url_invalid`
+        // validation error rather than a raw serde "missing field" message.
+        "web_view" => json!({ "url": "" }),
         "file_path" => json!({ "path": "" }),
         "path" => json!({
             "from": { "kind": "free", "point": { "x": x, "y": y } },
@@ -1892,6 +1920,61 @@ mod tests {
         assert!(schema::validate(&l).is_ok());
     }
 
+    /// ADR-0059 D1 — `create web_view --set url=…` persists the url and passes
+    /// validate; the default size is the web_view default.
+    #[test]
+    fn create_web_view_persists_url() {
+        let mut l = Layout::empty();
+        let fields = serde_json::json!({ "url": "https://example.com/dash" });
+        let id = op_create(&mut l, "web_view", None, None, None, None, Some(&fields)).unwrap();
+        let idx = item_idx(&l, &id).unwrap();
+        match &l.items[idx] {
+            Item::WebView { url, common } => {
+                assert_eq!(url, "https://example.com/dash");
+                assert_eq!((common.w, common.h), (480.0, 360.0));
+            }
+            other => panic!("unexpected variant {other:?}"),
+        }
+        assert!(schema::validate(&l).is_ok());
+    }
+
+    /// ADR-0059 D1 — a create with a rejected scheme deserializes but fails at
+    /// the pipeline validate (`op_create` builds the item; `validate` rejects).
+    #[test]
+    fn create_web_view_bad_scheme_fails_validate() {
+        let mut l = Layout::empty();
+        let fields = serde_json::json!({ "url": "javascript:alert(1)" });
+        op_create(&mut l, "web_view", None, None, None, None, Some(&fields)).unwrap();
+        assert_eq!(
+            schema::validate(&l),
+            Err(schema::ValidationError::WebViewUrlInvalid)
+        );
+    }
+
+    /// ADR-0059 D8 — **edit-path parity**: editing a valid web_view's url to
+    /// `javascript:alert(1)` goes through the generic field-merge edit and is
+    /// then rejected by the same `validate()` the wire handler runs after edit.
+    #[test]
+    fn edit_web_view_to_bad_scheme_rejected() {
+        let ok: Item = serde_json::from_value(serde_json::json!({
+            "type": "web_view",
+            "id": A, "parent_id": null,
+            "x": 0.0, "y": 0.0, "w": 480.0, "h": 360.0, "z": 0,
+            "visibility": "visible", "locked": false, "minimized": false,
+            "url": "https://example.com"
+        }))
+        .unwrap();
+        let mut l = layout_with(vec![ok]);
+        assert!(schema::validate(&l).is_ok());
+        // Generic edit merge accepts the field write…
+        op_edit(&mut l, A, &serde_json::json!({ "url": "javascript:alert(1)" }), false).unwrap();
+        // …but the pipeline validate rejects the result (parity with create).
+        assert_eq!(
+            schema::validate(&l),
+            Err(schema::ValidationError::WebViewUrlInvalid)
+        );
+    }
+
     #[test]
     fn spawn_defaults_center_top_z_and_reports_uuid() {
         let mut l = layout_with(vec![rect(A, 3)]);
@@ -1978,6 +2061,27 @@ mod tests {
         let mut l2 = layout_with(vec![rect(B, 0)]);
         let err = op_minimize(&mut l2, B, true, false).unwrap_err();
         assert_eq!(err.code, "minimize_unsupported");
+    }
+
+    #[test]
+    fn minimize_restore_parity_web_view() {
+        // web_view minimize keeps `w`, sets `h = WV_STRIP_H`; restore falls back
+        // to WV_RESTORE_W × WV_RESTORE_H (FE `WebViewNode.svelte::onMinimizeClick`).
+        let mut l = layout_with(vec![Item::WebView {
+            url: "https://example.com".to_string(),
+            common: common(A, 0),
+        }]);
+        let start_w = l.items[0].common().w;
+        op_minimize(&mut l, A, true, false).unwrap();
+        let c = l.items[0].common();
+        assert!(c.minimized);
+        assert_eq!(c.h, WV_STRIP_H);
+        assert_eq!(c.w, start_w, "minimize keeps width");
+        op_minimize(&mut l, A, false, false).unwrap();
+        let c = l.items[0].common();
+        assert!(!c.minimized);
+        assert_eq!(c.w, WV_RESTORE_W);
+        assert_eq!(c.h, WV_RESTORE_H);
     }
 
     #[test]

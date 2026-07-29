@@ -61,6 +61,9 @@
     | 'note' // lucide scroll-text (Toolbar2 anchor) — note tool / NoteNode / modal / layer tree
     | 'library' // lucide square-library — SnippetsNode header
     | 'image' // lucide image — ImageNode empty state
+    | 'globe' // lucide globe — WebViewNode identity / web_view tool
+    | 'reload' // lucide rotate-cw — web_view reload
+    | 'external' // lucide external-link — open in browser
     // Inspector state glyphs (RightPanel inspect tab)
     | 'eye' // visible
     | 'eye-off' // hidden
@@ -177,6 +180,20 @@
     <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
     <circle cx="9" cy="9" r="2" />
     <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+  {:else if name === 'globe'}
+    <!-- lucide globe (24×24 canonical geometry) — web_view type identity. -->
+    <circle cx="12" cy="12" r="10" />
+    <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" />
+    <path d="M2 12h20" />
+  {:else if name === 'reload'}
+    <!-- lucide rotate-cw — reload the live view. -->
+    <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+    <path d="M21 3v6h-6" />
+  {:else if name === 'external'}
+    <!-- lucide external-link — open in a new browser tab. -->
+    <path d="M15 3h6v6" />
+    <path d="M10 14 21 3" />
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
   {:else if name === 'eye'}
     <path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" />
     <circle cx="12" cy="12" r="3" />

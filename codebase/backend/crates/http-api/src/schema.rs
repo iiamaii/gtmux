@@ -60,6 +60,12 @@ pub const SNIPPET_BODY_MAX_BYTES: usize = 64 * 1024;
 /// 의 hard cap 으로 1000 enforce — FE 의 [+ add] 는 999 entry 이후 disabled.
 pub const SNIPPETS_ENTRIES_CAP: usize = 1000;
 
+/// Maximum bytes for a `WebView::url` (ADR-0059 D1). A form guard only — the
+/// live srcdoc / remote-page size cap (ADR-0059 D8) is a FE fetch concern. A
+/// URL longer than this is almost certainly a paste error / abuse and is
+/// rejected at validate time (`WebViewUrlInvalid`).
+pub const WEB_VIEW_URL_MAX_BYTES: usize = 4 * 1024;
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Top-level Layout
 // ─────────────────────────────────────────────────────────────────────────────
@@ -776,6 +782,34 @@ pub enum Item {
         #[serde(default)]
         entries: Vec<SnippetEntry>,
     },
+    /// ADR-0059 D1 — Web View. A **live read-only window** onto an address:
+    /// either an `http(s)://` absolute URL or a workspace(B)-relative file
+    /// path (html/md/image). Pure web state — no tmux surface (invariant #1/#2).
+    ///
+    /// Distinct from `Document` (which *owns* a workspace file with edit /
+    /// find / view_state); this component only *renders* whatever the address
+    /// currently serves (reload = latest). `url` form is validated on every
+    /// create / edit (`validate()` → [`is_valid_web_view_url`]):
+    ///   * **accept** — `http://` / `https://` absolute URLs, or a clean
+    ///     workspace(B)-relative path (same form guard as `image`/`document`
+    ///     `path`; the hard A+denylist boundary stays at serve time,
+    ///     `GET /api/fs/file`).
+    ///   * **reject** — any other scheme (`javascript:` / `file:` / `data:` /
+    ///     `vbscript:` …), scheme-relative `//host`, empty string, or a
+    ///     traversal / absolute local path (`WebViewUrlInvalid`).
+    ///
+    /// The app's own origin (`host:port` == the running server's bind) is a
+    /// separate reject enforced at the handler layer where the server port is
+    /// known — [`reject_own_origin_web_views`] (ADR-0059 D8). No `view_state`
+    /// persists in v1 (cross-origin iframe scroll restore is structurally
+    /// impossible) — only `url` is durable.
+    WebView {
+        #[serde(flatten)]
+        common: ItemCommon,
+        /// The linked address. `http(s)://` absolute URL or a clean
+        /// workspace(B)-relative file path. Validated by [`validate`].
+        url: String,
+    },
 }
 
 impl Item {
@@ -793,7 +827,8 @@ impl Item {
             | Item::Document { common, .. }
             | Item::FilePath { common, .. }
             | Item::Path { common, .. }
-            | Item::Snippets { common, .. } => common,
+            | Item::Snippets { common, .. }
+            | Item::WebView { common, .. } => common,
         }
     }
 }
@@ -911,6 +946,21 @@ pub enum ValidationError {
     /// ADR-0038 — duplicate `SnippetEntry::id` within a single `Snippets` item.
     #[error("duplicate snippet entry id within a single item: {0:?}")]
     DuplicateSnippetEntryId(String),
+    /// ADR-0059 D1 — a `web_view` `url` is not a valid address: empty, an
+    /// over-cap string, a rejected scheme (`javascript:` / `file:` / `data:`
+    /// / `vbscript:` / scheme-relative `//host` …), or a workspace path that
+    /// is absolute / contains `.`·`..` traversal. Only `http(s)://` absolute
+    /// URLs and clean workspace(B)-relative paths pass.
+    #[error("web_view url is invalid (empty/over-cap/rejected-scheme/traversal)")]
+    WebViewUrlInvalid,
+    /// ADR-0059 D8 — a `web_view` `url` points at the app's own origin
+    /// (`host:port` equals the running server's bind). Rejected to prevent
+    /// recursive self-embedding and token exposure. (Loopback on *other*
+    /// ports stays allowed — a local dev-server preview is a core use case.)
+    /// Produced by [`reject_own_origin_web_views`] at the handler layer, where
+    /// the server port is known — `validate()` (port-agnostic) never emits it.
+    #[error("web_view url points at the app's own origin (self-embedding rejected)")]
+    WebViewOwnOrigin,
 }
 
 impl ValidationError {
@@ -949,6 +999,8 @@ impl ValidationError {
             Self::SnippetBodyTooLong => "snippet_body_too_long",
             Self::SnippetsEntriesTooMany => "snippets_entries_too_many",
             Self::DuplicateSnippetEntryId(_) => "duplicate_snippet_entry_id",
+            Self::WebViewUrlInvalid => "web_view_url_invalid",
+            Self::WebViewOwnOrigin => "web_view_own_origin",
         }
     }
 }
@@ -975,6 +1027,156 @@ pub(crate) fn is_clean_relative_workspace_path(p: &str) -> bool {
     }
     path.components()
         .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// ADR-0059 D1 — whether a URL string carries an explicit URL *scheme*
+/// (`scheme:` where `scheme` matches `[a-zA-Z][a-zA-Z0-9+.-]*`) appearing
+/// before the first path separator. Used to reject every scheme other than
+/// the http(s) allow-list (`javascript:` / `file:` / `data:` / `vbscript:` /
+/// `mailto:` …) while still treating a workspace path whose *filename* happens
+/// to contain a `:` after a `/` (e.g. `docs/a:b.md`) as a path, not a scheme.
+fn has_url_scheme(url: &str) -> bool {
+    let mut chars = url.char_indices();
+    // First char must be an ASCII alpha to start a scheme.
+    match chars.next() {
+        Some((_, c)) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    for (i, c) in chars {
+        match c {
+            ':' => return i > 0,
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '+' | '.' | '-' => {}
+            // A `/` (or anything else) before a `:` means no scheme — the
+            // colon, if any, lives inside a path component.
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// ADR-0059 D1 — form validation for a `web_view` `url`. Two accepted shapes:
+///   1. an `http://` / `https://` absolute URL (scheme case-insensitive) with
+///      a non-empty authority, or
+///   2. a clean workspace(B)-relative file path (reuses
+///      [`is_clean_relative_workspace_path`] — rejects absolute / `.`·`..`
+///      traversal / NUL / empty; the hard A+denylist boundary is enforced at
+///      serve time, `GET /api/fs/file`).
+///
+/// Everything else is rejected: empty, over-cap (`WEB_VIEW_URL_MAX_BYTES`),
+/// scheme-relative `//host` (inherits the app scheme ⇒ own-origin risk), and
+/// any non-http(s) scheme (`javascript:` / `file:` / `data:` / `vbscript:` …).
+///
+/// This is *form only* — existence and the app's-own-origin reject (D8,
+/// [`reject_own_origin_web_views`]) are enforced elsewhere.
+pub(crate) fn is_valid_web_view_url(url: &str) -> bool {
+    if url.is_empty() || url.len() > WEB_VIEW_URL_MAX_BYTES {
+        return false;
+    }
+    // Scheme-relative `//host/...` inherits the embedding page's scheme — treat
+    // as an untrusted origin and reject (never a workspace path either).
+    if url.starts_with("//") {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    if let Some(rest) = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+    {
+        // Require a non-empty authority (host). `rest` is the post-`://`
+        // remainder of the *lowercased* copy — only its emptiness matters.
+        return !rest.is_empty() && !rest.starts_with('/');
+    }
+    // Any other explicit scheme is rejected; otherwise treat as a workspace
+    // path and apply the clean-relative form guard.
+    if has_url_scheme(url) {
+        return false;
+    }
+    is_clean_relative_workspace_path(url)
+}
+
+/// ADR-0059 D8 — parse the lowercased host and effective port from an
+/// `http(s)://` URL. Returns `None` for non-http(s) URLs (workspace paths /
+/// rejected schemes never carry an origin). Best-effort authority parse (no
+/// `url` crate): strips optional `userinfo@`, handles bracketed IPv6
+/// (`[::1]:port`), and defaults the port to 80 (http) / 443 (https) when
+/// absent. Used only to detect the app's own origin — a parse miss returns
+/// `None` (treated as "not own origin", the safe non-blocking default; the
+/// form guard already ran in `validate()`).
+fn parse_http_host_port(url: &str) -> Option<(String, u16)> {
+    let lower = url.to_ascii_lowercase();
+    let (default_port, rest) = if let Some(r) = lower.strip_prefix("http://") {
+        (80u16, r)
+    } else if let Some(r) = lower.strip_prefix("https://") {
+        (443u16, r)
+    } else {
+        return None;
+    };
+    // Authority ends at the first `/`, `?`, or `#`.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    // Drop optional userinfo (`user:pass@host`).
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Bracketed IPv6 literal: `[::1]` or `[::1]:port`.
+    if let Some(after) = host_port.strip_prefix('[') {
+        let (host, tail) = after.split_once(']')?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) if !p.is_empty() => p.parse().ok()?,
+            Some(_) => return None, // trailing `:` with no digits
+            None => default_port,
+        };
+        return Some((host.to_string(), port));
+    }
+    // host[:port]
+    match host_port.rsplit_once(':') {
+        Some((host, p)) if !p.is_empty() => Some((host.to_string(), p.parse().ok()?)),
+        Some(_) => None,
+        None => Some((host_port.to_string(), default_port)),
+    }
+}
+
+/// ADR-0059 D8 — reject any `web_view` whose `url` resolves to the app's own
+/// origin (`host:port` == the running server's bind). This blocks recursive
+/// self-embedding and token exposure. Enforced at the handler layer (both the
+/// full-layout PUT and the batch-ops path) because the server port lives in
+/// config, not in the port-agnostic [`validate`].
+///
+/// A URL is own-origin when its (effective) port equals the server `port`
+/// **and** its host is one the server itself answers on: the configured
+/// `bind` host, or any loopback / unspecified host when the bind is a loopback
+/// or wildcard. Crucially, loopback on a *different* port stays allowed — a
+/// `http://localhost:<dev-port>` preview is a core use case (D8). Non-http(s)
+/// URLs (workspace paths) never match.
+pub fn reject_own_origin_web_views(
+    layout: &Layout,
+    bind: &str,
+    port: u16,
+) -> Result<(), ValidationError> {
+    const LOOPBACK: &[&str] = &["localhost", "127.0.0.1", "::1", "0.0.0.0", "::"];
+    let bind_lower = bind.to_ascii_lowercase();
+    let bind_is_wildcard_or_loopback =
+        LOOPBACK.contains(&bind_lower.as_str()) || bind_lower.starts_with("unix:");
+    for it in &layout.items {
+        let Item::WebView { url, .. } = it else {
+            continue;
+        };
+        let Some((host, url_port)) = parse_http_host_port(url) else {
+            continue; // workspace path or non-http(s) — no origin.
+        };
+        if url_port != port {
+            continue; // different port ⇒ never our own origin (dev-server ok).
+        }
+        let host_is_own = host == bind_lower
+            || (bind_is_wildcard_or_loopback && LOOPBACK.contains(&host.as_str()));
+        if host_is_own {
+            return Err(ValidationError::WebViewOwnOrigin);
+        }
+    }
+    Ok(())
 }
 
 /// Shared text-payload byte cap check (ADR-0018 D8). Reused by `Item::Text`
@@ -1021,6 +1223,7 @@ fn is_connectable(item: &Item) -> bool {
             | Item::Document { .. }
             | Item::FilePath { .. }
             | Item::Snippets { .. }
+            | Item::WebView { .. }
     )
 }
 
@@ -1300,6 +1503,17 @@ pub fn validate(layout: &Layout) -> Result<(), ValidationError> {
                     if e.body.len() > SNIPPET_BODY_MAX_BYTES {
                         return Err(ValidationError::SnippetBodyTooLong);
                     }
+                }
+            }
+            Item::WebView { url, .. } => {
+                // ADR-0059 D1 — url form guard (scheme allow-list + workspace
+                // path clean-form). Runs on both create and edit because both
+                // wire paths (`PUT /layout`, `POST /layout/ops`) funnel through
+                // `validate()`. The app's-own-origin reject (D8) needs the
+                // server port and is enforced at the handler layer
+                // (`reject_own_origin_web_views`), not here.
+                if !is_valid_web_view_url(url) {
+                    return Err(ValidationError::WebViewUrlInvalid);
                 }
             }
             _ => {}
@@ -1928,6 +2142,164 @@ mod tests {
             view_state: None,
         });
         assert_eq!(validate(&l), Err(ValidationError::DocumentInlineTooLong));
+    }
+
+    // ── ADR-0059 D1/D8 — Web View item (url form guard + own-origin) ──
+
+    /// Build a single-item layout carrying one `web_view` with the given url.
+    fn web_view_layout(url: &str) -> Layout {
+        let mut l = Layout::empty();
+        l.items.push(Item::WebView {
+            common: item_common(UUID_A),
+            url: url.to_string(),
+        });
+        l
+    }
+
+    /// Round-trips as a flat `{ "type": "web_view", ...common, "url": … }`
+    /// object (no nested `common` envelope) and validates.
+    #[test]
+    fn round_trip_web_view_item() {
+        let l = web_view_layout("https://example.com/dash");
+        let s = serde_json::to_string(&l).unwrap();
+        let parsed: Layout = serde_json::from_str(&s).unwrap();
+        assert_eq!(l, parsed);
+        assert_eq!(validate(&l), Ok(()));
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["items"][0]["type"], "web_view");
+        assert_eq!(v["items"][0]["url"], "https://example.com/dash");
+        assert!(v["items"][0].get("common").is_none());
+    }
+
+    /// ADR-0059 D1 — accepted url shapes: http(s) absolute URLs (scheme case
+    /// insensitive) and clean workspace(B)-relative file paths.
+    #[test]
+    fn web_view_accepts_http_and_workspace_paths() {
+        for ok in [
+            "http://example.com",
+            "https://example.com/a/b?c=1#frag",
+            "HTTPS://Example.COM/Keep-Case",
+            "http://localhost:5173",   // dev-server preview (loopback, other port)
+            "http://127.0.0.1:3000/x", // loopback, other port
+            "docs/report.md",
+            "assets/diagram.html",
+            "a/b/c/img.png",
+            ".config/preview.html", // leading-dot filename is a Normal component
+        ] {
+            assert_eq!(validate(&web_view_layout(ok)), Ok(()), "expected accept for {ok:?}");
+        }
+    }
+
+    /// ADR-0059 D1 — rejected schemes + malformed forms → `WebViewUrlInvalid`.
+    #[test]
+    fn web_view_rejects_bad_schemes_and_forms() {
+        for bad in [
+            "",                       // empty
+            "javascript:alert(1)",    // xss scheme
+            "JavaScript:alert(1)",    // scheme match is case-insensitive
+            "data:text/html,<script>",
+            "file:///etc/passwd",
+            "vbscript:msgbox(1)",
+            "mailto:x@y.z",
+            "//evil.com/x",           // scheme-relative → untrusted origin
+            "http://",                // empty authority
+            "https:///no-host",       // empty authority (leading slash)
+            "../secret.html",         // path traversal
+            "/etc/passwd",            // absolute local path
+            "a/../../b.md",           // embedded traversal
+        ] {
+            assert_eq!(
+                validate(&web_view_layout(bad)),
+                Err(ValidationError::WebViewUrlInvalid),
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    /// ADR-0059 D1 — url over [`WEB_VIEW_URL_MAX_BYTES`] is rejected.
+    #[test]
+    fn web_view_url_cap_enforced() {
+        let long = format!("https://example.com/{}", "a".repeat(WEB_VIEW_URL_MAX_BYTES));
+        assert_eq!(
+            validate(&web_view_layout(&long)),
+            Err(ValidationError::WebViewUrlInvalid)
+        );
+    }
+
+    /// ADR-0059 — legacy records that predate web_view (no such item) load and
+    /// validate unchanged (the variant is purely additive).
+    #[test]
+    fn legacy_layout_without_web_view_still_valid() {
+        let json = serde_json::json!({
+            "schema_version": 2,
+            "groups": [],
+            "items": [{
+                "type": "note",
+                "id": UUID_A, "parent_id": null,
+                "x": 0.0, "y": 0.0, "w": 100.0, "h": 50.0, "z": 0,
+                "visibility": "visible", "locked": false, "minimized": false,
+                "title": "t", "body": "b", "color": "#fff"
+            }],
+            "viewport": { "x": 0.0, "y": 0.0, "zoom": 1.0 }
+        });
+        let l: Layout = serde_json::from_value(json).unwrap();
+        assert_eq!(validate(&l), Ok(()));
+    }
+
+    /// ADR-0059 D8 — own-origin reject: a web_view pointing at the server's
+    /// own `host:port` is rejected, while loopback on a *different* port (a
+    /// dev-server preview) and a differing host stay allowed.
+    #[test]
+    fn web_view_own_origin_rejected() {
+        // Server bound loopback on 9001.
+        let bind = "127.0.0.1";
+        let port = 9001u16;
+
+        // Own origin — same loopback host + same port.
+        for own in [
+            "http://127.0.0.1:9001",
+            "http://localhost:9001/x",
+            "http://127.0.0.1:9001/nested",
+        ] {
+            let l = web_view_layout(own);
+            assert_eq!(validate(&l), Ok(()), "form-valid precheck for {own:?}");
+            assert_eq!(
+                reject_own_origin_web_views(&l, bind, port),
+                Err(ValidationError::WebViewOwnOrigin),
+                "expected own-origin reject for {own:?}"
+            );
+        }
+
+        // Allowed — same host, different port (dev-server preview) + remote host.
+        for ok in [
+            "http://127.0.0.1:5173",
+            "http://localhost:3000/app",
+            "https://example.com:9001/x", // remote host, port match is irrelevant
+            "docs/local.html",            // workspace path — no origin
+        ] {
+            let l = web_view_layout(ok);
+            assert_eq!(
+                reject_own_origin_web_views(&l, bind, port),
+                Ok(()),
+                "expected own-origin allow for {ok:?}"
+            );
+        }
+    }
+
+    /// ADR-0059 D8 — default-port own-origin: an `https://<bind>` with no
+    /// explicit port matches a server bound on 443 (scheme default).
+    #[test]
+    fn web_view_own_origin_default_port() {
+        let l = web_view_layout("https://myhost.example");
+        assert_eq!(
+            reject_own_origin_web_views(&l, "myhost.example", 443),
+            Err(ValidationError::WebViewOwnOrigin)
+        );
+        // http default 80 differs from the https URL's default 443 → allowed.
+        assert_eq!(
+            reject_own_origin_web_views(&l, "myhost.example", 80),
+            Ok(())
+        );
     }
 
     // ── ADR-0056 D1/D2/D3 — Document view_state (mode + anchor) ──
