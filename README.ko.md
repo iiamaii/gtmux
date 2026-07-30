@@ -5,7 +5,9 @@
 **gtmux는 터미널 중심 작업을 위한 단일 사용자 웹 캔버스 워크스페이스입니다.**
 로컬 또는 개인 cloud 환경에서 Rust 서버를 실행하고, PTY 기반 shell을
 spawn한 뒤, 브라우저의 무한 캔버스 위에 terminal, note, snippet,
-document, image, shape, file reference를 자유롭게 배치합니다.
+document, image, live web view, shape, file reference를 자유롭게
+배치합니다. 번들된 `gtmux` CLI 로 캔버스 전체를 터미널에서 — 또는 AI
+에이전트에게 맡겨 — 제어할 수도 있습니다.
 
 터미널 탭을 여러 개 열어두고 “어느 탭이 무엇이었는지” 기억하는 대신,
 관련 terminal panel과 메모, 명령 snippet, 참고 문서, 이미지, 도형을 한
@@ -16,13 +18,14 @@ Browser canvas
   ├─ Terminal panels      xterm.js 로 렌더되는 live PTY shell
   ├─ Snippets             자주 쓰는 command/text 를 badge 로 저장하고 copy
   ├─ Notes & documents    markdown, PDF, file reference, image
+  ├─ Web views            URL / workspace 파일을 iframe 으로 라이브 렌더
   ├─ Shapes & text        가벼운 다이어그램과 시각적 구분
   └─ Groups & layers      구조화, visibility, lock, z-order
 
-          HTTP + WebSocket
-                │
-                ▼
-gtmux server: Rust · axum · tokio · portable-pty
+          HTTP + WebSocket                    gtmux CLI (agent-driven)
+                │                                     │
+                ▼                                     ▼
+gtmux server: Rust · axum · tokio · portable-pty  ──  layout / terminal ops
 ```
 
 ---
@@ -60,7 +63,20 @@ panel을 의미 있는 위치에 두고, 주변에 note와 snippet을 붙이고,
 
 - **작업 중 문서화**  
   note, markdown document, PDF, image, file path, shape, free draw, text
-  label을 terminal 옆에 붙여 작업 맥락을 함께 유지합니다.
+  label을 terminal 옆에 붙여 작업 맥락을 함께 유지합니다. workspace 의
+  text/markdown/HTML 파일을 그 자리에서 preview·편집(명시적 저장 +
+  충돌 감지)하고, document/preview 안을 Cmd/Ctrl+F 로 검색합니다.
+
+- **Live web view**  
+  원격 URL 이나 workspace 파일(HTML / Markdown / image)을 iframe 으로
+  라이브 렌더하는 web-view panel 을 올립니다. embedding 을 거부하는
+  사이트는 open-in-browser fallback 을 제공합니다.
+
+- **터미널·에이전트에서 조작**  
+  `gtmux` CLI 가 서버 HTTP API 를 통해 live 캔버스를 제어합니다 — item
+  move/resize/create/delete, 다른 terminal spawn·read·send, align,
+  group, panel 연결. AI 에이전트가 pane 안에서 캔버스를 조작할 수
+  있도록 Agent Skill(`gtmux skill install`)을 함께 제공합니다.
 
 - **Group과 layer tree**  
   visual hierarchy, visibility, lock, z-index를 분리해 관리합니다. workflow
@@ -193,7 +209,8 @@ codebase/
 ## 프로젝트 상태
 
 gtmux는 활발히 개발 중입니다. terminal panel, session 관리, canvas layout,
-group, snippet, document, asset, import/export, auth, reconnect, local/cloud
+group, snippet, document, asset, web view, 인-플레이스 preview 편집·검색,
+import/export, auth, reconnect, `gtmux` CLI / agent skill, local/cloud
 기동 경로가 구현되어 있지만, 아직 안정화가 계속되는 프로젝트로 보는 것이
 맞습니다.
 

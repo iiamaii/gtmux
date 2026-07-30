@@ -14,6 +14,9 @@
 2. [Architecture: server · terminal server · web app — and Terminal vs Terminal panel](#2-architecture)
 3. [Toolbar — every tool in detail](#3-toolbar--every-tool-in-detail)
 4. [Group feature](#4-group-feature)
+5. [Files tab — browse, preview, edit](#5-files-tab--browse-preview-edit)
+6. [In-document find (Cmd/Ctrl+F)](#6-in-document-find)
+7. [Agent / CLI control (`gtmux` CLI)](#7-agent--cli-control)
 
 Appendix:
 - [A. Keyboard shortcuts](#a-keyboard-shortcuts)
@@ -311,11 +314,11 @@ The toolbar lives at the top of the workspace. From left to right:
 ```
 [Active session dropdown] | [Select · Hand] | [Terminal] |
                             [Rect · Ellipse · Line · Free draw · Text] |
-                            [Note · Snippets · Document · Image · File path] |
+                            [Note · Snippets · Document · Image · File path · Web view] |
                                             [Undo · Redo · Lock indicator]
 ```
 
-12 canvas tools live in the centre, divided into four semantic groups.
+13 canvas tools live in the centre, divided into four semantic groups.
 A divider sits between groups. Tools are **one-shot** by default — you
 spawn one item and the toolbar bounces back to Select. Hold the lock
 (press **Q** while a tool is active) to keep spawning the same type
@@ -421,16 +424,63 @@ file paths). All drag-spawn.
   - Asset-backed: upload a file → server stores it under
     `<workspace>/.assets/<sha256>` and the item carries the
     `asset_id`.
-- Three render modes cycle through a button on the node:
-  - **Rendered**: Markdown → HTML, sanitised through DOMPurify.
-  - **Interactive**: sandboxed iframe — full HTML/JS but isolated
-    origin.
+- A segmented **[Rendered | Source]** control on the node header (aria
+  *Document view mode*) toggles between:
+  - **Rendered**: Markdown → HTML, sanitised through DOMPurify. HTML
+    documents render inside a sandboxed, origin-isolated iframe.
   - **Source**: raw text.
+- Header also carries **Find in document** (§6), **Copy path**, **Change
+  document**, and minimize / maximize / close. Double-click the title to
+  rename; double-click the body to edit inline.
+
+#### Web view (W)
+- Drag-spawn a live view of a **web address or a workspace file**. The
+  Web-view tool opens a **New web view** modal first (the node isn't
+  created until you commit a valid address).
+- **Address rules** — the `url` accepts exactly two forms:
+  - an **`http(s)://` absolute URL**, or
+  - a **workspace-relative path** to an HTML / Markdown / image file.
+  - `javascript:` / `file:` / `data:` / absolute local paths / `..`
+    traversal are rejected, as is the app's own origin (recursive
+    embed). A loopback dev server on another port
+    (`http://localhost:5173`) *is* allowed. 4 KiB cap.
+  - In the **change modal** a scheme-less entry is auto-fixed: a bare
+    host like `example.com` becomes `https://…`, while a loopback host
+    (`localhost`, `127.0.0.1`, `[::1]`, with optional port) becomes
+    `http://…`. The modal previews the normalized value ("Will be saved
+    as …") before you commit. (The **CLI requires an explicit scheme** —
+    see §7.)
+- **Render matrix**:
+
+  | Address | Rendered as |
+  |---|---|
+  | `http(s)://` remote | `<iframe src>` (browser SOP-isolated, no sandbox) |
+  | local `.html` | `<iframe srcdoc sandbox="allow-scripts">` — scripts run in an opaque origin (no app-origin access, no sanitize) |
+  | local `.md` | the shared Markdown render pipeline (same output as a Document node) |
+  | local image | inline `<img>`, contain-fit |
+  | anything else | an error state (Invalid address / Unsupported file type / Preview unavailable) |
+
+- **Header**: globe glyph + address label · **Reload** · **Copy URL** ·
+  **Open in browser** · **Change address** · minimize · maximize ·
+  close. web_view supports **minimize** and participates in
+  **edge-dock** with the other box-type items.
+- **Open-in-browser fallback**: some sites refuse to be embedded
+  (`X-Frame-Options` / `frame-ancestors`) and show a blank frame —
+  cross-origin means the failure can't be detected. The node shows the
+  hint *"If the site refuses to load here, use 'Open in browser'."* and
+  the header's **Open in browser** button always opens the URL in a new
+  tab.
+- Known limits: text can blur at zoom ≠ 100 % (CSS scale); an https-served
+  app blocks `http://` URLs as mixed content; maximize loads a fresh
+  iframe (canvas-side scroll/SPA state does not follow).
 
 #### Image (I)
-- Drag-spawn the placeholder, then upload an image via the picker.
-- `POST /api/assets/upload` — server SHA256-hashes the bytes, stores
-  at `<workspace>/.assets/<sha256>`, returns `asset_id`.
+- Drag-spawn the placeholder, then pick or upload an image via the picker.
+- Picking an **existing workspace file** references it by path (no copy —
+  the node follows the file). Uploading **external bytes** goes through
+  the assets endpoint — server SHA256-hashes them, stores at
+  `<workspace>/.assets/<sha256>`, returns `asset_id`. An image item
+  carries exactly one of the two.
 - Supported: PNG, JPEG, WebP, GIF.
 - Max size: `[assets].max_size_bytes` (default 50 MiB, sample sets
   100 MiB).
@@ -474,7 +524,7 @@ bindings:
 | Mode | V (Select), H (Hand) |
 | Terminal | T |
 | Figures | R (Rect), O (Ellipse), L (Line), P (Free draw), T (Text) |
-| Content | N (Note), D (Document), I (Image), F (File path) |
+| Content | N (Note), D (Document), I (Image), F (File path), W (Web view) |
 | History | Cmd/Ctrl+Z (Undo), Shift+Cmd/Ctrl+Z (Redo) |
 | Tool lock | Q |
 | Cancel | Esc |
@@ -598,6 +648,188 @@ When M ≥ 2:
 
 ---
 
+## 5) Files tab — browse, preview, edit
+
+The left sidebar's **Files** tab browses the session's workspace tree.
+Beyond navigation it is the host for reading and editing workspace
+files.
+
+### 5.1 Selecting and previewing
+
+- **Single-click** a file selects it and shows a read-only preview in
+  the right panel's **Preview** tab (text / code, Markdown, HTML, image,
+  PDF). Selecting does **not** force a folded right panel open.
+- **Double-click** a file explicitly reveals the preview: it expands a
+  folded right panel onto the Preview tab. Double-clicking a **directory**
+  toggles its expand / collapse instead.
+- The preview toolbar (both inline and maximized) is, in order: the
+  **[Viewer | Edit]** mode control · **Find in file** · **Download** ·
+  **Copy path** · **Maximize / Restore**.
+
+### 5.2 Files context menu
+
+Right-click a row:
+
+- **File**: Open in Preview · Insert as image · Insert as document ·
+  Insert as file path · Copy path · Copy · **Download** · Rename ·
+  Remove.
+- **Directory**: Select folder · Upload here… · Paste here · Insert as
+  file path · New folder · Rename · Copy path · Copy · Remove.
+- **Multi-select**: Insert selected · Insert as file paths · Copy · Copy
+  paths · Remove selected.
+
+**Drag a file onto a live terminal panel** to type its path into that
+shell — the path is sent as PTY *input text only* (POSIX-quoted if it
+contains shell-special characters, no trailing Enter, so nothing runs
+until you press Return). Dropping onto empty canvas materializes canvas
+items instead.
+
+### 5.3 In-place editing (text / Markdown / HTML)
+
+The Preview surface can edit workspace **text, Markdown, and HTML**
+files in place (image / PDF / directory are view-only).
+
+- Switch the header's mode control from **Viewer** to **Edit** (the Edit
+  segment is tinted purple — the app-wide "edit mode" signal). Markdown
+  and HTML open on their **source** text and re-render on save.
+- A second header row appears in edit mode: **Save** · **Undo** ·
+  **Redo**, with a **●** dirty indicator on the right.
+- Saving is **explicit** — there is no autosave. Save with the **Save**
+  button or **Cmd/Ctrl+S** (the shortcut is intercepted, so it never
+  opens the browser's save dialog).
+- **Conflict-safe writes.** Editing captures the file's version
+  (`If-Match`). If the file changed on disk since you started (another
+  program or an agent wrote it), Save opens a **"File changed on disk"**
+  dialog with **Reload (drop my changes)** or **Overwrite** — and lets
+  you *copy your draft to the clipboard* first.
+- **Undo / Redo** in edit mode operate on the native text-editor stack
+  (Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z pass through to the textarea, not the
+  canvas history stack).
+- **Dirty guard**: changing the selected file, switching session /
+  workspace, or leaving the browser while unsaved prompts a
+  *"Discard unsaved changes?"* confirm. Drafts live in memory only.
+- Under the hood, saving goes through `PUT /api/fs/file` (UTF-8 text
+  only, mandatory `If-Match`; `412` on conflict, `428` if the version
+  header is missing).
+
+### 5.4 View-state persistence (silent)
+
+Document nodes remember their scroll position and Rendered/Source mode
+across canvas ↔ maximize and across a page reload — it just works, no
+control to manage. (Remote web views cannot restore scroll and persist
+only their URL.)
+
+---
+
+## 6) In-document find
+
+`Cmd/Ctrl+F` searches **inside** the document or preview you're looking
+at, instead of the left-panel search. A floating **find bar** appears in
+the top-right of the surface:
+
+- Input placeholder **Find**; matches are **literal substring,
+  case-insensitive**.
+- Match counter shows **current / total** (e.g. `3/12`); `0/0` in a
+  warning tone when nothing matches; very large results cap at
+  `5000+`.
+- **Enter** = next match, **Shift+Enter** = previous (also the `↑`/`↓`
+  buttons); **Esc** closes the bar.
+- Highlighting uses the CSS Custom Highlight API, so the rendered DOM is
+  never rewritten.
+
+**Where Cmd/Ctrl+F routes** (first match wins):
+
+1. Focus is in a terminal → left-panel search (terminal special-case,
+   unchanged).
+2. A maximized, searchable document → that document's find bar.
+3. A text selection inside a document / preview → that surface's find
+   bar, pre-filled with the selection.
+4. A single selected document item, or the Preview tab on a searchable
+   file → that surface's find bar.
+5. Otherwise → the existing left-panel search behavior.
+
+Coverage (v1): Markdown *rendered* and *source / text* views. HTML
+*rendered* (sandbox iframe), PDF, and image views don't expose Find —
+toggle HTML to Source to search it. Find is available while editing a
+preview (it searches the draft).
+
+---
+
+## 7) Agent / CLI control
+
+Everything you can do on the canvas by hand, a terminal command — or an
+AI agent running inside a pane — can do through the **`gtmux` CLI**. The
+CLI drives the **live** server over its HTTP API (web state only; tmux
+state is still owned by tmux), so changes appear on the canvas in real
+time. Full contract: `gtmux skill` (or install it for agents with
+`gtmux skill install`).
+
+### 7.1 Layout control (`gtmux layout`)
+
+Targets are an **item UUID or an exact label**. Inside a
+gtmux-spawned terminal, `--session` defaults to `$GTMUX_CANVAS_SESSION`.
+
+```bash
+gtmux layout list                      # every item: id/type/label/geometry/visibility/locked/z
+gtmux layout get <target>              # one item in detail (--json for full payload)
+gtmux layout connections <target>      # path connections touching an item
+
+gtmux layout move <target>   --x <f> --y <f>
+gtmux layout resize <target> --w <f> --h <f>
+gtmux layout show|hide|minimize|restore <target>   # minimize: terminal/note/document/snippets/web_view
+gtmux layout label <target> <text> | --clear
+gtmux layout raise|raise-top|lower|lower-bottom <target>
+gtmux layout edit <target> --set k=v … | --json '<partial payload>'
+gtmux layout create <type> [--x --y --w --h] [--set …|--json …]
+gtmux layout delete <target> [--kill-terminal] [--force]
+gtmux layout group create <t1> <t2> … [--label <s>] | ungroup <g> | reparent <t> --parent <g|root>
+gtmux layout align <mode> <t1> <t2> …   # left/right/top/bottom/center-h/center-v/distribute-h/distribute-v
+gtmux layout batch --json '<ops[]>'     # atomic multi-op
+```
+
+`create <type>` accepts
+`text|note|rect|ellipse|line|free_draw|image|document|web_view|file_path|path|snippets`
+(terminals are not created here — use `terminal spawn`). Creating a
+**web_view** requires an **explicit scheme** — write
+`gtmux layout create web_view --set url=http://localhost:5173`, not
+`localhost:5173` (the browser modal's scheme auto-fix does not apply on
+the CLI). Same URL rules as §3.4.
+
+Locked items are refused (409) unless you pass `--force`; z-order is the
+four raise/lower actions only (no arbitrary z); `maximized` / viewport /
+selection are not CLI-controllable.
+
+### 7.2 Terminals (`gtmux terminal`)
+
+```bash
+gtmux terminal spawn [--x --y --w --h]     # new PTY terminal + panel
+gtmux terminal mount <uuid> [--x --y]      # re-mount a pool terminal onto the canvas
+gtmux terminal unmount <target>            # remove the panel, keep the PTY in the pool
+gtmux terminal kill <target>               # SIGTERM the pool terminal
+gtmux terminal ls                          # the live terminal pool
+gtmux terminal read <target> [--tail N] [--raw]     # read recent output (ANSI-stripped by default)
+gtmux terminal send <target> <text> [--no-enter]    # inject input (adds a newline unless --no-enter)
+gtmux terminal send <target> --bytes <hex>          # control bytes (03 = Ctrl-C, 1b5b41 = Up)
+```
+
+`read` returns a snapshot of a lossy 128 KiB ring — long output loses
+its head, and full-screen TUIs (vim, interactive `claude`/`codex`) are
+near-useless to scrape; run those headless (NDJSON) if you need complete
+capture. Never `send` to your own `$GTMUX_TERMINAL_ID` (self-injection).
+
+### 7.3 Workspace, session, files, skill
+
+```bash
+gtmux workspace get --session <name>                # print session Workspace(B) root
+gtmux workspace set <path> --session <name>         # re-point it
+gtmux session ls | export | import | create | delete  # session records (create/delete gate on auth)
+gtmux fs upload <src> --dir <ws-relative> --session <name>   # import a local file into the workspace
+gtmux skill [--section <n>]                # print the embedded agent skill
+gtmux skill install [--claude] [--codex] [--force]   # install it for AI agents
+```
+
+---
+
 ## A. Keyboard shortcuts
 
 Canvas focus required (the canvas-root element, not a terminal panel
@@ -617,6 +849,7 @@ text area).
 | D | Document |
 | I | Image |
 | F | File path |
+| W | Web view |
 
 ### Tool modifiers
 | Key | Action |
@@ -674,7 +907,18 @@ text area).
 | Key | Action |
 |---|---|
 | `0` | Reset zoom to 100% |
-| Shift + `1` | Fit all items in viewport |
+| Shift + `1` | Fit all items in viewport (panel-aware — fits into the canvas region left visible by the open side panels, not the raw window) |
+
+Zoom ranges from **5 % to 300 %** (`Cmd/Ctrl + Scroll`, or the viewport
+pill).
+
+### Document & preview
+| Key | Action |
+|---|---|
+| Cmd/Ctrl + F | Open in-document find on the focused document / preview (§6); elsewhere routes to left-panel search |
+| Cmd/Ctrl + S | Save (only while editing a file preview, §5.3) — does not trigger the browser save dialog |
+| Enter / Shift+Enter | Next / previous find match |
+| Esc | Close the find bar (first), then exit edit mode |
 
 All single-key bindings are reassignable in **Settings → Keyboard**.
 
@@ -712,10 +956,19 @@ All single-key bindings are reassignable in **Settings → Keyboard**.
 
 ### Viewport controls (bottom centre pill)
 
-- Zoom −, zoom %, zoom +.
+- Zoom −, zoom %, zoom + (range **5 %–300 %**).
 - Reset to 100%.
-- Fit all.
+- **Fit all panels** — panel-aware: fits into the canvas area left
+  visible by the open side panels, not the raw window.
 - Selection count badge.
+
+### Panel width (double-click the resize handle)
+
+Double-clicking a left- or right-panel resize handle (the `ew-resize`
+border) toggles the panel between its **minimum width** and a
+**content-fit width** — a one-gesture way to peek at a narrow panel and
+snap back, without dragging. This is distinct from folding the panel
+(the fold button / collapsed rail).
 
 ### Context menu (right-click)
 
