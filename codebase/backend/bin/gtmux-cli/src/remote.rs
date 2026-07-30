@@ -381,10 +381,11 @@ pub enum TerminalCmd {
     Send {
         /// Pool terminal UUID or exact label.
         target: String,
-        /// Text to send. A trailing newline is appended (runs the command)
-        /// unless `--no-enter`. Omit when using `--bytes`.
+        /// Text to send. Submitted by a separate CR (Enter) write after a short
+        /// delay (ADR-0054 D4 amend — reliable for raw-mode agent TUIs) unless
+        /// `--no-enter`. Omit when using `--bytes`.
         text: Option<String>,
-        /// Do not append a trailing newline (send the keystrokes only).
+        /// Do not submit — send the keystrokes only (no trailing CR).
         #[arg(long = "no-enter")]
         no_enter: bool,
         /// Send raw control bytes as hex (e.g. `03` = Ctrl-C, `1b5b41` = Up).
@@ -906,38 +907,49 @@ fn terminal_dispatch(cmd: TerminalCmd) -> Result<(), CliError> {
             bytes,
             instance,
         } => {
-            let payload: Vec<u8> = match (text, bytes) {
-                (Some(_), Some(_)) => {
-                    return Err(CliError::local(
-                        "pass either the text argument or --bytes, not both",
-                    ))
-                }
-                (None, None) => {
-                    return Err(CliError::local(
-                        "nothing to send: provide text or --bytes <hex>",
-                    ))
-                }
-                (Some(t), None) => {
-                    let mut v = t.into_bytes();
-                    if !no_enter {
-                        v.push(b'\n');
-                    }
-                    v
-                }
-                // --no-enter does not apply to raw control bytes.
-                (None, Some(hex)) => crate::ansi::parse_hex(&hex).map_err(CliError::Local)?,
-            };
+            let plan = plan_send(text, bytes, no_enter).map_err(CliError::Local)?;
             let client = connect(instance.instance)?;
             let uuid = resolve_pool_terminal(&client, &target)?;
-            let b64 = BASE64.encode(&payload);
-            let resp = client.send_json(
-                "POST",
-                &format!("/api/terminals/{uuid}/input"),
-                &json!({ "bytes_base64": b64 }),
-                &[],
-            )?;
-            let sent = resp.get("sent").and_then(Value::as_u64).unwrap_or(0);
-            println!("sent {sent} bytes to {uuid}");
+            match plan {
+                SendPlan::Single(payload) => {
+                    let sent = post_input(&client, &uuid, &payload)?;
+                    println!("sent {sent} bytes to {uuid}");
+                }
+                SendPlan::Submit(text_bytes) => {
+                    // ADR-0054 D4 amend (2026-07-30): submit as a 2-write —
+                    // text (no trailing newline) then, after a fixed delay, a
+                    // lone CR. A single text+LF write lands in one read() and
+                    // raw-mode TUIs (claude/codex, ink) treat it as a paste, so
+                    // the newline is a literal line-break, not a submit. The gap
+                    // lets the terminal close its paste-detection window before
+                    // the CR arrives as its own keystroke.
+                    let mut sent = 0u64;
+                    // Empty text (`send <t> ''`): the server 400s on 0-byte
+                    // input, so skip the text write and submit only the CR.
+                    if !text_bytes.is_empty() {
+                        sent += post_input(&client, &uuid, &text_bytes)?;
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            SEND_SUBMIT_DELAY_MS,
+                        ));
+                    }
+                    match post_input(&client, &uuid, &[CR]) {
+                        Ok(n) => sent += n,
+                        Err(e) => {
+                            // Partial failure: the text is already in the input
+                            // buffer. Re-running would duplicate it, so guide the
+                            // caller to submit the CR alone instead.
+                            return Err(CliError::Local(format!(
+                                "text delivered to {uuid} but the Enter (CR) write \
+                                 failed: {e:?}. The text is in the input buffer — \
+                                 do NOT re-run this command (it would duplicate the \
+                                 text). Recover by sending just the Enter: \
+                                 `gtmux terminal send {uuid} --bytes 0d`.",
+                            )));
+                        }
+                    }
+                    println!("sent {sent} bytes to {uuid}");
+                }
+            }
             Ok(())
         }
     }
@@ -1254,6 +1266,59 @@ fn session_list_entry(client: &Client, session: &str) -> Result<Value, CliError>
             code: "session_not_found".into(),
             message: format!("no session named '{session}' on instance"),
         })
+}
+
+/// Fixed delay between the text write and the CR write in `terminal send`'s
+/// 2-write submit (ADR-0054 D4 amend). Wide enough to clear a raw-mode TUI's
+/// paste-detection window (same tick / tens of ms) so the CR reads as its own
+/// Enter keystroke rather than being coalesced with the text.
+const SEND_SUBMIT_DELAY_MS: u64 = 150;
+
+/// Carriage return — the byte a keyboard Enter emits in raw mode. Shells map it
+/// CR→NL via termios `icrnl`, so canonical command use is unaffected.
+const CR: u8 = 0x0d;
+
+/// Wire plan for `terminal send`, kept pure so the 2-write submit contract
+/// (ADR-0054 D4 amend) is unit-testable without a live server.
+enum SendPlan {
+    /// One POST of these exact bytes: `--bytes <hex>`, or `--no-enter` text.
+    Single(Vec<u8>),
+    /// Submit these text bytes (no trailing newline) then, after a delay, a
+    /// lone CR. Empty text ⇒ the text write is skipped and only the CR is sent.
+    Submit(Vec<u8>),
+}
+
+/// Derive the send plan from the CLI args. Errors mirror the old inline
+/// validation (mutual exclusion / nothing-to-send / bad hex).
+fn plan_send(
+    text: Option<String>,
+    bytes: Option<String>,
+    no_enter: bool,
+) -> Result<SendPlan, String> {
+    match (text, bytes) {
+        (Some(_), Some(_)) => Err("pass either the text argument or --bytes, not both".into()),
+        (None, None) => Err("nothing to send: provide text or --bytes <hex>".into()),
+        // Text with no explicit Enter suppression submits via the 2-write path;
+        // `--no-enter` sends the keystrokes only (single write, no CR).
+        (Some(t), None) if no_enter => Ok(SendPlan::Single(t.into_bytes())),
+        (Some(t), None) => Ok(SendPlan::Submit(t.into_bytes())),
+        // --no-enter does not apply to raw control bytes.
+        (None, Some(hex)) => Ok(SendPlan::Single(crate::ansi::parse_hex(&hex)?)),
+    }
+}
+
+/// POST one raw byte chunk to a terminal's input; returns the server's `sent`
+/// count. The 2-write submit waits on each response before the next write, so
+/// PTY write order is guaranteed.
+fn post_input(client: &Client, uuid: &str, payload: &[u8]) -> Result<u64, CliError> {
+    let b64 = BASE64.encode(payload);
+    let resp = client.send_json(
+        "POST",
+        &format!("/api/terminals/{uuid}/input"),
+        &json!({ "bytes_base64": b64 }),
+        &[],
+    )?;
+    Ok(resp.get("sent").and_then(Value::as_u64).unwrap_or(0))
 }
 
 fn resolve_pool_terminal(client: &Client, needle: &str) -> Result<String, CliError> {
@@ -1930,6 +1995,80 @@ mod tests {
             resolve_target(&layout, ID_TERM, TargetDomain::TerminalItem).unwrap(),
             ID_TERM
         );
+    }
+
+    // ── terminal send: 2-write CR submit (ADR-0054 D4 amend) ──────────────
+
+    /// Text without `--no-enter` = text bytes (NO trailing newline) followed by
+    /// a lone CR (0x0d), sent as two separate writes.
+    #[test]
+    fn send_text_submits_with_separate_cr() {
+        let plan = plan_send(Some("echo hi".into()), None, false).unwrap();
+        let SendPlan::Submit(text) = plan else {
+            panic!("text should submit via 2-write");
+        };
+        assert_eq!(text, b"echo hi", "text carries no trailing newline");
+        assert!(!text.ends_with(b"\n"), "no LF appended to the text write");
+        // The submit write is a single CR byte.
+        assert_eq!([CR], [0x0d]);
+    }
+
+    /// A multiline prompt keeps its internal `\n` (TUI multiline paste); the CR
+    /// is still the only submit byte.
+    #[test]
+    fn send_multiline_text_keeps_internal_newlines() {
+        let plan = plan_send(Some("line1\nline2".into()), None, false).unwrap();
+        let SendPlan::Submit(text) = plan else {
+            panic!("expected submit");
+        };
+        assert_eq!(text, b"line1\nline2");
+        assert!(!text.ends_with(b"\n"), "no submit LF appended");
+    }
+
+    /// `--no-enter` = a single write of exactly the text, no CR, no LF.
+    #[test]
+    fn send_no_enter_is_single_write_without_newline() {
+        let plan = plan_send(Some("partial".into()), None, true).unwrap();
+        let SendPlan::Single(payload) = plan else {
+            panic!("--no-enter should be a single write");
+        };
+        assert_eq!(payload, b"partial");
+        assert!(!payload.ends_with(b"\n"));
+        assert!(!payload.ends_with(&[CR]));
+    }
+
+    /// `--bytes` is unchanged: a single write of the decoded hex, unaffected by
+    /// `--no-enter`.
+    #[test]
+    fn send_bytes_is_unchanged_single_write() {
+        let plan = plan_send(None, Some("03".into()), false).unwrap();
+        let SendPlan::Single(payload) = plan else {
+            panic!("--bytes should be a single write");
+        };
+        assert_eq!(payload, vec![0x03]);
+        // --no-enter has no effect on raw bytes.
+        let plan2 = plan_send(None, Some("1b5b41".into()), true).unwrap();
+        assert!(matches!(plan2, SendPlan::Single(ref p) if *p == vec![0x1b, 0x5b, 0x41]));
+    }
+
+    /// Empty text (not `--no-enter`) → the text write is skipped (server 400s on
+    /// 0 bytes); only the CR is submitted. The plan carries empty text; the
+    /// dispatch elides the first POST.
+    #[test]
+    fn send_empty_text_submits_cr_only() {
+        let plan = plan_send(Some(String::new()), None, false).unwrap();
+        let SendPlan::Submit(text) = plan else {
+            panic!("empty text still submits");
+        };
+        assert!(text.is_empty(), "no text write for empty input");
+    }
+
+    /// Argument validation is preserved.
+    #[test]
+    fn send_rejects_conflicting_and_empty_args() {
+        assert!(plan_send(Some("x".into()), Some("03".into()), false).is_err());
+        assert!(plan_send(None, None, false).is_err());
+        assert!(plan_send(None, Some("zz".into()), false).is_err(), "bad hex");
     }
 
     #[test]
