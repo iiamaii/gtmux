@@ -808,7 +808,7 @@ gtmux terminal unmount <target>            # remove the panel, keep the PTY in t
 gtmux terminal kill <target>               # SIGTERM the pool terminal
 gtmux terminal ls                          # the live terminal pool
 gtmux terminal read <target> [--tail N] [--raw]     # read recent output (ANSI-stripped by default)
-gtmux terminal send <target> <text> [--no-enter]    # inject input (adds a newline unless --no-enter)
+gtmux terminal send <target> <text> [--no-enter]    # inject input; submits via a separate delayed CR (Enter) write — reliable for agent TUIs. --no-enter = keystrokes only
 gtmux terminal send <target> --bytes <hex>          # control bytes (03 = Ctrl-C, 1b5b41 = Up)
 ```
 
@@ -827,6 +827,42 @@ gtmux fs upload <src> --dir <ws-relative> --session <name>   # import a local fi
 gtmux skill [--section <n>]                # print the embedded agent skill
 gtmux skill install [--claude] [--codex] [--force]   # install it for AI agents
 ```
+
+### 7.4 Letting an agent build your canvas (self-building layouts)
+
+The intended way to use §7.1–7.3 is usually **not** typing them yourself
+— it is handing them to an AI agent running *inside* your session:
+
+1. **One-time setup**: `gtmux skill install --claude` (and/or `--codex`).
+   This installs the CLI contract as an agent skill, so the agent knows
+   every command, target rule, and gate without you pasting docs.
+   Restart the agent CLI once so it picks the skill up.
+2. **Spawn a terminal on the canvas** (toolbar Terminal tool or
+   `gtmux terminal spawn`) and start your agent in it (`claude`,
+   `codex`, …). Because the pane is a gtmux-spawned PTY,
+   `$GTMUX_CANVAS_SESSION` and `$GTMUX_TERMINAL_ID` are pre-set — the
+   agent's `gtmux` calls target **this session** automatically, and you
+   watch the canvas assemble itself live around the agent's own
+   terminal.
+3. **Prompt it.** The agent reads current state with
+   `gtmux layout list` and mutates from there. Example prompts:
+
+   > *"Use the gtmux skill. Build a research board in this session:
+   > two terminals on the left (one running the test watcher), README.md
+   > as a document in the middle, and a web_view of
+   > `http://localhost:5173` on the right. Label, group and align
+   > everything, then leave a note with what you did."*
+
+   > *"Tidy up this canvas: align the overlapping panels into a grid,
+   > group the terminals, minimize anything I haven't touched, and label
+   > the groups."*
+
+   > *"Watch the build terminal (`gtmux terminal read`), and when it
+   > fails, open the failing file as a document next to it."*
+
+   Practical guardrails the skill already teaches the agent: locked
+   items are refused without `--force`; it must never `send` to its own
+   `$GTMUX_TERMINAL_ID`; viewport/selection stay user-owned.
 
 ---
 
