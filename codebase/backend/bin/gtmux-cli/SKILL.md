@@ -64,7 +64,7 @@ gtmux terminal mount <uuid> [--x --y]      # pool 의 기존 terminal 을 canvas
 gtmux terminal unmount <target>            # panel 만 제거, terminal 은 pool 잔류
 gtmux terminal kill <target>               # process 종료
 gtmux terminal read <target> [--tail N] [--raw]   # 터미널 출력 읽기 (기본 ANSI strip 텍스트, --raw 는 원본 바이트)
-gtmux terminal send <target> <text> [--no-enter]  # 입력 주입 (기본 뒤에 \n → 명령 실행; --no-enter 는 개행 없이)
+gtmux terminal send <target> <text> [--no-enter]  # 입력 주입. 기본: text 를 보낸 뒤 짧은 지연 후 별도의 CR(0x0d, Enter) 를 한 번 더 write → 제출. raw-mode agent TUI(claude/codex)에서 안정적. --no-enter 는 CR 없이 키입력만
 gtmux terminal send <target> --bytes <hex>        # 제어 시퀀스 (03=Ctrl-C, 1b5b41=Up)
 gtmux workspace set <path> --session <name>
 gtmux session create <name> [--workspace <p>] [--yes|--password <p>]  # 추가 인증 게이트
@@ -94,7 +94,7 @@ gtmux fs upload <src-path> --dir <ws-relative> --session <name>       # workspac
   gtmux layout edit <target> --set url=https://other.example.com  # 주소 변경
   ```
   규칙(스킴 제한·own-origin 거부·loopback 허용·4KiB)은 §3. 스킴 위반 등은 exit≠0 + stderr code(`web_view_url_invalid`/`web_view_own_origin`).
-- **worker 터미널**: `terminal spawn` 으로 하위 터미널을 만들고, `terminal read`/`terminal send` 로 출력을 읽고 명령을 주입. 흐름: 다른 패널을 `terminal read <other>` 로 관찰 → 구상한 작업을 `terminal send <other> "ls"` 로 실행. 단 `read` 는 raw ring(128KiB drop-oldest) 스냅샷이라 **긴 출력의 앞부분은 유실**되고 ANSI 가 섞인다(기본 출력은 CLI-side ANSI strip). claude/codex 대화형 TUI·vim 같은 **full-screen 재그리기 화면은 raw 가 재그리기 스트림이라 거의 무의미** — 완전 캡처·명령 완료 신호가 필요하면 headless(`claude -p --output-format stream-json`, `codex exec --json`)를 그 터미널에서 돌려 NDJSON 을 직접 파싱하라.
+- **worker 터미널**: `terminal spawn` 으로 하위 터미널을 만들고, `terminal read`/`terminal send` 로 출력을 읽고 명령을 주입. 흐름: 다른 패널을 `terminal read <other>` 로 관찰 → 구상한 작업을 `terminal send <other> "ls"` 로 실행. 단 `read` 는 raw ring(128KiB drop-oldest) 스냅샷이라 **긴 출력의 앞부분은 유실**되고 ANSI 가 섞인다(기본 출력은 CLI-side ANSI strip). claude/codex 대화형 TUI·vim 같은 **full-screen 재그리기 화면은 raw 가 재그리기 스트림이라 거의 무의미** — 완전 캡처·명령 완료 신호가 필요하면 headless(`claude -p --output-format stream-json`, `codex exec --json`)를 그 터미널에서 돌려 NDJSON 을 직접 파싱하라. 다른 agent 터미널에 프롬프트를 send 하기 전, `terminal read <t> --tail 5` 로 대상이 idle(입력 대기) 인지 먼저 확인하라 — 만약 Enter 가 씹혀 프롬프트가 입력창에 걸려 있으면 `terminal send <t> --bytes 0d` 로 CR 만 다시 보내 제출한다(text 재전송 금지 — 중복 주입).
 
 ## 5. 하지 말 것
 
