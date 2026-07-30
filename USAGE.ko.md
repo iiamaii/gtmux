@@ -14,6 +14,9 @@
 2. [Architecture: server · terminal server · web app — 그리고 Terminal vs Terminal panel](#2-architecture)
 3. [Toolbar — tool 별 세부 기능](#3-toolbar--tool-별-세부-기능)
 4. [Group 기능](#4-group-기능)
+5. [Files 탭 — 탐색 · preview · 편집](#5-files-탭--탐색--preview--편집)
+6. [문서 내 검색 (Cmd/Ctrl+F)](#6-문서-내-검색)
+7. [Agent / CLI 제어 (`gtmux` CLI)](#7-agent--cli-제어)
 
 Appendix:
 - [A. Keyboard shortcuts](#a-keyboard-shortcuts)
@@ -301,11 +304,11 @@ Toolbar 는 workspace 상단. 좌 → 우:
 ```
 [Active session dropdown] | [Select · Hand] | [Terminal] |
                             [Rect · Ellipse · Line · Free draw · Text] |
-                            [Note · Snippets · Document · Image · File path] |
+                            [Note · Snippets · Document · Image · File path · Web view] |
                                             [Undo · Redo · Lock indicator]
 ```
 
-12개 canvas tool 이 중앙에 있고, 4개의 semantic 그룹으로 묶여 divider
+13개 canvas tool 이 중앙에 있고, 4개의 semantic 그룹으로 묶여 divider
 로 구분된다. Tool 은 기본적으로 **one-shot** — item 1개 spawn 하면
 Select 로 자동 복귀. 같은 종류를 연속으로 만들고 싶으면 tool 활성 상태
 에서 **Q** 로 lock — **Esc** 까지 유지.
@@ -402,16 +405,59 @@ path). 전부 drag-spawn.
   - Asset-backed: 파일 업로드 → 서버가
     `<workspace>/.assets/<sha256>` 에 저장, item 은
     `asset_id` 보유.
-- 3가지 render 모드를 노드 위 버튼으로 순환:
-  - **Rendered**: Markdown → HTML, DOMPurify 로 sanitize.
-  - **Interactive**: sandboxed iframe — 전체 HTML/JS 허용되지만 origin
-    격리.
+- 노드 헤더의 세그먼트 **[Rendered | Source]** 컨트롤(aria *Document
+  view mode*)로 전환:
+  - **Rendered**: Markdown → HTML, DOMPurify 로 sanitize. HTML 문서는
+    origin 격리된 sandbox iframe 안에서 렌더.
   - **Source**: raw text.
+- 헤더에는 **Find in document**(§6) · **Copy path** · **Change
+  document** + minimize / maximize / close 도 있다. 제목 double-click
+  으로 rename, body double-click 으로 인라인 편집.
+
+#### Web view (W)
+- **web 주소 또는 workspace 파일**의 라이브 뷰를 drag-spawn. Web-view
+  tool 은 먼저 **New web view** 모달을 열고, 유효한 주소를 확정해야
+  노드가 생성된다.
+- **주소 규칙** — `url` 은 정확히 두 형태만 허용:
+  - **`http(s)://` 절대 URL**, 또는
+  - HTML / Markdown / image 파일의 **workspace 상대 경로**.
+  - `javascript:` / `file:` / `data:` / 절대 로컬 경로 / `..` traversal
+    은 거부되며, 앱 자신의 origin(재귀 embed)도 거부. 타 포트 loopback
+    dev 서버(`http://localhost:5173`)는 허용. 4 KiB 상한.
+  - **change 모달**에서 스킴 없는 입력은 자동 보정된다: `example.com`
+    같은 일반 host 는 `https://…`, loopback host(`localhost`,
+    `127.0.0.1`, `[::1]`, 포트 선택)는 `http://…`. 모달이 보정된 값을
+    미리 보여준다("Will be saved as …"). (**CLI 는 스킴 명시 필수** —
+    §7 참조.)
+- **렌더 매트릭스**:
+
+  | 주소 | 렌더 |
+  |---|---|
+  | `http(s)://` 원격 | `<iframe src>` (브라우저 SOP 격리, sandbox 미지정) |
+  | 로컬 `.html` | `<iframe srcdoc sandbox="allow-scripts">` — opaque origin 에서 스크립트 동작(앱 origin 접근 불가, sanitize 없음) |
+  | 로컬 `.md` | 공유 Markdown 렌더 파이프라인(Document 노드와 동일 출력) |
+  | 로컬 image | inline `<img>`, contain-fit |
+  | 그 외 | 오류 상태(Invalid address / Unsupported file type / Preview unavailable) |
+
+- **헤더**: globe 글리프 + 주소 라벨 · **Reload** · **Copy URL** ·
+  **Open in browser** · **Change address** · minimize · maximize ·
+  close. web_view 는 **minimize** 를 지원하고 다른 box-형 item 과 함께
+  **edge-dock** 에 참여한다.
+- **open-in-browser fallback**: 일부 사이트는 embedding 을 거부하고
+  (`X-Frame-Options` / `frame-ancestors`) 빈 프레임이 된다 — cross-origin
+  이라 실패 감지가 불가. 노드는 *"If the site refuses to load here, use
+  'Open in browser'."* 힌트를 보여주고, 헤더의 **Open in browser** 버튼은
+  항상 새 탭에서 URL 을 연다.
+- 알려진 한계: zoom ≠ 100 % 에서 텍스트 블러(CSS scale); https 로 서빙된
+  앱은 `http://` URL 을 mixed content 로 차단; maximize 는 새 iframe 을
+  로드(캔버스 쪽 스크롤/SPA 상태는 따라가지 않음).
 
 #### Image (I)
-- Placeholder drag-spawn → picker 로 이미지 업로드.
-- `POST /api/assets/upload` — 서버가 SHA256 hash 후
-  `<workspace>/.assets/<sha256>` 에 저장, `asset_id` 반환.
+- Placeholder drag-spawn → picker 로 이미지 선택 또는 업로드.
+- **기존 workspace 파일 선택**은 path 참조(복사 없음 — 노드가 파일을
+  따라감). **외부 바이트 업로드**는 assets 엔드포인트 경유 — 서버가
+  SHA256 hash 후 `<workspace>/.assets/<sha256>` 에 저장, `asset_id`
+  반환. image item 은 둘 중 정확히 하나만 보유.
 - 지원: PNG, JPEG, WebP, GIF.
 - 최대 크기: `[assets].max_size_bytes` (기본 50 MiB, sample 은
   100 MiB).
@@ -453,7 +499,7 @@ Override 는 `localStorage` 에 저장, 브라우저 scope.
 | Mode | V (Select), H (Hand) |
 | Terminal | T |
 | Figures | R (Rect), O (Ellipse), L (Line), P (Free draw), T (Text) |
-| Content | N (Note), D (Document), I (Image), F (File path) |
+| Content | N (Note), D (Document), I (Image), F (File path), W (Web view) |
 | History | Cmd/Ctrl+Z (Undo), Shift+Cmd/Ctrl+Z (Redo) |
 | Tool lock | Q |
 | Cancel | Esc |
@@ -569,6 +615,178 @@ M ≥ 2 일 때:
 
 ---
 
+## 5) Files 탭 — 탐색 · preview · 편집
+
+좌측 사이드바의 **Files** 탭은 session 의 workspace 트리를 탐색한다.
+탐색을 넘어 workspace 파일을 읽고 편집하는 host 이기도 하다.
+
+### 5.1 선택과 preview
+
+- 파일 **single-click** = 선택 + 우측 패널 **Preview** 탭에 read-only
+  preview 표시(text / code, Markdown, HTML, image, PDF). 선택은 접힌
+  우 패널을 강제로 펼치지 **않는다**.
+- 파일 **double-click** = preview 를 명시적으로 reveal: 접힌 우 패널을
+  Preview 탭으로 펼친다. **디렉토리** double-click 은 expand / collapse
+  토글.
+- preview 툴바(inline · maximized 공통) 순서: **[Viewer | Edit]** 모드
+  컨트롤 · **Find in file** · **Download** · **Copy path** · **Maximize
+  / Restore**.
+
+### 5.2 Files context menu
+
+Row 우클릭:
+
+- **File**: Open in Preview · Insert as image · Insert as document ·
+  Insert as file path · Copy path · Copy · **Download** · Rename ·
+  Remove.
+- **Directory**: Select folder · Upload here… · Paste here · Insert as
+  file path · New folder · Rename · Copy path · Copy · Remove.
+- **Multi-select**: Insert selected · Insert as file paths · Copy · Copy
+  paths · Remove selected.
+
+**파일을 live terminal panel 위로 drag** 하면 그 shell 에 경로가
+입력된다 — 경로는 PTY *입력 텍스트로만* 전송된다(shell-special 문자
+포함 시 POSIX single-quote, trailing Enter 없음 → 사용자가 Return 을
+누르기 전엔 실행 안 됨). 빈 canvas 위로 drop 하면 canvas item 이
+materialize 된다.
+
+### 5.3 인-플레이스 편집 (text / Markdown / HTML)
+
+Preview 표면은 workspace **text · Markdown · HTML** 파일을 그 자리에서
+편집한다(image / PDF / directory 는 view-only).
+
+- 헤더 모드 컨트롤을 **Viewer** → **Edit** 로 전환(Edit 세그먼트는
+  보라색 — 앱 전역 "편집 모드" 신호). Markdown / HTML 은 **source**
+  텍스트로 열리고 저장 시 재렌더.
+- 편집 모드에서 2nd 헤더 행이 나타난다: **Save** · **Undo** ·
+  **Redo**, 우측에 **●** dirty 표시.
+- 저장은 **명시적** — autosave 없음. **Save** 버튼 또는 **Cmd/Ctrl+S**
+  (단축키는 가로채므로 브라우저 저장 dialog 를 안 띄운다).
+- **충돌 안전 저장.** 편집 진입 시 파일 버전(`If-Match`)을 보관. 그
+  사이 디스크에서 파일이 바뀌었으면(다른 프로그램·에이전트) Save 가
+  **"File changed on disk"** dialog 를 띄운다 — **Reload (drop my
+  changes)** 또는 **Overwrite**, 그리고 먼저 *draft 를 clipboard 로
+  복사*할 수 있다.
+- 편집 모드의 **Undo / Redo** 는 네이티브 텍스트 에디터 스택에 작동
+  (Cmd/Ctrl+Z, Shift+Cmd/Ctrl+Z 가 canvas history 가 아니라 textarea 로
+  통과).
+- **dirty 가드**: 선택 파일 변경 · session / workspace 전환 · 저장 안
+  된 채 브라우저 이탈 시 *"Discard unsaved changes?"* confirm. draft 는
+  메모리 only.
+- 내부적으로 저장은 `PUT /api/fs/file`(UTF-8 텍스트 전용, `If-Match`
+  필수; 충돌 `412`, 버전 헤더 부재 `428`).
+
+### 5.4 뷰 상태 영속화 (silent)
+
+Document 노드는 스크롤 위치와 Rendered/Source 모드를 canvas ↔ maximize
+전환과 페이지 reload 에 걸쳐 기억한다 — 관리할 컨트롤 없이 그냥 된다.
+(원격 web view 는 스크롤 복원이 불가해 URL 만 영속.)
+
+---
+
+## 6) 문서 내 검색
+
+`Cmd/Ctrl+F` 는 좌측 패널 검색 대신 지금 보고 있는 document / preview
+**안**을 검색한다. 표면 우상단에 플로팅 **find bar** 가 뜬다:
+
+- Input placeholder **Find**; 매칭은 **연속 문자열, 대소문자 무시**.
+- 매치 카운터는 **현재 / 전체**(예: `3/12`); 매치 없으면 경고 톤
+  `0/0`; 대용량은 `5000+` 로 cap.
+- **Enter** = 다음, **Shift+Enter** = 이전(`↑`/`↓` 버튼도); **Esc** =
+  닫기.
+- 하이라이트는 CSS Custom Highlight API 사용 — 렌더된 DOM 을 재작성하지
+  않는다.
+
+**Cmd/Ctrl+F 라우팅**(먼저 매치되는 것 우선):
+
+1. focus 가 terminal 안 → left-panel 검색(터미널 특례, 불변).
+2. maximize 된 검색 가능 document → 그 문서의 find bar.
+3. document / preview 안의 텍스트 선택 → 그 표면의 find bar, 선택
+   텍스트로 prefill.
+4. 단일 선택 document item, 또는 검색 가능 파일의 Preview 탭 → 그
+   표면의 find bar.
+5. 그 외 → 기존 left-panel 검색 동작.
+
+커버리지(v1): Markdown *rendered* + *source / text* 뷰. HTML
+*rendered*(sandbox iframe) · PDF · image 는 Find 미노출 — HTML 은
+Source 로 토글해 검색. preview 편집 중에도 find 사용 가능(draft 를
+검색).
+
+---
+
+## 7) Agent / CLI 제어
+
+canvas 에서 손으로 하는 모든 것을 터미널 명령 — 또는 pane 안에서 도는
+AI 에이전트 — 이 **`gtmux` CLI** 로 할 수 있다. CLI 는 **live** 서버의
+HTTP API 를 통해 제어하므로(web state 전용 — tmux state 는 여전히 tmux
+소유) 변경이 canvas 에 실시간 반영된다. 전체 계약: `gtmux skill`(또는
+에이전트용 설치 `gtmux skill install`).
+
+### 7.1 Layout 제어 (`gtmux layout`)
+
+target 은 **item UUID 또는 정확 일치 label**. gtmux 가 spawn 한 터미널
+안에서 `--session` 은 `$GTMUX_CANVAS_SESSION` 로 기본값.
+
+```bash
+gtmux layout list                      # 전체 item: id/type/label/geometry/visibility/locked/z
+gtmux layout get <target>              # 단건 상세 (--json 시 payload 전체)
+gtmux layout connections <target>      # item 에 연결된 path
+
+gtmux layout move <target>   --x <f> --y <f>
+gtmux layout resize <target> --w <f> --h <f>
+gtmux layout show|hide|minimize|restore <target>   # minimize: terminal/note/document/snippets/web_view
+gtmux layout label <target> <text> | --clear
+gtmux layout raise|raise-top|lower|lower-bottom <target>
+gtmux layout edit <target> --set k=v … | --json '<partial payload>'
+gtmux layout create <type> [--x --y --w --h] [--set …|--json …]
+gtmux layout delete <target> [--kill-terminal] [--force]
+gtmux layout group create <t1> <t2> … [--label <s>] | ungroup <g> | reparent <t> --parent <g|root>
+gtmux layout align <mode> <t1> <t2> …   # left/right/top/bottom/center-h/center-v/distribute-h/distribute-v
+gtmux layout batch --json '<ops[]>'     # 원자적 일괄 적용
+```
+
+`create <type>` 은
+`text|note|rect|ellipse|line|free_draw|image|document|web_view|file_path|path|snippets`
+허용(terminal 은 여기서 생성 불가 — `terminal spawn`). **web_view**
+생성은 **스킴 명시 필수** —
+`gtmux layout create web_view --set url=http://localhost:5173` 로 쓰고
+`localhost:5173` 는 안 됨(브라우저 모달의 스킴 자동 보정은 CLI 에
+미적용). URL 규칙은 §3.4 와 동일.
+
+locked item 은 `--force` 없이는 거부(409); z 는 raise/lower 4액션만(임의
+z 불가); `maximized` / viewport / selection 은 CLI 제어 불가.
+
+### 7.2 Terminal (`gtmux terminal`)
+
+```bash
+gtmux terminal spawn [--x --y --w --h]     # 새 PTY terminal + panel
+gtmux terminal mount <uuid> [--x --y]      # pool 의 terminal 을 canvas 에 재-mount
+gtmux terminal unmount <target>            # panel 만 제거, PTY 는 pool 잔류
+gtmux terminal kill <target>               # pool terminal SIGTERM
+gtmux terminal ls                          # live terminal pool
+gtmux terminal read <target> [--tail N] [--raw]     # 최근 출력 읽기(기본 ANSI strip)
+gtmux terminal send <target> <text> [--no-enter]    # 입력 주입(기본 뒤에 개행; --no-enter 는 없이)
+gtmux terminal send <target> --bytes <hex>          # 제어 바이트(03 = Ctrl-C, 1b5b41 = Up)
+```
+
+`read` 는 lossy 128 KiB ring 의 스냅샷 — 긴 출력은 앞부분이 유실되고,
+full-screen TUI(vim, 대화형 `claude`/`codex`)는 스크레이핑이 거의
+무의미하다(완전 캡처가 필요하면 headless NDJSON). 자기 자신의
+`$GTMUX_TERMINAL_ID` 로는 절대 `send` 하지 말 것(self-injection).
+
+### 7.3 Workspace · session · files · skill
+
+```bash
+gtmux workspace get --session <name>                # session Workspace(B) root 출력
+gtmux workspace set <path> --session <name>         # 재지정
+gtmux session ls | export | import | create | delete  # session 레코드(create/delete 는 auth 게이트)
+gtmux fs upload <src> --dir <ws-relative> --session <name>   # 로컬 파일을 workspace 로 반입
+gtmux skill [--section <n>]                # 임베디드 agent skill 출력
+gtmux skill install [--claude] [--codex] [--force]   # AI 에이전트용 설치
+```
+
+---
+
 ## A. Keyboard shortcuts
 
 Canvas focus 가 필요 (terminal panel 의 텍스트 영역이 아닌 canvas-root
@@ -588,6 +806,7 @@ element).
 | D | Document |
 | I | Image |
 | F | File path |
+| W | Web view |
 
 ### Tool modifier
 | 키 | 액션 |
@@ -645,7 +864,17 @@ element).
 | 키 | 액션 |
 |---|---|
 | `0` | Zoom 100% reset |
-| Shift + `1` | 모든 item 을 viewport 에 맞춤 |
+| Shift + `1` | 모든 item 을 viewport 에 맞춤 (panel-aware — raw window 가 아니라 열린 side panel 이 남긴 가시 canvas 영역 기준) |
+
+Zoom 범위는 **5 % ~ 300 %**(`Cmd/Ctrl + Scroll`, 또는 viewport pill).
+
+### Document & preview
+| 키 | 액션 |
+|---|---|
+| Cmd/Ctrl + F | focus 된 document / preview 에서 문서 내 검색(§6) 열기; 그 외에는 left-panel 검색으로 라우팅 |
+| Cmd/Ctrl + S | 저장 (file preview 편집 중일 때만, §5.3) — 브라우저 저장 dialog 를 안 띄움 |
+| Enter / Shift+Enter | 다음 / 이전 매치 |
+| Esc | find bar 닫기(먼저), 이어서 편집 모드 종료 |
 
 Single-key binding 은 모두 **Settings → Keyboard** 에서 재할당
 가능.
@@ -682,10 +911,18 @@ Single-key binding 은 모두 **Settings → Keyboard** 에서 재할당
 
 ### Viewport controls (하단 중앙 pill)
 
-- Zoom −, zoom %, zoom +.
+- Zoom −, zoom %, zoom + (범위 **5 %~300 %**).
 - 100% reset.
-- Fit all.
+- **Fit all panels** — panel-aware: raw window 가 아니라 열린 side
+  panel 이 남긴 가시 canvas 영역에 맞춘다.
 - Selection count 배지.
+
+### 패널 폭 (resize handle double-click)
+
+좌/우 패널의 resize handle(`ew-resize` 경계)을 double-click 하면 패널
+폭을 **최소 폭** ↔ **콘텐츠-fit 폭** 으로 토글한다 — 드래그 없이 좁은
+패널을 잠깐 확인하고 되돌리는 1-gesture. 패널 접기(fold 버튼 /
+collapsed rail)와는 별개다.
 
 ### Context menu (우클릭)
 

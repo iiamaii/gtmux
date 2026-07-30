@@ -253,9 +253,9 @@ dialog** 가 나타나 session 을 선택 또는 생성하라고 묻는다.
    workspace 파일을 만들고, 빈 canvas 가 열린다.
 4. 이후 toolbar 좌측 상단의 **Active session dropdown** 으로 같은
    서버 안의 session 들을 전환한다. Titlebar 의 kebab (`Session menu`)
-   안에는 [New session] / [Session list] / [Import session] / [Export
-   session] / [Rotate token] / [Settings] / [Shutdown] / [Logout] 가
-   있다.
+   에는 네 항목 — **Switch session…** / **Import layout** / **Export
+   layout** / **Settings…** — 만 있고, auth/lifecycle 관련(Sign out,
+   Rotate token, password, Shutdown)은 전부 **Settings** 안에 있다.
 
 이제 canvas 에 Terminal panel 을 떨어뜨려 본다:
 
@@ -265,6 +265,11 @@ dialog** 가 나타나 session 을 선택 또는 생성하라고 묻는다.
 - Shell 은 `$SHELL` 을 따른다 (macOS 기본 `/bin/zsh`, 대부분의 Linux
   는 `/bin/bash`). WebSocket 끊김에도 살아남고, panel 의 **×** 로 닫을
   때는 confirm modal 거쳐 shell 이 종료된다.
+
+나머지 toolbar tool 도 같은 방식으로 item 을 놓는다 — Note, Snippets,
+Document, Image, File path, shape, Text, 그리고 **Web view**(**W** 를
+누른 뒤 URL 또는 workspace 파일을 주면 라이브 렌더). 전체 tool 은
+[`USAGE.ko.md`](USAGE.ko.md) 참조.
 
 전체 기능 (toolbar 모든 tool, Group, layer tree, clipboard, shortcut)
 설명은 [`USAGE.ko.md`](USAGE.ko.md) 에 있다.
@@ -319,12 +324,22 @@ gtmux teardown --name prod --force      # 5단계 청소
                                         # 부분 보존: --keep-state / --keep-config
 gtmux set-password / reset-password     # 선택적 password credential 추가 / 제거
 gtmux rotate-token --name prod          # 서버 token 재발급 (cloud / offline)
+gtmux skill install                     # agent skill 설치 (Claude + Codex 디렉토리 양쪽)
 ```
 
 (`--session` 은 `--name` 의 deprecated alias 로 여전히 동작하나 deprecation
 경고를 출력한다.)
 
 전체 flag 는 `gtmux <subcommand> --help`.
+
+### 터미널·에이전트에서 캔버스 조작
+
+서버가 떠 있으면 같은 `gtmux` 바이너리가 HTTP API 로 live 캔버스를
+제어한다 — `gtmux layout …`(move / resize / create / delete / align /
+group), `gtmux terminal …`(다른 panel spawn / read / send),
+`gtmux workspace|session|fs …`. `gtmux skill` 로 agent 계약을 출력하거나
+`gtmux skill install` 로 에이전트 skill 디렉토리에 설치한다. 전체 명령
+reference 는 [`USAGE.ko.md`](USAGE.ko.md) §7.
 
 ---
 

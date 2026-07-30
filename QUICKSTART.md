@@ -262,10 +262,11 @@ appears asking you to pick or create a session.
    `${XDG_STATE_HOME:-~/.local/state}/gtmux/<name>.json` and the canvas
    loads, blank.
 4. From now on the **Active session dropdown** in the toolbar (top-left)
-   switches between sessions inside the same server. Use the kebab menu
-   in the titlebar (`Session menu`) for [New session], [Session list],
-   [Import session], [Export session], [Rotate token], [Settings],
-   [Shutdown], [Logout].
+   switches between sessions inside the same server. The kebab menu in
+   the titlebar (`Session menu`) has four items — **Switch session…**,
+   **Import layout**, **Export layout**, **Settings…** — and everything
+   auth/lifecycle-related (Sign out, Rotate token, password, Shutdown)
+   lives under **Settings**.
 
 You can now drop a Terminal panel onto the canvas:
 
@@ -275,6 +276,11 @@ You can now drop a Terminal panel onto the canvas:
 - The shell follows `$SHELL` (default `/bin/zsh` on macOS, `/bin/bash`
   on most Linux). It survives WebSocket disconnects; closing the panel
   via the **×** button kills the shell (with a confirm modal).
+
+The other toolbar tools drop items the same way — Note, Snippets,
+Document, Image, File path, shapes, Text, and **Web view** (press **W**,
+then give it a URL or a workspace file to render live). See
+[`USAGE.md`](USAGE.md) for the full tool set.
 
 Full feature walkthrough — toolbar tools, groups, layer tree, clipboard,
 shortcuts — lives in [`USAGE.md`](USAGE.md).
@@ -330,12 +336,23 @@ gtmux teardown --name prod --force      # 5-step cleanup
                                         # opt-out parts with --keep-state / --keep-config
 gtmux set-password / reset-password     # add / remove the optional password credential
 gtmux rotate-token --name prod          # reissue the server token (cloud / offline)
+gtmux skill install                     # install the agent skill (both Claude + Codex dirs)
 ```
 
 (`--session` is still accepted as a deprecated alias for `--name`; it
 prints a deprecation warning.)
 
 `gtmux <subcommand> --help` for the complete flag list.
+
+### Driving the canvas from a terminal or an agent
+
+Once a server is running, the same `gtmux` binary can control the live
+canvas over its HTTP API — `gtmux layout …` (move / resize / create /
+delete / align / group), `gtmux terminal …` (spawn / read / send other
+panels), `gtmux workspace|session|fs …`. Run `gtmux skill` to print the
+agent contract, or `gtmux skill install` to drop it into your agent's
+skill directory. The full command reference is in
+[`USAGE.md`](USAGE.md) §7.
 
 ---
 

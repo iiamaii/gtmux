@@ -5,7 +5,9 @@
 **gtmux is a single-user web canvas for terminal-centered work.**
 It runs a local or private-cloud Rust server, spawns PTY-backed shells,
 and lets you arrange terminals, notes, snippets, documents, images,
-shapes, and file references on an infinite browser canvas.
+live web views, shapes, and file references on an infinite browser
+canvas. You can drive the whole canvas from your terminal — or hand it
+to an AI agent — through the bundled `gtmux` CLI.
 
 It is designed for people who live in terminals but need more spatial
 context than a tab list: operators, developers, SREs, researchers, and
@@ -17,13 +19,14 @@ Browser canvas
   ├─ Terminal panels      live PTY shells rendered with xterm.js
   ├─ Snippets             one-click reusable commands/text blocks
   ├─ Notes & documents    markdown, PDFs, file references, images
+  ├─ Web views            live URL / workspace-file panels (iframe)
   ├─ Shapes & text        visual grouping and lightweight diagrams
   └─ Groups & layers      structure, visibility, locking, z-order
 
-          HTTP + WebSocket
-                │
-                ▼
-gtmux server: Rust · axum · tokio · portable-pty
+          HTTP + WebSocket                    gtmux CLI (agent-driven)
+                │                                     │
+                ▼                                     ▼
+gtmux server: Rust · axum · tokio · portable-pty  ──  layout / terminal ops
 ```
 
 ---
@@ -57,7 +60,17 @@ and return later to the same layout.
   text blocks as badges. Click a badge to copy its body.
 - **Document as you go.** Add notes, markdown documents, PDFs, images,
   file paths, shapes, free-draw marks, and text labels next to the
-  terminals they explain.
+  terminals they explain. Preview and edit workspace text/markdown/HTML
+  files in place (explicit save with conflict detection), and search
+  within a document or preview with Cmd/Ctrl+F.
+- **Embed live web views.** Drop a web-view panel that renders a remote
+  URL or a workspace file (HTML / Markdown / image) live in an iframe,
+  with an open-in-browser fallback for sites that refuse embedding.
+- **Drive it from a terminal or an agent.** The `gtmux` CLI controls the
+  live canvas over the server's HTTP API — move/resize/create/delete
+  items, spawn and read/send other terminals, align, group, and connect
+  panels. It ships an Agent Skill (`gtmux skill install`) so AI agents
+  running inside a pane can operate the canvas.
 - **Organize complex tasks.** Use groups and the layer tree to keep
   workflows tidy without mixing visual layout with terminal process
   lifecycle.
@@ -190,8 +203,9 @@ codebase/
 ## Project Status
 
 gtmux is under active development. Core terminal panels, session
-management, canvas layout, groups, snippets, documents, assets,
-import/export, auth, reconnect handling, and local/cloud startup paths
+management, canvas layout, groups, snippets, documents, assets, web
+views, in-place preview editing and find, import/export, auth, reconnect
+handling, the `gtmux` CLI / agent skill, and local/cloud startup paths
 are implemented, but the project should still be treated as evolving
 software rather than a stable production platform.
 
