@@ -351,8 +351,11 @@ canvas over its HTTP API — `gtmux layout …` (move / resize / create /
 delete / align / group), `gtmux terminal …` (spawn / read / send other
 panels), `gtmux workspace|session|fs …`. Run `gtmux skill` to print the
 agent contract, or `gtmux skill install` to drop it into your agent's
-skill directory. The full command reference is in
-[`USAGE.md`](USAGE.md) §7.
+skill directory. Best experienced the other way around: spawn a terminal
+**on the canvas**, run `claude`/`codex` inside it, and ask it to *build
+the layout for you* — the skill-aware agent assembles terminals,
+documents and web views around itself, live. Command reference +
+example prompts: [`USAGE.md`](USAGE.md) §7 (esp. §7.4).
 
 ---
 

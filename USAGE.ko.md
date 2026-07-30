@@ -765,7 +765,7 @@ gtmux terminal unmount <target>            # panel 만 제거, PTY 는 pool 잔�
 gtmux terminal kill <target>               # pool terminal SIGTERM
 gtmux terminal ls                          # live terminal pool
 gtmux terminal read <target> [--tail N] [--raw]     # 최근 출력 읽기(기본 ANSI strip)
-gtmux terminal send <target> <text> [--no-enter]    # 입력 주입(기본 뒤에 개행; --no-enter 는 없이)
+gtmux terminal send <target> <text> [--no-enter]    # 입력 주입; submit 은 별도 지연 CR(Enter) write — agent TUI 에 안정적. --no-enter = 키입력만
 gtmux terminal send <target> --bytes <hex>          # 제어 바이트(03 = Ctrl-C, 1b5b41 = Up)
 ```
 
@@ -784,6 +784,39 @@ gtmux fs upload <src> --dir <ws-relative> --session <name>   # 로컬 파일을 
 gtmux skill [--section <n>]                # 임베디드 agent skill 출력
 gtmux skill install [--claude] [--codex] [--force]   # AI 에이전트용 설치
 ```
+
+### 7.4 에이전트에게 canvas 구성 맡기기 (self-building layout)
+
+§7.1–7.3 의 의도된 사용법은 대개 직접 타이핑이 **아니라** — 세션 *안*
+터미널에서 도는 AI 에이전트에게 맡기는 것이다:
+
+1. **1회 설치**: `gtmux skill install --claude` (그리고/또는
+   `--codex`). CLI 계약이 agent skill 로 설치되어, 문서를 붙여넣지
+   않아도 에이전트가 모든 명령·target 규칙·게이트를 안다. 설치 후
+   에이전트 CLI 를 한 번 재시작해야 skill 이 인지된다.
+2. **canvas 에 터미널을 spawn** 하고(툴바 Terminal 도구 또는
+   `gtmux terminal spawn`) 그 안에서 에이전트를 실행한다(`claude`,
+   `codex`, …). gtmux 가 spawn 한 PTY 라 `$GTMUX_CANVAS_SESSION` /
+   `$GTMUX_TERMINAL_ID` 가 미리 설정돼 있어 — 에이전트의 `gtmux` 호출은
+   자동으로 **이 세션**을 향하고, 에이전트 자신의 터미널 주위로 canvas
+   가 실시간으로 구성되는 걸 지켜보게 된다.
+3. **프롬프트를 준다.** 에이전트는 `gtmux layout list` 로 현재 상태를
+   읽고 거기서 출발한다. 예시 프롬프트:
+
+   > *"gtmux skill 을 사용해. 이 세션에 research 보드를 만들어줘:
+   > 좌측에 터미널 2개(하나는 테스트 watcher 실행), 중앙에 README.md
+   > document, 우측에 `http://localhost:5173` web_view. 전부 label +
+   > group + 정렬하고, 작업 내역을 note 로 남겨."*
+
+   > *"이 canvas 정리해줘: 겹친 패널을 그리드로 정렬, 터미널은 group,
+   > 안 쓰는 건 minimize, group 에 label."*
+
+   > *"빌드 터미널을 지켜보다가(`gtmux terminal read`), 실패하면 실패한
+   > 파일을 그 옆에 document 로 열어줘."*
+
+   skill 이 이미 가르치는 실전 가드: locked item 은 `--force` 없이
+   거부; 자기 자신의 `$GTMUX_TERMINAL_ID` 로는 절대 `send` 금지;
+   viewport/selection 은 사용자 소유.
 
 ---
 

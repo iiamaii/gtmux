@@ -338,8 +338,12 @@ gtmux skill install                     # agent skill 설치 (Claude + Codex 디
 제어한다 — `gtmux layout …`(move / resize / create / delete / align /
 group), `gtmux terminal …`(다른 panel spawn / read / send),
 `gtmux workspace|session|fs …`. `gtmux skill` 로 agent 계약을 출력하거나
-`gtmux skill install` 로 에이전트 skill 디렉토리에 설치한다. 전체 명령
-reference 는 [`USAGE.ko.md`](USAGE.ko.md) §7.
+`gtmux skill install` 로 에이전트 skill 디렉토리에 설치한다. 사실 가장
+좋은 사용법은 반대 방향이다: **캔버스 위에** 터미널을 spawn 하고 그 안에서
+`claude`/`codex` 를 실행한 뒤 *레이아웃을 대신 구성해 달라고* 요청하면 —
+skill 을 인지한 에이전트가 자기 주위로 터미널·문서·web view 를 실시간으로
+배치한다. 명령 reference + 예시 프롬프트:
+[`USAGE.ko.md`](USAGE.ko.md) §7 (특히 §7.4).
 
 ---
 
