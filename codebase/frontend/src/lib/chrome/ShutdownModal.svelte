@@ -72,7 +72,7 @@
         throw e; // ReauthModal branches + stays open for retry.
       }
       if (e instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       toastStore.show({

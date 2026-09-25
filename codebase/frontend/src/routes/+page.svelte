@@ -183,7 +183,7 @@
       // Phase 2 fail — toast 로 silent 안내 + 사용자 명시 분기 (ReconnectModal
       // 까지는 escalation 안 함, Case II 의 무거운 modal 회피).
       if (result.kind === 'unauthorized') {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       if (result.kind === 'confirm_required') {
@@ -316,7 +316,7 @@
           // 무효 토큰을 401 로 거부하므로 재전송은 무의미. URL 을 정리한 뒤
           // 토큰 없는 /auth FE 페이지로 보내 token/password 폼 재인증을 받는다.
           stripTokenFromUrl();
-          window.location.href = '/auth';
+          window.location.href = ((window as any).__gwB || '') + '/auth';
           return;
         }
       }
@@ -342,7 +342,7 @@
           clearTimeout(timeoutId);
         }
         if (res.status === 401) {
-          window.location.href = '/auth';
+          window.location.href = ((window as any).__gwB || '') + '/auth';
           return;
         }
         if (res.ok) {

@@ -20,11 +20,18 @@ if (!target) {
 }
 
 function pickPage(pathname: string): typeof AppPage {
+  // 게이트웨이 서브패스 배포 대응: shim 이 심은 base 프리픽스(window.__gwB, 예 '/gtmux')
+  // 를 떼고 라우팅. 루트 배포 시엔 __gwB 부재 → 무변경.
+  const base = (window as unknown as { __gwB?: string }).__gwB || '';
+  let p = pathname;
+  if (base && (p === base || p.startsWith(base + '/'))) {
+    p = p.slice(base.length) || '/';
+  }
   if (
-    pathname === '/auth' ||
-    pathname.startsWith('/auth/') ||
-    pathname === '/auth-preview' ||
-    pathname.startsWith('/auth-preview/')
+    p === '/auth' ||
+    p.startsWith('/auth/') ||
+    p === '/auth-preview' ||
+    p.startsWith('/auth-preview/')
   ) {
     return AuthPage;
   }

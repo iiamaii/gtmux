@@ -572,7 +572,7 @@
       toolStore.consume();
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       toastStore.show({

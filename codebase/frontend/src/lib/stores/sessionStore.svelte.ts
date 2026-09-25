@@ -1379,7 +1379,7 @@ class SessionStore {
       return { ok: true, layout };
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return { ok: false };
       }
       // 0065 FE-2 — caller 가 priorSnapshot 을 명시했다는 것은 호출 *전* store
@@ -1474,7 +1474,7 @@ class SessionStore {
         fail += 1;
       }
       if (unauthorized) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return { ok, fail };
       }
       if (ok > 0) {
@@ -1518,7 +1518,7 @@ class SessionStore {
       }
     }
     if (unauthorized) {
-      window.location.href = '/auth';
+      window.location.href = ((window as any).__gwB || '') + '/auth';
       return { ok, fail };
     }
     if (ok > 0) {
@@ -1594,7 +1594,7 @@ class SessionStore {
             }
           } catch (err) {
             if (err instanceof UnauthorizedError) {
-              window.location.href = '/auth';
+              window.location.href = ((window as any).__gwB || '') + '/auth';
               return;
             }
             historyStore.reset(sessionName);
@@ -1626,7 +1626,7 @@ class SessionStore {
       void this.respawnUnmatched(active.name);
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       // D9 — etag mismatch (rebase 도 fail) 또는 D1.2 unmatched terminal.
@@ -1663,7 +1663,7 @@ class SessionStore {
       void terminalPool.refresh();
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       toastStore.show({
@@ -1689,7 +1689,7 @@ class SessionStore {
       void this.respawnUnmatched(active.name);
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       historyStore.reset(active.name);

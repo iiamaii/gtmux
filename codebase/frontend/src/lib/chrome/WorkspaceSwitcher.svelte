@@ -80,7 +80,7 @@
 
   function redirectToAuth(): void {
     workspaceSwitcher.close();
-    window.location.href = '/auth';
+    window.location.href = ((window as any).__gwB || '') + '/auth';
   }
 
   function goCreateRoot(): void {

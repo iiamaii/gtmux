@@ -31,7 +31,7 @@ function sendLeave(): void {
   }
   try {
     const webpageId = encodeURIComponent(getWebpageId());
-    const url = `/api/leave?webpage_id=${webpageId}`;
+    const url = `${((window as any).__gwB || '')}/api/leave?webpage_id=${webpageId}`;
     // sendBeacon 의 default Content-Type 은 `text/plain;charset=UTF-8`.
     // BE 는 body 무시 + query 의 webpage_id 만 본다.
     navigator.sendBeacon(url, new Blob([], { type: 'text/plain;charset=UTF-8' }));

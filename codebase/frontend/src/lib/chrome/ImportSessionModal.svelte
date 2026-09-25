@@ -184,7 +184,7 @@
     } catch (err) {
       stage = 'preview';
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       if (err instanceof ImportNameConflictError) {
@@ -247,7 +247,7 @@
       });
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       toastStore.show({

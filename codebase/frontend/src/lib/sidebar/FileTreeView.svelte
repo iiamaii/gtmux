@@ -322,7 +322,7 @@
       await workspaceManifest.load();
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       console.debug('[gtmux] file tree manifest load failed', err);
@@ -589,7 +589,7 @@
       // gracefully to Phase-1-only results (D4) — no destructive surface.
       if (err instanceof DOMException && err.name === 'AbortError') return;
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       serverResults = [];
@@ -655,7 +655,7 @@
       void hydrateExpandedDirs(expandedDirs, res.dir);
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       rootPath = dir;
@@ -749,7 +749,7 @@
       childrenByDir = nextChildren;
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       // A directory that no longer exists (deleted on disk) must not stay in the
@@ -1596,7 +1596,7 @@
 
   function uploadErrorMessage(err: unknown): string {
     if (err instanceof UnauthorizedError) {
-      window.location.href = '/auth';
+      window.location.href = ((window as any).__gwB || '') + '/auth';
       return 'Unauthorized.';
     }
     if (err instanceof FsApiUnavailableError) return 'Workspace file operation is not available on this server.';
@@ -1629,7 +1629,7 @@
       });
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       const message = err instanceof WorkspaceUpdateUnavailableError

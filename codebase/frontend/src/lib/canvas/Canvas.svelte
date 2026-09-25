@@ -461,7 +461,7 @@
               (r) => r.status === 'rejected' && r.reason instanceof UnauthorizedError,
             );
             if (unauthorized) {
-              window.location.href = '/auth';
+              window.location.href = ((window as any).__gwB || '') + '/auth';
               return;
             }
             void terminalPool.refresh();
@@ -1488,7 +1488,7 @@
       })
       .catch((err: unknown) => {
         if (err instanceof UnauthorizedError) {
-          window.location.href = '/auth';
+          window.location.href = ((window as any).__gwB || '') + '/auth';
           return;
         }
         toastStore.show({
@@ -2375,7 +2375,7 @@
 
   function onSpawnError(err: unknown): void {
     if (err instanceof UnauthorizedError) {
-      window.location.href = '/auth';
+      window.location.href = ((window as any).__gwB || '') + '/auth';
       return;
     }
     toastStore.show({
@@ -2725,7 +2725,7 @@
       toolStore.consume();
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       toastStore.show({
@@ -3560,7 +3560,7 @@
   allowDirectories={filePicker.allowDirectories}
   onCancel={() => filePicker.cancel()}
   onSelect={(abs, kind) => filePicker.select(abs, kind)}
-  onUnauthorized={() => { window.location.href = '/auth'; }}
+  onUnauthorized={() => { window.location.href = ((window as any).__gwB || '') + '/auth'; }}
 />
 
 <style>

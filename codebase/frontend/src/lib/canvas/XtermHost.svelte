@@ -5,9 +5,15 @@
   // ADR-0049 D3 / T3 — gate-closed hint, fired once PER SESSION (not per
   // component). Lives in the module script so the once-guard is shared across
   // every XtermHost instance, including mirrored instances of the same pane.
+  //
+  // D3-b amend (2026-07-12) made consent the SOLE gate, so the only way to reach
+  // this hint is the setting being off — plain HTTP still copies under the
+  // Cmd/Ctrl+C gesture (D7). The old wording claimed HTTPS was required, which
+  // sent plain-HTTP users looking for a TLS fix that would not have helped.
   const osc52HintOnce = runOnce(() => {
     toastStore.show({
-      message: 'Terminal clipboard copy needs HTTPS (or localhost) and the OSC 52 setting enabled.',
+      message:
+        'Terminal clipboard copy is off — enable “Allow terminal clipboard copy (OSC 52)” in Settings › Behavior.',
       tone: 'warning',
     });
   });

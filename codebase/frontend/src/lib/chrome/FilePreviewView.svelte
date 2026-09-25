@@ -378,7 +378,7 @@
       saveError = result.message;
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       saveError = err instanceof Error ? err.message : String(err);
@@ -444,7 +444,7 @@
       conflict = null;
     } catch (err) {
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       saveError = err instanceof Error ? err.message : String(err);
@@ -516,7 +516,7 @@
     } catch (err) {
       if (loadedPath !== path) return;
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       errorMessage = err instanceof Error

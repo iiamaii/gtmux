@@ -152,7 +152,7 @@
       if (res.kind === 'ok') {
         // Vite+Svelte SPA (no SvelteKit) — 전체 페이지 reload 로 root mount.
         // BE 가 sanitize 한 redirect 를 사용 (open-redirect 방지).
-        window.location.href = res.redirect || '/';
+        window.location.href = ((window as any).__gwB || '') + (res.redirect || '/');
         return;
       }
       if (res.kind === 'rate_limited') {

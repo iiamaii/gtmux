@@ -173,7 +173,7 @@
           (r) => r.status === 'rejected' && r.reason instanceof UnauthorizedError,
         );
         if (unauth) {
-          window.location.href = '/auth';
+          window.location.href = ((window as any).__gwB || '') + '/auth';
           return;
         }
       }

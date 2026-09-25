@@ -133,7 +133,7 @@
     } catch (err) {
       input.checked = settingsStore.behavior[key];
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       toastStore.show({
@@ -161,7 +161,7 @@
     } catch (e) {
       console.debug('[gtmux] logout failed', e);
     }
-    window.location.href = '/auth';
+    window.location.href = ((window as any).__gwB || '') + '/auth';
   }
 
   /* ── Rotate token (step-up re-auth, ADR-0020 D18.3 + D16) ────────── */
@@ -206,7 +206,7 @@
         throw err; // ReauthModal branches + stays open for retry.
       }
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       toastStore.show({
@@ -218,7 +218,7 @@
     }
     rotateReauthOpen = false;
     // Session is dead (revoke_all) — full reload into /auth, like onLogout.
-    window.location.href = '/auth';
+    window.location.href = ((window as any).__gwB || '') + '/auth';
   }
 
   /* ── Password set / change (ADR-0020 D17) ────────────────────────── */
@@ -290,7 +290,7 @@
         return;
       }
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       pwError = err instanceof Error ? err.message : String(err);
@@ -352,7 +352,7 @@
         throw err; // ReauthModal branches + stays open for retry.
       }
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       toastStore.show({

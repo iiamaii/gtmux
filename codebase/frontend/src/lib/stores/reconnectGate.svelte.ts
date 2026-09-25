@@ -176,7 +176,7 @@ class ReconnectGate {
         this.state = 'not_found';
         return;
       case 'unauthorized':
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       case 'unreachable':
         this.state = 'unreachable';

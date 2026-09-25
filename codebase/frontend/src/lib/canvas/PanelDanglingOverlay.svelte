@@ -42,7 +42,7 @@
       // Lock 해제 — mark 는 유지. 사용자가 다시 CTA 누르면 재시도.
       danglingTerminals.releaseRespawn(terminalId);
       if (err instanceof UnauthorizedError) {
-        window.location.href = '/auth';
+        window.location.href = ((window as any).__gwB || '') + '/auth';
         return;
       }
       // exit (auto) path 는 silent (race) — killed (manual) path 는 surface.
