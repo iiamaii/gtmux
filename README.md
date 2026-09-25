@@ -9,6 +9,8 @@ live web views, shapes, and file references on an infinite browser
 canvas. You can drive the whole canvas from your terminal — or hand it
 to an AI agent — through the bundled `gtmux` CLI.
 
+![gtmux canvas — live terminals, a note, snippets, a markdown document and a web view on one board](docs/images/canvas-dark.png)
+
 It is designed for people who live in terminals but need more spatial
 context than a tab list: operators, developers, SREs, researchers, and
 anyone who keeps several command lines, notes, runbooks, and references
@@ -28,6 +30,24 @@ Browser canvas
                 ▼                                     ▼
 gtmux server: Rust · axum · tokio · portable-pty  ──  layout / terminal ops
 ```
+
+---
+
+## Screenshots
+
+**One board per task.** A training run and a working shell on the left;
+the task note, one-click command snippets, the project README and a live
+dashboard (`web_view` of a workspace HTML file) beside them. Every panel
+survives browser reloads, and the whole layout can be driven from the
+`gtmux` CLI.
+
+![gtmux canvas in light theme](docs/images/canvas-light.png)
+
+**Several drives, one sandbox.** With `extra_workspace_roots` configured
+(e.g. a secondary SSD at `/mnt/ssd2`), the file picker shows a **Roots**
+bar that jumps between the primary workspace and each extra mount point.
+
+<img src="docs/images/workspace-roots-picker.png" alt="File picker with Roots shortcuts for home and data" width="560">
 
 ---
 

@@ -9,6 +9,8 @@ document, image, live web view, shape, file reference를 자유롭게
 배치합니다. 번들된 `gtmux` CLI 로 캔버스 전체를 터미널에서 — 또는 AI
 에이전트에게 맡겨 — 제어할 수도 있습니다.
 
+![gtmux 캔버스 — 라이브 터미널, 메모, snippet, markdown 문서, web view 를 한 보드에 배치한 모습](docs/images/canvas-dark.png)
+
 터미널 탭을 여러 개 열어두고 “어느 탭이 무엇이었는지” 기억하는 대신,
 관련 terminal panel과 메모, 명령 snippet, 참고 문서, 이미지, 도형을 한
 화면 안에서 공간적으로 정리하는 것이 목표입니다.
@@ -27,6 +29,24 @@ Browser canvas
                 ▼                                     ▼
 gtmux server: Rust · axum · tokio · portable-pty  ──  layout / terminal ops
 ```
+
+---
+
+## 스크린샷
+
+**작업 하나에 보드 하나.** 왼쪽에는 학습 실행 터미널과 작업용 shell,
+오른쪽에는 할 일 메모, 클릭 한 번으로 복사되는 명령 snippet, 프로젝트
+README 문서, workspace 의 HTML 파일을 띄운 라이브 대시보드(`web_view`)가
+놓여 있습니다. 모든 패널은 브라우저를 새로고침해도 그대로 남고, 레이아웃
+전체를 `gtmux` CLI 로 조작할 수 있습니다.
+
+![gtmux 캔버스 (라이트 테마)](docs/images/canvas-light.png)
+
+**디스크가 여러 개여도 샌드박스는 하나.** 설정에 `extra_workspace_roots`
+(예: 보조 SSD `/mnt/ssd2`)를 넣으면 파일 선택창에 **Roots** 바가 생겨,
+기본 workspace 와 추가 마운트 지점 사이를 바로 오갈 수 있습니다.
+
+<img src="docs/images/workspace-roots-picker.png" alt="home / data 루트 바로가기가 있는 파일 선택창" width="560">
 
 ---
 
