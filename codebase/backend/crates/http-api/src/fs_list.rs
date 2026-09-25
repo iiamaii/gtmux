@@ -51,6 +51,10 @@ struct FsListResponse {
     entries: Vec<FsEntry>,
     total: usize,
     truncated: bool,
+    /// Every Server Workspace(A) root, primary first — the picker renders one
+    /// shortcut per entry so an extra mount (`/mnt/ssd2`) is reachable even
+    /// though no `..` leads there from the primary root.
+    roots: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,11 +89,11 @@ pub async fn fs_list_handler(
     State(state): State<AppState>,
     Query(q): Query<FsListQuery>,
 ) -> Response {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
 
-    // Resolve target dir. Empty = Server Workspace(A) root (default open).
+    // Resolve target dir. Empty = the primary A root (default open).
     let target: PathBuf = if q.dir.is_empty() {
-        server_workspace.to_path_buf()
+        server_workspace.primary().to_path_buf()
     } else {
         PathBuf::from(&q.dir)
     };
@@ -170,9 +174,9 @@ pub async fn fs_list_handler(
         entries.truncate(MAX_ENTRIES);
     }
 
-    // Parent — the A root has no parent for the picker (don't escape A), and
+    // Parent — an A root has no parent for the picker (don't escape A), and
     // a parent that would leave A / land in the denylist is suppressed.
-    let parent: Option<String> = if canonical == server_workspace {
+    let parent: Option<String> = if server_workspace.is_root(&canonical) {
         None
     } else {
         canonical
@@ -187,6 +191,7 @@ pub async fn fs_list_handler(
         entries,
         total,
         truncated,
+        roots: server_workspace.to_display_strings(),
     };
 
     (StatusCode::OK, Json(body)).into_response()
@@ -200,7 +205,7 @@ pub async fn fs_mkdir_handler(
     State(state): State<AppState>,
     Json(body): Json<FsMutateBody>,
 ) -> Response {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
     let candidate = PathBuf::from(&body.path);
     if !candidate.is_absolute() {
         return error(StatusCode::BAD_REQUEST, "invalid_path");
@@ -255,7 +260,7 @@ pub async fn fs_rmdir_handler(
     State(state): State<AppState>,
     Json(body): Json<FsMutateBody>,
 ) -> Response {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
     let candidate = PathBuf::from(&body.path);
     if !candidate.is_absolute() {
         return error(StatusCode::BAD_REQUEST, "invalid_path");
@@ -271,7 +276,7 @@ pub async fn fs_rmdir_handler(
         return error(StatusCode::FORBIDDEN, "dir_not_allowed");
     }
     // Refuse to remove the A root itself.
-    if canonical == server_workspace {
+    if server_workspace.is_root(&canonical) {
         return error(StatusCode::FORBIDDEN, "dir_not_allowed");
     }
     if !canonical.is_dir() {
@@ -306,7 +311,7 @@ pub async fn fs_rename_handler(
     State(state): State<AppState>,
     Json(body): Json<FsRenameBody>,
 ) -> Response {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
 
     let candidate = PathBuf::from(&body.path);
     if !candidate.is_absolute() || body.path.contains('\0') {
@@ -328,7 +333,7 @@ pub async fn fs_rename_handler(
         return error(StatusCode::FORBIDDEN, "dir_not_allowed");
     }
     // Refuse to rename the A root itself — root re-point is `PUT /workspace`.
-    if source == server_workspace {
+    if server_workspace.is_root(&source) {
         return error(StatusCode::FORBIDDEN, "dir_not_allowed");
     }
     let Some(parent) = source.parent() else {
@@ -371,7 +376,7 @@ pub async fn fs_remove_handler(
     State(state): State<AppState>,
     Json(body): Json<FsMutateBody>,
 ) -> Response {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
     let candidate = PathBuf::from(&body.path);
     if !candidate.is_absolute() || body.path.contains('\0') {
         return error(StatusCode::BAD_REQUEST, "invalid_path");
@@ -387,7 +392,7 @@ pub async fn fs_remove_handler(
         return error(StatusCode::FORBIDDEN, "dir_not_allowed");
     }
     // Refuse to remove the A root itself.
-    if canonical == server_workspace {
+    if server_workspace.is_root(&canonical) {
         return error(StatusCode::FORBIDDEN, "dir_not_allowed");
     }
 

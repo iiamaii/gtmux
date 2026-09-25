@@ -91,7 +91,7 @@ pub async fn file_stat_handler(
     //    The sandbox check is cheap (no lock) so it runs first.
     let in_sandbox = crate::fs_guard::is_path_allowed(
         &canonical,
-        state.server_workspace.as_path(),
+        state.server_workspace.as_ref(),
         &state.fs_denylist,
     );
     if !in_sandbox {
@@ -367,6 +367,7 @@ mod tests {
             frontend_dist: None,
             workspace_path: None,
             server_workspace: None,
+            extra_workspace_roots: Vec::new(),
             default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
@@ -478,7 +479,9 @@ mod tests {
         let (mut state, token, tmp) = integration_state();
         // A = the temp root; the probe lives inside it. No allowlist entry.
         let canonical_a = std::fs::canonicalize(tmp.path()).unwrap();
-        state.server_workspace = std::sync::Arc::new(canonical_a);
+        state.server_workspace = std::sync::Arc::new(crate::fs_guard::WorkspaceRoots::single(
+            canonical_a,
+        ));
         let probe = tmp.path().join("inside.md");
         std::fs::write(&probe, b"a\nb\n").unwrap();
 

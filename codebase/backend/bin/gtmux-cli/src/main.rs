@@ -606,6 +606,27 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         "server workspace (A) bound"
     );
 
+    //     Extra A roots — config `extra_workspace_roots`. Separate mount points
+    //     (an external / secondary SSD such as `/mnt/ssd2`) that the picker and
+    //     every path guard treat as additional browsable tops. A missing entry
+    //     is *not* fatal: the drive may simply be unmounted right now, so it is
+    //     logged and skipped instead of taking the whole Instance down.
+    let (extra_workspace_roots, skipped_workspace_roots) =
+        gtmux_http_api::resolve_extra_workspace_roots(&config.extra_workspace_roots);
+    for (path, reason) in &skipped_workspace_roots {
+        warn!(
+            extra_workspace_root = %path.display(),
+            reason = %reason,
+            "extra workspace root unusable; skipping (not mounted?)"
+        );
+    }
+    for root in &extra_workspace_roots {
+        info!(
+            extra_workspace_root = %root.display(),
+            "extra workspace root (A) bound"
+        );
+    }
+
     // 6c) password hash — ADR-0020 D5 + **D18.2**. Loaded eagerly whenever the
     //     hash FILE EXISTS, regardless of the (now-deprecated, D18.1)
     //     `config.auth.mode`. This is what makes a config/CLI-set password an
@@ -683,6 +704,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         hub.clone(),
         workspace.clone(),
         server_workspace.clone(),
+        extra_workspace_roots.clone(),
         password_hash,
         trusted_proxy_nets,
     );
@@ -798,6 +820,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         listener.local_addr().ok(),
         &workspace,
         &server_workspace,
+        &extra_workspace_roots,
         workspace_uses_legacy_default,
     );
 
@@ -856,6 +879,7 @@ fn build_app_state(
     hub: Hub,
     workspace: gtmux_http_api::WorkspaceManager,
     server_workspace: PathBuf,
+    extra_workspace_roots: Vec<PathBuf>,
     password_hash: Option<String>,
     trusted_proxy_nets: Vec<ipnet::IpNet>,
 ) -> gtmux_http_api::AppState {
@@ -876,7 +900,7 @@ fn build_app_state(
         hub,
         workspace,
     )
-    .with_server_workspace(server_workspace)
+    .with_server_workspace_roots(server_workspace, extra_workspace_roots)
     // ADR-0003 D12: inject the boot-validated trusted-proxy CIDR allowlist.
     .with_trusted_proxy_nets(trusted_proxy_nets);
     if let Some(h) = password_hash {
@@ -918,6 +942,7 @@ fn build_router(
 /// First-run banner. ADR-0003 D3 + D21 c1. The token is emitted cleartext on
 /// stdout *exactly once* — the user is expected to follow the URL, receive an
 /// HttpOnly cookie, and bookmark the path-only URL thereafter.
+#[allow(clippy::too_many_arguments)]
 fn print_banner(
     config: &Config,
     mode: Mode,
@@ -925,6 +950,7 @@ fn print_banner(
     bound: Option<SocketAddr>,
     workspace: &gtmux_http_api::WorkspaceManager,
     server_workspace: &std::path::Path,
+    extra_workspace_roots: &[PathBuf],
     workspace_uses_legacy_default: bool,
 ) {
     let displayed_addr = bound
@@ -954,6 +980,9 @@ fn print_banner(
     );
     println!("  Token path:   {} (0600)", token_path);
     println!("  Workspace(A): {}", server_workspace.display());
+    for root in extra_workspace_roots {
+        println!("  Workspace(A+): {}", root.display());
+    }
     println!("  Store(C):     {}", workspace.path().display());
     if workspace_uses_legacy_default {
         println!(

@@ -75,8 +75,8 @@ pub use file_open::{
     FileOpenContext,
 };
 pub use fs_guard::{
-    build_denylist, effective_workspace, resolve_server_workspace, validate_workspace_root,
-    ServerWorkspaceError, WorkspaceRootError,
+    build_denylist, effective_workspace, resolve_extra_workspace_roots, resolve_server_workspace,
+    validate_workspace_root, ServerWorkspaceError, WorkspaceRootError, WorkspaceRoots,
 };
 pub use fs_file::FsFileWriteResponse;
 pub use fs_search::{FsSearchEntry, FsSearchResponse};
@@ -152,12 +152,14 @@ pub struct AppState {
     /// `/api/sessions[/<name>[/layout]]` routes are wired and accept requests;
     /// when `None` those routes return 503.
     pub workspace: Option<Arc<WorkspaceManager>>,
-    /// Server Workspace(A) root — the canonical fs sandbox boundary every
+    /// Server Workspace(A) roots — the canonical fs sandbox boundary every
     /// user-steerable filesystem access is clamped to (ADR-0045 D3 / D6).
-    /// Resolved once at boot (`--workspace` > config > `$HOME`); tests default
-    /// it to the current dir. The `fs_list` / `mkdir` / `rmdir` /
-    /// `workspace_root` / terminal-cwd paths all check membership against this.
-    pub server_workspace: Arc<std::path::PathBuf>,
+    /// Resolved once at boot: the primary root (`--workspace` > config >
+    /// `$HOME`) plus config `extra_workspace_roots` (separate mount points such
+    /// as `/mnt/ssd2`). The `fs_list` / `mkdir` / `rmdir` / `workspace_root` /
+    /// terminal-cwd paths all check membership against this set; the primary
+    /// root stays the default open and the closed fallback.
+    pub server_workspace: Arc<fs_guard::WorkspaceRoots>,
     /// M2 denylist (ADR-0045 D6): canonical `{ Store dir, gtmux config dir,
     /// gtmux state dir }`. A path inside A but also inside any denylist entry
     /// is rejected — this is what stops the user from pointing a terminal /
@@ -317,11 +319,11 @@ impl AppState {
             // tests override via `with_server_workspace`. Denylist starts
             // empty and is populated by `with_workspace` (it needs the Store
             // dir). No IO/canonicalize here — boot wiring does the real resolve.
-            server_workspace: Arc::new(
+            server_workspace: Arc::new(fs_guard::WorkspaceRoots::single(
                 std::env::var_os("HOME")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from("/")),
-            ),
+            )),
             fs_denylist: Arc::new(Vec::new()),
             workspace_manifest: Arc::new(RwLock::new(WorkspaceManifest::default())),
             session_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -584,13 +586,31 @@ impl AppState {
     /// [`resolve_server_workspace`](crate::resolve_server_workspace) and passes
     /// the canonical path here. Composes with [`with_workspace`](Self::with_workspace)
     /// (order-independent — A and the denylist are set on separate fields).
-    pub fn with_server_workspace(mut self, root: std::path::PathBuf) -> Self {
+    pub fn with_server_workspace(self, root: std::path::PathBuf) -> Self {
+        self.with_server_workspace_roots(root, Vec::new())
+    }
+
+    /// Like [`with_server_workspace`](Self::with_server_workspace) but also
+    /// admits extra A roots (config `extra_workspace_roots`) — separate mount
+    /// points, e.g. an external SSD at `/mnt/ssd2`, that the picker and every
+    /// path guard then treat as additional browsable tops. Boot resolves them
+    /// with [`resolve_extra_workspace_roots`](crate::resolve_extra_workspace_roots)
+    /// (missing ones already dropped) before calling this.
+    pub fn with_server_workspace_roots(
+        mut self,
+        root: std::path::PathBuf,
+        extra: Vec<std::path::PathBuf>,
+    ) -> Self {
         // Store the canonical form so the guard's `starts_with` lines up with
         // canonicalized candidate paths (symlinked TMPDIR on macOS, etc.).
         // Boot passes an already-canonical path; the fallback keeps a raw
         // value usable if canonicalize fails (non-existent → caught earlier).
         let canonical = root.canonicalize().unwrap_or(root);
-        self.server_workspace = Arc::new(canonical);
+        let extra = extra
+            .into_iter()
+            .map(|p| p.canonicalize().unwrap_or(p))
+            .collect();
+        self.server_workspace = Arc::new(fs_guard::WorkspaceRoots::new(canonical, extra));
         self
     }
 
@@ -1364,6 +1384,7 @@ mod tests {
             frontend_dist: None,
             workspace_path: None,
             server_workspace: None,
+            extra_workspace_roots: Vec::new(),
             default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
@@ -9157,6 +9178,98 @@ mod tests {
         // The Store dir is inside A but on the denylist → 403.
         let store_uri = format!("/api/fs/list?dir={}", store_dir.to_string_lossy());
         let (status, body) = authed_json(&app, &token, Method::GET, &store_uri, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"], "dir_not_allowed");
+
+        // Single-root A still advertises exactly one picker root.
+        assert_eq!(
+            body_roots(&authed_json(&app, &token, Method::GET, "/api/fs/list?dir=", None).await.1),
+            vec![a_root.to_string_lossy().into_owned()]
+        );
+    }
+
+    fn body_roots(body: &Value) -> Vec<String> {
+        body["roots"]
+            .as_array()
+            .expect("roots array")
+            .iter()
+            .map(|v| v.as_str().expect("root string").to_string())
+            .collect()
+    }
+
+    /// An extra A root (config `extra_workspace_roots` — e.g. a second SSD
+    /// mounted at `/mnt/ssd2`) is browsable in the picker and selectable as a
+    /// session `workspace_root`, even though no path leads there from the
+    /// primary root.
+    #[tokio::test]
+    async fn fs_list_and_session_create_accept_extra_workspace_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let drive = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let a_root = dir.path().canonicalize().unwrap();
+        let drive_root = drive.path().canonicalize().unwrap();
+        let outside_root = outside.path().canonicalize().unwrap();
+        std::fs::create_dir_all(drive_root.join("proj")).unwrap();
+
+        let token = issue_token().expect("token");
+        let store_dir = a_root.join("store");
+        let wm = WorkspaceManager::from_path(store_dir).expect("workspace");
+        let state = AppState::new(test_config(), token.clone())
+            .with_server_workspace_roots(a_root.clone(), vec![drive_root.clone()])
+            .with_workspace(wm);
+        let app = router_with_state(state);
+
+        // Default open is still the primary root, and both roots are advertised.
+        let (status, body) =
+            authed_json(&app, &token, Method::GET, "/api/fs/list?dir=", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["dir"], a_root.to_string_lossy().as_ref());
+        assert_eq!(
+            body_roots(&body),
+            vec![
+                a_root.to_string_lossy().into_owned(),
+                drive_root.to_string_lossy().into_owned(),
+            ]
+        );
+
+        // The extra root lists, and is itself a top (no parent exposed).
+        let uri = format!("/api/fs/list?dir={}", drive_root.to_string_lossy());
+        let (status, body) = authed_json(&app, &token, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["parent"], Value::Null);
+        assert_eq!(body["entries"][0]["name"], "proj");
+
+        // A directory under it is a valid session workspace_root.
+        let proj = drive_root.join("proj");
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions",
+            Some(json!({
+                "name": "ondrive",
+                "workspace_root": proj.to_string_lossy(),
+                "confirm": true,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        // …and the attach response reports it as the effective workspace (F1b),
+        // i.e. the guard did not silently fall back to the primary root.
+        let (status, body) = authed_json(
+            &app,
+            &token,
+            Method::POST,
+            "/api/sessions/ondrive/attach",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["workspace_root"], proj.to_string_lossy().as_ref());
+
+        // An unlisted root is still outside the sandbox.
+        let uri = format!("/api/fs/list?dir={}", outside_root.to_string_lossy());
+        let (status, body) = authed_json(&app, &token, Method::GET, &uri, None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"], "dir_not_allowed");
     }

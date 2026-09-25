@@ -105,7 +105,7 @@ pub async fn fs_copy_handler(
 }
 
 fn copy_request(state: &AppState, body: FsCopyBody) -> Result<Vec<CopiedEntry>, CopyError> {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
     let denylist = state.fs_denylist.as_ref();
 
     let mode = match body.on_conflict.as_deref() {
@@ -133,7 +133,7 @@ fn copy_request(state: &AppState, body: FsCopyBody) -> Result<Vec<CopiedEntry>, 
         }
         let canonical = guarded_canonical(raw, server_workspace, denylist)?;
         // Refuse the A root itself as a source.
-        if canonical == server_workspace {
+        if server_workspace.is_root(&canonical) {
             return Err(CopyError::Denied);
         }
         // Cycle: copying X into X or into a descendant of X.
@@ -192,7 +192,7 @@ fn copy_request(state: &AppState, body: FsCopyBody) -> Result<Vec<CopiedEntry>, 
 /// [`CopyError::Denied`].
 fn guarded_canonical(
     raw: &str,
-    server_workspace: &Path,
+    server_workspace: &fs_guard::WorkspaceRoots,
     denylist: &[PathBuf],
 ) -> Result<PathBuf, CopyError> {
     let candidate = PathBuf::from(raw);
@@ -255,7 +255,7 @@ fn resolve_target(
 fn copy_tree(
     src: &Path,
     dst: &Path,
-    server_workspace: &Path,
+    server_workspace: &fs_guard::WorkspaceRoots,
     denylist: &[PathBuf],
     budget: &mut usize,
 ) -> Result<(), CopyError> {
@@ -312,6 +312,7 @@ mod tests {
     fn copy_tree_copies_file_and_recursive_directory() {
         let a = TempDir::new().unwrap();
         let a_root = a.path().canonicalize().unwrap();
+        let roots = fs_guard::WorkspaceRoots::single(a_root.clone());
         let denylist: Vec<PathBuf> = vec![];
 
         // File copy.
@@ -320,7 +321,7 @@ mod tests {
         copy_tree(
             &a_root.join("f.txt"),
             &a_root.join("f-copy.txt"),
-            &a_root,
+            &roots,
             &denylist,
             &mut budget,
         )
@@ -334,7 +335,7 @@ mod tests {
         std::fs::create_dir(d.join("sub")).unwrap();
         std::fs::write(d.join("sub").join("b.txt"), b"b").unwrap();
         let mut budget = 0;
-        copy_tree(&d, &a_root.join("d2"), &a_root, &denylist, &mut budget).unwrap();
+        copy_tree(&d, &a_root.join("d2"), &roots, &denylist, &mut budget).unwrap();
         assert_eq!(std::fs::read(a_root.join("d2").join("a.txt")).unwrap(), b"a");
         assert_eq!(
             std::fs::read(a_root.join("d2").join("sub").join("b.txt")).unwrap(),
@@ -348,6 +349,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let a = TempDir::new().unwrap();
         let a_root = a.path().canonicalize().unwrap();
+        let roots = fs_guard::WorkspaceRoots::single(a_root.clone());
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("secret"), b"s").unwrap();
 
@@ -357,7 +359,7 @@ mod tests {
         symlink(outside.path().join("secret"), d.join("link")).unwrap();
 
         let mut budget = 0;
-        let res = copy_tree(&d, &a_root.join("d2"), &a_root, &[], &mut budget);
+        let res = copy_tree(&d, &a_root.join("d2"), &roots, &[], &mut budget);
         assert!(matches!(res, Err(CopyError::InvalidRequest)));
     }
 
@@ -365,13 +367,14 @@ mod tests {
     fn copy_tree_budget_trips_too_large() {
         let a = TempDir::new().unwrap();
         let a_root = a.path().canonicalize().unwrap();
+        let roots = fs_guard::WorkspaceRoots::single(a_root.clone());
         std::fs::write(a_root.join("f.txt"), b"x").unwrap();
         // Budget already at the cap → the single entry trips it.
         let mut budget = COPY_ENTRY_BUDGET;
         let res = copy_tree(
             &a_root.join("f.txt"),
             &a_root.join("f2.txt"),
-            &a_root,
+            &roots,
             &[],
             &mut budget,
         );

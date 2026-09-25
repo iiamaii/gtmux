@@ -67,6 +67,10 @@
 
   let currentDir = $state<string>('');
   let parentDir = $state<string | null>(null);
+  // Server Workspace(A) roots reported by the last listing (primary first).
+  // With `extra_workspace_roots` configured these are separate mount points —
+  // e.g. `$HOME` and `/mnt/ssd2` — so the only way between them is a shortcut.
+  let workspaceRoots = $state<string[]>([]);
   let entries = $state<FsEntry[]>([]);
   let total = $state(0);
   let truncated = $state(false);
@@ -151,6 +155,18 @@
   );
   const breadcrumbSegments = $derived.by(() => buildBreadcrumbSegments(currentDir));
 
+  // Root shortcuts. Only meaningful when the server exposes more than one A
+  // root and the picker is browsing A itself (a `workspace`-rooted picker is
+  // deliberately clamped to one session's workspace, so leaving it is wrong).
+  const rootShortcuts = $derived.by((): { path: string; label: string; current: boolean }[] => {
+    if (rootKind !== 'server' || workspaceRoots.length < 2) return [];
+    return workspaceRoots.map((path) => ({
+      path,
+      label: path.split('/').filter(Boolean).at(-1) ?? path,
+      current: isPathWithinRoot(currentDir, path),
+    }));
+  });
+
   async function navigate(dir: string): Promise<void> {
     const nextDir = rootKind === 'workspace' && boundaryRoot.length > 0
       ? (isPathWithinRoot(dir, boundaryRoot) ? dir : boundaryRoot)
@@ -167,6 +183,7 @@
       entries = res.entries;
       total = res.total;
       truncated = res.truncated;
+      workspaceRoots = res.roots ?? [];
     } catch (err) {
       if (err instanceof UnauthorizedError) {
         onUnauthorized?.();
@@ -193,6 +210,7 @@
       entries = [];
       total = 0;
       truncated = false;
+      workspaceRoots = [];
       loading = false;
       mutating = false;
       errorMessage = null;
@@ -430,6 +448,26 @@
     </span>
   {/snippet}
   {#snippet body()}
+    {#if rootShortcuts.length > 0}
+      <!-- Separate mount points (e.g. $HOME and /mnt/ssd2): no `..` connects
+           them, so each configured A root gets a shortcut. -->
+      <div class="fx-roots">
+        <span class="fx-roots-label">Roots</span>
+        {#each rootShortcuts as root (root.path)}
+          <button
+            type="button"
+            class="root-chip"
+            class:cur={root.current}
+            title={root.path}
+            disabled={loading}
+            onclick={() => void navigate(root.path)}
+          >
+            {root.label}
+          </button>
+        {/each}
+      </div>
+    {/if}
+
     <div class="fx-bar">
       <button
         type="button"
@@ -675,6 +713,56 @@
     border-bottom: 1px solid var(--color-border);
     background: var(--color-surface-2);
     min-width: 0;
+  }
+
+  .fx-roots {
+    display: flex;
+    align-items: center;
+    gap: var(--space-4);
+    height: 30px;
+    padding: 0 var(--space-6);
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface-2);
+    min-width: 0;
+    overflow-x: auto;
+  }
+
+  .fx-roots-label {
+    flex: 0 0 auto;
+    color: var(--color-fg-muted);
+    font-size: var(--text-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .root-chip {
+    flex: 0 0 auto;
+    max-width: 180px;
+    padding: 2px 8px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    color: var(--color-fg-muted);
+    background: transparent;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--font-mono);
+    font-size: var(--text-base);
+  }
+
+  .root-chip:hover:not(:disabled) {
+    background: var(--color-glass-1);
+    color: var(--color-fg);
+  }
+
+  .root-chip.cur {
+    color: var(--color-fg);
+    border-color: color-mix(in srgb, var(--color-accent) 40%, transparent);
+    background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  }
+
+  .root-chip:disabled {
+    opacity: 0.5;
   }
 
   .crumbs {

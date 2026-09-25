@@ -100,6 +100,18 @@ gtmux local ready (instance)
   Backend:      PtyBackend (ADR-0013, supervisor pid=<n>)
 ```
 
+`Workspace(A)` is the filesystem ceiling gtmux may browse / spawn / open in
+(default `$HOME`). To include a separate mount point — a secondary or external
+SSD — add it as an extra root in the config:
+
+```toml
+extra_workspace_roots = ["/mnt/ssd2"]
+```
+
+Each extra root prints as `Workspace(A+): /mnt/ssd2` in the banner and shows up
+as a shortcut in the file picker and in the session workspace-folder chooser.
+An entry that is not mounted is logged and skipped — it never blocks boot.
+
 Local-mode characteristics:
 
 | | |

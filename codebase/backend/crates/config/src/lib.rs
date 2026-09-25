@@ -107,6 +107,15 @@ pub struct Config {
     /// `$HOME` 가 기본값. boot-immutable, boot 시 존재 확인(미존재 → hard error).
     #[serde(default)]
     pub server_workspace: Option<std::path::PathBuf>,
+    /// Server Workspace(A) 의 *추가* root 목록 — `server_workspace` 한 곳으로는
+    /// 표현할 수 없는 별도 mount point(예: 외장/보조 SSD `/mnt/ssd2`)를 같은
+    /// 샌드박스 안으로 들인다. 각 항목은 절대경로여야 하며 boot 시
+    /// canonicalize + 디렉터리 확인을 거친다. **미존재/미마운트 항목은 boot 를
+    /// 막지 않고 경고 로그 후 skip** — 외장 디스크가 빠져 있어도 Instance 는
+    /// 그대로 떠야 하기 때문. primary root 안에 이미 포함된 경로는 무시된다.
+    /// 비우면 종전과 동일한 단일 root 동작.
+    #[serde(default)]
+    pub extra_workspace_roots: Vec<std::path::PathBuf>,
     /// Session 의 effective workspace(B) fallback chain 중간값 (ADR-0046 D1/D7):
     /// `session.workspace_root ?? default_session_workspace ?? $HOME`. 설정 시
     /// Server Workspace(A) 내부여야 한다. `None` 이면 `$HOME` 로 fallback
@@ -361,6 +370,7 @@ pub fn load_with_overrides(
         frontend_dist: None,
         workspace_path: None,
         server_workspace: None,
+        extra_workspace_roots: Vec::new(),
         default_session_workspace: None,
         auth: AuthConfig::default(),
         assets: AssetsConfig::default(),
@@ -467,6 +477,7 @@ struct DefaultsSeed {
     frontend_dist: Option<std::path::PathBuf>,
     workspace_path: Option<std::path::PathBuf>,
     server_workspace: Option<std::path::PathBuf>,
+    extra_workspace_roots: Vec<std::path::PathBuf>,
     default_session_workspace: Option<std::path::PathBuf>,
     auth: AuthConfig,
     assets: AssetsConfig,
@@ -565,6 +576,18 @@ fn validate(cfg: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::Validation(
             "assets.max_size_bytes must be greater than 0".to_string(),
         ));
+    }
+
+    // extra_workspace_roots 는 sandbox 상한을 넓히는 값이라 상대경로처럼
+    // "무엇을 가리키는지 모호한" 입력은 boot 에서 거부한다. 존재 여부는 여기서
+    // 보지 않는다 — 외장 디스크 미마운트는 정상 상황이라 boot 시 warn+skip.
+    for root in &cfg.extra_workspace_roots {
+        if !root.is_absolute() {
+            return Err(ConfigError::Validation(format!(
+                "extra_workspace_roots entry {:?} must be an absolute path",
+                root
+            )));
+        }
     }
 
     // mode-section 정합. cloud 모드는 cloud 섹션이 필요하다. TLS 를 요구하는

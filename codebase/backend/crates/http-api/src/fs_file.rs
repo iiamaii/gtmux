@@ -65,7 +65,7 @@ pub async fn fs_file_serve_handler(
     Query(q): Query<FsFileQuery>,
     req: axum::http::Request<Body>,
 ) -> Response {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
     let candidate = PathBuf::from(&q.path);
     if !candidate.is_absolute() || q.path.contains('\0') {
         return error(StatusCode::BAD_REQUEST, "invalid_path");
@@ -202,7 +202,7 @@ pub async fn fs_file_write_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
     let max_size_bytes = state.config.assets.max_size_bytes;
 
     let candidate = PathBuf::from(&q.path);
@@ -354,7 +354,7 @@ pub async fn fs_upload_handler(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Response {
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
     let max_size_bytes = state.config.assets.max_size_bytes;
 
     let mut dir: Option<String> = None;

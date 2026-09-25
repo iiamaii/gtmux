@@ -1,7 +1,9 @@
 // File system picker — ADR-0035 / 0061.
 //
-// MVP scope: workspace root only. External roots (ADR-0035 D2.1 picker.roots)
-// land in Stage 3 with the toml schema mutation.
+// The listing is rooted at the Server Workspace(A) *root set*: the primary root
+// plus the server's `extra_workspace_roots` (ADR-0035 D2.1 picker.roots). Each
+// `fs/list` response carries the full root list so the picker can offer a
+// shortcut per root.
 
 import { UnauthorizedError } from './sessions';
 import type { components } from '$lib/types/api';
@@ -24,6 +26,14 @@ export interface FsListResponse {
   entries: FsEntry[];
   total: number;
   truncated: boolean;
+  /**
+   * Every Server Workspace(A) root, primary first — the server's config
+   * `extra_workspace_roots` (a second/external SSD such as `/mnt/ssd2`) shows
+   * up here alongside the primary root. The picker renders one shortcut per
+   * entry because no `..` chain connects two mount points. Optional: a server
+   * older than the multi-root change omits it.
+   */
+  roots?: string[];
 }
 
 export class DirNotAllowedError extends Error {

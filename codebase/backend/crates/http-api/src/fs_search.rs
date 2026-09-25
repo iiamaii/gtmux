@@ -145,13 +145,13 @@ pub async fn fs_search_handler(
         return error(StatusCode::BAD_REQUEST, "empty_query");
     }
 
-    let server_workspace = state.server_workspace.as_path();
+    let server_workspace = state.server_workspace.as_ref();
 
     // Resolve + guard `root`. Empty = A root (the `fs_list` default). A
     // non-empty value runs the full `validate_workspace_root` guard, mapping
     // each rejection to the contract's error code.
     let root: PathBuf = if q.root.is_empty() {
-        server_workspace.to_path_buf()
+        server_workspace.primary().to_path_buf()
     } else {
         match fs_guard::validate_workspace_root(&q.root, server_workspace, &state.fs_denylist) {
             Ok(p) => p,
@@ -177,7 +177,7 @@ pub async fn fs_search_handler(
             &tokens,
             limit,
             show_hidden,
-            server_workspace.as_path(),
+            server_workspace.as_ref(),
             denylist.as_ref(),
         )
     })
@@ -235,7 +235,7 @@ fn walk_search(
     tokens: &[String],
     limit: usize,
     show_hidden: bool,
-    server_workspace: &Path,
+    server_workspace: &fs_guard::WorkspaceRoots,
     denylist: &[PathBuf],
 ) -> WalkResult {
     let mut results: Vec<FsSearchEntry> = Vec::new();
@@ -417,7 +417,8 @@ mod tests {
         denylist: &[PathBuf],
     ) -> WalkResult {
         let tokens = tokenize(q.trim());
-        walk_search(root, root, &tokens, limit, show_hidden, root, denylist)
+        let roots = fs_guard::WorkspaceRoots::single(root.to_path_buf());
+        walk_search(root, root, &tokens, limit, show_hidden, &roots, denylist)
     }
 
     #[test]

@@ -30,6 +30,22 @@ bind    = "127.0.0.1"
 
 # ── 이하 섹션은 전부 선택 — 생략 시 안전한 기본값이 적용된다. ──
 
+# Server Workspace(A) — browse/spawn/open 가능한 file system 상한(샌드박스).
+# 생략 시 `$HOME`. `gtmux start --workspace <path>` 가 본 값보다 우선.
+# server_workspace = "/home/me"
+#
+# A 의 *추가* root. `server_workspace` 하나로는 표현할 수 없는 별도 mount
+# point(예: 보조/외장 SSD)를 같은 샌드박스로 들인다. picker 상단에 root 별
+# 바로가기가 뜨고, session workspace 폴더로도 고를 수 있다.
+#   · 절대경로만 허용 (상대경로는 boot 에서 거부)
+#   · 미마운트/미존재 항목은 boot 를 막지 않고 warn 로그 후 skip
+#   · `server_workspace` 안에 이미 포함된 경로는 무시(중복)
+# extra_workspace_roots = ["/mnt/ssd2"]
+#
+# 세션 workspace(B) 의 기본값 (session.workspace_root 미지정 시). A 안이어야
+# 한다. 생략 시 `$HOME`.
+# default_session_workspace = "/home/me/projects"
+
 [runtime]
 log_level  = "info"   # trace|debug|info|warn|error|off
 log_format = "auto"   # auto(tty=text / pipe=json) | text | json

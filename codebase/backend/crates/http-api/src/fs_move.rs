@@ -109,7 +109,7 @@ pub async fn fs_move_handler(
 }
 
 fn move_request(state: &AppState, body: FsMoveBody) -> Result<Vec<MovedEntry>, MoveError> {
-    let a = state.server_workspace.as_path();
+    let a = state.server_workspace.as_ref();
     let denylist = state.fs_denylist.as_ref();
 
     // Conflict mode — only reject / rename; overwrite is explicitly unsupported.
@@ -136,8 +136,8 @@ fn move_request(state: &AppState, body: FsMoveBody) -> Result<Vec<MovedEntry>, M
             return Err(MoveError::InvalidRequest);
         }
         let src = guarded_canonical(raw, a, denylist)?;
-        if src == a {
-            return Err(MoveError::Denied); // cannot move the A root itself
+        if a.is_root(&src) {
+            return Err(MoveError::Denied); // cannot move an A root itself
         }
         // Cycle: moving X into X or a descendant of X.
         if dest_dir == src || dest_dir.starts_with(&src) {
@@ -221,7 +221,11 @@ enum ConflictMode {
 
 /// Canonicalize `raw` (absolute, no NUL) and assert it clears the A-scope +
 /// denylist guard.
-fn guarded_canonical(raw: &str, a: &Path, denylist: &[PathBuf]) -> Result<PathBuf, MoveError> {
+fn guarded_canonical(
+    raw: &str,
+    a: &fs_guard::WorkspaceRoots,
+    denylist: &[PathBuf],
+) -> Result<PathBuf, MoveError> {
     let candidate = PathBuf::from(raw);
     if !candidate.is_absolute() || raw.contains('\0') {
         return Err(MoveError::InvalidRequest);
@@ -294,7 +298,7 @@ fn first_free_suffixed(dir: &Path, name: &str, taken: impl Fn(&Path) -> bool) ->
 /// or a descendant that leaves the guard. `budget` caps total entries visited.
 fn assert_tree_safe(
     dir: &Path,
-    a: &Path,
+    a: &fs_guard::WorkspaceRoots,
     denylist: &[PathBuf],
     budget: &mut usize,
 ) -> Result<(), MoveError> {
@@ -335,6 +339,7 @@ mod tests {
     fn assert_tree_safe_accepts_plain_tree_rejects_symlink() {
         let a = TempDir::new().unwrap();
         let a_root = a.path().canonicalize().unwrap();
+        let roots = fs_guard::WorkspaceRoots::single(a_root.clone());
         let d = a_root.join("d");
         std::fs::create_dir(&d).unwrap();
         std::fs::write(d.join("a.txt"), b"a").unwrap();
@@ -342,7 +347,7 @@ mod tests {
         std::fs::write(d.join("sub").join("b.txt"), b"b").unwrap();
 
         let mut budget = 0;
-        assert!(assert_tree_safe(&d, &a_root, &[], &mut budget).is_ok());
+        assert!(assert_tree_safe(&d, &roots, &[], &mut budget).is_ok());
 
         #[cfg(unix)]
         {
@@ -351,7 +356,7 @@ mod tests {
             symlink(outside.path(), d.join("link")).unwrap();
             let mut budget = 0;
             assert!(matches!(
-                assert_tree_safe(&d, &a_root, &[], &mut budget),
+                assert_tree_safe(&d, &roots, &[], &mut budget),
                 Err(MoveError::InvalidRequest)
             ));
         }

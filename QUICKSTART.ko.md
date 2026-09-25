@@ -97,6 +97,17 @@ gtmux local ready (instance)
   Backend:      PtyBackend (ADR-0013, supervisor pid=<n>)
 ```
 
+`Workspace(A)` 는 browse/spawn/open 가능한 file system 상한이다(기본 `$HOME`).
+별도 mount point(보조·외장 SSD 등)를 같이 쓰려면 config 에 root 를 추가한다:
+
+```toml
+extra_workspace_roots = ["/mnt/ssd2"]
+```
+
+추가된 root 는 banner 에 `Workspace(A+): /mnt/ssd2` 로 찍히고, 파일 picker 상단
+바로가기와 세션 workspace 폴더 선택지에 함께 나타난다. 마운트돼 있지 않은
+항목은 boot 를 막지 않고 경고 로그 후 skip 된다.
+
 Local 모드의 특징:
 
 | | |
