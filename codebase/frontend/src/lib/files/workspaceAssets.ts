@@ -1,3 +1,4 @@
+import { normalizeNativePath, isAbsoluteNativePath } from './nativePath';
 export const WORKSPACE_FILE_DRAG_MIME = 'application/x-gtmux-workspace-file';
 
 export const IMAGE_EXTENSIONS = [
@@ -53,7 +54,7 @@ export interface WorkspaceDraggedFile {
 }
 
 export function basename(path: string): string {
-  return path.split('/').filter(Boolean).pop() ?? path;
+  return normalizeNativePath(path).split('/').filter(Boolean).pop() ?? path;
 }
 
 export function extension(path: string): string {
@@ -276,6 +277,7 @@ function codeMeta(shikiLang: string, label: string): WorkspaceFilePreviewMeta {
 }
 
 export function isPathWithinRoot(path: string, root: string): boolean {
+  path = normalizeNativePath(path);
   const cleanRoot = normalizeWorkspaceRoot(root);
   if (cleanRoot === null) return false;
   if (cleanRoot === '/') return path.startsWith('/');
@@ -283,6 +285,7 @@ export function isPathWithinRoot(path: string, root: string): boolean {
 }
 
 export function workspaceRelativePath(root: string, absolutePath: string): string | null {
+  absolutePath = normalizeNativePath(absolutePath);
   if (!isPathWithinRoot(absolutePath, root)) return null;
   const cleanRoot = normalizeWorkspaceRoot(root);
   if (cleanRoot === null || absolutePath === cleanRoot) return null;
@@ -299,11 +302,11 @@ export function resolveWorkspacePath(root: string, relativePath: string): string
 
 function normalizeWorkspaceRoot(root: string): string | null {
   if (root.length === 0) return null;
-  return root.replace(/\/+$/, '') || '/';
+  return normalizeNativePath(root).replace(/\/+$/, '') || '/';
 }
 
 export function isSafeWorkspaceRelativePath(path: string): boolean {
-  if (path.length === 0 || path.startsWith('/') || path.includes('\0')) return false;
+  if (path.length === 0 || isAbsoluteNativePath(path) || path.includes('\\') || path.includes('\0')) return false;
   return path.split('/').every((segment) =>
     segment.length > 0 && segment !== '.' && segment !== '..',
   );

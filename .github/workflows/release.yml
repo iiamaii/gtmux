@@ -1,0 +1,92 @@
+name: Build installable artifacts
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+            binary: gtmux
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+            binary: gtmux
+          - os: macos-15-intel
+            label: macos-x64
+            binary: gtmux
+          - os: macos-latest
+            label: macos-arm64
+            binary: gtmux
+          - os: windows-latest
+            label: windows-x64
+            binary: gtmux.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: 2
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      GTMUX_RELEASE_REPOSITORY: ${{ github.repository }}
+      GTMUX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codebase/backend
+      - run: cargo test --workspace --locked
+        working-directory: codebase/backend
+      - run: cargo build --release --locked --bin gtmux
+        working-directory: codebase/backend
+      - run: npm ci
+        working-directory: codebase/frontend
+      - run: npm run build -- --outDir ../../.artifacts/frontend
+        working-directory: codebase/frontend
+      - run: node scripts/prepare-launcher.mjs codebase/backend/target/release/${{ matrix.binary }} .artifacts/frontend
+      - run: node scripts/release-version.mjs
+      - run: npm ci
+        working-directory: codebase/launcher
+      - run: npm test
+        working-directory: codebase/launcher
+      - run: node scripts/package-server.mjs ${{ matrix.label }}
+      - run: npm run dist
+        working-directory: codebase/launcher
+      - name: Check packaged application lifecycle
+        if: runner.os != 'Linux'
+        run: node test/package-smoke.mjs
+        working-directory: codebase/launcher
+      - name: Check packaged Linux application lifecycle
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum node test/package-smoke.mjs
+        working-directory: codebase/launcher
+      - name: Check real updater download and checksum rejection
+        if: runner.os == 'Linux'
+        run: node test/update-feed-smoke.mjs
+        working-directory: codebase/launcher
+      - name: Check local certificate issuance without public deployment
+        run: node test/local-https-smoke.mjs
+        working-directory: codebase/launcher
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gtmux-server-${{ matrix.label }}
+          path: .artifacts/packages/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gtmux-desktop-${{ matrix.label }}
+          path: |
+            codebase/launcher/dist/*.exe
+            codebase/launcher/dist/*.zip
+            codebase/launcher/dist/*.dmg
+            codebase/launcher/dist/*.AppImage
+            codebase/launcher/dist/*.tar.gz
+            codebase/launcher/dist/*.yml
+            codebase/launcher/dist/*.blockmap
+# Publishing and signing require a maintainer decision. This workflow only
+# produces downloadable artifacts; it never creates a release or pushes a tag.

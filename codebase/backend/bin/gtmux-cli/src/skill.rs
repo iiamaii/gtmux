@@ -290,7 +290,7 @@ fn install_one(
 
 fn run_install(claude: bool, codex: bool, force: bool) -> ExitCode {
     // `$HOME` is required — user-level skill dirs hang off it (ADR-0055 D2).
-    let base_home = match std::env::var_os("HOME") {
+    let base_home = match gtmux_platform::home() {
         Some(h) if !h.is_empty() => PathBuf::from(h),
         _ => {
             eprintln!(

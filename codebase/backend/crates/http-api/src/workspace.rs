@@ -47,11 +47,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt as StdOpenOptionsExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+#[cfg(unix)]
 use atomic_write_file::unix::OpenOptionsExt as AwfOpenOptionsExt;
 use atomic_write_file::OpenOptions as AwfOpenOptions;
 use ring::digest::{digest, SHA256};
@@ -476,10 +479,10 @@ impl WorkspaceManager {
             ))
         })?;
         ensure_dir_0700(dir)?;
-        let mut f = AwfOpenOptions::new()
-            .mode(SESSION_FILE_MODE)
-            .preserve_mode(false)
-            .open(&path)
+        let mut options = AwfOpenOptions::new();
+        #[cfg(unix)]
+        options.mode(SESSION_FILE_MODE).preserve_mode(false);
+        let mut f = options.open(&path)
             .map_err(|e| WorkspaceError::Io(e.into()))?;
         f.write_all(&bytes).map_err(WorkspaceError::Io)?;
         f.commit().map_err(|e| WorkspaceError::Io(e.into()))?;
@@ -649,10 +652,10 @@ pub(crate) fn atomic_write_session(path: &Path, bytes: &[u8]) -> Result<(), Work
         ))
     })?;
     ensure_dir_0700(dir)?;
-    let mut f = AwfOpenOptions::new()
-        .mode(SESSION_FILE_MODE)
-        .preserve_mode(false)
-        .open(path)
+    let mut options = AwfOpenOptions::new();
+        #[cfg(unix)]
+        options.mode(SESSION_FILE_MODE).preserve_mode(false);
+        let mut f = options.open(path)
         .map_err(|e| WorkspaceError::Io(e.into()))?;
     f.write_all(bytes).map_err(WorkspaceError::Io)?;
     f.commit().map_err(|e| WorkspaceError::Io(e.into()))?;
@@ -719,7 +722,7 @@ fn xdg_gtmux_data_dir() -> Result<PathBuf, WorkspaceError> {
         }
         p
     } else {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
+        let home = gtmux_platform::home().ok_or_else(|| {
             WorkspaceError::BadXdg("$HOME not set; cannot resolve XDG_DATA_HOME default".into())
         })?;
         PathBuf::from(home).join(".local").join("share")
@@ -854,11 +857,8 @@ fn validate_folder_acyclic(folders: &[WorkspaceFolder]) -> Result<(), WorkspaceE
 
 /// Recursively create `dir` (if missing) and chmod 0700.
 fn ensure_dir_0700(dir: &Path) -> std::io::Result<()> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let perm = std::fs::Permissions::from_mode(WORKSPACE_DIR_MODE);
-    std::fs::set_permissions(dir, perm)
+    gtmux_platform::private_dir(dir)?;
+    Ok(())
 }
 
 /// Recover the session name from a path within the workspace dir. Returns
@@ -902,6 +902,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ensure_dirs_creates_locks_subdir_0700() {
         let (_dir, wm) = fresh_manager();
         assert!(wm.locks_dir().exists());
@@ -1047,6 +1048,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn boot_migration_v1_to_v2_rewrites_in_place() {
         let (dir, wm) = fresh_manager();
         let v1 = json!({
@@ -1163,7 +1165,7 @@ mod tests {
         fn new() -> (Self, PathBuf) {
             let lock = XDG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev_data = std::env::var_os("XDG_DATA_HOME");
-            let prev_home = std::env::var_os("HOME");
+            let prev_home = gtmux_platform::home();
             let dir = TempDir::new().unwrap();
             std::env::set_var("XDG_DATA_HOME", dir.path());
             std::env::remove_var("HOME");

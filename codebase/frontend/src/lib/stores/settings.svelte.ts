@@ -11,8 +11,8 @@
 //  - `+page.svelte` mount 시 1회 load.
 //  - SettingsOverlay 의 toggle 은 PATCH → 응답 snapshot 으로 store 갱신.
 //
-// 주의: settings 자체는 server-wide + in-memory only (BE 주석). 서버 재시작
-// 후 default 로 복귀. FE 측에서 별도 disk 영속 안 함.
+// Behavior는 서버 전역 설정이며 호스트가 파일 편집을 제공하면 TOML에 저장됨.
+// FE는 PATCH 성공 후에만 반영하고 별도 파일을 쓰지 않음.
 
 import {
   getSettings,

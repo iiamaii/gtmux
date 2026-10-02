@@ -18,3 +18,8 @@ experiments/
 
 # Added by code-review-graph
 .code-review-graph/
+
+# Local build tools and review artifacts
+.local-tools/
+.artifacts/
+website/dist/

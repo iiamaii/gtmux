@@ -12,13 +12,16 @@ import { pathEditStore } from '$lib/stores/pathEditStore.svelte';
 import { sessionStore } from '$lib/stores/sessionStore.svelte';
 import { resolveWidthToggle } from '$lib/stores/panelWidthToggle';
 
-export type LeftPanelTab = 'layers' | 'terminals' | 'files';
+export type LeftPanelTab = 'layers' | 'terminals' | 'files' | 'activity';
 export type RightPanelTab = 'inspect' | 'preview';
 
 export type ChromeState = {
   sidebarCollapsed: boolean;
   leftPanelTab: LeftPanelTab;
   leftPanelWidth: number;
+  leftPanelActivityVisible: boolean;
+  leftPanelStandardWidth: number;
+  leftPanelActivityWidth: number;
   paneInfoCollapsed: boolean;
   rightPanelTab: RightPanelTab;
   rightPanelWidth: number;
@@ -38,6 +41,9 @@ const DEFAULT: ChromeState = {
   sidebarCollapsed: false,
   leftPanelTab: 'layers',
   leftPanelWidth: 268,
+  leftPanelActivityVisible: false,
+  leftPanelStandardWidth: 268,
+  leftPanelActivityWidth: 340,
   paneInfoCollapsed: false,
   rightPanelTab: 'inspect',
   rightPanelWidth: 268,
@@ -95,10 +101,22 @@ class ChromeStore {
     this.persist();
   }
 
+  setActivityPanelVisible(visible: boolean): void {
+    if (visible === this.state.leftPanelActivityVisible) return;
+    this.state = {
+      ...this.state,
+      leftPanelActivityVisible: visible,
+      leftPanelWidth: visible ? this.state.leftPanelActivityWidth : this.state.leftPanelStandardWidth,
+    };
+    this.persist();
+  }
+
   setLeftPanelWidth(width: number): void {
     this.state = {
       ...this.state,
       leftPanelWidth: clamp(width, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
+      [this.state.leftPanelActivityVisible ? 'leftPanelActivityWidth' : 'leftPanelStandardWidth']:
+        clamp(width, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
     };
     this.persist();
   }
@@ -177,7 +195,7 @@ function resolveInitial(): ChromeState {
           ? obj.sidebarCollapsed
           : DEFAULT.sidebarCollapsed,
       leftPanelTab:
-        leftTab === 'layers' || leftTab === 'terminals' || leftTab === 'files'
+        leftTab === 'layers' || leftTab === 'terminals' || leftTab === 'files' || leftTab === 'activity'
           ? leftTab
           : DEFAULT.leftPanelTab,
       paneInfoCollapsed:
@@ -186,6 +204,11 @@ function resolveInitial(): ChromeState {
           : DEFAULT.paneInfoCollapsed,
       rightPanelTab:
         rightTab === 'inspect' || rightTab === 'preview' ? rightTab : DEFAULT.rightPanelTab,
+      leftPanelActivityVisible: obj.leftPanelActivityVisible === true,
+      leftPanelStandardWidth: typeof obj.leftPanelStandardWidth === 'number' ? obj.leftPanelStandardWidth
+        : typeof obj.leftPanelWidth === 'number' ? obj.leftPanelWidth : DEFAULT.leftPanelStandardWidth,
+      leftPanelActivityWidth: typeof obj.leftPanelActivityWidth === 'number' ? obj.leftPanelActivityWidth
+        : Math.max(340, typeof obj.leftPanelWidth === 'number' ? obj.leftPanelWidth : 268),
       leftPanelWidth:
         typeof obj.leftPanelWidth === 'number'
           ? obj.leftPanelWidth
@@ -205,6 +228,8 @@ function normalizeState(state: ChromeState): ChromeState {
   return {
     ...state,
     leftPanelWidth: clamp(state.leftPanelWidth, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
+    leftPanelStandardWidth: clamp(state.leftPanelStandardWidth, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
+    leftPanelActivityWidth: clamp(state.leftPanelActivityWidth, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH),
     rightPanelTab: rightPanelTabForLeft(state.leftPanelTab),
     rightPanelWidth: clamp(state.rightPanelWidth, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
   };

@@ -1,0 +1,67 @@
+name: Documentation site
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['website/**', 'codebase/config.*.sample.toml', '.github/workflows/docs.yml']
+permissions:
+  contents: read
+concurrency:
+  group: documentation-pages
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci && npm run check && npm run build
+        working-directory: website
+        env:
+          SITE_BASE: /${{ github.event.repository.name }}/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: documentation-site
+          path: website/dist
+  publish:
+    # Opt in only after the maintainer configures Pages to use GitHub Actions. A generated gh-pages branch is retained.
+    if: vars.GTMUX_PUBLISH_DOCS == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: github-pages
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: documentation-site
+          path: /tmp/gtmux-site
+      - name: Update generated branch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git switch --create gh-pages --track origin/gh-pages
+          else
+            git switch --orphan gh-pages
+          fi
+          git rm -rf --ignore-unmatch .
+          cp -a /tmp/gtmux-site/. .
+          git add .
+          if ! git diff --cached --quiet; then
+            git commit -m 'docs: update generated site'
+            git push origin HEAD:gh-pages
+          fi
+      - name: Deploy Pages artifact
+        uses: actions/deploy-pages@v4

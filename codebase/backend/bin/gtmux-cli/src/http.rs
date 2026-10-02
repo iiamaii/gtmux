@@ -133,7 +133,16 @@ pub fn parse_bind_port(raw: &str) -> (Option<String>, Option<u16>) {
 /// `http://<host>:<port>` for an instance, from its per-instance config
 /// file. Unspecified binds (`0.0.0.0` / `::`) map to loopback; IPv6 hosts
 /// are bracketed.
+fn loopback_endpoint(raw: &str) -> Result<String, CliError> {
+    let socket = raw.strip_prefix("http://").and_then(|v| v.parse::<std::net::SocketAddr>().ok())
+        .filter(|s| s.ip().is_loopback() && s.port() != 0)
+        .ok_or_else(|| CliError::local("GTMUX_SERVER_URL must be an HTTP loopback IP endpoint with a port"))?;
+    Ok(format!("http://{socket}"))
+}
 pub fn server_base_url(instance: &str) -> Result<String, CliError> {
+    if std::env::var("GTMUX_SERVER_INSTANCE").ok().as_deref() == Some(instance) {
+        if let Ok(endpoint) = std::env::var("GTMUX_SERVER_URL") { return loopback_endpoint(&endpoint); }
+    }
     let dir = crate::config_dir_for_humanise()
         .ok_or_else(|| CliError::local("cannot resolve XDG_CONFIG_HOME (and $HOME is unset)"))?;
     let path = dir.join(format!("{instance}.config.toml"));
@@ -370,6 +379,11 @@ impl MultipartBody {
 mod tests {
     use super::*;
 
+    #[test]
+    fn effective_hook_endpoint_is_loopback_only() {
+        for value in ["http://127.0.0.1:9001", "http://[::1]:9123"] { assert!(loopback_endpoint(value).is_ok()); }
+        for value in ["https://127.0.0.1:9001", "http://example.com:80", "http://192.168.1.2:80", "http://127.0.0.1:0", "http://127.0.0.1:80/path", "http://user@127.0.0.1:80"] { assert!(loopback_endpoint(value).is_err()); }
+    }
     #[test]
     fn parse_bind_port_reads_both() {
         let raw = "[server]\nsession = \"x\"\nbind = \"127.0.0.1\"\nport = 9001\n";

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+gtmux-platform = { workspace = true }
 figment = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }

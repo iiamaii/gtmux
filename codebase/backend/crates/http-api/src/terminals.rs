@@ -596,6 +596,59 @@ fn service_unavailable(code: &'static str) -> Response {
         .into_response()
 }
 
+/// Authenticated server-wide metadata snapshot, independent of panel streaming.
+/// The boot id and pane id scope client acknowledgements across restarts/respawns.
+pub async fn activity_handler(State(state): State<crate::AppState>) -> Response {
+    let Some(hub) = state.hub.as_ref() else {
+        return service_unavailable("hub_not_configured");
+    };
+    let pool = state.terminal_map.snapshot().await;
+    let rows: Vec<_> = pool
+        .into_iter()
+        .filter_map(|(id, pane)| {
+            hub.backend().activity(pane).map(|activity| {
+                json!({
+                    "id": id, "pane_id": pane.0, "activity": activity
+                })
+            })
+        })
+        .collect();
+    Json(json!({ "server_id": state.server_id.as_ref(), "terminals": rows })).into_response()
+}
+
+/// Explicit semantic state from an agent hook (not inferred from output silence).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivityReport {
+    pub state: gtmux_pty_backend::activity::ActivityState,
+}
+
+/// Authenticated like terminal input; does not send bytes into the terminal.
+pub async fn report_activity_handler(
+    State(state): State<crate::AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<ActivityReport>,
+) -> Response {
+    use gtmux_pty_backend::activity::ActivityState;
+    if body.state == ActivityState::Quiet {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_activity_state"})),
+        )
+            .into_response();
+    }
+    let Some(hub) = state.hub.as_ref() else {
+        return service_unavailable("hub_not_configured");
+    };
+    let Some(pane) = state.terminal_map.lookup_pane(&id).await else {
+        return terminal_not_alive(&id);
+    };
+    if !hub.backend().report_activity(pane, body.state) {
+        return terminal_not_alive(&id);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,46 @@
+name: Verify
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: 2
+    defaults:
+      run:
+        working-directory: codebase/backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: codebase/backend
+      - run: cargo test --workspace --locked
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: codebase/frontend
+      - run: npm run check && npm test && npm run build -- --outDir ../../.artifacts/frontend
+        working-directory: codebase/frontend
+      - run: npm ci && npm test
+        working-directory: codebase/launcher
+      - run: npm ci && npm run check && npm run build
+        working-directory: website
+        env:
+          DOCS_BASE_REF: ${{ github.event.pull_request.base.sha }}

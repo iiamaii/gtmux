@@ -15,6 +15,7 @@
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -154,14 +155,17 @@ pub fn save_token(session_name: &str, token: &TokenString) -> Result<()> {
     // Scope the file handle so it closes before rename — required on some
     // filesystems (and avoids holding an fd through the rename point).
     let write_result = (|| -> Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(TOKEN_FILE_PERM)
-            .open(&tmp_path)?;
+        let mut options = OpenOptions::new();
+            options.write(true)
+            .create_new(true);
+        #[cfg(unix)]
+        options.mode(TOKEN_FILE_PERM);
+        let mut f = options.open(&tmp_path)?;
         // Some umasks may override the creation mode on older kernels — set
         // permissions explicitly post-open to guarantee 0600.
+        #[cfg(unix)]
         let perm = fs::Permissions::from_mode(TOKEN_FILE_PERM);
+        #[cfg(unix)]
         f.set_permissions(perm)?;
         f.write_all(token.0.as_bytes())?;
         f.sync_all()?;
@@ -265,7 +269,7 @@ fn state_home() -> Result<PathBuf> {
         return Ok(PathBuf::from(s));
     }
     // Spec default: `~/.local/state`. `$HOME` is required when XDG is unset.
-    let home = std::env::var_os("HOME").ok_or(AuthError::HomeUnset)?;
+    let home = gtmux_platform::home().ok_or(AuthError::HomeUnset)?;
     Ok(PathBuf::from(home).join(".local").join("state"))
 }
 
@@ -276,12 +280,17 @@ fn ensure_state_dir(dir: &Path) -> Result<()> {
     if !dir.exists() {
         fs::create_dir_all(dir)?;
     }
+    #[cfg(windows)]
+    gtmux_platform::private_dir(dir)?;
     // Force 0700 regardless of umask; same-user only.
+    #[cfg(unix)]
     let perm = fs::Permissions::from_mode(TOKEN_DIR_PERM);
+    #[cfg(unix)]
     fs::set_permissions(dir, perm)?;
     Ok(())
 }
 
+#[cfg(unix)]
 fn check_perm(path: &Path, expected: u32) -> Result<()> {
     let meta = fs::metadata(path)?;
     let actual = meta.permissions().mode() & PERM_MASK;
@@ -299,8 +308,7 @@ fn check_perm(path: &Path, expected: u32) -> Result<()> {
 /// Required for rename durability on POSIX (rename metadata lives in the
 /// directory inode, not the file).
 fn fsync_dir(dir: &Path) -> Result<()> {
-    let d = File::open(dir)?;
-    d.sync_all()?;
+    gtmux_platform::sync_dir(dir)?;
     Ok(())
 }
 
@@ -382,6 +390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn perm_0600_enforced() {
         let _g = EnvGuard::new();
         let t = issue_token().unwrap();
@@ -394,6 +403,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn perm_rejection_on_load() {
         let _g = EnvGuard::new();
         let t = issue_token().unwrap();
@@ -416,6 +426,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn perm_rejection_on_dir() {
         let _g = EnvGuard::new();
         let t = issue_token().unwrap();
@@ -486,6 +497,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn load_missing_returns_not_found() {
         let _g = EnvGuard::new();
         // Touch the gtmux dir with correct perms so the perm gate passes
@@ -497,3 +509,6 @@ mod tests {
         assert!(matches!(err, AuthError::NotFound(_)), "got {err:?}");
     }
 }
+
+#[cfg(windows)]
+fn check_perm(path: &Path, expected: u32) -> Result<()> { gtmux_platform::check_private(path, expected)?; Ok(()) }

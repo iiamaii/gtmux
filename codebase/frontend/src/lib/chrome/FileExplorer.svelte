@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { normalizeNativePath } from '$lib/files/nativePath';
   /**
    * FileExplorer — unified directory/file picker for Project Workspace flows.
    *
@@ -212,16 +213,17 @@
     if (path.length === 0) {
       return [{ kind: 'segment', label: 'Server workspace', path: '', current: true }];
     }
+    path = normalizeNativePath(path);
     const absolute = path.startsWith('/');
     const parts = path.split('/').filter(Boolean);
     if (parts.length === 0) {
       return [{ kind: 'segment', label: '/', path: '/', current: true }];
     }
     const segments: BreadcrumbSegment[] = [];
-    let cursor = absolute ? '' : '';
+    let cursor = path.startsWith('//') ? '/' : '';
     for (let i = 0; i < parts.length; i += 1) {
       const part = parts[i] ?? '';
-      cursor = absolute ? `${cursor}/${part}` : joinPath(cursor, part);
+      cursor = i === 0 && /^[a-z]:$/i.test(part) ? `${part}/` : absolute ? `${cursor}/${part}` : joinPath(cursor, part);
       segments.push({
         kind: 'segment',
         label: part,

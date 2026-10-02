@@ -82,7 +82,7 @@ pub fn default_allowlist_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
+            let home = gtmux_platform::home()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             home.join(".config")
@@ -96,7 +96,7 @@ pub fn default_audit_dir() -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
+            let home = gtmux_platform::home()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             home.join(".local").join("state")

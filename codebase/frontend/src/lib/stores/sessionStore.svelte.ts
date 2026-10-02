@@ -1,3 +1,4 @@
+import { normalizeNativePath } from '$lib/files/nativePath';
 // SessionStore — session-scoped layout / viewport / M / I / maximize state.
 //
 // 정본:
@@ -155,7 +156,7 @@ class SessionStore {
   active = $state<ActiveSession | null>(null);
 
   get effectiveWorkspaceRoot(): string {
-    return this.active?.effectiveWorkspaceRoot ?? '';
+    return normalizeNativePath(this.active?.effectiveWorkspaceRoot ?? '');
   }
 
   /** `items[]` 의 in-memory representation — id 키 SvelteMap. */

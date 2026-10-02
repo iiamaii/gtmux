@@ -20,6 +20,7 @@ export type SettingsSection =
   | 'auth'
   | 'behavior'
   | 'components'
+  | 'server'
   | 'about';
 
 class SettingsDialogStore {

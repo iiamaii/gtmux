@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/platform",
   "crates/ws-server",
   "crates/http-api",
   "crates/config",
@@ -21,6 +22,7 @@ repository = "https://github.com/gtmux/gtmux"
 # 개별 crate Cargo.toml은 `workspace = true`로 inherit한다.
 # 참조: docs/reports/0007-backend-runtime.md §2·§8 표.
 [workspace.dependencies]
+gtmux-platform = { path = "crates/platform" }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "io-util", "process", "signal", "sync", "fs", "time", "net"] }
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 tokio-tungstenite = { version = "0.29", features = ["handshake"] }

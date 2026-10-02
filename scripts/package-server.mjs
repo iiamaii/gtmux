@@ -1,0 +1,13 @@
+import { createRequire } from 'node:module';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+const require = createRequire(new URL('../codebase/launcher/package.json', import.meta.url));
+const tar = require('tar');
+const label = process.argv[2];
+if (!/^(linux|macos|windows)-(x64|arm64)$/.test(label ?? '')) throw new Error('Provide a supported OS/architecture label.');
+await mkdir('.artifacts/packages', { recursive: true });
+const archive = `.artifacts/packages/gtmux-server-${label}.tar.gz`;
+await tar.c({ gzip: true, file: archive, cwd: 'codebase/launcher/resources', portable: true }, ['.']);
+const hash = createHash('sha256').update(await readFile(archive)).digest('hex');
+await writeFile(archive + '.sha256', `${hash}  gtmux-server-${label}.tar.gz\n`);
+console.log(archive);

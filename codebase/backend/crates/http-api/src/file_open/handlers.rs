@@ -350,6 +350,8 @@ mod tests {
             default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
+            behavior: gtmux_config::BehaviorSettings::default(),
+        public_origin: None,
         };
         let tmp = TempDir::new().unwrap();
         let mut state = crate::AppState::new(cfg, token.clone());
@@ -394,10 +396,7 @@ mod tests {
         let target = tmp.path().join("notes");
         std::fs::create_dir(&target).unwrap();
         let app = crate::router_with_state(state.clone());
-        let body = format!(
-            r#"{{"ext":"md","prefix":"{}","label":"Notes"}}"#,
-            target.display()
-        );
+        let body = serde_json::json!({"ext":"md", "prefix":target, "label":"Notes"}).to_string();
         let resp = app
             .clone()
             .oneshot(
@@ -443,7 +442,7 @@ mod tests {
         // Use a non-canonical form: with trailing slash, with `..` segment.
         let raw = target.join("..").join("notes");
         let app = crate::router_with_state(state);
-        let body = format!(r#"{{"ext":"md","prefix":"{}"}}"#, raw.display());
+        let body = serde_json::json!({"ext":"md", "prefix":raw}).to_string();
         let resp = app
             .oneshot(
                 HttpRequest::builder()
@@ -495,7 +494,7 @@ mod tests {
         let target = tmp.path().join("notes");
         std::fs::create_dir(&target).unwrap();
         let app = crate::router_with_state(state);
-        let body = format!(r#"{{"ext":"md","prefix":"{}"}}"#, target.display());
+        let body = serde_json::json!({"ext":"md", "prefix":target}).to_string();
         let r1 = app
             .clone()
             .oneshot(
@@ -687,7 +686,7 @@ mod tests {
         std::fs::write(&target_file, b"#!/bin/sh\n").unwrap();
         let canon = std::fs::canonicalize(&target_file).unwrap();
         let app = crate::router_with_state(state);
-        let body = format!(r#"{{"path":"{}","user_confirmed":false}}"#, canon.display());
+        let body = serde_json::json!({"path":canon,"user_confirmed":false}).to_string();
         let resp = app
             .oneshot(
                 HttpRequest::builder()

@@ -72,7 +72,7 @@ fn state_dir_for_gtmux() -> Result<PathBuf> {
         }
         return Ok(p.join("gtmux"));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
+    let home = gtmux_platform::home().ok_or_else(|| {
         StateFileError::BadXdg("$HOME not set; cannot resolve XDG_STATE_HOME default".to_string())
     })?;
     Ok(PathBuf::from(home)
@@ -91,7 +91,7 @@ fn config_dir_for_gtmux() -> Result<PathBuf> {
         }
         return Ok(p.join("gtmux"));
     }
-    let home = std::env::var_os("HOME").ok_or_else(|| {
+    let home = gtmux_platform::home().ok_or_else(|| {
         StateFileError::BadXdg("$HOME not set; cannot resolve XDG_CONFIG_HOME default".to_string())
     })?;
     Ok(PathBuf::from(home).join(".config").join("gtmux"))
@@ -100,8 +100,8 @@ fn config_dir_for_gtmux() -> Result<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PidLiveness {
     Absent,
-    Alive(libc::pid_t),
-    Stale(libc::pid_t),
+    Alive(i32),
+    Stale(i32),
     Malformed,
 }
 
@@ -125,6 +125,7 @@ pub fn check_pidfile_liveness(session: &str) -> Result<PidLiveness> {
 pub fn write_pidfile(session: &str) -> Result<PathBuf> {
     use std::fs::{self, OpenOptions};
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let final_path = pidfile_path_for(session)?;
@@ -143,12 +144,15 @@ pub fn write_pidfile(session: &str) -> Result<PathBuf> {
     ));
 
     let write_result = (|| -> io::Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(PIDFILE_PERM)
-            .open(&tmp_path)?;
+        let mut options = OpenOptions::new();
+            options.write(true)
+            .create_new(true);
+        #[cfg(unix)]
+        options.mode(PIDFILE_PERM);
+        let mut f = options.open(&tmp_path)?;
+        #[cfg(unix)]
         let perm = fs::Permissions::from_mode(PIDFILE_PERM);
+        #[cfg(unix)]
         f.set_permissions(perm)?;
         writeln!(f, "{}", std::process::id())?;
         f.sync_all()?;
@@ -172,31 +176,36 @@ pub fn write_pidfile(session: &str) -> Result<PathBuf> {
 }
 
 fn ensure_state_dir(dir: &Path) -> Result<()> {
+    #[cfg(windows)]
+    gtmux_platform::private_dir(dir)?;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     if !dir.exists() {
         fs::create_dir_all(dir)?;
     }
+    #[cfg(unix)]
     let perm = fs::Permissions::from_mode(PIDFILE_DIR_PERM);
+    #[cfg(unix)]
     fs::set_permissions(dir, perm)?;
     Ok(())
 }
 
 fn fsync_dir(dir: &Path) -> io::Result<()> {
-    let d = std::fs::File::open(dir)?;
-    d.sync_all()
+    gtmux_platform::sync_dir(dir)
 }
 
-fn parse_pid(raw: &str) -> Option<libc::pid_t> {
+fn parse_pid(raw: &str) -> Option<i32> {
     let line = raw.lines().find(|l| !l.trim().is_empty())?.trim();
-    let n: libc::pid_t = line.parse().ok()?;
+    let n: i32 = line.parse().ok()?;
     if n <= 0 {
         return None;
     }
     Some(n)
 }
 
-fn pid_is_alive(pid: libc::pid_t) -> bool {
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
     // SAFETY: `libc::kill(pid, 0)` is the canonical "probe" — no signal
     // is delivered. The pid was just parsed; sig=0 is a constant.
     let rc = unsafe { libc::kill(pid, 0) };
@@ -211,10 +220,10 @@ fn pid_is_alive(pid: libc::pid_t) -> bool {
 pub enum StopOutcome {
     NoPidfile(PathBuf),
     MalformedPidfile(PathBuf),
-    AlreadyDead { pid: libc::pid_t, path: PathBuf },
-    Stopped { pid: libc::pid_t, path: PathBuf },
-    Killed { pid: libc::pid_t, path: PathBuf },
-    TimedOut { pid: libc::pid_t, path: PathBuf },
+    AlreadyDead { pid: i32, path: PathBuf },
+    Stopped { pid: i32, path: PathBuf },
+    Killed { pid: i32, path: PathBuf },
+    TimedOut { pid: i32, path: PathBuf },
 }
 
 pub async fn stop_server(session: &str, grace: Duration, force_kill: bool) -> Result<StopOutcome> {
@@ -237,7 +246,10 @@ pub async fn stop_server(session: &str, grace: Duration, force_kill: bool) -> Re
 
     // SAFETY: identical to `pid_is_alive` — kill with a parsed pid +
     // constant signal number.
+    #[cfg(unix)]
     let term_rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    #[cfg(windows)]
+    let term_rc = { gtmux_platform::request_stop(pid)?; 0 };
     if term_rc != 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
@@ -265,7 +277,13 @@ pub async fn stop_server(session: &str, grace: Duration, force_kill: bool) -> Re
     }
 
     // SAFETY: same as SIGTERM call above.
+    #[cfg(unix)]
     let kill_rc = unsafe { libc::kill(pid, libc::SIGKILL) };
+    #[cfg(windows)]
+    let kill_rc = {
+        let sys = sysinfo::System::new_all();
+        if sys.process(sysinfo::Pid::from_u32(pid as u32)).is_some_and(|p| p.kill()) { 0 } else { -1 }
+    };
     if kill_rc != 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
@@ -347,6 +365,7 @@ pub async fn teardown(session: &str, opts: TeardownOpts) -> Result<TeardownRepor
 }
 
 async fn remove_state_file(path: &Path, kind: &str) -> std::result::Result<bool, String> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let meta = match tokio::fs::metadata(path).await {
@@ -354,6 +373,7 @@ async fn remove_state_file(path: &Path, kind: &str) -> std::result::Result<bool,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("{kind} stat failed at {}: {e}", path.display())),
     };
+    #[cfg(unix)]
     if kind == "token" {
         let mode = meta.permissions().mode() & 0o777;
         if mode != 0o600 {
@@ -403,7 +423,10 @@ mod tests {
     #[test]
     fn pid_is_alive_self() {
         // Our own PID is always alive while this test runs.
-        let me = std::process::id() as libc::pid_t;
+        let me = std::process::id() as i32;
         assert!(pid_is_alive(me));
     }
 }
+
+#[cfg(windows)]
+fn pid_is_alive(pid: i32) -> bool { gtmux_platform::pid_alive(pid) }

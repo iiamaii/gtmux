@@ -11,6 +11,7 @@ license.workspace = true
 #       docs/adr/0014-process-supervisor.md (D2/D6/D7/D8)
 
 [dependencies]
+gtmux-platform = { workspace = true }
 portable-pty = "0.9"
 tokio = { workspace = true }
 bytes = { workspace = true }

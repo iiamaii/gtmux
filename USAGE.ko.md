@@ -916,6 +916,89 @@ Single-key binding 은 모두 **Settings → Keyboard** 에서 재할당
 
 ## B. 기타 UI surface
 
+### 터미널 활동 상태
+
+**Settings → Appearance → Terminal activity**에서 켤 수 있다(기본 꺼짐).
+왼쪽 **Activity** 탭에는 현재 세션의 살아 있는 터미널이 표시된다.
+완료·입력 대기·읽지 않은 출력은 각각 설정할 수 있고, 목록과 브라우저 탭
+표시도 따로 켜고 끌 수 있다. 전체 기능을 끄면 두 표시가 숨겨지고 브라우저
+폴링도 중단된다. 설정은 같은 출처의 브라우저 탭끼리 공유하며, 읽음 확인은
+탭별 sessionStorage에 별도로 보관한다.
+
+Activity가 보이면 사이드바 기본 너비는 340px, 숨기면 268px이다.
+경계를 드래그한 사용자 너비는 두 상태별로 따로 저장하며, 기능을 켜고 끄거나
+새로고침해도 해당 상태의 너비로 복원된다.
+
+**Activity title format**에서 `{title}`(기존 탭 제목), `{activity}`(대기 알림)로
+전체 형식을 지정한다. 완료·입력 대기·미확인 문구는 각각 `{count}`를 쓰거나
+`✓` 같은 고정 기호로 지정할 수 있다. 예를 들어 `{title} | {activity}`와
+완료 문구 `✓ {count}`는 `gtmux - work | ✓ 2`로 표시된다.
+미리보기·Enter/포커스 이동 시 저장·기본값 복원을 제공한다. 잘못된 형식은
+오류를 표시하고 이전 저장값을 유지한다. 대기 알림이 없으면 기존 탭 제목만 표시한다.
+
+
+- **Active / Output quiet**: 출력 발생 / 출력이 잠잠해짐. 출력이 멈췄다는
+  이유만으로 에이전트 작업 완료라고 판단하지 않는다.
+- **Completed / Needs input**: 명시적 상태 보고. 셸 명령 완료는
+  OSC 133 C/D 셸 통합 마커로도 감지한다.
+- **(estimated)**: `❯`, `›`, `(y/n)`, “press enter to continue” 등 일부
+  프롬프트로 추정한 상태다. 전체 화면 재출력·사용자 프롬프트·다국어 도구에
+  따라 오탐이나 누락이 가능하다. 셸 명령 완료와 실행 중인 에이전트의 한 턴
+  완료는 서로 다르다.
+- **Unread output**: 마지막 확인 이후 새 출력. 보이는 터미널에 포커스를
+  주거나 행의 체크 버튼 또는 **Mark listed terminals read**를 누르면 출력과
+  대기 중인 알림을 확인 처리한다. 스크롤백을 실제로 전부 읽었는지는 판단하지 않는다.
+
+새 터미널의 첫 관측값은 기준점이며 기존 출력을 미확인 알림으로 띄우지 않는다.
+서버 재시작·터미널 재생성 시에도 기준점이 새로 만들어진다. 활성화하고 세션에
+연결된 동안 2초 간격으로 조회하며 백그라운드 탭에서는 브라우저 제한으로 지연될 수
+있다. 탭 제목은 해당 세션 터미널만 집계한다(예: `[1 done] gtmux - work`).
+중복 상태는 입력 대기 → 완료 → 미확인 출력 순으로 한 터미널당 한 번 집계한다.
+읽음 처리 후에도 목록의 현재 상태는 유지되고 대기 알림만 사라진다.
+API 오류 시 목록에 오류와 재시도를 표시하며 복구 전까지 탭 알림을 숨긴다.
+UI를 꺼도 서버의 용량 제한된 활동 메타데이터 수집은 유지된다.
+
+정확한 에이전트 상태를 연결하려면 해당 도구의 hook에서 다음 명령을 호출한다.
+에이전트가 실행되는 gtmux 터미널의 환경을 이어받고 `gtmux`가 PATH에 있어야 한다.
+
+```sh
+gtmux terminal report working
+gtmux terminal report needs_input
+gtmux terminal report completed
+```
+
+터미널은 `GTMUX_TERMINAL_ID` 환경 변수로 자동 선택한다. 바깥에서 호출할 때는
+`--target <terminal-uuid> --instance <instance-name>`을 지정한다.
+기존 인증 연결을 사용하며 터미널에 입력을 전송하지 않는다. 명시적 상태는 다음 보고,
+터미널 입력 또는 셸 마커까지 유지되므로 새 턴 시작에는 `working`을 보고한다.
+`unknown`도 지원한다. 연동 인터페이스를 제공하는 기능이며 도구별 hook을 자동
+설치하지는 않는다. CLI와 백엔드는 같은 리비전으로 빌드해야 한다.
+
+커스텀 클라이언트는 인증된 `GET /api/terminals/activity`로
+`{server_id, terminals: [{id, pane_id, activity: {state, source, output_seq,
+state_seq}}]}`를 받는다. `source`는 `output`, `heuristic`, `shell`, `report`다.
+인증된 `POST /api/terminals/<uuid>/activity`에
+`{"state":"completed"}`를 보내면 204를 반환한다.
+`working`, `needs_input`, `unknown`도 허용하며 없는 터미널은 404,
+`quiet`는 400, 알 수 없는 상태는 422, PTY hub가 없는 서버는 503이다.
+카운터는 프로세스 내 확인용 값이며 바이트 수나 영구 이력이 아니다.
+응답에 터미널 출력 원문은 포함되지 않는다.
+
+### 브라우저 탭 제목
+
+세션을 열면 탭 제목이 `gtmux - <세션 이름>`으로 표시되고, 연결된 세션이
+없으면 `gtmux`로 표시된다. 제목은 현재 활성 세션을 따라 변경된다.
+**Settings → Appearance → Browser tabs**에서 세션 이름 표시를 끄거나
+`{app}`, `{session}`을 이용해 형식을 변경할 수 있다(예: `{session} | {app}`).
+형식에는 `{session}`이 포함되어야 하며 최대 120자까지 입력할 수 있다.
+입력 중 미리보기가 표시되고, 필드를 벗어나거나 Enter를 누르면 유효한
+형식이 저장된다. **Reset format**은 기본 형식으로 되돌린다.
+
+이 설정은 현재 브라우저에 저장되고 같은 서버 origin의 다른 탭에도
+동기화된다. 각 탭에는 자기 세션 이름이 표시된다. 서버 TOML 설정이나
+세션 내보내기에는 포함되지 않는다. 브라우저 저장소에 쓰지 못하면 오류를
+표시하고 이전 설정을 유지한다.
+
 ### Titlebar (44px, 상단)
 
 - 좌: Session menu (kebab `⋮`) + brand mark + "gtmux".
@@ -986,3 +1069,92 @@ group 액션 — list. Shortcut 을 잊었을 때 유용.
 - [`QUICKSTART.ko.md`](QUICKSTART.ko.md) — 설치 / 설정 / 인증 /
   session 생성.
 - [`README.ko.md`](README.ko.md) — project 개요.
+
+### 세션 attach 복구
+
+브라우저 연결 종료 시 터미널 프로세스를 죽이지 않고 소유권을 정리한다.
+이전 WebSocket 종료 알림은 새 연결의 attach를 해제하지 않는다. HTTP attach
+후 WebSocket이 열리지 않은 경우 30초 유휴 기간 후 정리한다(5초 간격 검사).
+살아 있는 WebSocket은 보호한다. 서버 간 소유권의 기준은 OS flock이며 lease
+문구가 만료됐다는 이유만으로 인수하지 않는다. 빈 `.locks/*.lock` 파일은
+inode를 유지하기 위해 남겨두므로 실행 중 삭제하지 않는다. 서버 재시작은
+저장된 레이아웃과 달리 실행 중인 터미널 프로세스를 종료할 수 있다.
+
+### 서버 설정 파일 저장
+
+**Settings → Server**에서 instance TOML을 편집한다. 포트·작업 폴더는 일반
+폼으로, 나머지 프록시·보안 등 기존 스키마는 Advanced TOML로 편집한다.
+일반 폼을 draft에 적용한 뒤 Save configuration을 누르고 토큰/비밀번호로
+확인한다. 검증 후 원자적으로 저장하며 오류 시 초안과 실행 중 값을 유지한다.
+외부 수정과 충돌하면 명시적으로 Reload한 뒤 다시 저장한다. gtmux 간 저장은
+직렬화하지만 별도 편집기는 저장과 동시에 쓰지 않아야 한다(마지막 revision
+검사로 일반 외부 수정을 감지하나 파일시스템 경쟁을 완전히 제거하지는 못한다).
+symlink 설정 파일은 UI에서 편집하지 않는다. 주석은 유지한다.
+
+시작 설정은 재시작 후 적용하며 CLI 플래그와 GTMUX 환경 변수의 우선순위는
+유지된다. UI에서 실행 중 주소와 시작 설정 변경 여부를 보여준다. Behavior
+스위치는 `[behavior]`에 저장 성공한 뒤 즉시 적용하며 고급 편집기에서 저장한
+Behavior 수정도 동일하다. 외부 편집기로 파일을 수정하면 재시작 후 반영한다. 파일이 깨져 있으면 덮어쓰지 않고 스위치 저장도 실패한다.
+Appearance 설정은 브라우저에 유지한다. 내장 사용자는 ConfigFile을 명시적으로
+제공해야 파일 저장이 활성화되고, 없으면 Behavior는 메모리에만 유지된다.
+
+CLI는 `--config` 지정 파일 또는 `~/.config/gtmux/<name>.config.toml`을 사용한다.
+기본 파일이 없으면 최초 저장 시 생성한다. 저장 자체는 서버·터미널을 재시작하지
+않는다. 설정과 CLI 우선 적용값을 검토한 뒤 수동 재시작한다. 포트 충돌은 시작
+시 실제 bind에서 확인한다.
+
+### 서버 상태와 안전한 종료
+
+**Settings → Server → Stop server**에서 instance와 모든 세션의 활성 터미널
+수를 확인하고 토큰/비밀번호로 종료를 승인한다. 서버 종료는 실행 중 프로그램을
+끝내며 프로세스를 일시정지·복원하지 않는다. 저장된 레이아웃과 설정은 유지한다.
+종료 시 새 터미널 생성을 차단하고 WebSocket에 종료 의도를 알린다. HTTP 요청은
+최대 10초간 정리하고 별도 WebSocket handler 종료를 추가로 최대 2초 기다린다.
+backend의 자식 프로세스를 정리한 뒤 attach guard와
+pidfile을 해제한다. 브라우저 종료는 CLI 종료 코드 6을 유지하며 SIGINT/SIGTERM도
+같은 정리 경로를 사용한다.
+
+인증이 필요한 `GET /api/server/status`는 상태·기능 지원 여부·서버 전체 집계를
+반환한다. 내장 사용자는 `AppState::with_shutdown_signal`로 종료 요청 수신을
+명시적으로 연결하고 호스트에서 정리를 수행한다. HTTP 라이브러리는 호스트
+프로세스를 종료하지 않는다. 연결하지 않으면 브라우저 종료는 비활성화된다.
+backend 참조를 보유한 경우 blocking thread에서 `PtyBackend::shutdown`을 호출한
+뒤 `AppState::release_all_attaches`를 호출해 명시적으로 정리할 수 있다.
+
+자동 재시작, Electron 창·트레이·백그라운드 권한과 웹/앱 실행 모드는 후속 범위다.
+독립 실행 서버는 기존 `gtmux start --name <instance> --config <path>` 명령으로
+다시 시작한다. 저장한 포트는 이때 적용되므로 프록시와 CLI 우선 적용값도 확인한다.
+
+
+## 패키지 서버와 데스크톱 관리자
+
+`codebase/backend`에서 `cargo build --locked --bin gtmux`로 서버를 빌드합니다.
+`codebase/frontend`에서 `npm run build -- --outDir ../../.artifacts/frontend`로
+별도 프런트엔드를 만듭니다. 저장소 루트에서
+`node scripts/prepare-launcher.mjs codebase/backend/target/debug/gtmux .artifacts/frontend`
+(Windows는 `gtmux.exe`)를 실행한 뒤 `codebase/launcher`에서 `npm ci`, `npm start`를
+실행합니다. `npm run web`은 로컬 브라우저 관리자를 제공하며 `--data-dir`로
+별도의 테스트 프로필을 선택할 수 있습니다.
+
+첫 실행에서 사용하지 않는 포트와 프로젝트 폴더를 선택합니다. 설정은 관리자의
+독립된 `server.toml`에 저장됩니다. 이후 포트·작업 폴더는 워크스페이스 설정 → 서버에서
+수정하고 관리자에서 재시작합니다. 중지·재시작은 실행 중 터미널 프로그램을 종료하지만
+저장된 세션 레이아웃은 유지합니다. 직접 실행한 프로세스만 관리하며 백그라운드 모드는
+트레이로 제어합니다. 앱 종료 시 서버도 종료합니다.
+
+외부 공개: 공개 도메인을 입력하고 DNS·포트 조건을 검토한 뒤 체크섬 검증된 프록시를
+설치하고 계획을 적용합니다. 마지막으로 공개 HTTPS를 확인합니다. DNS·공유기 포트
+전달·방화벽 권한은 사전 조건이며 자동 변경하지 않습니다. 원본 TOML을 백업하고
+외부 변경을 감지하여 복구 시 덮어쓰기를 방지합니다. 빌드·테스트에서는 인증서를
+발급하지 않습니다.
+
+설정 샘플 참조 페이지는 문서 빌드 때 자동 생성합니다. 코드 변경 시 영문 문서와
+대응하는 한글 변경을 CI에서 요구합니다. 내용 정확성과 번역 의미는 리뷰로 확인합니다.
+
+브라우저 탭 제목의 unread 개수는 기본적으로 숨깁니다. **Settings → Appearance → Terminal activity → Unread in browser tab**을 켜면 다시 표시됩니다. Terminal activity, Unread output, Browser tab indicators도 켜져 있어야 합니다. Activity 목록의 unread 표시는 별도로 유지됩니다. 숨긴 사이드바 목록은 같은 위치의 Activity list를 켜서 복원합니다.
+
+### 에이전트 hook·IP HTTPS·앱 업데이트
+
+데스크톱 관리자의 **Agent activity**에서 Claude Code·Codex·Gemini CLI·Copilot·Cursor·Aider·OpenCode 연동 설정을 생성하거나 설치 내용을 검토합니다. 기존 설정을 백업하고 충돌을 표시하며 에이전트 재시작과 자체 hook 신뢰 확인이 필요합니다. [에이전트 설정](website/content/ko/agents.md)을 참고하세요.
+
+**External access**에서 Caddy를 통한 도메인·공인 IP 인증서와 사설 IP용 Local CA를 선택하고 on/off·설정 복원·루트 인증서 내보내기·인증서 검증을 수행합니다. 네트워크 조건은 [HTTPS 설정](website/content/ko/external-access.md)에 있습니다. **Updates**는 릴리스 피드가 설정된 앱에서 선택적인 자동 확인·다운로드와 명시적 확인 후 설치를 지원합니다. [업데이트 준비와 한계](website/content/ko/updates.md)를 참고하세요. 서버가 꺼진 상태의 포트 복구 기능은 외부 TOML 변경을 다시 읽은 뒤 저장합니다.

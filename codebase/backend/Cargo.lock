@@ -624,6 +624,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "gtmux-platform",
  "ring",
  "serde",
  "tempfile",
@@ -643,6 +644,7 @@ dependencies = [
  "gtmux-auth",
  "gtmux-config",
  "gtmux-http-api",
+ "gtmux-platform",
  "gtmux-pty-backend",
  "gtmux-ws-server",
  "ipnet",
@@ -664,6 +666,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "figment",
+ "gtmux-platform",
  "serde",
  "thiserror 2.0.18",
  "toml",
@@ -683,6 +686,7 @@ dependencies = [
  "fs2",
  "gtmux-auth",
  "gtmux-config",
+ "gtmux-platform",
  "gtmux-pty-backend",
  "gtmux-ws-server",
  "http",
@@ -694,10 +698,20 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml_edit",
  "tower",
  "tower-http",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "gtmux-platform"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -707,6 +721,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "dashmap",
+ "gtmux-platform",
  "libc",
  "portable-pty",
  "serde",
@@ -727,6 +742,7 @@ dependencies = [
  "futures",
  "gtmux-auth",
  "gtmux-config",
+ "gtmux-platform",
  "gtmux-pty-backend",
  "http",
  "libc",

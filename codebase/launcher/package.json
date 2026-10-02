@@ -1,0 +1,87 @@
+{
+  "name": "gtmux-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "gtmux server manager and desktop application",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/electron.cjs",
+  "scripts": {
+    "start": "electron .",
+    "web": "node src/cli.mjs",
+    "test": "node --test test/*.test.mjs",
+    "pack": "electron-builder --config electron-builder.config.cjs --dir",
+    "dist": "electron-builder --config electron-builder.config.cjs --publish never",
+    "test:browser": "node test/browser-smoke.mjs",
+    "test:electron": "node test/electron-smoke.mjs"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9",
+    "smol-toml": "1.9.0",
+    "tar": "7.5.22",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
+    "playwright": "1.63.0"
+  },
+  "build": {
+    "appId": "dev.gtmux.desktop",
+    "productName": "gtmux",
+    "asar": true,
+    "files": [
+      "src/**",
+      "ui/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": "server"
+      },
+      {
+        "from": "../frontend/src/styles/tokens.css",
+        "to": "design-tokens.css"
+      },
+      {
+        "from": "../frontend/src/styles/settings-controls.css",
+        "to": "settings-controls.css"
+      }
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "category": "Development"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createStartMenuShortcut": true,
+      "createDesktopShortcut": true,
+      "shortcutName": "gtmux",
+      "deleteAppDataOnUninstall": false,
+      "artifactName": "gtmux-Setup-${version}-${arch}.${ext}"
+    },
+    "publish": null,
+    "icon": "ui/icon.png"
+  }
+}

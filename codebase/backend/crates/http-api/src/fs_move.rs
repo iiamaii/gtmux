@@ -332,6 +332,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    #[cfg(unix)]
     fn assert_tree_safe_accepts_plain_tree_rejects_symlink() {
         let a = TempDir::new().unwrap();
         let a_root = a.path().canonicalize().unwrap();

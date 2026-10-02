@@ -42,7 +42,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
 use gtmux_auth::{verify_token, TokenString};
-use gtmux_config::{derive_mode, Mode};
+use gtmux_config::Mode;
 use ipnet::IpNet;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
@@ -357,10 +357,13 @@ pub async fn hash_password_async(plaintext: String) -> Result<String, AuthError>
 /// Persist `hash` to `path` with mode 0600 (ADR-0020 D5). The parent dir is
 /// created with mode 0700 if missing — mirrors the layout-store pattern.
 pub fn save_password_hash(path: &Path, hash: &str) -> Result<(), AuthError> {
+    #[cfg(unix)]
     use atomic_write_file::unix::OpenOptionsExt as AwfOpenOptionsExt;
     use atomic_write_file::OpenOptions as AwfOpenOptions;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as StdOpenOptionsExt;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     let dir = path.parent().ok_or_else(|| {
@@ -372,11 +375,11 @@ pub fn save_password_hash(path: &Path, hash: &str) -> Result<(), AuthError> {
     if !dir.exists() {
         std::fs::create_dir_all(dir).map_err(AuthError::Io)?;
     }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(AuthError::Io)?;
-    let mut f = AwfOpenOptions::new()
-        .mode(0o600)
-        .preserve_mode(false)
-        .open(path)
+    gtmux_platform::private_dir(dir).map_err(AuthError::Io)?;
+    let mut options = AwfOpenOptions::new();
+        #[cfg(unix)]
+        options.mode(0o600).preserve_mode(false);
+        let mut f = options.open(path)
         .map_err(|e| AuthError::Io(e.into()))?;
     f.write_all(hash.as_bytes()).map_err(AuthError::Io)?;
     f.commit().map_err(|e| AuthError::Io(e.into()))?;
@@ -734,7 +737,7 @@ pub(crate) fn rate_limit_key_for_state(
     headers: &HeaderMap,
     peer: Option<IpAddr>,
 ) -> String {
-    let mode = derive_mode(&state.config.server.bind);
+    let mode = state.config.mode();
     rate_limit_key(headers, peer, mode, &state.trusted_proxy_nets)
 }
 
@@ -1054,6 +1057,7 @@ pub async fn auth_rotate_handler(State(state): State<AppState>, req: Request<Bod
 /// is reachable from the same host. The token rides the FE AuthPage
 /// magic-link query (`?t=`).
 fn build_open_url(config: &gtmux_config::Config, token: &TokenString) -> String {
+    if let Some(origin) = &config.public_origin { return format!("{origin}/auth?t={}", token.0); }
     let scheme = if config.tls_required() {
         "https"
     } else {
@@ -1279,7 +1283,7 @@ pub fn default_password_hash_path() -> Result<PathBuf, AuthError> {
         }
         p
     } else {
-        let home = std::env::var_os("HOME").ok_or_else(|| {
+        let home = gtmux_platform::home().ok_or_else(|| {
             AuthError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "$HOME not set; cannot resolve XDG_STATE_HOME default",
@@ -1380,12 +1384,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn argon2_load_save_round_trip() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("password.argon2");
         let h = hash_password("a-good-password").unwrap();
         save_password_hash(&path, &h).unwrap();
         // 0600 enforced on disk.
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);

@@ -311,6 +311,16 @@ pub enum GroupCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum TerminalCmd {
+    /// Report an agent turn state without writing to its stdin (hook integration).
+    Report {
+        #[arg(value_parser = ["working", "completed", "needs_input", "unknown"])]
+        state: String,
+        /// UUID or exact label. Defaults to the terminal running this hook.
+        #[arg(long, env = "GTMUX_TERMINAL_ID")]
+        target: String,
+        #[command(flatten)]
+        instance: InstanceOpt,
+    },
     /// Spawn a fresh PTY terminal and persist its panel (headless-complete —
     /// ADR-0053 D11).
     Spawn {
@@ -486,6 +496,7 @@ pub fn run_layout(cmd: LayoutCmd) -> ExitCode {
 
 pub fn run_terminal(cmd: TerminalCmd) -> ExitCode {
     let label = match &cmd {
+        TerminalCmd::Report { .. } => "terminal report",
         TerminalCmd::Spawn { .. } => "terminal spawn",
         TerminalCmd::Mount { .. } => "terminal mount",
         TerminalCmd::Unmount { .. } => "terminal unmount",
@@ -800,6 +811,12 @@ fn group_dispatch(cmd: GroupCmd) -> Result<(), CliError> {
 
 fn terminal_dispatch(cmd: TerminalCmd) -> Result<(), CliError> {
     match cmd {
+        TerminalCmd::Report { state, target, instance } => {
+            let client = connect(instance.instance)?;
+            let uuid = resolve_pool_terminal(&client, &target)?;
+            client.send_json("POST", &format!("/api/terminals/{uuid}/activity"), &json!({"state":state}), &[])?;
+            Ok(())
+        }
         TerminalCmd::Spawn { x, y, w, h, ctx } => {
             let (client, session) = open(ctx)?;
             let mut op = obj(&[("op", json!("spawn"))]);

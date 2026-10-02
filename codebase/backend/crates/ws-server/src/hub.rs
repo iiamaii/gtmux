@@ -23,6 +23,30 @@
 //! the ring snapshot. Putting the catch-up in Hub would force per-subscriber
 //! state that the broadcast model would never naturally express.
 
+/// Last-socket disconnect, fenced against a newer connection or HTTP attach.
+#[derive(Debug, Clone)]
+pub struct DisconnectEvent { pub owner: String, pub generation: u64 }
+#[derive(Default)]
+struct OwnerConnections { generation: u64, connections: std::collections::HashSet<String> }
+
+pub struct ConnectionLease { hub: Hub, owner: String, id: String }
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        let event = {
+            let mut owners = self.hub.owner_connections.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(owner) = owners.get_mut(&self.owner) else { return; };
+            owner.connections.remove(&self.id);
+            owner.connections.is_empty().then(|| DisconnectEvent { owner: self.owner.clone(), generation: owner.generation })
+        };
+        if let (Some(event), Some(sink)) = (event, self.hub.disconnect_sink()) { let _ = sink.send(event); }
+    }
+}
+
+pub(crate) struct SocketLease(Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for SocketLease {
+    fn drop(&mut self) { self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
+}
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -340,6 +364,7 @@ impl Default for HeartbeatTimings {
 /// `Hub` is cheap to clone — internal state is `Arc<…>` + broadcast senders.
 #[derive(Clone)]
 pub struct Hub {
+    active_sockets: Arc<std::sync::atomic::AtomicUsize>,
     backend: PtyBackend,
     /// Multiplexed `(pane_id, bytes)` live output stream. Each WS subscriber
     /// receives an independent queue at [`HUB_BROADCAST_CAPACITY`] depth.
@@ -361,7 +386,8 @@ pub struct Hub {
     /// lock automatically. `None` when no consumer has registered — the
     /// channel is then a no-op and the lock is released only via explicit
     /// `DELETE /api/sessions/:name/attach`.
-    disconnect_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    owner_connections: Arc<std::sync::Mutex<std::collections::HashMap<String, OwnerConnections>>>,
+    disconnect_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<DisconnectEvent>>>>,
     /// Optional heartbeat sink (ADR-0019 D6.2). The WS handler emits the
     /// connection's cookie value on every Ping/Pong receive so the http-api
     /// layer can refresh the matching `.lock` file's `lease_until_unix`
@@ -493,10 +519,12 @@ impl Hub {
         });
 
         Self {
+            active_sockets: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             backend,
             pane_output,
             layout_events,
             _mux_task: Arc::new(mux_task),
+            owner_connections: Arc::default(),
             disconnect_tx: Arc::new(std::sync::Mutex::new(None)),
             heartbeat_tx: Arc::new(std::sync::Mutex::new(None)),
             heartbeat_timings: Arc::new(std::sync::RwLock::new(HeartbeatTimings::default())),
@@ -516,11 +544,21 @@ impl Hub {
         }
     }
 
+    pub(crate) fn track_socket(&self) -> SocketLease {
+        self.active_sockets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SocketLease(self.active_sockets.clone())
+    }
+
+    /// Number of outstanding WebSocket upgrades/handlers, including bearer-only clients.
+    pub fn active_socket_count(&self) -> usize {
+        self.active_sockets.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Register a sink that receives the cookie value of every closing WS
     /// connection (ADR-0019 D6 / ADR-0021 D6). The http-api layer uses this
     /// to auto-release any cross-server session lock the cookie still holds.
     /// Replaces a previously-registered sink; safe to call multiple times.
-    pub fn set_disconnect_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+    pub fn set_disconnect_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<DisconnectEvent>) {
         if let Ok(mut slot) = self.disconnect_tx.lock() {
             *slot = Some(tx);
         }
@@ -540,7 +578,7 @@ impl Hub {
     /// only by subsequent connections — never an in-flight one (avoids a
     /// half-state where a new sink misses a "closing" event from a socket
     /// whose snapshot still pointed at the old sink).
-    pub fn disconnect_sink(&self) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+    pub fn disconnect_sink(&self) -> Option<tokio::sync::mpsc::UnboundedSender<DisconnectEvent>> {
         self.disconnect_tx.lock().ok().and_then(|s| s.clone())
     }
 
@@ -583,7 +621,34 @@ impl Hub {
     /// session lock is the source of truth — this table only steers WS
     /// frame routing, so a missed update degrades to "session-scoped frame
     /// behaves like server-wide" until the next attach refreshes it.
+    pub fn register_connection(&self, owner: &str, id: &str) -> ConnectionLease {
+        let mut owners = self.owner_connections.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = owners.entry(owner.to_owned()).or_default();
+        entry.generation += 1;
+        entry.connections.insert(id.to_owned());
+        ConnectionLease { hub: self.clone(), owner: owner.to_owned(), id: id.to_owned() }
+    }
+
+    pub fn has_owner_connection(&self, owner: &str) -> bool {
+        self.owner_connections.lock().unwrap_or_else(|e| e.into_inner()).get(owner)
+            .is_some_and(|entry| !entry.connections.is_empty())
+    }
+
+    /// Run a synchronous cleanup while excluding connection registration.
+    /// Callers must acquire their async attach maps before entering this fence;
+    /// the callback must not call connection-registry methods or await.
+    pub fn with_disconnected_owner(&self, owner: &str, generation: Option<u64>, cleanup: impl FnOnce()) {
+        let owners = self.owner_connections.lock().unwrap_or_else(|e| e.into_inner());
+        let eligible = match owners.get(owner) {
+            Some(entry) => entry.connections.is_empty() && generation.is_none_or(|g| g == entry.generation),
+            None => generation.is_none(),
+        };
+        if eligible { cleanup(); }
+    }
+
     pub fn set_session_for_owner(&self, owner_key: &str, session_name: &str) {
+        self.owner_connections.lock().unwrap_or_else(|e| e.into_inner())
+            .entry(owner_key.to_owned()).or_default().generation += 1;
         let changed = match self.session_table.write() {
             Ok(mut t) => {
                 let prev = t.insert(owner_key.to_string(), session_name.to_string());
