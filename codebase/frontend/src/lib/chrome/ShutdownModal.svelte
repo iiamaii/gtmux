@@ -1,28 +1,9 @@
 <script lang="ts">
-  /**
-   * Session shutdown confirm modal (plan 0005 Stage C, ADR-0017 §D3).
-   *
-   * Triggered from SessionMenu. The shutdown path is HTTP: on confirm we run a
-   * step-up re-auth (ADR-0020 D16) — the ReauthModal collects the mode-aware
-   * credential (password if `auth.password_set`, else token) and calls
-   * `POST /api/shutdown` with `{ credential }`. The backend re-verifies the
-   * credential inline, then schedules graceful shutdown, emits SERVER_SHUTDOWN
-   * over WS, and exits with code 6. ReconnectBanner surfaces the intentional
-   * shutdown branch.
-   *
-   * Information density (ref §10 Figma style + sketch §13 destructive
-   * action prevention):
-   *   - Title: "Shutdown session '<name>'?"
-   *   - 3 bullets: pane count / layout preservation / exit-code semantics
-   *   - Actions: [Cancel] ghost + [Shutdown] danger → step-up re-auth
-   */
-
   import Modal from '$lib/ui/Modal.svelte';
   import Button from '$lib/ui/Button.svelte';
   import ReauthModal from './ReauthModal.svelte';
-  import { muxStore } from '$lib/stores/mux.svelte';
   import { toastStore } from '$lib/ui/toast-store.svelte';
-  import { shutdownServer } from '$lib/http/shutdown';
+  import { shutdownServer, serverStatus, type ServerStatus } from '$lib/http/shutdown';
   import { UnauthorizedError } from '$lib/http/sessions';
   import {
     InvalidCredentialError,
@@ -36,11 +17,18 @@
     onclose: () => void;
   }
 
-  const { open, sessionName, onclose }: Props = $props();
+  const { open, onclose }: Props = $props();
 
-  const liveCount = $derived(
-    [...muxStore.panes.values()].filter((p) => !p.dead).length
-  );
+  let status = $state<ServerStatus | null>(null);
+  let statusError = $state('');
+  $effect(() => {
+    if (!open) return;
+    let disposed = false;
+    status = null; statusError = '';
+    void serverStatus().then(value => { if (!disposed) status = value; })
+      .catch(e => { if (!disposed) statusError = e instanceof Error ? e.message : String(e); });
+    return () => { disposed = true; };
+  });
 
   let reauthOpen = $state(false);
 
@@ -88,23 +76,23 @@
   }
 </script>
 
-<Modal {open} {onclose} title="Shutdown session '{sessionName}'?">
+<Modal {open} {onclose} title="Stop server?">
   {#snippet body()}
-    <ul class="bullets">
-      <li>
-        <strong>{liveCount}</strong>
-        {liveCount === 1 ? 'active pane' : 'active panes'} will be reaped
-      </li>
-      <li>Canvas layout will be preserved on disk</li>
-      <li>Server process will exit with code 6</li>
-    </ul>
-    <p class="hint">
-      You'll need <code>gtmux start --session {sessionName}</code> to re-enter.
-    </p>
+    {#if status}
+      <p class="hint">Server <strong>{status.instance}</strong> at {status.bind}:{status.port}</p>
+      <ul class="bullets">
+        <li>All <strong>{status.active_terminals}</strong> active terminals on this server will stop, across every session and browser tab.</li>
+        <li>Saved session layouts and configuration stay on disk. Running programs will end.</li>
+      </ul>
+      <p class="hint">Start the server again with <code>gtmux start --name {status.instance}</code> and the same configuration, or your host application.</p>
+      {#if !status.can_shutdown}<p class="hint">This host manages the server lifecycle. Stop it from the host application.</p>{/if}
+    {:else}
+      <p class="hint" role="status">{statusError || 'Checking server status…'}</p>
+    {/if}
   {/snippet}
   {#snippet footer()}
     <Button variant="ghost" onclick={onclose} disabled={reauthOpen}>Cancel</Button>
-    <Button variant="danger" onclick={onConfirm} disabled={reauthOpen}>
+    <Button variant="danger" onclick={onConfirm} disabled={reauthOpen || !status?.can_shutdown || status.state === 'stopping'}>
       Shutdown
     </Button>
   {/snippet}

@@ -167,9 +167,11 @@ impl Allowlist {
     /// Check whether `path` matches any entry. ADR-0023 D2 algorithm.
     pub fn check<'a>(&'a self, path: &Path) -> AllowlistMatch<'a> {
         let path_str = path.to_string_lossy();
+        #[cfg(windows)]
+        let path_str = path_str.replace('\\', "/");
         let lower_tail = path_str.to_lowercase();
         for entry in &self.entries {
-            if !path_str.starts_with(&entry.prefix) {
+            if !path_str.starts_with(&entry.prefix.replace(if cfg!(windows) { '\\' } else { '/' }, "/")) {
                 continue;
             }
             let needle = format!(".{}", entry.ext);
@@ -226,13 +228,15 @@ pub(crate) fn normalise_prefix(raw: &str) -> Result<String, AllowlistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_path(path: &str) -> String { if cfg!(windows) { format!("C:{path}") } else { path.to_owned() } }
+
 
     #[test]
     fn add_and_check_match() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        a.add("md", "/tmp/notes/", None).unwrap();
-        let m = a.check(Path::new("/tmp/notes/spec.md"));
+        a.add("md", &test_path("/tmp/notes/"), None).unwrap();
+        let m = a.check(Path::new(&test_path("/tmp/notes/spec.md")));
         assert!(matches!(m, AllowlistMatch::Allowed(_)));
     }
 
@@ -240,8 +244,8 @@ mod tests {
     fn ext_case_insensitive() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        a.add("MD", "/tmp/notes/", None).unwrap();
-        let m = a.check(Path::new("/tmp/notes/UPPER.MD"));
+        a.add("MD", &test_path("/tmp/notes/"), None).unwrap();
+        let m = a.check(Path::new(&test_path("/tmp/notes/UPPER.MD")));
         assert!(matches!(m, AllowlistMatch::Allowed(_)));
     }
 
@@ -249,8 +253,8 @@ mod tests {
     fn prefix_case_sensitive() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        a.add("md", "/tmp/Notes/", None).unwrap();
-        let m = a.check(Path::new("/tmp/notes/spec.md"));
+        a.add("md", &test_path("/tmp/Notes/"), None).unwrap();
+        let m = a.check(Path::new(&test_path("/tmp/notes/spec.md")));
         assert!(matches!(m, AllowlistMatch::Denied), "lowercase != Notes");
     }
 
@@ -258,8 +262,8 @@ mod tests {
     fn recursive_subdir_match() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        a.add("pdf", "/tmp/docs/", None).unwrap();
-        let m = a.check(Path::new("/tmp/docs/2026/q1/report.pdf"));
+        a.add("pdf", &test_path("/tmp/docs/"), None).unwrap();
+        let m = a.check(Path::new(&test_path("/tmp/docs/2026/q1/report.pdf")));
         assert!(matches!(m, AllowlistMatch::Allowed(_)));
     }
 
@@ -270,8 +274,8 @@ mod tests {
         // must still hit confirm modal (the FE-NEW-8 path).
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        a.add("md", "/tmp/proj/", None).unwrap();
-        let m = a.check(Path::new("/tmp/proj/payload.sh"));
+        a.add("md", &test_path("/tmp/proj/"), None).unwrap();
+        let m = a.check(Path::new(&test_path("/tmp/proj/payload.sh")));
         assert!(matches!(m, AllowlistMatch::Denied));
     }
 
@@ -279,8 +283,8 @@ mod tests {
     fn add_rejects_duplicate() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        a.add("md", "/tmp/notes/", None).unwrap();
-        let err = a.add("md", "/tmp/notes/", None).unwrap_err();
+        a.add("md", &test_path("/tmp/notes/"), None).unwrap();
+        let err = a.add("md", &test_path("/tmp/notes/"), None).unwrap_err();
         assert!(matches!(err, AllowlistError::Validation("duplicate")));
     }
 
@@ -288,7 +292,7 @@ mod tests {
     fn add_normalises_ext_lowercase() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        let entry = a.add("MD", "/tmp/notes/", None).unwrap().clone();
+        let entry = a.add("MD", &test_path("/tmp/notes/"), None).unwrap().clone();
         assert_eq!(entry.ext, "md");
     }
 
@@ -296,7 +300,7 @@ mod tests {
     fn add_rejects_leading_dot_ext() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        let err = a.add(".md", "/tmp/notes/", None).unwrap_err();
+        let err = a.add(".md", &test_path("/tmp/notes/"), None).unwrap_err();
         assert!(matches!(
             err,
             AllowlistError::Validation("ext_contains_dot")
@@ -307,7 +311,7 @@ mod tests {
     fn add_rejects_prefix_without_slash() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        let err = a.add("md", "/tmp/notes", None).unwrap_err();
+        let err = a.add("md", &test_path("/tmp/notes"), None).unwrap_err();
         assert!(matches!(
             err,
             AllowlistError::Validation("prefix_must_end_slash")
@@ -329,9 +333,9 @@ mod tests {
     fn remove_returns_true_when_present() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut a = Allowlist::empty(dir.path().join("alist.json"));
-        a.add("md", "/tmp/notes/", None).unwrap();
-        assert!(a.remove("md", "/tmp/notes/").unwrap());
-        assert!(!a.remove("md", "/tmp/notes/").unwrap());
+        a.add("md", &test_path("/tmp/notes/"), None).unwrap();
+        assert!(a.remove("md", &test_path("/tmp/notes/")).unwrap());
+        assert!(!a.remove("md", &test_path("/tmp/notes/")).unwrap());
     }
 
     #[test]
@@ -339,9 +343,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("alist.json");
         let mut a = Allowlist::empty(path.clone());
-        a.add("md", "/tmp/notes/", Some("Notes".to_string()))
+        a.add("md", &test_path("/tmp/notes/"), Some("Notes".to_string()))
             .unwrap();
-        a.add("pdf", "/tmp/docs/", None).unwrap();
+        a.add("pdf", &test_path("/tmp/docs/"), None).unwrap();
         // Reload from disk.
         let b = Allowlist::load(&path).unwrap();
         assert_eq!(b.entries().len(), 2);

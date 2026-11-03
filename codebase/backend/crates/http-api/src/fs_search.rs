@@ -504,6 +504,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn symlink_is_not_followed() {
         use std::os::unix::fs::symlink;
         let (_a, root) = fixture();

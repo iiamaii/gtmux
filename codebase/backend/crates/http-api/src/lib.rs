@@ -60,6 +60,8 @@ mod session_lock;
 mod session_pane_set;
 mod sessions;
 mod settings;
+mod config_file;
+pub use config_file::ConfigFile;
 mod shutdown;
 mod terminal_map;
 mod terminals;
@@ -205,6 +207,10 @@ pub struct AppState {
     /// `.locks/<name>.lock` bodies so other servers can disambiguate
     /// holders that happen to share a PID.
     pub server_id: Arc<str>,
+    /// Optional host-selected configuration document.
+    pub config_file: Option<ConfigFile>,
+    /// Host-owned stop request. Embedders opt in explicitly; this library never exits the process.
+    pub shutdown_signal: Option<tokio::sync::watch::Sender<bool>>,
     /// Locks currently held by *this* server, keyed by session name. The
     /// outer Mutex protects the map; each [`LockGuard`] inside is itself
     /// the OS-level flock. Serialises same-server attach attempts on the
@@ -294,6 +300,7 @@ impl AppState {
                 Arc::new(Vec::new())
             }
         };
+        let behavior_settings = Arc::new(RwLock::new(config.behavior));
         Self {
             session_table,
             rate_limiter: default_rate_limiter(),
@@ -301,6 +308,8 @@ impl AppState {
             password_hash: Arc::new(RwLock::new(None)),
             password_hash_path: None,
             server_id: Arc::from(fresh_server_id()),
+            config_file: None,
+            shutdown_signal: None,
             session_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_locks_by_owner: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -318,7 +327,7 @@ impl AppState {
             // empty and is populated by `with_workspace` (it needs the Store
             // dir). No IO/canonicalize here — boot wiring does the real resolve.
             server_workspace: Arc::new(
-                std::env::var_os("HOME")
+                gtmux_platform::home()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from("/")),
             ),
@@ -326,7 +335,7 @@ impl AppState {
             workspace_manifest: Arc::new(RwLock::new(WorkspaceManifest::default())),
             session_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_cache: Arc::new(SessionCache::new()),
-            behavior_settings: default_behavior_settings(),
+            behavior_settings,
             file_open: FileOpenContext::production(),
             respawn_locks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             attach_index: Arc::new(attach_index::AttachIndex::new()),
@@ -369,6 +378,26 @@ impl AppState {
         self
     }
 
+    /// Opt in to browser stop requests handled by the embedding host.
+    pub fn with_shutdown_signal(mut self, signal: tokio::sync::watch::Sender<bool>) -> Self {
+        self.shutdown_signal = Some(signal);
+        self
+    }
+
+    /// Release only our guards, after terminal teardown has completed.
+    pub async fn release_all_attaches(&self) {
+        let mut owners = self.session_locks_by_owner.lock().await;
+        let mut holders = self.session_locks.lock().await;
+        holders.clear();
+        owners.clear();
+    }
+
+    /// Opt in to authenticated persistent config editing.
+    pub fn with_config_file(mut self, file: ConfigFile) -> Self {
+        self.config_file = Some(file);
+        self
+    }
+
     /// Refresh the lease body of the session lock currently held by the
     /// Webpage identified by `owner_key` (= `auth_cookie + 0x1f + webpage_id`,
     /// ADR-0019 D5.6 / ADR-0019 D6.2). Called from the WS heartbeat consumer
@@ -382,7 +411,6 @@ impl AppState {
         let Some(name) = by_owner.get(owner_key).cloned() else {
             return;
         };
-        drop(by_owner);
         let mut holders = self.session_locks.lock().await;
         if let Some(guard) = holders.get_mut(&name) {
             if let Err(e) = guard.refresh_lease(owner_key) {
@@ -392,6 +420,25 @@ impl AppState {
                     "session_lock: lease refresh failed"
                 );
             }
+        }
+    }
+
+    /// Only reap this process's unattached guards. Never override an OS lock
+    /// held by another process, and never time out a live WS from lease text.
+    pub async fn reap_abandoned_attaches(&self) {
+        let mut owners = self.session_locks_by_owner.lock().await;
+        let mut holders = self.session_locks.lock().await;
+        let expired: Vec<_> = owners.iter().filter(|(_, name)| {
+            holders.get(*name).is_some_and(|guard| guard.is_expired())
+        }).map(|(owner, name)| (owner.clone(), name.clone())).collect();
+        for (owner, name) in expired {
+            let mut cleanup = || {
+                owners.remove(&owner);
+                holders.remove(&name);
+                if let Some(hub) = &self.hub { hub.clear_session_for_owner(&owner); }
+            };
+            if let Some(hub) = &self.hub { hub.with_disconnected_owner(&owner, None, cleanup); }
+            else { cleanup(); }
         }
     }
 
@@ -429,27 +476,31 @@ impl AppState {
     /// ADR-0019 D5.6 / ADR-0019 D6). Called from the WS disconnect consumer
     /// task on close. Idempotent — an owner that never attached is a no-op.
     pub async fn release_lock_for_owner(&self, owner_key: &str) {
+        self.release_owner_if(owner_key, None).await;
+    }
+
+    /// Release only if the disconnect still describes the current owner generation.
+    pub async fn release_disconnected_owner(&self, event: gtmux_ws_server::DisconnectEvent) {
+        self.release_owner_if(&event.owner, Some(event.generation)).await;
+    }
+
+    async fn release_owner_if(&self, owner_key: &str, generation: Option<u64>) {
         // Locks are taken in a fixed order (locks_by_owner → session_locks)
         // anywhere two maps are touched together, so a same-owner attach
         // racing with a disconnect cannot deadlock.
         let mut by_owner = self.session_locks_by_owner.lock().await;
-        let Some(name) = by_owner.remove(owner_key) else {
-            return;
-        };
         let mut holders = self.session_locks.lock().await;
-        if let Some(mut guard) = holders.remove(&name) {
-            tracing::info!(
-                session = %name,
-                "session_lock: auto-released on WS disconnect"
-            );
-            guard.release();
-        }
-        // Stage 5-A: mirror the auto-release into the hub's owner ↔
-        // session table so a fresh WS reconnect doesn't see this Webpage
-        // as still session-attached.
-        if let Some(hub) = self.hub.as_ref() {
-            hub.clear_session_for_owner(owner_key);
-        }
+        let mut cleanup = || {
+            let Some(name) = by_owner.remove(owner_key) else { return; };
+            if let Some(mut guard) = holders.remove(&name) {
+                tracing::info!(session = %name, "session_lock: released owner");
+                guard.release();
+            }
+            if let Some(hub) = self.hub.as_ref() { hub.clear_session_for_owner(owner_key); }
+        };
+        if let Some(generation) = generation {
+            if let Some(hub) = &self.hub { hub.with_disconnected_owner(owner_key, Some(generation), cleanup); }
+        } else { cleanup(); }
     }
 
     /// Spawn a fresh Terminal in the PTY backend and bind it to `uuid` in
@@ -866,6 +917,8 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             axum::routing::delete(sessions::delete_item_handler),
         )
         .route("/api/terminals", get(terminals::list_handler))
+        .route("/api/terminals/activity", get(terminals::activity_handler))
+        .route("/api/terminals/{id}/activity", axum::routing::post(terminals::report_activity_handler))
         .route(
             "/api/terminals/{id}",
             axum::routing::patch(terminals::patch_handler),
@@ -887,6 +940,9 @@ pub fn router_with_state_and_spa(state: AppState, frontend_dist: Option<&Path>) 
             "/api/terminals/{id}/input",
             axum::routing::post(terminals::input_handler),
         )
+        .route("/api/server/status", axum::routing::get(shutdown::status))
+        .route("/api/config", axum::routing::get(config_file::get).put(config_file::put))
+        .route("/api/config/preview", axum::routing::post(config_file::preview))
         .route(
             "/api/settings",
             get(settings::get_handler).patch(settings::patch_handler),
@@ -1179,8 +1235,9 @@ pub const COOKIE_NAME_STR: &str = "gtmux_auth";
 //  Handlers
 // ─────────────────────────────────────────────────────────────────────────────
 
-async fn healthz_handler() -> Response {
+async fn healthz_handler(State(state): State<AppState>) -> Response {
     let mut resp = Json(json!({ "ok": true })).into_response();
+    if let Ok(value) = state.server_id.parse() { resp.headers_mut().insert("x-gtmux-server-id", value); }
     apply_security_headers(resp.headers_mut(), Mode::Local /* harmless */);
     resp
 }
@@ -1367,6 +1424,8 @@ mod tests {
             default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
+            behavior: gtmux_config::BehaviorSettings::default(),
+        public_origin: None,
         }
     }
 
@@ -5787,6 +5846,62 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    #[tokio::test]
+    async fn activity_routes_require_authentication() {
+        let (app, _) = make_app();
+        for (method, uri) in [(Method::GET, "/api/terminals/activity"),
+            (Method::POST, "/api/terminals/missing/activity")] {
+            let response = app.clone().oneshot(HttpRequest::builder()
+                .method(method).uri(uri).header(header::HOST, TEST_HOST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"state":"completed"}"#)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_reports_and_snapshot_track_live_terminals() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = make_state_with_workspace_and_hub(&dir);
+        let uuid = "11111111-2222-4333-8444-555555555aaa";
+        let pane = state.spawn_terminal_with_uuid(uuid.into(), None, None).await.unwrap();
+        let app = router_with_state(state.clone());
+        for (id, body, expected) in [
+            (uuid, r#"{"state":"completed"}"#, StatusCode::NO_CONTENT),
+            ("missing", r#"{"state":"completed"}"#, StatusCode::NOT_FOUND),
+            (uuid, r#"{"state":"quiet"}"#, StatusCode::BAD_REQUEST),
+            (uuid, r#"{"state":"invalid"}"#, StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let response = app.clone().oneshot(HttpRequest::builder().method(Method::POST)
+                .uri(format!("/api/terminals/{id}/activity"))
+                .header(header::HOST, TEST_HOST).header(header::AUTHORIZATION, bearer(&token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let response = app.oneshot(HttpRequest::builder().uri("/api/terminals/activity")
+            .header(header::HOST, TEST_HOST).header(header::AUTHORIZATION, bearer(&token))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(body["server_id"], state.server_id.as_ref());
+        let rows = body["terminals"].as_array().unwrap();
+        let row = rows.iter().find(|row| row["id"] == uuid).unwrap();
+        assert_eq!(row["pane_id"], pane.0);
+        assert_eq!(row["activity"]["state"], "completed");
+        assert_eq!(row["activity"]["source"], "report");
+        state.hub.as_ref().unwrap().backend().kill(pane).unwrap();
+    }
+
+    #[tokio::test]
+    async fn activity_snapshot_requires_hub() {
+        let (app, token) = make_app();
+        let response = app.oneshot(HttpRequest::builder().uri("/api/terminals/activity")
+            .header(header::HOST, TEST_HOST).header(header::AUTHORIZATION, bearer(&token))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     // ── ADR-0054: terminal output read + input send ──
 
     #[tokio::test]
@@ -5934,7 +6049,7 @@ mod tests {
         let app = router_with_state(state.clone());
 
         let marker = "GTMUX_ADR0054_MARKER";
-        let line = format!("echo {marker}\n");
+        let line = format!("echo {marker}{}", if cfg!(windows) { "\r" } else { "\n" });
         let b64 = base64::engine::general_purpose::STANDARD.encode(&line);
         let resp = app
             .clone()
@@ -6805,7 +6920,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(release.status(), StatusCode::OK);
-        assert!(!workspace_dir.join(".locks/gamma.lock").exists());
+        assert_eq!(std::fs::metadata(workspace_dir.join(".locks/gamma.lock")).unwrap().len(), 0);
         // Now cookie_b can acquire it.
         assert_eq!(post(cookie_b).await.unwrap().status(), StatusCode::OK);
     }
@@ -6899,13 +7014,13 @@ mod tests {
             .insert(cookie_value.to_string(), "refresh".to_string());
 
         let path = locks_dir.join("refresh.lock");
-        let lease_before: serde_json::Value =
+        let mut lease_before: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        lease_before["lease_until_unix"] = json!(0);
+        std::fs::write(&path, serde_json::to_vec(&lease_before).unwrap()).unwrap();
         let before_until = lease_before["lease_until_unix"].as_u64().unwrap();
 
-        // Sleep past the 1s resolution of unix-seconds so the new lease
-        // can demonstrably differ.
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        // An expired diagnostic value avoids dependence on wall-clock jumps.
         state.refresh_lease_for_owner(cookie_value).await;
 
         let lease_after: serde_json::Value =
@@ -6960,7 +7075,7 @@ mod tests {
         state.release_lock_for_owner(cookie_value).await;
         assert!(state.session_locks.lock().await.is_empty());
         assert!(state.session_locks_by_owner.lock().await.is_empty());
-        assert!(!dir.path().join(".locks/manual.lock").exists());
+        assert_eq!(std::fs::metadata(dir.path().join(".locks/manual.lock")).unwrap().len(), 0);
 
         // Idempotent — second call on an absent cookie is a no-op.
         state.release_lock_for_owner(cookie_value).await;
@@ -7647,6 +7762,124 @@ mod tests {
     // ── Implicit detach-on-reattach (session switch UX) ──────────────────
 
     #[tokio::test]
+    async fn old_disconnect_cannot_release_a_reconnected_owner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, workspace) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        hub.set_disconnect_sink(tx);
+        let guard = session_lock::acquire(&workspace.join(".locks"), "demo", state.server_id.clone(), "owner").unwrap();
+        state.session_locks.lock().await.insert("demo".into(), guard);
+        state.session_locks_by_owner.lock().await.insert("owner".into(), "demo".into());
+        let old = hub.register_connection("owner", "old");
+        drop(old);
+        let stale = rx.recv().await.unwrap();
+        let new = hub.register_connection("owner", "new");
+        state.release_disconnected_owner(stale).await;
+        assert!(state.session_locks.lock().await.contains_key("demo"));
+        drop(new);
+        let stale = rx.recv().await.unwrap();
+        // An HTTP reattach can precede the new WebSocket upgrade.
+        hub.set_session_for_owner("owner", "demo");
+        state.release_disconnected_owner(stale).await;
+        assert!(state.session_locks.lock().await.contains_key("demo"));
+        let last = hub.register_connection("owner", "last");
+        drop(last);
+        state.release_disconnected_owner(rx.recv().await.unwrap()).await;
+        assert!(state.session_locks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_while_disconnect_waits_for_holder_map_keeps_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, workspace) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        hub.set_disconnect_sink(tx);
+        let guard = session_lock::acquire(&workspace.join(".locks"), "demo", state.server_id.clone(), "owner").unwrap();
+        state.session_locks.lock().await.insert("demo".into(), guard);
+        state.session_locks_by_owner.lock().await.insert("owner".into(), "demo".into());
+        let old = hub.register_connection("owner", "old");
+        hub.set_session_for_owner("owner", "demo");
+        drop(old);
+        let event = rx.recv().await.unwrap();
+        let holders = state.session_locks.lock().await;
+        let cleanup_state = state.clone();
+        let cleanup = tokio::spawn(async move { cleanup_state.release_disconnected_owner(event).await; });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while state.session_locks_by_owner.try_lock().is_ok() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let new = hub.register_connection("owner", "new");
+        drop(holders);
+        cleanup.await.unwrap();
+        assert!(state.session_locks.lock().await.contains_key("demo"));
+        // HTTP attach after WS registration must still release on its actual last close.
+        hub.set_session_for_owner("owner", "demo");
+        drop(new);
+        state.release_disconnected_owner(rx.recv().await.unwrap()).await;
+        assert!(state.session_locks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoned_http_attach_expires_but_live_socket_is_protected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, _, workspace) = make_state_with_workspace_and_hub(&dir);
+        let hub = state.hub.as_ref().unwrap();
+        for name in ["idle", "live", "fresh"] {
+            let mut guard = session_lock::acquire(&workspace.join(".locks"), name, state.server_id.clone(), name).unwrap();
+            if name != "fresh" { guard.expire_for_test(); }
+            state.session_locks.lock().await.insert(name.into(), guard);
+            state.session_locks_by_owner.lock().await.insert(name.into(), name.into());
+        }
+        let connection = hub.register_connection("live", "connection");
+        state.reap_abandoned_attaches().await;
+        let holders = state.session_locks.lock().await;
+        assert!(!holders.contains_key("idle"));
+        assert!(holders.contains_key("live"));
+        assert!(holders.contains_key("fresh"));
+        drop(holders);
+        drop(connection);
+        state.reap_abandoned_attaches().await;
+        assert!(!state.session_locks.lock().await.contains_key("live"));
+    }
+
+    #[tokio::test]
+    async fn attach_and_disconnect_do_not_invert_map_locks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (state, token, workspace_dir) = make_state_with_workspace_and_hub(&dir);
+        for name in ["old", "new"] {
+            std::fs::write(workspace_dir.join(format!("{name}.json")),
+                serde_json::to_vec(&json!({"schema_version":2,"groups":[],"items":[],
+                    "viewport":{"x":0,"y":0,"zoom":1}})).unwrap()).unwrap();
+        }
+        let app = router_with_state(state.clone());
+        let request = |name: &str, owner: &str| HttpRequest::builder().method(Method::POST)
+            .uri(format!("/api/sessions/{name}/attach"))
+            .header(header::HOST, TEST_HOST).header(header::AUTHORIZATION, bearer(&token))
+            .header(header::COOKIE, format!("gtmux_auth={owner}"))
+            .body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(request("old", "old-owner")).await.unwrap().status(), StatusCode::OK);
+        // Force real attach to queue for holders before disconnect does.
+        let holders = state.session_locks.lock().await;
+        let attach = tokio::spawn(app.oneshot(request("new", "new-owner")));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let release_state = state.clone();
+        let disconnect = tokio::spawn(async move { release_state.release_lock_for_owner("old-owner").await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(holders);
+        let mut attach = attach;
+        let mut disconnect = disconnect;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let response = (&mut attach).await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            (&mut disconnect).await.unwrap();
+        }).await;
+        attach.abort(); disconnect.abort();
+        assert!(result.is_ok(), "attach and disconnect deadlocked; both retain LockGuards");
+        assert!(!state.session_locks.lock().await.contains_key("old"));
+    }
+
+    #[tokio::test]
     async fn attach_implicitly_releases_previous_session_for_same_cookie() {
         // ADR-0019 D3 single-attach: when the same cookie attaches to a
         // *different* session, the previous session's flock must auto-release.
@@ -7707,7 +7940,7 @@ mod tests {
             .unwrap();
         assert_eq!(r2.status(), StatusCode::OK);
         // 'one' lock must be gone, 'two' lock present.
-        assert!(!workspace_dir.join(".locks/one.lock").exists());
+        assert_eq!(std::fs::metadata(workspace_dir.join(".locks/one.lock")).unwrap().len(), 0);
         assert!(workspace_dir.join(".locks/two.lock").exists());
         // hub mirror must now point at 'two'.
         assert_eq!(hub.session_for_owner(cookie_value), Some("two".into()));
@@ -8636,6 +8869,7 @@ mod tests {
     /// 400 not_a_file (symlinks are refused lexically, before canonicalize
     /// would follow them — the link target stays untouched).
     #[tokio::test]
+    #[cfg(unix)]
     async fn fs_file_write_rejects_directory_and_symlink() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _) = make_app_with_workspace(&dir);
@@ -8790,6 +9024,7 @@ mod tests {
     /// creation fail → 500 write_failed, the target keeps its old content,
     /// and no temp file is left behind.
     #[tokio::test]
+    #[cfg(unix)]
     async fn fs_file_write_failure_leaves_old_content_and_no_temp() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -9566,6 +9801,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg(unix)]
     async fn fs_copy_directory_with_symlink_rejected_no_partial() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::TempDir::new().unwrap();
@@ -9893,6 +10129,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg(unix)]
     async fn fs_move_rejects_symlink_source_and_descendant() {
         use std::os::unix::fs::symlink;
         let dir = tempfile::TempDir::new().unwrap();
@@ -9967,12 +10204,13 @@ mod tests {
     async fn create_rejects_workspace_root_outside_a() {
         let dir = tempfile::TempDir::new().unwrap();
         let (app, token, _store) = make_app_with_workspace(&dir);
+        let outside = tempfile::tempdir().unwrap();
         let (status, body) = authed_json(
             &app,
             &token,
             Method::POST,
             "/api/sessions",
-            Some(json!({ "name": "escape", "workspace_root": "/etc", "confirm": true })),
+            Some(json!({ "name": "escape", "workspace_root": outside.path(), "confirm": true })),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

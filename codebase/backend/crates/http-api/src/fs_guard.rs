@@ -31,7 +31,7 @@ use thiserror::Error;
 pub fn gtmux_config_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(s) if !s.is_empty() => PathBuf::from(s),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+        _ => PathBuf::from(gtmux_platform::home()?).join(".config"),
     };
     Some(base.join("gtmux"))
 }
@@ -41,7 +41,7 @@ pub fn gtmux_config_dir() -> Option<PathBuf> {
 pub fn gtmux_state_dir() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_STATE_HOME") {
         Some(s) if !s.is_empty() => PathBuf::from(s),
-        _ => PathBuf::from(std::env::var_os("HOME")?)
+        _ => PathBuf::from(gtmux_platform::home()?)
             .join(".local")
             .join("state"),
     };
@@ -81,7 +81,7 @@ pub fn resolve_server_workspace(
         (Some(p), _) => p,
         (None, Some(p)) => p,
         (None, None) => {
-            let home = std::env::var_os("HOME")
+            let home = gtmux_platform::home()
                 .ok_or_else(|| ServerWorkspaceError::Unresolved("$HOME not set".into()))?;
             PathBuf::from(home)
         }
@@ -202,7 +202,7 @@ pub fn effective_workspace(
     effective_workspace_with_home(
         record_root,
         config_default,
-        std::env::var_os("HOME").as_deref().map(Path::new),
+        gtmux_platform::home().as_deref().map(Path::new),
         server_workspace,
         denylist,
     )

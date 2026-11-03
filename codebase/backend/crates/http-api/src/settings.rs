@@ -20,10 +20,8 @@
 //! `unknown_field` so an FE-side typo surfaces immediately instead of
 //! being silently ignored.
 //!
-//! Persistence is **in-memory only** for the Stage 7 minimal slice — the
-//! `behavior` toggle survives WS reconnects and HTTP retries inside one
-//! server boot, but resets on restart. Disk persistence is a follow-up
-//! item; the wire contract here does not depend on it.
+//! With a configured ConfigFile, behavior patches are persisted before being
+//! applied live. Embedders without a ConfigFile retain memory-only behavior.
 
 use std::sync::Arc;
 
@@ -32,58 +30,12 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::AppState;
 
-/// Mutable behavior settings.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct BehaviorSettings {
-    /// ADR-0021 G25.1.b: when true, panel close = panel + terminal SIGTERM
-    /// with no per-action dialog. Default `false` per `bool::default()`.
-    pub auto_kill_terminal_on_panel_close: bool,
-    /// ADR-0035 D7: when true, FilePicker shows dot-prefixed entries
-    /// (e.g. `.git`, `.env`, `.config`). Default `false` — hidden entries
-    /// are skipped (typical UX). Toggleable from Settings UI.
-    pub picker_show_hidden: bool,
-    /// 0077 follow-up: when true, switching from one active session to a
-    /// different session triggers a full `window.location.reload()` after
-    /// the new layout has loaded. First attach (`idle → session`) and modal
-    /// cancel paths (`cancelAttachConfirm`) are *not* affected. Forcing a
-    /// reload re-runs the auth gate + attach + self-heal pipeline, so any
-    /// FE-side cache divergence from the BE (e.g. stale `terminalPool`,
-    /// stuck WS subscribers) is reset at a well-defined boundary.
-    /// Default `true` per the user request.
-    #[serde(default = "default_reload_on_session_switch")]
-    pub reload_on_session_switch: bool,
-    /// ADR-0049: when true, the FE may honor terminal OSC 52 clipboard
-    /// *write* sequences (e.g. drag-copy from a mouse-mode TUI like
-    /// `claude`). Default `false` — security-defaults §1.6 forbids
-    /// auto-enable; the user must explicitly opt in. The BE only stores
-    /// and exposes this flag; all clipboard logic, the secure-context
-    /// gate, and OSC 52 read-blocking live entirely in the FE.
-    #[serde(default)]
-    pub osc52_clipboard_write_enabled: bool,
-}
-
-const fn default_reload_on_session_switch() -> bool {
-    true
-}
-
-impl Default for BehaviorSettings {
-    fn default() -> Self {
-        Self {
-            auto_kill_terminal_on_panel_close: false,
-            picker_show_hidden: false,
-            reload_on_session_switch: default_reload_on_session_switch(),
-            // Security default: never auto-enable (ADR-0049 D3-a,
-            // security-defaults §1.6). Must stay `false`.
-            osc52_clipboard_write_enabled: false,
-        }
-    }
-}
+pub use gtmux_config::BehaviorSettings;
 
 /// Compile-time build metadata. Sourced from `Cargo.toml` + optional
 /// `GTMUX_BUILD_SHA` env var (set by a future build.rs / CI step).
@@ -299,7 +251,8 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
     // Start from the *current* behavior so partial updates merge
     // semantically (FE can send `{"behavior":{"auto_kill_terminal_on_panel_close":true}}`
     // without echoing every other field — when more fields land).
-    let mut next = *state.behavior_settings.read().await;
+    let mut current = state.behavior_settings.write().await;
+    let mut next = *current;
     let Some(behavior_obj) = behavior_value.as_object() else {
         return (
             StatusCode::BAD_REQUEST,
@@ -365,12 +318,17 @@ pub(crate) async fn patch_handler(State(state): State<AppState>, req: Request<Bo
         }
     }
 
-    // Commit + reflect in the response. Two `await` boundaries (read
-    // above, write here) are fine — same task, no contention possible.
-    {
-        let mut w = state.behavior_settings.write().await;
-        *w = next;
+    // Serialize concurrent PATCH requests and change memory only after disk commit.
+    if let Some(file) = state.config_file.clone() {
+        let config = state.config.clone();
+        match tokio::task::spawn_blocking(move || file.save_behavior(next, &config)).await {
+            Ok(Ok(())) => {},
+            Ok(Err((status, message))) => return (status, Json(json!({"error":"config_file_error","message":message}))).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error":"config_file_error","message":e.to_string()}))).into_response(),
+        }
     }
+    *current = next;
+    drop(current);
     let password_set = current_password_set(&state).await;
     let token_present = current_token_present(&state).await;
     Json(build_snapshot(&state, next, password_set, token_present)).into_response()
@@ -792,6 +750,8 @@ mod tests {
             default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
+            behavior: gtmux_config::BehaviorSettings::default(),
+        public_origin: None,
         };
         let state = AppState::new(cfg, token.clone());
         (state, token)

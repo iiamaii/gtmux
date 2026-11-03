@@ -962,6 +962,95 @@ All single-key bindings are reassignable in **Settings → Keyboard**.
 
 ## B. Other UI surfaces
 
+### Terminal activity
+
+Enable **Settings → Appearance → Terminal activity** (off by default).
+The **Activity** tab in the left panel lists live terminals in the current
+session. Completion, input-needed and unread-output indicators each have
+an independent switch, as do the list and browser-tab indicators. Turning
+the master switch off hides both surfaces and stops browser polling.
+The sidebar defaults to 340px when Activity is visible (268px otherwise).
+Dragging its edge saves separate widths for the two configurations; toggling
+Activity restores the corresponding width, including after reload.
+
+**Activity title format** controls the wrapper with `{title}` (the existing
+browser title) and `{activity}` (pending states). Completion, input-needed
+and unread labels each accept `{count}`, or a static symbol such as `✓`.
+For example, `{title} | {activity}` with completion label `✓ {count}` shows
+`gtmux - work | ✓ 2`. Preview, Enter/blur saving and reset are provided.
+Invalid formats show an error and keep the last saved value. No pending
+activity means the ordinary browser title is used without the wrapper.
+
+Preferences are saved in this browser and shared across same-origin tabs;
+read acknowledgements are kept separately in each tab's session storage.
+
+- **Active / Output quiet**: printable output arrived / output has paused.
+  Silence alone never means that an agent completed its task.
+- **Completed / Needs input**: an explicit report; shell command completion
+  can also come from OSC 133 C/D shell integration markers.
+- **(estimated)**: limited prompt recognition, such as `❯`, `›`, `(y/n)`
+  or “press enter to continue”. Full-screen redraws, custom prompts and
+  localized tools may produce missing or incorrect estimates. Shell command
+  completion is distinct from an agent turn completing inside that command.
+- **Unread output**: new printable output since acknowledgement. Focusing
+  a visible terminal, clicking its checkmark or choosing **Mark listed
+  terminals read** acknowledges output and pending notices. This records
+  focus/acknowledgement, not whether you actually read every line of scrollback.
+
+The first observation of a new terminal is the baseline: existing output
+is not announced as unread. Server restarts and terminal respawns get new
+baselines. The browser polls every two seconds while enabled and connected
+to a session; background-tab throttling can delay updates. Each browser tab
+counts only terminals belonging to its session, e.g. `[1 done] gtmux - work`.
+If multiple categories apply, input-needed takes priority over completion,
+then unread, so each terminal is counted once. Current state stays in the
+list after acknowledgement; only pending notices clear. On API errors the
+list shows an error and retries; browser badges are suppressed until recovery.
+The server tracks bounded activity metadata even when the UI is disabled.
+
+For reliable agent lifecycle integration, have the tool's hook call these
+commands from the environment of its gtmux terminal (with `gtmux` on PATH):
+
+```sh
+gtmux terminal report working
+gtmux terminal report needs_input
+gtmux terminal report completed
+```
+
+`GTMUX_TERMINAL_ID` selects the terminal automatically. Outside that terminal,
+pass `--target <terminal-uuid> --instance <instance-name>`. Reports use the
+existing authenticated connection and never send input to the terminal.
+Explicit states persist until another report, terminal input or shell marker;
+report `working` when a new turn begins. `unknown` is also accepted. These
+commands provide the integration interface; agent-specific hooks are **not**
+automatically installed. Use the CLI and backend built from the same revision.
+
+For custom clients, authenticated `GET /api/terminals/activity` returns
+`{server_id, terminals: [{id, pane_id, activity: {state, source, output_seq,
+state_seq}}]}`. `source` is `output`, `heuristic`, `shell` or `report`.
+Authenticated `POST /api/terminals/<uuid>/activity` accepts
+`{"state":"working|completed|needs_input|unknown"}` (choose one value),
+returning 204; a missing terminal returns 404, `quiet` returns 400, and an
+unknown state returns 422. A backend without a PTY hub returns 503.
+Counters are process-local acknowledgement tokens, not byte counts or history.
+No terminal output content is included in these responses.
+
+### Browser tab titles
+
+Tabs show `gtmux - <session name>` while a session is open, and `gtmux`
+when no session is attached. The title follows the active session.
+In **Settings → Appearance → Browser tabs**, turn session names off or
+customize the format using `{app}` and `{session}` (for example,
+`{session} | {app}`). The format must include `{session}` and is limited
+to 120 characters. A preview updates as you type; valid formats save on
+leaving the field or pressing Enter. **Reset format** restores the default.
+
+These preferences are saved in this browser and synchronized across tabs
+on the same server origin; each tab still displays its own session name.
+They do not change server TOML settings or session exports. If browser
+storage rejects a write, an error is shown and the previous preference
+remains active.
+
 ### Titlebar (44 px, top)
 
 - Left: Session menu (kebab `⋮`) + brand mark + "gtmux".
@@ -1035,3 +1124,104 @@ shortcuts, group ops. Useful when you've forgotten a shortcut.
 - [`QUICKSTART.md`](QUICKSTART.md) — install, config, auth, session
   creation.
 - [`README.md`](README.md) — project overview.
+
+### Session attach recovery
+
+Disconnected browser ownership is cleaned up without killing its terminals.
+A stale WebSocket close cannot release a newer connection's attach. An HTTP
+attach that never opens a WebSocket is reclaimed after the 30-second idle
+window (checked every five seconds); live WebSockets remain protected.
+The OS flock is authoritative across servers: expired diagnostic lease text
+does not permit takeover. Empty `.locks/*.lock` files are intentionally kept
+to preserve their inode. Do not delete these files while a server is running.
+Restarting a server can terminate live terminal processes even though saved
+layouts survive.
+
+### Persistent server configuration
+
+Open **Settings → Server** to edit the instance TOML file. Common fields cover
+the port and workspace folders; Advanced TOML exposes the rest of the existing
+schema, including proxy/security settings. Apply common fields to the draft,
+then Save configuration and confirm with your token/password. Save validates
+the document and writes atomically; errors keep the draft and running values.
+External changes produce a conflict: reload explicitly before retrying.
+Concurrent cooperating gtmux writers are serialized; unrelated editors must
+not write concurrently with a save (a final revision check narrows but cannot
+eliminate that filesystem race). Symlink config files are not editable here.
+
+Saved startup settings take effect on restart, not immediately. CLI flags and
+GTMUX environment overrides still win. The UI shows the running address and
+whether saved startup settings differ from boot. Comments are retained.
+Behavior switches persist in `[behavior]` and apply live only after a
+successful save, including Behavior edits saved from the advanced editor.
+External file edits load on restart. Invalid external TOML
+blocks Behavior saves rather than overwriting the file. Browser appearance
+preferences remain browser-local. Embedded hosts must explicitly supply
+`ConfigFile` to enable persistence; otherwise Behavior stays memory-only.
+
+The CLI selects the explicit `--config` file or the per-instance default
+`~/.config/gtmux/<name>.config.toml`. A missing default file is created on the
+first successful save. Configuration saves never restart the server or stop
+terminals. Restart manually after reviewing the saved file and current CLI
+overrides; port occupancy is checked when binding at startup.
+
+### Server status and safe stop
+
+**Settings → Server → Stop server** shows the instance and the number of
+active terminals across all sessions. Confirm with your token/password.
+Stopping ends running terminal programs; it preserves saved layouts and
+configuration, but does not suspend or checkpoint processes. New terminal
+spawns are fenced during teardown. WebSockets receive the shutdown notice,
+HTTP requests have up to ten seconds to drain and detached WebSocket handlers
+have up to two additional seconds to close, then the backend reaps its
+children before releasing attach guards and removing the pidfile. Browser
+shutdown retains CLI exit code 6; SIGINT/SIGTERM use the same cleanup path.
+
+`GET /api/server/status` requires authentication and reports lifecycle state,
+capabilities and server-wide counts. Embedded hosts opt in through
+`AppState::with_shutdown_signal`; the HTTP library never exits the host
+process. The host must consume the request and perform cleanup. Without this
+integration browser stop is disabled. For explicit cleanup with retained
+backend clones, call `PtyBackend::shutdown` on a blocking thread, then
+`AppState::release_all_attaches`.
+
+Automatic restart, Electron window/tray/background permissions and web/app
+launch modes are future work. Restart the standalone server using the same
+`gtmux start --name <instance> --config <path>` command. A newly saved port
+applies on that start; update any reverse proxy and CLI overrides accordingly.
+
+
+## Packaged server and desktop manager
+
+Build the backend with `cargo build --locked --bin gtmux` in `codebase/backend`.
+Build the frontend into an isolated directory:
+`npm run build -- --outDir ../../.artifacts/frontend` in `codebase/frontend`.
+From the repository root, stage resources with
+`node scripts/prepare-launcher.mjs codebase/backend/target/debug/gtmux .artifacts/frontend`
+(use `gtmux.exe` on Windows). Then run `npm ci` and `npm start` in
+`codebase/launcher`; `npm run web` provides the local browser manager instead.
+Use `--data-dir` with the web manager to select an isolated test profile.
+
+Choose an unused port and project folder on first run. Saved server settings are
+in the manager's own `server.toml`. Change port/workspace through workspace
+Settings → Server, then restart from the manager. Stop/restart ends live terminal
+programs but preserves saved session layouts. The manager controls only processes
+it started. Background mode keeps a tray control; quitting stops its server.
+
+External access: enter a public domain, review DNS/port prerequisites, install
+the checksum-verified proxy, apply the plan, then verify public HTTPS. DNS,
+router forwarding and firewall permissions are prerequisites, not automatically
+changed. Backup/rollback protects the original TOML and detects external edits.
+The application does not obtain a certificate during build or tests.
+
+Configuration sample reference pages are regenerated on every website build.
+CI requires English documentation changes and corresponding Korean updates for
+code changes; reviewers still verify accuracy and translation meaning.
+
+Unread counts in browser tab titles are off by default. Enable **Settings → Appearance → Terminal activity → Unread in browser tab** to restore them; also enable Terminal activity, Unread output and Browser tab indicators. The Activity list still shows unread output independently. To restore a hidden sidebar list, enable Activity list in the same section.
+
+### Agent hooks, IP HTTPS and app updates
+
+In the desktop manager, use **Agent activity** to generate or review additive Claude Code, Codex, Gemini CLI, Copilot, Cursor, Aider and OpenCode integrations. Existing settings are backed up and conflicts are reported; restart the agent and review its hook trust prompt. See [agent setup](website/content/en/agents.md).
+
+**External access** supports domain/public-IP certificates through Caddy and local-CA certificates for private IPs, with on/off, saved settings, root certificate export and certificate verification. [HTTPS setup](website/content/en/external-access.md) explains network prerequisites. **Updates** provides optional automatic checks/downloads and explicit confirmed installation for release-configured desktop packages; [update preparation and limitations](website/content/en/updates.md). The stopped-server port recovery control reloads external TOML changes before saving.

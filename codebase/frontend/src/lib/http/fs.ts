@@ -1,3 +1,4 @@
+import { normalizeNativePath } from '$lib/files/nativePath';
 // File system picker — ADR-0035 / 0061.
 //
 // MVP scope: workspace root only. External roots (ADR-0035 D2.1 picker.roots)
@@ -184,7 +185,8 @@ export async function listDir(dir: string, options: ListDirOptions = {}): Promis
   if (res.status === 403) throw new DirNotAllowedError();
   if (res.status === 404) throw new DirNotFoundError();
   if (!res.ok) throw new Error(`GET /api/fs/list returned ${res.status}`);
-  return res.json() as Promise<FsListResponse>;
+  const body = await res.json() as FsListResponse;
+  return { ...body, dir: normalizeNativePath(body.dir), parent: body.parent === null ? null : normalizeNativePath(body.parent) };
 }
 
 /** One `GET /api/fs/search` hit (ADR-0052 D5). `kind` narrowed from the
@@ -239,7 +241,7 @@ export async function searchFs(
   const body = (await res.json()) as components['schemas']['FsSearchResponse'];
   return {
     results: (body.results ?? []).map((entry) => ({
-      path: entry.path,
+      path: normalizeNativePath(entry.path),
       name: entry.name,
       // BE emits the same `"file"`/`"directory"` representation as fs_list; any
       // other value is coerced to `file` so the union stays sound.
@@ -344,7 +346,7 @@ export async function renameFs(path: string, newName: string): Promise<RenameFsR
   ) {
     throw new Error('POST /api/fs/rename response missing path/name/kind');
   }
-  return { path: body.path, name: body.name, kind: body.kind };
+  return { path: normalizeNativePath(body.path), name: body.name, kind: body.kind };
 }
 
 export async function removeFs(path: string): Promise<void> {
@@ -425,8 +427,8 @@ export async function copyFs(
         throw new Error('POST /api/fs/copy response entry missing source/path/name/kind');
       }
       return {
-        source: entry.source,
-        path: entry.path,
+        source: normalizeNativePath(entry.source),
+        path: normalizeNativePath(entry.path),
         name: entry.name,
         kind: entry.kind,
       };
@@ -490,8 +492,8 @@ export async function moveFs(
         throw new Error('POST /api/fs/move response entry missing source/path/name/kind');
       }
       return {
-        source: entry.source,
-        path: entry.path,
+        source: normalizeNativePath(entry.source),
+        path: normalizeNativePath(entry.path),
         name: entry.name,
         kind: entry.kind,
       };

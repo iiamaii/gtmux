@@ -1,61 +1,26 @@
-//! Slice D-5 — `POST /api/shutdown` (BE-9 Tier 3, ADR-0014 D12).
-//!
-//! Triggers a graceful server exit from the browser. Returns 202
-//! immediately so the FE can flip its banner before the process dies;
-//! the actual teardown runs on a detached tokio task that:
-//!   1. waits ~50 ms for the 202 response to flush
-//!   2. publishes a `0x89 SERVER_SHUTDOWN` notify on the hub
-//!   3. waits ~200 ms for WS handlers to emit + close (1000 normal)
-//!   4. releases every session lock currently held by this server
-//!   5. calls `std::process::exit(EXIT_GRACEFUL)`
-//!
-//! Child-process SIGHUP happens naturally on process exit (the
-//! `PtyBackend` `Drop` chain sends SIGTERM/SIGHUP per ADR-0014 D5).
-//! Session record flush is a no-op invariant — `PUT /api/layout` is
-//! always atomic so the disk is authoritative at every instant.
-
+//! Authenticated lifecycle requests. The embedding host owns process teardown.
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
-use std::time::Duration;
-
 use crate::auth::{apply_security_headers, parse_step_up_body, verify_step_up};
 use crate::AppState;
 
-/// Exit code for a graceful shutdown (mirrors ADR-0014 D7's exit-code
-/// regimen — `exit 6 = graceful`).
-const EXIT_GRACEFUL: i32 = 6;
+pub async fn status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let stopping = state.shutdown_signal.as_ref().is_some_and(|s| *s.borrow());
+    Json(json!({
+        "state": if stopping { "stopping" } else { "running" },
+        "instance": state.config.server.session,
+        "bind": state.config.server.bind, "port": state.config.server.port,
+        "active_terminals": state.hub.as_ref().map(|h| h.backend().pane_count()).unwrap_or(0),
+        "attached_sessions": state.session_locks.lock().await.len(),
+        "can_shutdown": state.shutdown_signal.as_ref().is_some_and(|s| !s.is_closed()),
+        "can_restart": false,
+    }))
+}
 
-/// Delay between 202 response and the WS broadcast. Picked to be long
-/// enough for axum to flush the response on a localhost socket but
-/// short enough that the user perceives the shutdown as immediate.
-const PRE_BROADCAST_DELAY: Duration = Duration::from_millis(50);
-
-/// Delay between WS broadcast and process exit. Each WS handler needs
-/// time to (a) drain the channel, (b) encode + send the `0x89` frame,
-/// (c) send the close frame. 200 ms is comfortable on localhost.
-const PRE_EXIT_DELAY: Duration = Duration::from_millis(200);
-
-/// `POST /api/shutdown` — ADR-0014 D12. Schedules a graceful exit.
-///
-/// Outcomes:
-/// - 202 + `{ "shutdown": "scheduled", "expected_exit_code": 6 }`
-///   on success — the actual exit lands a few hundred ms later via a
-///   detached background task. The auth middleware (`/api/*` bearer or
-///   cookie) gates this — same trust level as `gtmux teardown`.
-/// - 503 `hub_not_configured` when the hub is missing (unit-test
-///   AppState without `with_hub_*`). In production the hub is always
-///   present; this branch documents the precondition without panicking.
-///
-/// Step-up re-auth (ADR-0020 D16): the body carries
-/// `{ "credential": "<password | token>" }`, verified mode-aware *before*
-/// any teardown is scheduled. A missing credential → `401 credential_required`;
-/// a mismatch → `401 invalid_credential`; password-mode brute-force →
-/// `429 + Retry-After`. Credential verification is the *first* precondition;
-/// the `hub_not_configured` 503 check runs only after it passes.
 pub async fn shutdown_handler(State(state): State<AppState>, req: Request<Body>) -> Response {
     // ADR-0020 D16: verify the step-up credential before scheduling teardown.
     // Read the body manually (empty / absent body → `credential_required`,
@@ -84,50 +49,12 @@ pub async fn shutdown_handler(State(state): State<AppState>, req: Request<Body>)
             .into_response();
     }
 
-    tokio::spawn(perform_shutdown(state));
-
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({
-            "shutdown": "scheduled",
-            "expected_exit_code": EXIT_GRACEFUL,
-        })),
-    )
-        .into_response()
-}
-
-async fn perform_shutdown(state: AppState) {
-    // 1. Let the 202 reach the FE.
-    tokio::time::sleep(PRE_BROADCAST_DELAY).await;
-
-    // 2. Notify every WS subscriber. `publish_server_shutdown` is a
-    //    fire-and-forget — if no subscribers exist (no WS connections)
-    //    the send is a no-op.
-    if let Some(hub) = state.hub.as_ref() {
-        hub.publish_server_shutdown("user_initiated", EXIT_GRACEFUL);
-    }
-
-    // 3. Give WS handlers room to emit + close.
-    tokio::time::sleep(PRE_EXIT_DELAY).await;
-
-    // 4. Release session locks explicitly. `std::process::exit` skips
-    //    Rust destructors, so we cannot rely on `LockGuard::drop` —
-    //    iterate the holder map and clean up before exit. Per ADR-0014
-    //    D7 step 3, `${XDG_STATE_HOME}/.locks/<name>.lock` files get
-    //    unlinked here so the next boot doesn't see stale orphans.
-    {
-        let mut holders = state.session_locks.lock().await;
-        let names: Vec<String> = holders.keys().cloned().collect();
-        for name in &names {
-            if let Some(mut guard) = holders.remove(name) {
-                guard.release();
-            }
-        }
-    }
-
-    // 5. Bye.
-    tracing::info!(exit_code = EXIT_GRACEFUL, "shutdown: graceful exit");
-    std::process::exit(EXIT_GRACEFUL);
+    let Some(signal) = state.shutdown_signal.as_ref().filter(|s| !s.is_closed()) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "shutdown_not_managed"}))).into_response();
+    };
+    // Idempotent request; the host delays teardown until this response can flush.
+    signal.send_replace(true);
+    (StatusCode::ACCEPTED, Json(json!({ "shutdown": "scheduled", "expected_exit_code": 6 }))).into_response()
 }
 
 #[cfg(test)]
@@ -167,6 +94,8 @@ mod tests {
             default_session_workspace: None,
             auth: gtmux_config::AuthConfig::default(),
             assets: gtmux_config::AssetsConfig::default(),
+            behavior: gtmux_config::BehaviorSettings::default(),
+        public_origin: None,
         };
         let state = AppState::new(cfg, token.clone());
         (state, token)
@@ -220,16 +149,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
-
-    // ─── ADR-0020 D16: step-up re-auth on shutdown ───────────────────────
-    //
-    // The 202-scheduled branch can't be unit-tested (it would
-    // `std::process::exit` and tear the harness down), so a *successful*
-    // credential is observed by it reaching the next precondition — the
-    // `hub_not_configured` 503 (no hub is wired in unit-test `AppState`). The
-    // 503 therefore proves "credential passed; the action would proceed". A
-    // *rejected* credential is observed by the 401 short-circuit before the
-    // hub check ever runs.
 
     /// Issue a token-mode session cookie against `state` so a cookie-authed
     /// shutdown request can pass the `/api/*` middleware (the credential gate
@@ -375,11 +294,40 @@ mod tests {
         );
     }
 
-    // Notes on what is NOT unit-tested here:
-    //   * 202 + scheduled exit — this would actually `std::process::exit`
-    //     and tear down the cargo-test harness. The 202 path is
-    //     exercised by smoke gate 5-12 against a release binary running
-    //     in its own process.
-    //   * `0x89 SERVER_SHUTDOWN` frame emission — covered by smoke gate
-    //     5-12's WS read + envelope parse before the close arrives.
+    #[tokio::test]
+    async fn shutdown_is_host_owned_idempotent_and_observable() {
+        let (mut state, token) = token_only_state();
+        state.hub = Some(gtmux_ws_server::Hub::new(gtmux_pty_backend::PtyBackend::new()));
+        let request = || HttpRequest::builder().method(Method::POST).uri("/api/shutdown")
+            .header(header::HOST, TEST_HOST).header(header::AUTHORIZATION, bearer(&token))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&json!({"credential":token.0})).unwrap())).unwrap();
+        let unmanaged = crate::router_with_state(state.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(unmanaged.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(unmanaged.into_body(), 4096).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"], "shutdown_not_managed");
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let state = state.with_shutdown_signal(tx);
+        assert_eq!(status(State(state.clone())).await.0["state"], "running");
+        let app = crate::router_with_state(state.clone());
+        for _ in 0..2 {
+            assert_eq!(app.clone().oneshot(request()).await.unwrap().status(), StatusCode::ACCEPTED);
+        }
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
+        let snapshot = status(State(state.clone())).await.0;
+        assert_eq!(snapshot["state"], "stopping");
+        assert_eq!(snapshot["can_restart"], false);
+        drop(rx);
+        assert_eq!(app.oneshot(request()).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn server_status_requires_authentication() {
+        let (state, _) = token_only_state();
+        let response = crate::router_with_state(state).oneshot(HttpRequest::builder()
+            .uri("/api/server/status").header(header::HOST, TEST_HOST).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
 }

@@ -621,56 +621,24 @@ pub async fn attach_handler(
     // Same-name reattach is an idempotent no-op — the cleanup branch is
     // skipped and the rest of this handler short-circuits via the
     // `holders.contains_key(&name)` check immediately below.
-    let previous_session: Option<String> = {
-        let by_owner = state.session_locks_by_owner.lock().await;
-        by_owner
-            .get(&owner_key)
-            .filter(|prev| prev.as_str() != name)
-            .cloned()
-    };
-    if let Some(prev_name) = previous_session {
-        let mut by_owner = state.session_locks_by_owner.lock().await;
-        by_owner.remove(&owner_key);
-        drop(by_owner);
-        let mut holders = state.session_locks.lock().await;
-        if let Some(mut guard) = holders.remove(&prev_name) {
-            tracing::info!(
-                owner_len = owner_key.len(),
-                prev_session = %prev_name,
-                next_session = %name,
-                "session_lock: implicit detach on webpage switch"
-            );
-            guard.release();
-        }
-        drop(holders);
-        if let Some(hub) = state.hub.as_ref() {
-            hub.clear_session_for_owner(&owner_key);
-        }
-    }
-
-    // ADR-0019 D3 — same-cookie same-session reattach is an idempotent
-    // 200 (not a 409). Surfaces when:
-    //   * refresh races where the SPA's reattach POST overtakes the WS
-    //     close → release_lock_for_owner pipeline; and
-    //   * plan-0008 Phase 2 silent reattach (WS reconnecting→open or
-    //     visibility-change while still holding the lock).
-    // In both cases the *same* cookie already owns this session's lock,
-    // so no acquire runs — just re-classify the layout and reply OK.
-    {
-        let by_owner = state.session_locks_by_owner.lock().await;
-        if by_owner
-            .get(&owner_key)
-            .map(|s| s == &name)
-            .unwrap_or(false)
-        {
+    // One transaction, always owner map before holder map. Disconnect and
+    // refresh take the same order; never leave an unindexed LockGuard behind.
+    let mut by_owner = state.session_locks_by_owner.lock().await;
+    let mut holders = state.session_locks.lock().await;
+    if let Some(previous) = by_owner.get(&owner_key).cloned() {
+        if previous == name {
+            if let Some(hub) = &state.hub { hub.set_session_for_owner(&owner_key, &name); }
+            drop(holders);
             drop(by_owner);
             return reuse_existing_attach_response(&state, wm, &name).await;
         }
+        by_owner.remove(&owner_key);
+        holders.remove(&previous);
+        if let Some(hub) = &state.hub { hub.clear_session_for_owner(&owner_key); }
     }
 
     // Same-server serialisation (D6.6) — only one attach attempt at a time
     // per session name from *this* process.
-    let mut holders = state.session_locks.lock().await;
     if holders.contains_key(&name) {
         // Held by a *different* cookie on this server — no takeover.
         return lock_conflict_response(&state, wm, &name);
@@ -708,19 +676,7 @@ pub async fn attach_handler(
     };
 
     holders.insert(name.clone(), guard);
-    // Reverse-index by cookie so a WS disconnect can find this lock to
-    // release. `_unknown` (anonymous) attaches are still recorded — they
-    // simply won't be auto-released since the WS will not present the
-    // missing cookie.
-    {
-        let mut by_owner = state.session_locks_by_owner.lock().await;
-        // If the same cookie had a stale entry for a previous attach (e.g.
-        // the FE retried after a transient error), the prior session lock
-        // would have been released already by the path that took it out
-        // of `session_locks` — but the reverse map could lag. Overwriting
-        // here is the safer choice.
-        by_owner.insert(owner_key.clone(), name.clone());
-    }
+    by_owner.insert(owner_key.clone(), name.clone());
     // Stage 5-A: mirror the cookie ↔ session binding into the WS hub so the
     // dispatcher (5-C) can route session-scoped envelopes only to the
     // matching webpage. Skip when no hub is wired (unit-test paths).
@@ -732,6 +688,7 @@ pub async fn attach_handler(
     // is a per-cookie read of the session record and a non-mutating scan
     // against `terminal_map`.
     drop(holders);
+    drop(by_owner);
 
     // Match-or-spawn classification (ADR-0018 D6 read half). The FE uses
     // `unmatched` to decide whether to render the confirm modal; spawning
@@ -1100,21 +1057,12 @@ async fn reuse_existing_attach_response(
 }
 
 async fn release_attach(state: &crate::AppState, name: &str, owner_key: &str) {
-    let mut holders = state.session_locks.lock().await;
-    if let Some(mut guard) = holders.remove(name) {
-        guard.release();
-    }
     let mut by_owner = state.session_locks_by_owner.lock().await;
-    if matches!(by_owner.get(owner_key), Some(v) if v == name) {
-        by_owner.remove(owner_key);
-    }
-    // Stage 5-A: keep the WS hub's owner ↔ session_name map in lock-step
-    // with the http-api reverse-index. The hub method is a no-op on missing
-    // entries, so a failed-attach cleanup path that never wrote anything
-    // here is still safe.
-    if let Some(hub) = state.hub.as_ref() {
-        hub.clear_session_for_owner(owner_key);
-    }
+    if !matches!(by_owner.get(owner_key), Some(v) if v == name) { return; }
+    let mut holders = state.session_locks.lock().await;
+    by_owner.remove(owner_key);
+    holders.remove(name);
+    if let Some(hub) = state.hub.as_ref() { hub.clear_session_for_owner(owner_key); }
 }
 
 /// `DELETE /api/sessions/:name/attach` — release the lock held by this
@@ -1125,26 +1073,7 @@ pub async fn detach_handler(
     req: Request<Body>,
 ) -> Response {
     let owner_key = attach_owner_key(req.headers());
-    {
-        let mut by_owner = state.session_locks_by_owner.lock().await;
-        let owns = matches!(by_owner.get(&owner_key), Some(v) if v == &name);
-        if owns {
-            by_owner.remove(&owner_key);
-            drop(by_owner);
-            let mut holders = state.session_locks.lock().await;
-            if let Some(mut guard) = holders.remove(&name) {
-                guard.release();
-            }
-        } else {
-            drop(by_owner);
-        }
-    }
-    // Stage 5-A: mirror the owner-specific prune into the WS hub so the
-    // dispatcher does not keep routing session-scoped envelopes to this
-    // webpage after detach.
-    if let Some(hub) = state.hub.as_ref() {
-        hub.clear_session_for_owner(&owner_key);
-    }
+    release_attach(&state, &name, &owner_key).await;
     (
         StatusCode::OK,
         Json(json!({ "name": name, "released": true })),

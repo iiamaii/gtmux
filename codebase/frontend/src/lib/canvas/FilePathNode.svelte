@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isAbsoluteNativePath } from '$lib/files/nativePath';
   // FilePathNode — SvelteFlow custom node for `type: "file_path"` (ADR-0018 D4).
   //
   // 사용자 입력 path 의 visual reference. 실제 OS-level open 은 ADR-0023 의
@@ -122,7 +123,7 @@
   const fpCopyPath = $derived.by((): string | null => {
     const raw = (data.path ?? '').trim();
     if (raw.length === 0) return null;
-    if (raw.startsWith('/')) return raw;
+    if (isAbsoluteNativePath(raw)) return raw;
     return resolveWorkspacePath(workspaceRoot, raw);
   });
 

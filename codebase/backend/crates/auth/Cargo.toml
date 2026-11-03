@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+gtmux-platform = { workspace = true }
 ring = { workspace = true }
 base64 = { workspace = true }
 tokio = { workspace = true }

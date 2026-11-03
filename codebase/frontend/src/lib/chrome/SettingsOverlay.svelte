@@ -56,6 +56,41 @@
   import { sessionStore } from '$lib/stores/sessionStore.svelte';
   import { shutdownDialog } from '$lib/stores/shutdownDialog.svelte';
 
+  import SettingsSwitch from './SettingsSwitch.svelte';
+  import ServerSettings from './ServerSettings.svelte';
+  import ActivitySettings from './ActivitySettings.svelte';
+  import { tabTitleStore } from '$lib/stores/tabTitle.svelte';
+  import {
+    DEFAULT_TAB_TITLE_PREFERENCES,
+    TAB_TITLE_FORMAT_MAX_LENGTH,
+    formatTabTitle,
+    validateTabTitleFormat,
+  } from '$lib/stores/tabTitle';
+
+  let titleFormatDraft = $state(tabTitleStore.preferences.format);
+  $effect(() => { titleFormatDraft = tabTitleStore.preferences.format; });
+  const titleFormatError = $derived(validateTabTitleFormat(titleFormatDraft));
+  const titlePreview = $derived(formatTabTitle(sessionStore.active?.name ?? 'my-session', {
+    enabled: tabTitleStore.preferences.enabled,
+    format: titleFormatDraft,
+  }));
+
+  function setTabTitleEnabled(input: HTMLInputElement): void {
+    if (!tabTitleStore.update({ enabled: input.checked })) {
+      input.checked = tabTitleStore.preferences.enabled;
+    }
+  }
+
+  function saveTitleFormat(): void {
+    if (titleFormatError === null) tabTitleStore.update({ format: titleFormatDraft });
+  }
+
+  function resetTitleFormat(): void {
+    if (tabTitleStore.update({ format: DEFAULT_TAB_TITLE_PREFERENCES.format })) {
+      titleFormatDraft = DEFAULT_TAB_TITLE_PREFERENCES.format;
+    }
+  }
+
   const open = $derived(settingsDialog.open);
   const section = $derived(settingsDialog.section);
   const activeSessionName = $derived(sessionStore.active?.name ?? 'current session');
@@ -96,6 +131,7 @@
       label: 'System',
       items: [
         { id: 'auth', label: 'Auth' },
+        { id: 'server', label: 'Server' },
         { id: 'about', label: 'About' },
       ],
     },
@@ -761,6 +797,57 @@
                 </div>
               </div>
             </div>
+            <div class="sgroup-head">Browser tabs</div>
+            <label class="srow">
+              <div>
+                <div class="lbl">Show session name in tab title</div>
+                <div class="dsc">Saved in this browser and shared with tabs on this server.</div>
+              </div>
+              <div class="ctl">
+                <SettingsSwitch
+                  checked={tabTitleStore.preferences.enabled}
+                  onchange={(e) => setTabTitleEnabled(e.currentTarget)}
+                />
+              </div>
+            </label>
+            <div class="srow title-format-row">
+              <div>
+                <label class="lbl" for="tab-title-format">Title format</label>
+                <div class="dsc" id="tab-title-format-help">
+                  Use <code>{'{app}'}</code> and <code>{'{session}'}</code>.
+                  Saves when you leave the field or press Enter.
+                </div>
+              </div>
+              <div class="title-format-controls">
+                <input
+                  id="tab-title-format"
+                  class="pw-input"
+                  type="text"
+                  bind:value={titleFormatDraft}
+                  maxlength={TAB_TITLE_FORMAT_MAX_LENGTH}
+                  disabled={!tabTitleStore.preferences.enabled}
+                  spellcheck="false"
+                  aria-invalid={titleFormatError !== null}
+                  aria-describedby="tab-title-format-help tab-title-format-feedback"
+                  onchange={saveTitleFormat}
+                  onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); saveTitleFormat(); } }}
+                />
+                <button type="button" class="btn" disabled={!tabTitleStore.preferences.enabled} onclick={resetTitleFormat}>
+                  Reset format
+                </button>
+              </div>
+            </div>
+            <div id="tab-title-format-feedback" class="dsc" aria-live="polite">
+              {#if tabTitleStore.preferences.enabled && titleFormatError !== null}
+                <span class="pw-hint-error">{titleFormatError}</span>
+              {:else}
+                Preview: <span class="title-preview">{titlePreview}</span>
+              {/if}
+            </div>
+            {#if tabTitleStore.saveError !== null}
+              <p class="pw-error" role="alert">{tabTitleStore.saveError}</p>
+            {/if}
+            <ActivitySettings />
           {:else if section === 'shortcuts'}
             <h3 class="section-head">Keyboard</h3>
             <p class="section-hint">
@@ -867,9 +954,7 @@
                 <div class="dsc">Include dot-prefixed files in workspace file pickers.</div>
               </div>
               <div class="ctl">
-                <input
-                  class="native-toggle"
-                  type="checkbox"
+                <SettingsSwitch
                   checked={settingsStore.behavior.picker_show_hidden}
                   onchange={(e) => void setBehaviorFlag('picker_show_hidden', e.currentTarget as HTMLInputElement)}
                 />
@@ -1041,8 +1126,7 @@
           {:else if section === 'behavior'}
             <h3 class="section-head">Behavior</h3>
             <p class="section-hint">
-              Per-action defaults. Settings persist for the lifetime of the
-              server process.
+              Per-action defaults. Settings apply immediately. When file editing is enabled, they are saved to the server configuration.
             </p>
             <div class="sgroup-head">Safety</div>
             <label class="srow">
@@ -1051,9 +1135,7 @@
                 <div class="dsc">Skip the confirm dialog and SIGTERM the terminal whenever a panel is closed.</div>
               </div>
               <div class="ctl">
-                <input
-                  class="native-toggle"
-                  type="checkbox"
+                <SettingsSwitch
                   checked={settingsStore.behavior.auto_kill_terminal_on_panel_close}
                   onchange={(e) => void setBehaviorFlag('auto_kill_terminal_on_panel_close', e.currentTarget as HTMLInputElement)}
                 />
@@ -1066,9 +1148,7 @@
                 <div class="dsc">After switching sessions, reload the page to reset caches, WS state, and attach state.</div>
               </div>
               <div class="ctl">
-                <input
-                  class="native-toggle"
-                  type="checkbox"
+                <SettingsSwitch
                   checked={settingsStore.behavior.reload_on_session_switch}
                   onchange={(e) => void setBehaviorFlag('reload_on_session_switch', e.currentTarget as HTMLInputElement)}
                 />
@@ -1092,9 +1172,7 @@
                 {/if}
               </div>
               <div class="ctl">
-                <input
-                  class="native-toggle"
-                  type="checkbox"
+                <SettingsSwitch
                   checked={settingsStore.behavior.osc52_clipboard_write_enabled}
                   onchange={(e) => void setBehaviorFlag('osc52_clipboard_write_enabled', e.currentTarget as HTMLInputElement)}
                 />
@@ -1144,6 +1222,8 @@
                 </button>
               </div>
             </div>
+          {:else if section === 'server'}
+            <ServerSettings />
           {:else if section === 'about'}
             <h3 class="section-head">About</h3>
             <p class="section-hint">
@@ -1229,7 +1309,7 @@
         </section>
       </div>
       <footer class="settings-foot">
-        <div class="dstate"><span class="dot"></span><span>All changes save automatically</span></div>
+        <div class="dstate"><span class="dot"></span><span>{section === 'server' ? 'Server configuration requires Save configuration' : 'All changes save automatically'}</span></div>
       </footer>
     </div>
   </div>
@@ -1471,6 +1551,14 @@
     border-bottom: 1px solid var(--color-border);
   }
 
+  .title-format-row { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+
+  .title-format-controls { display: flex; flex-wrap: wrap; gap: 8px; }
+
+  .title-format-controls .pw-input { flex: 1 1 220px; min-width: 0; }
+
+  .title-preview { overflow-wrap: anywhere; }
+
   .srow:last-child {
     border-bottom: 0;
   }
@@ -1572,11 +1660,13 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
+    transition: background-color var(--motion-fast) var(--motion-easing),
+      border-color var(--motion-fast) var(--motion-easing);
   }
 
   .btn:hover:not(:disabled) {
-    background: var(--color-glass-2);
-    border-color: var(--color-fg-subtle);
+    background: color-mix(in srgb, var(--color-fg) 4%, var(--color-surface-2));
+    border-color: var(--color-border-strong);
   }
 
   .btn:disabled {
@@ -1599,50 +1689,6 @@
     width: 32px;
     min-width: 32px;
     padding: 0;
-  }
-
-  .native-toggle {
-    box-sizing: border-box;
-    width: 28px;
-    height: 16px;
-    margin: 0;
-    display: block;
-    position: relative;
-    flex: 0 0 28px;
-    border: 0;
-    border-radius: var(--radius-pill);
-    background: var(--color-border-strong);
-    cursor: pointer;
-    appearance: none;
-    -webkit-appearance: none;
-    transition: background var(--motion-fast) var(--motion-easing);
-  }
-
-  .native-toggle::after {
-    content: '';
-    position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
-    background: var(--color-surface);
-    box-shadow: 0 1px 2px color-mix(in srgb, black 24%, transparent);
-    transition: left var(--motion-fast) var(--motion-easing);
-  }
-
-  .native-toggle:checked {
-    background: var(--color-accent);
-  }
-
-  .native-toggle:checked::after {
-    left: 14px;
-    background: var(--color-accent-fg);
-  }
-
-  .native-toggle:focus-visible {
-    outline: 2px solid var(--color-info);
-    outline-offset: 2px;
   }
 
   .slider {
@@ -2069,5 +2115,8 @@
     .ctl {
       justify-self: start;
     }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .btn { transition: none; }
   }
 </style>

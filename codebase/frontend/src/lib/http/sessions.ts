@@ -1,3 +1,4 @@
+import { normalizeNativePath } from '$lib/files/nativePath';
 // HTTP client — Session CRUD + attach + detach.
 //
 // 정본:
@@ -120,7 +121,7 @@ function normalizeSessionInfo(
 ): SessionInfo {
   return {
     name: raw.name,
-    workspace_root: typeof raw.workspace_root === 'string' ? raw.workspace_root : '',
+    workspace_root: typeof raw.workspace_root === 'string' ? normalizeNativePath(raw.workspace_root) : '',
     active: raw.active ?? false,
     folder_id: raw.folder_id ?? null,
     order: raw.order ?? index,

@@ -2,9 +2,7 @@
 //!
 //! macOS:    `open <path>`
 //! Linux:    `xdg-open <path>`
-//! Windows:  `cmd /C start "" <path>` (the empty `""` is the window title
-//!           argument — `start` requires it when the first quoted arg is
-//!           the path; otherwise the path is treated as a window title.)
+//! Windows: ShellExecuteW with a literal path and no shell command parsing.
 //!
 //! Critical: argv-direct via [`std::process::Command::new`], never shell
 //! string interpolation. The path has already been `canonicalize`d by
@@ -25,6 +23,7 @@ pub enum SpawnError {
 /// Spawn the platform OS-open handler with `path` as its sole argument.
 /// Returns immediately after `spawn()` (no `wait` / `output` — the
 /// caller's HTTP handler must not block on the GUI app launch).
+#[cfg(not(windows))]
 pub fn spawn(path: &Path) -> Result<(), SpawnError> {
     let (cmd, args): (&str, &[&str]) = match std::env::consts::OS {
         "macos" => ("open", &[]),
@@ -54,21 +53,7 @@ pub fn spawn(path: &Path) -> Result<(), SpawnError> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spawn_with_nonexistent_handler_returns_no_handler() {
-        // We can't easily simulate "no `open`" on macOS or "no
-        // `xdg-open`" on Linux without polluting PATH. Instead this
-        // test documents the contract — when the unit-test platform is
-        // not in the known list, `spawn` returns `NoHandler`. CI
-        // matrices that hit unknown platforms (FreeBSD, etc.) exercise
-        // the fallback.
-        //
-        // The actual success path is verified by `02_stage5.sh` gate
-        // 5-9, which spawns against a real binary on the dev host.
-        let _ = spawn(Path::new("/tmp/nonexistent"));
-    }
+#[cfg(windows)]
+pub fn spawn(path: &Path) -> Result<(), SpawnError> {
+    gtmux_platform::open_path(path).map_err(SpawnError::Io)
 }

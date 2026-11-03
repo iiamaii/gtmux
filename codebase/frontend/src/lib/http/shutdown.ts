@@ -76,3 +76,14 @@ export async function shutdownServer(
   if (!res.ok) throw new Error(`POST /api/shutdown returned ${res.status}`);
   return json<ShutdownResponse>(res);
 }
+
+export interface ServerStatus {
+  state: 'running' | 'stopping'; instance: string; bind: string; port: number;
+  active_terminals: number; attached_sessions: number; can_shutdown: boolean; can_restart: boolean;
+}
+export async function serverStatus(): Promise<ServerStatus> {
+  const res = await fetch('/api/server/status', { headers: shutdownHeaders(), credentials: 'include' });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`Server status unavailable (${res.status})`);
+  return json<ServerStatus>(res);
+}

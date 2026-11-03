@@ -55,6 +55,20 @@
   import { observeServerId, onServerIdMismatch } from '$lib/session/serverId';
   import type { WsClient } from '$lib/ws/client';
 
+  import { terminalActivity } from '$lib/stores/terminalActivity.svelte';
+  import { tabTitleStore } from '$lib/stores/tabTitle.svelte';
+  import { formatTabTitle } from '$lib/stores/tabTitle';
+
+  const sessionTerminalIds = $derived(new Set([...sessionStore.items.values()].filter((item) => item.type === 'terminal').map((item) => item.id)));
+  const browserTitle = $derived(terminalActivity.title(
+    formatTabTitle(sessionStore.active?.name, tabTitleStore.preferences), sessionTerminalIds,
+  ));
+  onMount(() => terminalActivity.listen());
+  $effect(() => {
+    if (terminalActivity.preferences.enabled && sessionStore.active !== null) return terminalActivity.start();
+  });
+  onMount(() => tabTitleStore.listen());
+
   const TOKEN_STORAGE_KEY = 'gtmux_token';
 
   /**
@@ -461,7 +475,7 @@
 </script>
 
 <svelte:head>
-  <title>gtmux</title>
+  <title>{browserTitle}</title>
 </svelte:head>
 
 <div class="app">

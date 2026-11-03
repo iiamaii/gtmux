@@ -31,6 +31,7 @@ mod ansi;
 mod http;
 mod process_audit;
 mod remote;
+mod agent;
 mod skill;
 mod state_files;
 
@@ -46,7 +47,7 @@ use gtmux_auth::{
     issue_token, load_token, rotate_token, save_token, shared_token, AuthError, SharedToken,
     TokenString,
 };
-use gtmux_config::{derive_mode, load_with_overrides as load_config, Config, Mode};
+use gtmux_config::{load_with_overrides as load_config, Config, Mode};
 use gtmux_pty_backend::PtyBackend;
 use gtmux_ws_server::Hub;
 use state_files::{
@@ -54,6 +55,7 @@ use state_files::{
     PidLiveness, StateFileError, StopOutcome, TeardownOpts, TeardownReport,
 };
 use tokio::net::TcpListener;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn};
 
@@ -186,6 +188,11 @@ enum Cmd {
     Layout {
         #[command(subcommand)]
         command: remote::LayoutCmd,
+    },
+    /// Generate observational agent hooks or report an agent lifecycle event.
+    Agent {
+        #[command(subcommand)]
+        command: agent::AgentCmd,
     },
     /// Terminal lifecycle: spawn/mount/unmount panels, kill/list the pool
     /// (ADR-0053 D11).
@@ -344,7 +351,7 @@ fn main() -> ExitCode {
             config_path,
             workspace_override: workspace_path,
         })) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(code) => code,
             Err(e) => report_start_error(e),
         },
         Cmd::Stop { name, force } => rt.block_on(stop(&name, force)),
@@ -382,6 +389,7 @@ fn main() -> ExitCode {
         } => remote::run_session_delete(session, yes, password, instance),
         Cmd::Session { command } => session_cmd(command),
         Cmd::Layout { command } => remote::run_layout(command),
+        Cmd::Agent { command } => agent::run(command),
         Cmd::Terminal { command } => remote::run_terminal(command),
         Cmd::Workspace { command } => remote::run_workspace(command),
         Cmd::Fs { command } => remote::run_fs(command),
@@ -429,7 +437,7 @@ struct StartArgs {
 ///  11) print first-run banner     — D21 c1 + ADR-0003 D3 token URL
 ///  12) install shutdown handlers  — SIGINT + SIGTERM → graceful (D5 daemon ⊥)
 ///  13) axum::serve(...)           — with_graceful_shutdown
-async fn start(args: StartArgs) -> anyhow::Result<()> {
+async fn start(args: StartArgs) -> anyhow::Result<ExitCode> {
     // 1a) Nested-tmux startup guard — ADR-0014 D10 amend (2026-05-14) 1차 방어.
     //     If the user is running gtmux from inside an existing outer tmux
     //     session, the inherited `TMUX` env makes the child shells we spawn
@@ -505,7 +513,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
 
     // 3) mode is *derived* from `bind`; we capture it so subsequent code can
     //    branch (token policy, future TLS/CSP) without re-parsing.
-    let mode = derive_mode(&config.server.bind);
+    let mode = config.mode();
 
     // 4) tracing — explicit, JSON when piped or asked, ANSI text on a tty.
     init_tracing(&config);
@@ -542,7 +550,9 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //    + `GTMUX_SERVER_PID=<pid>` so the
     //    boot-time orphan scanner (ADR-0014 D11) can identify strays
     //    from a previous crashed Server.
-    let backend = PtyBackend::with_session(Some(config.server.session.clone()));
+    let hook_endpoint = config.server.bind.parse::<std::net::IpAddr>().ok().filter(|ip| ip.is_loopback() || ip.is_unspecified())
+        .map(|ip| format!("http://{}:{}", if ip.is_ipv6() { "[::1]" } else { "127.0.0.1" }, config.server.port));
+    let backend = PtyBackend::with_session_endpoint(Some(config.server.session.clone()), hook_endpoint);
     info!("pty backend ready (ADR-0013 + ADR-0014 supervisor model)");
 
     // 6) token — ADR-0003 D13.1:
@@ -643,7 +653,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //   * `disconnect` — emitted on WS close; releases the session lock.
     //   * `heartbeat`  — emitted on every Ping/Pong; refreshes the lease
     //     body so peeking modals see an accurate expected-expiry hint.
-    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<gtmux_ws_server::DisconnectEvent>();
     let (heartbeat_tx, mut heartbeat_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     hub.set_disconnect_sink(disconnect_tx);
     hub.set_heartbeat_sink(heartbeat_tx);
@@ -686,6 +696,18 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         password_hash,
         trusted_proxy_nets,
     );
+    let editable_path = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => config_path_for(&args.instance)?,
+    };
+    let editable_path = if editable_path.is_absolute() { editable_path } else { std::env::current_dir()?.join(editable_path) };
+    let app_state = match gtmux_http_api::ConfigFile::new(editable_path) {
+        Ok(file) => app_state.with_config_file(file),
+        Err(error) => { warn!(%error, "configuration editor unavailable"); app_state }
+    };
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let app_state = app_state.with_shutdown_signal(shutdown_tx.clone());
 
     // Stage 5 D10 α: register the cookie validator so the WS handshake
     // accepts cookie auth as an alternative to the subprotocol bearer
@@ -707,11 +729,16 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     // in both sessions' layouts.
     hub.set_session_pane_set_provider(std::sync::Arc::new(app_state.clone()));
 
+    let state_for_reaper = app_state.clone();
+    let _reaper_task = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop { tick.tick().await; state_for_reaper.reap_abandoned_attaches().await; }
+    });
     let state_for_disconnect = app_state.clone();
     let _disconnect_task = tokio::spawn(async move {
         while let Some(owner_key) = disconnect_rx.recv().await {
             state_for_disconnect
-                .release_lock_for_owner(&owner_key)
+                .release_disconnected_owner(owner_key)
                 .await;
         }
     });
@@ -749,7 +776,7 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
         }
     });
 
-    let app = build_router(app_state, &config, shared.clone(), hub.clone());
+    let app = build_router(app_state.clone(), &config, shared.clone(), hub.clone());
 
     // 10) bind — TCP only for now (unix socket variant lives behind
     //    `bind = "unix:/..."` and is a planned alt-path; surface a friendly
@@ -805,7 +832,22 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //    The graceful shutdown future ends when *either* fires; axum then
     //    drains in-flight requests. ADR-0014 D5: dropping the PtyBackend
     //    sends SIGTERM → 200 ms grace → SIGKILL to every child shell.
-    let shutdown_signal = wait_for_shutdown();
+    let shutdown_hub = hub.clone();
+    let api_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let api_flag = api_requested.clone();
+    let mut drain_rx = shutdown_rx.clone();
+    let shutdown_signal = async move {
+        tokio::select! {
+            _ = wait_for_shutdown() => {},
+            _ = wait_for_stop_request(&mut shutdown_rx) => {
+                api_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        shutdown_tx.send_replace(true);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let api = api_flag.load(std::sync::atomic::Ordering::Relaxed);
+        shutdown_hub.publish_server_shutdown(if api { "user_initiated" } else { "signal" }, if api { 6 } else { 0 });
+    };
 
     // 13) serve.
     //    `into_make_service_with_connect_info::<SocketAddr>()` inserts the peer
@@ -816,12 +858,38 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
     //    When a unix-socket bind is eventually wired it will have no peer IP;
     //    `peer_from_parts` returns `None` there and the rate-limit key falls
     //    back to XFF-ignore (single bucket), which is the fail-closed default.
-    let serve_result = axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal)
-    .await;
+    .with_graceful_shutdown(shutdown_signal);
+    let serve = std::future::IntoFuture::into_future(server);
+    tokio::pin!(serve);
+    let serve_result = tokio::select! {
+        result = &mut serve => result,
+        _ = wait_for_stop_request(&mut drain_rx) => {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut serve).await {
+                Ok(result) => result,
+                Err(_) => { warn!("HTTP drain exceeded 10 seconds; continuing terminal teardown"); Ok(()) }
+            }
+        }
+    };
+    // Upgraded sockets are detached from axum's HTTP drain. Let their
+    // shutdown frames/close handlers finish even when there are no PTYs.
+    let sockets_closed = async {
+        while hub.active_socket_count() != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(2), sockets_closed).await.is_err() {
+        warn!(remaining = hub.active_socket_count(), "WebSocket shutdown drain timed out");
+    }
+    // Background consumers retain AppState/Hub/backend clones. Dropping one
+    // backend handle alone would not run its destructor.
+    _reaper_task.abort(); _disconnect_task.abort(); _heartbeat_task.abort(); _pane_died_task.abort();
+    let cleanup_backend = backend.clone();
+    tokio::task::spawn_blocking(move || cleanup_backend.shutdown()).await.context("terminal teardown")?;
+    app_state.release_all_attaches().await;
 
     // Post-shutdown — drop the PtyBackend so its `Drop` impl runs the
     // ADR-0014 D7 teardown step 1 (SIGTERM → grace → SIGKILL fan-out
@@ -846,7 +914,8 @@ async fn start(args: StartArgs) -> anyhow::Result<()> {
 
     print_farewell(&config.server.session);
 
-    serve_result.context("axum::serve")
+    serve_result.context("axum::serve")?;
+    Ok(if api_requested.load(std::sync::atomic::Ordering::Relaxed) { ExitCode::from(6) } else { ExitCode::SUCCESS })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -903,7 +972,8 @@ fn build_router(
         .config
         .frontend_dist
         .as_deref()
-        .map(|p| p.to_path_buf());
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::current_exe().ok()?.parent().map(|p| p.join("frontend")).filter(|p| p.join("index.html").is_file()));
     let http = gtmux_http_api::router_with_app_state(app_state, frontend_dist.as_deref());
     // ADR-0020 D18.3 (T1): the ws-server router stores an `Arc::clone` of the
     // *same* shared token cell the http-api AppState holds.
@@ -1042,6 +1112,13 @@ fn init_tracing(config: &Config) {
 /// Resolve the future that drives `with_graceful_shutdown`. Returns on either
 /// SIGINT (Ctrl-C) or SIGTERM (`kill <pid>`). Each completion path logs the
 /// trigger before the daemon-survive guarantee from D21 c5 kicks in.
+async fn wait_for_stop_request(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    // Drop watch::Ref before returning to select branches. Holding it while
+    // the shutdown future sends a state update would deadlock send_replace.
+    let _ = rx.wait_for(|requested| *requested).await;
+}
+
+#[cfg(unix)]
 async fn wait_for_shutdown() {
     // Per-signal handles must be created *before* we race on them. If
     // `signal()` fails we fall back to listening on whichever did succeed.
@@ -1103,7 +1180,7 @@ impl std::error::Error for BindError {}
 enum StartError {
     AlreadyRunning {
         instance: String,
-        pid: libc::pid_t,
+        pid: i32,
     },
     /// ADR-0014 D10 amend (2026-05-14) — `TMUX` env detected, refuse to start
     /// inside an outer tmux session. The variant carries the env value so
@@ -1243,7 +1320,7 @@ async fn teardown_cmd(args: TeardownArgs) -> ExitCode {
 /// Stdin-driven confirmation prompt. Returns `true` when the user typed
 /// `yes` (case-insensitive). Non-TTY callers see an instruction line and
 /// a `false` return.
-fn confirm_teardown(instance: &str, pid: libc::pid_t) -> bool {
+fn confirm_teardown(instance: &str, pid: i32) -> bool {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         eprintln!(
             "gtmux teardown: refusing to proceed without confirmation \
@@ -1611,7 +1688,7 @@ fn config_dir_for_humanise() -> Option<PathBuf> {
             return Some(p.join("gtmux"));
         }
     }
-    let home = std::env::var_os("HOME")?;
+    let home = gtmux_platform::home()?;
     Some(PathBuf::from(home).join(".config").join("gtmux"))
 }
 
@@ -1680,7 +1757,7 @@ fn status_state_dir() -> Option<PathBuf> {
             return Some(p.join("gtmux"));
         }
     }
-    let home = std::env::var_os("HOME")?;
+    let home = gtmux_platform::home()?;
     Some(
         PathBuf::from(home)
             .join(".local")
@@ -1786,6 +1863,7 @@ enum TokenStatus {
     Missing,
 }
 
+#[cfg(unix)]
 fn check_token_perm(instance: &str) -> TokenStatus {
     let Some(state_dir) = status_state_dir() else {
         return TokenStatus::Missing;
@@ -1794,6 +1872,7 @@ fn check_token_perm(instance: &str) -> TokenStatus {
     let Ok(meta) = std::fs::metadata(&token_path) else {
         return TokenStatus::Missing;
     };
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let mode = meta.permissions().mode() & 0o777;
     if mode == 0o600 {
@@ -2135,16 +2214,17 @@ fn session_import(
 /// server is writing the same file.
 fn write_session_file_0600(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let tmp = dir.join(format!(".gtmux-import-{}.tmp", std::process::id()));
     {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        gtmux_platform::private_dir(dir)?;
+        let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
@@ -2515,7 +2595,7 @@ mod tests {
         fn new() -> Self {
             let lock = CLI_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev_state = std::env::var_os("XDG_STATE_HOME");
-            let prev_home = std::env::var_os("HOME");
+            let prev_home = gtmux_platform::home();
             let state_dir = tempfile::tempdir().expect("state tempdir");
             let home_dir = tempfile::tempdir().expect("home tempdir");
             std::env::set_var("XDG_STATE_HOME", state_dir.path());
@@ -2563,8 +2643,10 @@ mod tests {
     /// exist) must succeed (exit 0) and remove the stale file so the
     /// next `gtmux start` sees a clean `Absent` state.
     #[tokio::test]
+    #[cfg(unix)]
     async fn stop_stale_pidfile_succeeds() {
         use std::io::Write;
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let _g = CliXdgGuard::new();
         let session = "stale-cli";
@@ -2576,7 +2658,7 @@ mod tests {
         )
         .unwrap();
         let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "{}", libc::pid_t::MAX).unwrap();
+        writeln!(f, "{}", i32::MAX).unwrap();
         drop(f);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let code = stop(session, false).await;
@@ -2615,4 +2697,36 @@ mod tests {
             other => panic!("expected Alive(self), got {other:?}"),
         }
     }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    #[tokio::test]
+    async fn stop_waiter_releases_watch_read_lock_before_draining() {
+        let (tx, mut rx) = tokio::sync::watch::channel(true);
+        super::wait_for_stop_request(&mut rx).await;
+        let (done, result) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || { tx.send_replace(true); done.send(()).unwrap(); });
+        result.recv_timeout(std::time::Duration::from_secs(1)).expect("watch read lock released");
+        writer.join().unwrap();
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown() {
+    // Dedicated thread: an unused blocking-pool wait would prevent runtime exit.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || { let _ = tx.send(gtmux_platform::wait_stop()); });
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = rx => {},
+    }
+}
+
+#[cfg(windows)]
+fn check_token_perm(instance: &str) -> TokenStatus {
+    let Some(dir) = status_state_dir() else { return TokenStatus::Missing; };
+    let path = dir.join(format!("{instance}.token"));
+    if !path.exists() { return TokenStatus::Missing; }
+    if gtmux_platform::check_private(&path, 0o600).is_ok() { TokenStatus::Ok } else { TokenStatus::BadPerm }
 }

@@ -10,6 +10,7 @@ name = "gtmux"
 path = "src/main.rs"
 
 [dependencies]
+gtmux-platform = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

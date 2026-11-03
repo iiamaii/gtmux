@@ -1,0 +1,12 @@
+{
+  "name": "gtmux-documentation",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node check.mjs"
+  },
+  "dependencies": {
+    "marked": "18.0.4"
+  }
+}

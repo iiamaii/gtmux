@@ -415,7 +415,7 @@
   });
 </script>
 
-<div bind:this={containerEl} class="xterm-host nowheel nodrag"></div>
+<div bind:this={containerEl} data-activity-pane={paneId} class="xterm-host nowheel nodrag"></div>
 
 <style>
   /* xterm.js DOM 렌더러는 측정 시점에 *0 × 0* 컨테이너에서 ColMeasure 가 무효 (R2 F7).

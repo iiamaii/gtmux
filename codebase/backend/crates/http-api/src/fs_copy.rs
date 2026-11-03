@@ -344,6 +344,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn copy_tree_refuses_symlink_in_tree() {
         use std::os::unix::fs::symlink;
         let a = TempDir::new().unwrap();

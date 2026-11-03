@@ -30,9 +30,9 @@ pub struct OrphanAuditReport {
     /// own PID). Subset of these are *signalled*.
     pub candidates: Vec<OrphanProcess>,
     /// Processes that were successfully signalled. Subset of candidates.
-    pub signalled: Vec<libc::pid_t>,
+    pub signalled: Vec<i32>,
     /// Processes that resisted SIGTERM and got SIGKILL.
-    pub force_killed: Vec<libc::pid_t>,
+    pub force_killed: Vec<i32>,
     /// Errors encountered (does not block boot — best-effort).
     pub warnings: Vec<String>,
 }
@@ -40,9 +40,9 @@ pub struct OrphanAuditReport {
 /// Single candidate orphan — surfaced for logging / debugging.
 #[derive(Debug, Clone)]
 pub struct OrphanProcess {
-    pub pid: libc::pid_t,
+    pub pid: i32,
     /// Recorded `GTMUX_SERVER_PID` env value (the prior Server's PID).
-    pub prior_server_pid: Option<libc::pid_t>,
+    pub prior_server_pid: Option<i32>,
     /// Command line of the orphan (e.g. `/bin/zsh`).
     pub command: String,
 }
@@ -54,6 +54,7 @@ pub struct OrphanProcess {
 /// Errors are accumulated into `report.warnings` — the function never
 /// blocks boot. A clean Server (no prior crash) returns an empty report
 /// in milliseconds (sysinfo enumerates ≈ 500 processes on macOS).
+#[cfg(unix)]
 pub fn reap_orphans(session_marker: &str) -> OrphanAuditReport {
     let mut report = OrphanAuditReport::default();
 
@@ -66,11 +67,11 @@ pub fn reap_orphans(session_marker: &str) -> OrphanAuditReport {
     );
 
     let our_pid_u32: u32 = std::process::id();
-    let our_pid = our_pid_u32 as libc::pid_t;
+    let our_pid = our_pid_u32 as i32;
 
     for (sys_pid, proc) in sys.processes() {
         let pid_u32: u32 = sys_pid.as_u32();
-        let pid = pid_u32 as libc::pid_t;
+        let pid = pid_u32 as i32;
         // Skip ourselves *and* our direct ancestors / children. The
         // tracked invariant is GTMUX_SERVER_PID — any matching child
         // whose prior_server_pid != our_pid is a *previous* Server's
@@ -185,9 +186,9 @@ pub fn reap_orphans(session_marker: &str) -> OrphanAuditReport {
 fn scan_environ<S: AsRef<str>>(
     environ: impl IntoIterator<Item = S>,
     instance_marker: &str,
-) -> (bool, Option<libc::pid_t>) {
+) -> (bool, Option<i32>) {
     let mut instance_match = false;
-    let mut prior_server_pid: Option<libc::pid_t> = None;
+    let mut prior_server_pid: Option<i32> = None;
     for entry in environ {
         let s = entry.as_ref();
         if let Some(value) = s
@@ -198,7 +199,7 @@ fn scan_environ<S: AsRef<str>>(
                 instance_match = true;
             }
         } else if let Some(value) = s.strip_prefix("GTMUX_SERVER_PID=") {
-            if let Ok(n) = value.parse::<libc::pid_t>() {
+            if let Ok(n) = value.parse::<i32>() {
                 prior_server_pid = Some(n);
             }
         }
@@ -258,4 +259,10 @@ mod tests {
         assert!(!m);
         assert_eq!(pid, None);
     }
+}
+
+#[cfg(windows)]
+pub fn reap_orphans(_session_marker: &str) -> OrphanAuditReport {
+    // Never terminate a Windows process based solely on a reused PID or env tag.
+    OrphanAuditReport::default()
 }

@@ -1,6 +1,6 @@
 # gtmux
 
-> **English** · [한국어](README.ko.md)
+> **English** · [한국어](.github/README.ko.md)
 
 **gtmux is a single-user web canvas for terminal-centered work.**
 It runs a local or private-cloud Rust server, spawns PTY-backed shells,
@@ -217,3 +217,20 @@ Dual-licensed under **MIT OR Apache-2.0**, matching the Rust workspace
 metadata. See
 [codebase/backend/LICENSE-MIT](codebase/backend/LICENSE-MIT) and
 [codebase/backend/LICENSE-APACHE](codebase/backend/LICENSE-APACHE).
+
+
+## Desktop, native packages and documentation
+
+This integration branch includes a local server manager (web, desktop, or both),
+port selection, an opt-in background tray, and a reviewed HTTPS proxy setup.
+The desktop package bundles the server and frontend; users do not need Rust,
+Node.js, Python, or a source rebuild. Native Windows uses ConPTY rather than WSL.
+Windows/macOS installers require their platform CI and runtime verification
+before release; the workflows produce artifacts and do not publish releases.
+
+See [installation](website/content/en/install.md),
+[server management](website/content/en/manager.md), and
+[external access](website/content/en/external-access.md).
+The custom bilingual documentation site is built with `cd website && npm ci && npm run build`.
+A maintainer can opt into `gh-pages` publication using `GTMUX_PUBLISH_DOCS=true`.
+Local research notes in `docs/` are not part of the contribution.

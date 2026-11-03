@@ -1,0 +1,7 @@
+node_modules/
+resources/
+dist/
+dist-windows/
+
+# Platform and isolated review package variants
+dist-*/
