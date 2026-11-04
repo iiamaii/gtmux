@@ -1,0 +1,22 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>Interface conventions · gtmux</title><link rel="stylesheet" href="/gtmux/assets/site.css"></head><body>
+<header><a class="brand" href="/gtmux/en/home.html">gtmux <span>documentation</span></a><label class="search-label"><span class="sr-only">Search documentation</span><input id="search" type="search" placeholder="Search documentation" autocomplete="off"></label><a href="/gtmux/ko/design.html" lang="ko">한국어</a></header>
+<div class="layout"><nav aria-label="Documentation"><a href="/gtmux/en/agents.html">Agent activity integrations</a><a href="/gtmux/en/architecture.html">Architecture and contracts</a><a href="/gtmux/en/contributing.html">Contributing</a><a href="/gtmux/en/design.html" aria-current="page">Interface conventions</a><a href="/gtmux/en/external-access.html">External HTTPS access</a><a href="/gtmux/en/index.html">gtmux</a><a href="/gtmux/en/install.html">Installation and updates</a><a href="/gtmux/en/manager.html">Server management</a><a href="/gtmux/en/updates.html">Application updates</a><a href="/gtmux/en/configuration-reference.html">Configuration reference</a></nav><main id="main"><div id="search-results" hidden></div><article><h1 id="section-0">Interface conventions</h1><p>Use the existing compact workspace controls, system font stack, spacing and
+light/dark color tokens. Settings should explain the outcome in user language.</p>
+<h2 id="section-1">Boolean settings</h2><p>Use a slide switch for persistent on/off preferences. The visual track is
+28 × 16 px with a 12 px thumb; use the existing switch component in the workspace.
+The manager&#39;s equivalent uses <code>role=&quot;switch&quot;</code>, an accessible label, a visible
+keyboard focus ring and reduced-motion support. A native checkbox may be the
+underlying input, but must not appear as an unstyled square checkbox.</p>
+<h2 id="section-2">State and confirmation</h2><p>Show starting, running, stopping and failed states explicitly. Disable conflicting
+actions while a request is pending. Port conflicts and write failures must show
+the concrete cause without silently overwriting another configuration.</p>
+<p>Stopping or restarting a server ends terminal programs. Explain this beside the
+confirmation, preserve saved layouts, and keep credentials out of logs. Background
+execution is opt-in and must leave an accessible tray control.</p>
+<h2 id="section-3">Review</h2><p>Check light and dark appearance, keyboard navigation, narrow windows, long paths,
+errors and empty states. Windows filesystem paths must remain valid when selected,
+joined, copied or converted into workspace-relative references.</p>
+<p>The manager imports the canonical workspace tokens; packaged resources include the same CSS. Runtime interface text is English. Only documentation is translated at this stage. Browser regression checks exercise slide switches, a 700px manager window, both themes, keyboard resizing and Activity width restoration.</p>
+<p>The desktop window, tray, executable and installer use the existing gtmux brand mark. The package icon source is <code>codebase/launcher/ui/icon.png</code>, copied unchanged from the workspace <code>brand.png</code>; <code>tray.png</code> comes from its 32px favicon. When making an unsigned Windows review build, disable signing with <code>signExecutable: false</code>; do not disable executable resource editing with <code>signAndEditExecutable: false</code>, which leaves the Electron icon in place.</p>
+<p>The desktop first-run screen follows SettingsOverlay geometry, not only its palette: 16px section titles, 12px labels, 11px descriptions, 32px inputs/buttons, and settings rows with 14px vertical padding and a 28px gap. Labels and controls align in two columns; paths and narrow screens use a stacked layout. The workspace switch component and manager load the same <code>settings-controls.css</code> instead of separate switch implementations.</p>
+</article><footer>This documentation describes the features in this source version.</footer></main><aside aria-label="On this page"><a href="#section-1">Boolean settings</a><a href="#section-2">State and confirmation</a><a href="#section-3">Review</a></aside></div><script src="/gtmux/assets/site.js" type="module" data-base="/gtmux/" data-language="en"></script></body></html>

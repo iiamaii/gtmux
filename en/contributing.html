@@ -1,0 +1,31 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>Contributing · gtmux</title><link rel="stylesheet" href="/gtmux/assets/site.css"></head><body>
+<header><a class="brand" href="/gtmux/en/home.html">gtmux <span>documentation</span></a><label class="search-label"><span class="sr-only">Search documentation</span><input id="search" type="search" placeholder="Search documentation" autocomplete="off"></label><a href="/gtmux/ko/contributing.html" lang="ko">한국어</a></header>
+<div class="layout"><nav aria-label="Documentation"><a href="/gtmux/en/agents.html">Agent activity integrations</a><a href="/gtmux/en/architecture.html">Architecture and contracts</a><a href="/gtmux/en/contributing.html" aria-current="page">Contributing</a><a href="/gtmux/en/design.html">Interface conventions</a><a href="/gtmux/en/external-access.html">External HTTPS access</a><a href="/gtmux/en/index.html">gtmux</a><a href="/gtmux/en/install.html">Installation and updates</a><a href="/gtmux/en/manager.html">Server management</a><a href="/gtmux/en/updates.html">Application updates</a><a href="/gtmux/en/configuration-reference.html">Configuration reference</a></nav><main id="main"><div id="search-results" hidden></div><article><h1 id="section-0">Contributing</h1><h2 id="section-1">Development environment</h2><p>Use the Rust toolchain pinned in <code>codebase/backend/rust-toolchain.toml</code> and Node.js 22 or newer. Install frontend and launcher dependencies with <code>npm ci</code> in their respective directories. Do not commit local investigation notes under <code>docs/</code>.</p>
+<pre><code class="language-sh">cd codebase/backend
+cargo test --workspace --locked
+cargo build -p gtmux-cli --locked
+cd ../frontend
+npm ci
+npm run check
+npm test
+npm run build
+cd ../launcher
+npm ci
+npm test
+</code></pre>
+<h2 id="section-2">Prepare a local desktop build</h2><p>From the repository root, copy your backend binary and built frontend into the launcher resources:</p>
+<pre><code class="language-sh">node scripts/prepare-launcher.mjs codebase/backend/target/debug/gtmux codebase/frontend/dist
+cd codebase/launcher
+npm start
+</code></pre>
+<p>For browser-only management without Electron, run <code>npm run web -- --data-dir /absolute/temporary/manager-data</code>. It prints a management URL and waits for you to choose Start. Always use a separate data folder and unused ports for testing; do not reuse a real user&#39;s Store or settings.</p>
+<h2 id="section-3">One contribution, reviewable commits</h2><p>Keep feature commits separate on one integration branch. Rebase or merge deliberately after inspecting upstream changes, including <code>push/cloud-mode</code>. Do not infer that an unmerged branch reserves a feature. Explain overlap and preserve independently useful upstream behavior.</p>
+<h2 id="section-4">Documentation checks</h2><p>English is the source language. Every English page has a Korean counterpart with the same filename. CI requires code changes to include documentation updates and requires changed English pages to have paired Korean edits. This checks update coverage, not translation accuracy. Configuration samples remain generated inputs for reference material; do not fabricate automatic prose translation.</p>
+<pre><code class="language-sh">cd website
+npm ci
+npm run check
+npm run build
+</code></pre>
+<p>The documentation workflow builds the custom static site on main. After maintainers select GitHub Actions as the Pages source and set the repository variable <code>GTMUX_PUBLISH_DOCS=true</code>, it also updates the generated <code>gh-pages</code> branch and deploys the Pages artifact. Pull requests only validate the site. Release workflows build server archives and desktop packages; secrets for signing are supplied by maintainers, never committed.</p>
+<h2 id="section-5">Packaged application regression check</h2><p>After <code>npm run pack</code>, set <code>GTMUX_TEST_APP</code> to the absolute unpacked executable path and run <code>npm run test:electron</code> in <code>codebase/launcher</code>. The test creates a temporary profile and unused port, starts a native server, opens a sandboxed workspace, stops the server, and closes the manager while the workspace remains open. It verifies the complete application exits successfully. It opens temporary desktop windows; do not point it at your normal application profile.</p>
+</article><footer>This documentation describes the features in this source version.</footer></main><aside aria-label="On this page"><a href="#section-1">Development environment</a><a href="#section-2">Prepare a local desktop build</a><a href="#section-3">One contribution, reviewable commits</a><a href="#section-4">Documentation checks</a><a href="#section-5">Packaged application regression check</a></aside></div><script src="/gtmux/assets/site.js" type="module" data-base="/gtmux/" data-language="en"></script></body></html>

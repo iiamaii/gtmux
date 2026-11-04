@@ -1,0 +1,36 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>Architecture and contracts · gtmux</title><link rel="stylesheet" href="/gtmux/assets/site.css"></head><body>
+<header><a class="brand" href="/gtmux/en/home.html">gtmux <span>documentation</span></a><label class="search-label"><span class="sr-only">Search documentation</span><input id="search" type="search" placeholder="Search documentation" autocomplete="off"></label><a href="/gtmux/ko/architecture.html" lang="ko">한국어</a></header>
+<div class="layout"><nav aria-label="Documentation"><a href="/gtmux/en/agents.html">Agent activity integrations</a><a href="/gtmux/en/architecture.html" aria-current="page">Architecture and contracts</a><a href="/gtmux/en/contributing.html">Contributing</a><a href="/gtmux/en/design.html">Interface conventions</a><a href="/gtmux/en/external-access.html">External HTTPS access</a><a href="/gtmux/en/index.html">gtmux</a><a href="/gtmux/en/install.html">Installation and updates</a><a href="/gtmux/en/manager.html">Server management</a><a href="/gtmux/en/updates.html">Application updates</a><a href="/gtmux/en/configuration-reference.html">Configuration reference</a></nav><main id="main"><div id="search-results" hidden></div><article><h1 id="section-0">Architecture and contracts</h1><h2 id="section-1">Process boundaries</h2><p>The Rust backend owns PTYs, session layouts and attach locks. The Svelte application renders the workspace and stores browser appearance preferences. The optional manager owns a single server child, a separate local control listener and, when selected, a Caddy child. Electron provides desktop windows and tray lifetime; it does not give workspace web content Node.js access.</p>
+<p>A managed server has its own TOML, Store and XDG directories. Loopback proxy deployment is explicit through <code>public_origin</code>; it activates cloud auth policy without binding the backend to an external interface.</p>
+<h2 id="section-2">Server API</h2><table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>GET /api/config</code></td>
+<td>Read file text, revision, saved/running configuration and restart status</td>
+</tr>
+<tr>
+<td><code>POST /api/config/preview</code></td>
+<td>Validate common-field edits without saving</td>
+</tr>
+<tr>
+<td><code>PUT /api/config</code></td>
+<td>Reauthenticated, revision-checked atomic save</td>
+</tr>
+<tr>
+<td><code>GET /api/server/status</code></td>
+<td>Lifecycle state and server-wide terminal/session counts</td>
+</tr>
+<tr>
+<td><code>POST /api/shutdown</code></td>
+<td>Reauthenticated host-owned stop request</td>
+</tr>
+</tbody></table>
+<p>These routes use the existing server authentication boundary. They do not install software. The local manager API uses a distinct bootstrap cookie and same-origin requests, and is never exposed by the proxy.</p>
+<h2 id="section-3">Attach ownership</h2><p>The operating-system file lock remains authoritative. Lease text is diagnostic; expiry cannot override another process&#39;s lock. Within a server, owner maps, holder maps and connection registration have a fixed locking order. Last-connection generation checks and guard release share one fence. Disconnected orphan ownership is reclaimed after its monotonic timeout; active sockets are protected.</p>
+<h2 id="section-4">Embedding</h2><p>The HTTP library does not exit its host. Hosts explicitly supply configuration-file editing and a shutdown signal receiver. They are responsible for draining connections, shutting down the PTY backend and releasing attach guards. The standalone CLI, desktop app and third-party hosts can share the backend without sharing process ownership.</p>
+</article><footer>This documentation describes the features in this source version.</footer></main><aside aria-label="On this page"><a href="#section-1">Process boundaries</a><a href="#section-2">Server API</a><a href="#section-3">Attach ownership</a><a href="#section-4">Embedding</a></aside></div><script src="/gtmux/assets/site.js" type="module" data-base="/gtmux/" data-language="en"></script></body></html>

@@ -1,0 +1,125 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>설정 참조 · gtmux</title><link rel="stylesheet" href="/gtmux/assets/site.css"></head><body>
+<header><a class="brand" href="/gtmux/ko/home.html">gtmux <span>documentation</span></a><label class="search-label"><span class="sr-only">문서 검색</span><input id="search" type="search" placeholder="문서 검색" autocomplete="off"></label><a href="/gtmux/en/configuration-reference.html" lang="en">English</a></header>
+<div class="layout"><nav aria-label="문서 목록"><a href="/gtmux/ko/agents.html">에이전트 Activity 연동</a><a href="/gtmux/ko/architecture.html">아키텍처와 통신 계약</a><a href="/gtmux/ko/contributing.html">기여 방법</a><a href="/gtmux/ko/design.html">인터페이스 규칙</a><a href="/gtmux/ko/external-access.html">외부 HTTPS 접속</a><a href="/gtmux/ko/index.html">gtmux</a><a href="/gtmux/ko/install.html">설치와 업데이트</a><a href="/gtmux/ko/manager.html">서버 관리</a><a href="/gtmux/ko/updates.html">앱 업데이트</a><a href="/gtmux/ko/configuration-reference.html" aria-current="page">설정 참조</a></nav><main id="main"><div id="search-results" hidden></div><article><h1 id="section-0">설정 참조</h1><p>매 빌드마다 저장소 설정 샘플에서 자동 생성합니다.</p>
+<h2 id="section-1">Local</h2><pre><code class="language-toml"># gtmux Sample Config — Local 모드 (loopback, 단일 머신)
+#
+# 언제 쓰나: 본인 컴퓨터에서만 접속(127.0.0.1). 외부 노출 없음, TLS 불요.
+# 사실 Local 모드는 config 파일 없이도 동작한다 — built-in default(bind=127.0.0.1,
+# port=9001)가 곧 Local 모드다. 본 파일은 port·로그·디바운스 등을 조정하고 싶을 때만 쓴다.
+#
+# 사용법:
+#   1) 본 파일을 `~/.config/gtmux/&lt;name&gt;.config.toml` 로 복사
+#   2) `&lt;name&gt;` 을 본인 instance 이름으로 교체(아래 [server].session 과 일치)
+#   3) `gtmux start --name &lt;name&gt; --config ~/.config/gtmux/&lt;name&gt;.config.toml`
+#
+# 인증(ADR-0020 D18): token 은 매 `gtmux start` 마다 자동 발급(배너의 Open URL 한 번
+#   열면 쿠키 발급). password 를 추가로 쓰려면 `gtmux set-password`(다음 start 부터 활성)
+#   또는 UI Settings → Auth(실행 중 즉시 활성, 재시작 불요). token·password 는 동시에
+#   유효하다(둘 중 아무거나로 로그인). config 에 배타적 auth mode 선택지는 없다.
+#
+# 상세: codebase/QUICKSTART.ko.md
+
+schema_version = 1
+
+[server]
+# instance 이름. `--name &lt;name&gt;` 과 일치해야 함. safe-filename charset
+# (^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$). 부팅 immutable.
+session = &quot;local&quot;
+# listen port. 1024–65535 (privileged port &lt; 1024 는 거부).
+port    = 9001
+# loopback bind → Local 모드 자동 추론. &quot;127.0.0.1&quot; | &quot;::1&quot; | &quot;localhost&quot; |
+# &quot;unix:/path/to.sock&quot; 모두 Local. 외부 노출은 config.cloud.sample.toml 참조.
+bind    = &quot;127.0.0.1&quot;
+
+# ── 이하 섹션은 전부 선택 — 생략 시 안전한 기본값이 적용된다. ──
+
+[runtime]
+log_level  = &quot;info&quot;   # trace|debug|info|warn|error|off
+log_format = &quot;auto&quot;   # auto(tty=text / pipe=json) | text | json
+# ring_buffer_size_kb     = 128   # pane 당 스크롤백 ring buffer (KB)
+# layout_debounce_ms      = 300   # Canvas Layout HTTP PUT debounce (ms)
+# panel_state_debounce_ms = 300   # Panel streaming-state 토글 debounce (ms)
+
+[auth]
+# Cookie 수명(일). 1–30, rolling renewal(사용 중이면 자동 연장).
+cookie_max_age_days = 7
+# password 로그인 실패 brute-force 방어: N 시도 / 5분 / IP.
+rate_limit_per_5min = 5
+
+[assets]
+# 업로드 asset 1개당 최대 저장 크기(byte). 기본 50 MiB.
+max_size_bytes = 52428800
+
+# Local 모드는 [security](cors_origins / host_allowlist)를 생략하면 loopback alias
+# (127.0.0.1 / localhost / [::1])로 자동 합성한다. [cloud] 섹션은 Local 에서 무시된다.
+</code></pre>
+<h2 id="section-2">Cloud</h2><pre><code class="language-toml"># gtmux Sample Config — Cloud 모드 (외부 노출, 보안 정책 강제)
+#
+# 언제 쓰나: 본인 머신 밖(LAN / VPN / Tailscale / 공인 IP)에서 접속. bind 가 loopback 이
+# 아니면 Cloud 모드가 자동 발동하고 [cloud] 섹션이 *필수*가 된다(없으면 부팅 거부).
+# Cloud 모드는 per-IP rate limit · strict origin/Host · (기본)TLS/HSTS 를 강제한다.
+#
+# 사용법:
+#   1) 본 파일을 `~/.config/gtmux/&lt;name&gt;.config.toml` 로 복사
+#   2) PUBLIC_HOST(공인 IP 또는 도메인) 와 port 를 본인 환경으로 교체
+#   3) 아래 [cloud] 에서 배포 형태 A(직접 TLS) / B(reverse proxy) 중 하나 선택
+#   4) `gtmux start --name &lt;name&gt; --config ~/.config/gtmux/&lt;name&gt;.config.toml`
+#
+# 인증(ADR-0020 D18): token 은 부팅 시 발급되며 cloud 에서는 영속(명시 회전 전까지 유지).
+#   password 를 추가하려면 `gtmux set-password`(다음 start 부터) 또는 UI Settings → Auth
+#   (즉시 활성). token·password 동시 유효. 누출 token 즉시 차단 = UI [Rotate token]
+#   (서버 token 재발급 + 전원 로그아웃 + 활성 WS 종료) 또는 CLI `gtmux rotate-token --name &lt;name&gt;`.
+#
+# 상세: codebase/QUICKSTART.ko.md, docs/deploy.md
+
+schema_version = 1
+
+[server]
+session = &quot;prod&quot;
+port    = 9001
+# 비-loopback bind → Cloud 모드 자동 추론. &quot;0.0.0.0&quot;(모든 인터페이스) 또는 특정 외부 IP.
+bind    = &quot;0.0.0.0&quot;
+
+[runtime]
+log_level  = &quot;info&quot;
+log_format = &quot;auto&quot;    # systemd journal 로 보낼 땐 &quot;json&quot;
+
+[security]
+# 브라우저가 보낼 Origin 의 정확-일치 화이트리스트. wildcard 금지. scheme+host(+port)
+# 형식으로, 브라우저가 *실제 접속하는* origin 그대로 적는다(reverse proxy 면 프록시의
+# 공개 origin). 여러 호스트(IP + 도메인)는 모두 나열.
+cors_origins   = [&quot;https://PUBLIC_HOST&quot;]
+# Host 헤더 화이트리스트 — DNS rebinding 방어. cors_origins 와 host 부분 일치.
+host_allowlist = [&quot;PUBLIC_HOST&quot;]
+
+[auth]
+cookie_max_age_days = 7
+rate_limit_per_5min = 5
+
+[assets]
+max_size_bytes = 52428800   # 50 MiB
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [cloud] — Cloud 모드 필수 섹션. 아래 형태 A / B 중 하나를 택한다.
+# ─────────────────────────────────────────────────────────────────────────────
+[cloud]
+# 분당 인증 실패 허용 횟수. [cloud] 의 *필수* 키(기본값 없음 — 생략하면 부팅 거부).
+rate_limit_auth_failures_per_minute = 10
+
+# ── 형태 A (권장·기본): gtmux 가 TLS 를 직접 종단 ──
+#   tls_required = true 가 기본값. cert/key 를 지정해야 부팅을 통과한다(둘 다 PEM, 0600).
+tls_required = true
+tls_cert = &quot;/etc/gtmux/cert.pem&quot;
+tls_key  = &quot;/etc/gtmux/key.pem&quot;
+
+# ── 형태 B (reverse proxy 가 TLS 종단): 위 A 의 3줄을 지우고 아래 주석을 해제 ──
+#   nginx / Caddy 등이 HTTPS 를 종단하고 gtmux 로 평문 HTTP 를 전달하는 경우.
+# tls_required = false                  # 신뢰 네트워크 평문 HTTP 허용(escape hatch)
+# trusted_proxy_ips = [&quot;10.0.0.2/32&quot;]   # 프록시 IP/CIDR. 이 IP 에서 온 요청에 한해
+#                                       # X-Forwarded-For 의 client IP 를 rate-limit key 로
+#                                       # 신뢰한다(ADR-0003 D12). 미설정/빈 목록이면 XFF 무시
+#                                       # → 프록시 socket IP 단일 버킷(전 클라이언트 공유) +
+#                                       # 부팅 시 stderr 경고. 프록시 IP 를 넣어야 per-client.
+# trusted_proxy_ips_required = true     # false 로 두면 위 빈 목록 경고를 끈다
+</code></pre>
+</article><footer>이 문서는 해당 소스 버전의 기능을 설명합니다.</footer></main><aside aria-label="On this page"><a href="#section-1">Local</a><a href="#section-2">Cloud</a></aside></div><script src="/gtmux/assets/site.js" type="module" data-base="/gtmux/" data-language="ko"></script></body></html>

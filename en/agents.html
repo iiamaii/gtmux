@@ -1,0 +1,71 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light dark"><title>Agent activity integrations · gtmux</title><link rel="stylesheet" href="/gtmux/assets/site.css"></head><body>
+<header><a class="brand" href="/gtmux/en/home.html">gtmux <span>documentation</span></a><label class="search-label"><span class="sr-only">Search documentation</span><input id="search" type="search" placeholder="Search documentation" autocomplete="off"></label><a href="/gtmux/ko/agents.html" lang="ko">한국어</a></header>
+<div class="layout"><nav aria-label="Documentation"><a href="/gtmux/en/agents.html" aria-current="page">Agent activity integrations</a><a href="/gtmux/en/architecture.html">Architecture and contracts</a><a href="/gtmux/en/contributing.html">Contributing</a><a href="/gtmux/en/design.html">Interface conventions</a><a href="/gtmux/en/external-access.html">External HTTPS access</a><a href="/gtmux/en/index.html">gtmux</a><a href="/gtmux/en/install.html">Installation and updates</a><a href="/gtmux/en/manager.html">Server management</a><a href="/gtmux/en/updates.html">Application updates</a><a href="/gtmux/en/configuration-reference.html">Configuration reference</a></nav><main id="main"><div id="search-results" hidden></div><article><h1 id="section-0">Agent activity integrations</h1><p>Enable <strong>Settings → Appearance → Terminal activity</strong> in the workspace. In the desktop manager, open <strong>Agent activity</strong>, select an agent and choose <strong>Generate integration</strong>. Copy and review the result before merging it into the agent&#39;s existing settings. Generation does not modify those settings or approve tools. Restart the agent after installing its hooks.</p>
+<p>The manager keeps the hook executable at a stable path in its own data directory, including for AppImage installations. Generate the integration again after updating gtmux to refresh that executable. If the manager data directory is removed, regenerate the integration. Hooks are inactive outside a gtmux terminal.</p>
+<h2 id="section-1">Supported signals</h2><table>
+<thead>
+<tr>
+<th>Agent</th>
+<th>Working</th>
+<th>Completed</th>
+<th>Input needed</th>
+<th>Setup</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Claude Code</td>
+<td>Prompt/tool hooks</td>
+<td>Stop</td>
+<td>PermissionRequest, permission notification</td>
+<td>Merge hooks into <code>~/.claude/settings.json</code></td>
+</tr>
+<tr>
+<td>Codex</td>
+<td>Prompt/tool hooks</td>
+<td>Stop</td>
+<td>PermissionRequest</td>
+<td>Merge into <code>~/.codex/hooks.json</code>, then review and trust in <code>/hooks</code></td>
+</tr>
+<tr>
+<td>Gemini CLI</td>
+<td>BeforeAgent/tool hooks</td>
+<td>AfterAgent</td>
+<td>ToolPermission notification</td>
+<td>Merge hooks into <code>~/.gemini/settings.json</code></td>
+</tr>
+<tr>
+<td>Copilot CLI</td>
+<td>Prompt/tool hooks</td>
+<td>agentStop</td>
+<td>Not classified by this adapter</td>
+<td><code>.github/hooks/gtmux-activity.json</code></td>
+</tr>
+<tr>
+<td>Cursor</td>
+<td>Prompt/tool hooks</td>
+<td>stop with completed status</td>
+<td>Not classified by this adapter</td>
+<td>Merge into <code>~/.cursor/hooks.json</code></td>
+</tr>
+<tr>
+<td>Aider</td>
+<td>Ordinary terminal activity</td>
+<td>Completion notification</td>
+<td>Not independently classified</td>
+<td>Merge generated keys into Aider YAML or use its notification command flag</td>
+</tr>
+<tr>
+<td>OpenCode</td>
+<td>session.status</td>
+<td>session.idle</td>
+<td>Permission/question events</td>
+<td>Save generated JavaScript as <code>.opencode/plugins/gtmux-activity.js</code></td>
+</tr>
+</tbody></table>
+<p>On Windows, <code>~</code> means your user profile. Use the gtmux build for the same operating environment as the agent. An agent installed only in WSL is not a Windows-native executable. Hook event availability depends on the agent version. Copilot configuration uses its executable/arguments hook format; Cursor CLI may expose fewer events than the desktop product.</p>
+<p>Subagent completion is excluded where the protocol identifies it. A stop hook reports that the agent reached a turn boundary; another hook may still request continuation. Cancellation and failures are not reported as successful completion. The adapter reads event metadata from the hook payload; it does not open transcripts or save/transmit prompts or API keys. Unsupported events remain unknown. Ordinary output-based estimates are still labelled estimated.</p>
+<h2 id="section-2">CLI and embedding</h2><p>Run <code>gtmux agent hooks claude</code> to print configuration; replace <code>claude</code> with <code>codex</code>, <code>gemini</code>, <code>copilot</code>, <code>cursor</code>, <code>aider</code>, or <code>opencode</code>. This never overwrites an existing hook file. The generated command invokes <code>gtmux agent event</code> with JSON on stdin. Hosts can also send <code>gtmux terminal report working</code>, <code>completed</code>, <code>needs_input</code>, or <code>unknown</code> from a gtmux pane.</p>
+<p>To disable integration, remove only the gtmux entries or its OpenCode plugin. To restore it, generate the configuration again. The Activity UI can be disabled independently. Unread counts in tab titles are off by default and can be restored in Appearance settings.</p>
+<h2 id="section-3">Sources and validation scope</h2><p>The adapters follow the official <a href="https://code.claude.com/docs/en/hooks">Claude hooks</a>, <a href="https://learn.chatgpt.com/docs/hooks">Codex hooks</a>, <a href="https://geminicli.com/docs/hooks/reference/">Gemini hooks</a>, <a href="https://docs.github.com/en/copilot/reference/hooks-reference">Copilot hooks</a>, <a href="https://cursor.com/docs/hooks">Cursor hooks</a>, <a href="https://aider.chat/docs/usage/notifications.html">Aider notifications</a>, and <a href="https://opencode.ai/docs/plugins/">OpenCode plugins</a> references. Protocol fixtures and real gtmux CLI/server transport are tested. This does not mean every installed agent version has been exercised through a paid model conversation.</p>
+<h2 id="section-4">Install and restore from the manager</h2><p>Choose <strong>Review installation</strong> to see the exact target, then <strong>Apply integration change</strong>. The manager appends hooks and backs up existing settings, retaining permissions and other hooks. Restart the agent and accept its own hook trust prompt where required. It never trusts hooks on your behalf. <strong>Review removal</strong> restores the original settings only if they have not changed since installation; otherwise remove only gtmux entries manually. Invalid JSON, unsupported comment syntax, an existing Aider notification command, conflicting plugins and concurrent edits are reported without overwriting them. Custom agent configuration directories (for example <code>CODEX_HOME</code>) require the manual generated configuration route.</p>
+</article><footer>This documentation describes the features in this source version.</footer></main><aside aria-label="On this page"><a href="#section-1">Supported signals</a><a href="#section-2">CLI and embedding</a><a href="#section-3">Sources and validation scope</a><a href="#section-4">Install and restore from the manager</a></aside></div><script src="/gtmux/assets/site.js" type="module" data-base="/gtmux/" data-language="en"></script></body></html>
