@@ -93,10 +93,17 @@ try {
   await page.locator('#confirm-stop').click();
   await page.locator('#state').filter({ hasText: /^stopped$/ }).waitFor({ timeout: 30000 });
   // Reopening after a server stop must reload the existing window with the new token.
+  const reopened = page.waitForResponse(response => response.url().endsWith('/api/open') && response.request().method() === 'POST');
   await page.getByRole('button', { name: 'Open workspace', exact: true }).click();
+  const openResponse = await reopened;
+  const openResult = await openResponse.json();
+  assert.equal(openResponse.status(), 200, JSON.stringify(openResult).replace(/token=[^\s"&]+/g, 'token=[redacted]'));
+  assert.equal(openResult.opened, true);
   await page.locator('#state').filter({hasText:/^running$/}).waitFor({timeout:30000});
   await workspace.getByLabel('Left panel',{exact:true}).waitFor();
-  await page.waitForFunction(()=>document.querySelector('#message').textContent==='Workspace opened.');
+  // Opening the workspace occludes the manager on macOS. Its animation
+  // frames may pause, so observe state independently of frame rendering.
+  await page.waitForFunction(()=>document.querySelector('#message').textContent==='Workspace opened.', null, {polling:100});
   await page.getByRole('button', {name:'Stop server…',exact:true}).click();
   await page.locator('#confirm-stop').click();
   await page.locator('#state').filter({hasText:/^stopped$/}).waitFor({timeout:30000});
