@@ -25,3 +25,5 @@ The operating-system file lock remains authoritative. Lease text is diagnostic; 
 ## Embedding
 
 The HTTP library does not exit its host. Hosts explicitly supply configuration-file editing and a shutdown signal receiver. They are responsible for draining connections, shutting down the PTY backend and releasing attach guards. The standalone CLI, desktop app and third-party hosts can share the backend without sharing process ownership.
+
+Authentication rate limits use elapsed monotonic time to expire failures. A newly booted host must still enforce the configured limit even when subtracting a full rate window from its clock would underflow; failures exactly on the window boundary continue to count.
