@@ -30,8 +30,6 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-      GTMUX_RELEASE_REPOSITORY: ${{ github.repository }}
-      GTMUX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85.0
@@ -51,6 +49,9 @@ jobs:
         working-directory: codebase/frontend
       - run: node scripts/prepare-launcher.mjs codebase/backend/target/release/${{ matrix.binary }} .artifacts/frontend
       - run: node scripts/release-version.mjs
+        # Packaging metadata is not a GTMUX server configuration field.
+        env:
+          GTMUX_RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       - run: npm ci
         working-directory: codebase/launcher
       - run: npm test
@@ -58,6 +59,8 @@ jobs:
       - run: node scripts/package-server.mjs ${{ matrix.label }}
       - run: npm run dist
         working-directory: codebase/launcher
+        env:
+          GTMUX_RELEASE_REPOSITORY: ${{ github.repository }}
       - name: Check packaged application lifecycle
         if: runner.os != 'Linux'
         run: node test/package-smoke.mjs
