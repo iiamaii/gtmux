@@ -265,11 +265,16 @@ impl RateLimiter {
     /// entries older than [`RATE_WINDOW`] are pruned on every call so the
     /// map cannot grow unboundedly across days of probing.
     pub async fn note_failure_and_check(&self, key: &str, limit: u32) -> bool {
-        let now = Instant::now();
-        let cutoff = now - RATE_WINDOW;
+        self.note_failure_at(key, limit, Instant::now()).await
+    }
+
+    async fn note_failure_at(&self, key: &str, limit: u32, now: Instant) -> bool {
         let mut map = self.inner.lock().await;
         let bucket = map.entry(key.to_string()).or_default();
-        bucket.retain(|&t| t >= cutoff);
+        // Computing a cutoff Instant can underflow on a newly booted Windows
+        // runner. Compare ages instead; retain future timestamps conservatively
+        // if concurrent requests sampled their clocks in a different order.
+        bucket.retain(|&t| now.saturating_duration_since(t) <= RATE_WINDOW);
         bucket.push(now);
         let too_many = bucket.len() as u32 > limit;
         if too_many {
@@ -1363,6 +1368,36 @@ mod tests {
             limiter.note_failure_and_check("ip", 5).await,
             "6th attempt must trip the limit"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_handles_clock_origin_and_window_boundary() {
+        // Find an Instant near the platform's lower bound without depending
+        // on runner uptime (Windows CI can start within RATE_WINDOW of it).
+        let reference = Instant::now();
+        let (mut low, mut high) = (0u64, u64::MAX);
+        while low < high {
+            let distance = high - low;
+            let mid = low + distance / 2 + distance % 2;
+            if reference.checked_sub(Duration::from_secs(mid)).is_some() {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        let origin = reference.checked_sub(Duration::from_secs(low)).unwrap();
+        assert!(origin.checked_sub(RATE_WINDOW).is_none());
+        let limiter = RateLimiter::new();
+        assert!(!limiter.note_failure_at("ip", 1, origin).await);
+        assert!(limiter.note_failure_at("ip", 1, origin).await);
+        // A different client must remain independent.
+        assert!(!limiter.note_failure_at("other", 1, origin).await);
+        // Exactly-on-boundary failures still count, as before.
+        assert!(limiter.note_failure_at("ip", 1, origin + RATE_WINDOW).await);
+        // Only the attempt made at the boundary remains now.
+        assert!(!limiter.note_failure_at("ip", 2, origin + RATE_WINDOW + Duration::from_nanos(1)).await);
+        limiter.reset("ip").await;
+        assert!(!limiter.note_failure_at("ip", 1, origin + RATE_WINDOW).await);
     }
 
     #[tokio::test]
